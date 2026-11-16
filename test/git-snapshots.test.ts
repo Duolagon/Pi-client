@@ -1,0 +1,261 @@
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { promisify } from "node:util";
+import { GitSnapshots } from "../src/git-snapshots.ts";
+
+const exec = promisify(execFile);
+async function fixture() {
+	const root = await mkdtemp(join(tmpdir(), "pi-git-snapshots-"));
+	const project = join(root, "project");
+	const data = join(root, "app-data");
+	await mkdir(project);
+	await exec("git", ["init", project]);
+	await writeFile(join(project, ".gitignore"), "ignored/\n");
+	await writeFile(join(project, "tracked.txt"), "index baseline\n");
+	await exec("git", ["add", "--", ".gitignore", "tracked.txt"], { cwd: project });
+	await writeFile(join(project, "tracked.txt"), "user's unstaged work\n");
+	await writeFile(join(project, "untracked.txt"), "user's untracked work\n");
+	await mkdir(join(project, "ignored"));
+	await writeFile(join(project, "ignored", "secret.txt"), "ignored data");
+	return { project, data, service: new GitSnapshots(data), cleanup: () => rm(root, { recursive: true, force: true }) };
+}
+
+test("checkpoints restore actual worktree changes and preserve prior edits, ignored files, and Git index", async () => {
+	const { project, data, service, cleanup } = await fixture();
+	try {
+		const index = await readFile(join(project, ".git", "index"));
+		const start = await service.begin(project, "conversation-1", "Implement a feature");
+		assert.equal(start.status, "pending");
+		await assert.rejects(service.restore(project, start.id), /未完成|尚未结束/);
+		await writeFile(join(project, "tracked.txt"), "agent update\n");
+		await rm(join(project, "untracked.txt"));
+		await mkdir(join(project, "new-folder"));
+		await writeFile(join(project, "new-folder", "new.txt"), "agent new file\n");
+		await writeFile(join(project, "ignored", "secret.txt"), "ignored external edit");
+		const finished = await service.finish(project, start.id);
+		assert.equal(finished.status, "ready");
+		assert.deepEqual(
+			finished.changes.map((item) => item.path),
+			["new-folder", "new-folder/new.txt", "tracked.txt", "untracked.txt"],
+		);
+		assert.deepEqual(await readFile(join(project, ".git", "index")), index);
+		const diff = await service.diff(project, start.id, "tracked.txt");
+		assert.match(diff.files[0].diff, /-user's unstaged work/);
+		assert.match(diff.files[0].diff, /\+agent update/);
+		const reloaded = new GitSnapshots(data);
+		assert.equal((await reloaded.list(project, "conversation-1"))[0].id, start.id);
+		assert.equal((await reloaded.list(project, "other")).length, 0);
+		const restored = await reloaded.restore(project, start.id);
+		assert.equal(restored.status, "restored", JSON.stringify(restored));
+		assert.equal(restored.checkpoint.status, "restored");
+		assert.equal(await readFile(join(project, "tracked.txt"), "utf8"), "user's unstaged work\n");
+		assert.equal(await readFile(join(project, "untracked.txt"), "utf8"), "user's untracked work\n");
+		await assert.rejects(lstat(join(project, "new-folder")), { code: "ENOENT" });
+		assert.equal(await readFile(join(project, "ignored", "secret.txt"), "utf8"), "ignored external edit");
+		assert.deepEqual(await readFile(join(project, ".git", "index")), index);
+		assert.equal((await reloaded.restore(project, start.id)).status, "unchanged");
+	} finally {
+		await cleanup();
+	}
+});
+
+test("restore preflights every selected file before writing and reports external edits as conflicts", async () => {
+	const { project, service, cleanup } = await fixture();
+	try {
+		const start = await service.begin(project, "conversation-2");
+		await writeFile(join(project, "tracked.txt"), "agent tracked");
+		await writeFile(join(project, "untracked.txt"), "agent untracked");
+		await service.finish(project, start.id);
+		await writeFile(join(project, "tracked.txt"), "external edit after finish");
+		const result = await service.restore(project, start.id);
+		assert.equal(result.status, "conflict");
+		assert.ok(result.conflicts.some((item) => item.path === "tracked.txt"));
+		assert.equal(await readFile(join(project, "untracked.txt"), "utf8"), "agent untracked");
+		assert.equal(await readFile(join(project, "tracked.txt"), "utf8"), "external edit after finish");
+		const partial = await service.restore(project, start.id, ["untracked.txt"]);
+		assert.equal(partial.status, "restored");
+		assert.equal(partial.checkpoint.status, "partially-restored");
+		assert.equal(await readFile(join(project, "tracked.txt"), "utf8"), "external edit after finish");
+		await writeFile(join(project, "tracked.txt"), "agent tracked");
+		assert.equal((await service.restore(project, start.id)).checkpoint.status, "restored");
+	} finally {
+		await cleanup();
+	}
+});
+
+test("binary bytes, executable permissions, deletion, and symlinks survive a durable checkpoint", async () => {
+	const { project, data, service, cleanup } = await fixture();
+	try {
+		const original = Buffer.from([0, 1, 255, 0, 17]);
+		await writeFile(join(project, "binary.bin"), original);
+		await writeFile(join(project, "run.sh"), "#!/bin/sh\nprintf original\n");
+		await chmod(join(project, "run.sh"), 0o755);
+		await writeFile(join(project, "outside.txt"), "outside original");
+		await symlink("outside.txt", join(project, "link"));
+		const start = await service.begin(project, "conversation-3");
+		await writeFile(join(project, "binary.bin"), Buffer.from([0, 42]));
+		await chmod(join(project, "run.sh"), 0o644);
+		await rm(join(project, "link"));
+		await symlink("/this/target/does/not/exist", join(project, "link"));
+		const finished = await service.finish(project, start.id);
+		assert.equal(finished.changes.find((item) => item.path === "binary.bin")?.binary, true);
+		const diff = await service.diff(project, start.id, "binary.bin");
+		assert.match(diff.files[0].diff, /Binary files/);
+		assert.equal((await new GitSnapshots(data).restore(project, start.id)).status, "restored");
+		assert.deepEqual(await readFile(join(project, "binary.bin")), original);
+		assert.equal((await lstat(join(project, "run.sh"))).mode & 0o777, 0o755);
+		assert.equal(await readlink(join(project, "link")), "outside.txt");
+		assert.equal(await readFile(join(project, "outside.txt"), "utf8"), "outside original");
+	} finally {
+		await cleanup();
+	}
+});
+
+test("file/directory transitions restore in dependency order and reject unseen children", async () => {
+	const { project, service, cleanup } = await fixture();
+	try {
+		await writeFile(join(project, "was-file"), "original file");
+		await mkdir(join(project, "was-dir"));
+		await writeFile(join(project, "was-dir", "child.txt"), "original child");
+		const start = await service.begin(project, "conversation-4");
+		await rm(join(project, "was-file"));
+		await mkdir(join(project, "was-file"));
+		await writeFile(join(project, "was-file", "new.txt"), "new child");
+		await rm(join(project, "was-dir"), { recursive: true });
+		await writeFile(join(project, "was-dir"), "replacement file");
+		await service.finish(project, start.id);
+		const incomplete = await service.restore(project, start.id, ["was-file"]);
+		assert.equal(incomplete.status, "conflict");
+		assert.equal(await readFile(join(project, "was-dir"), "utf8"), "replacement file");
+		await writeFile(join(project, "was-file", "external.txt"), "keep me");
+		const conflicted = await service.restore(project, start.id);
+		assert.equal(conflicted.status, "conflict");
+		assert.equal(await readFile(join(project, "was-file", "external.txt"), "utf8"), "keep me");
+		await rm(join(project, "was-file", "external.txt"));
+		const restored = await service.restore(project, start.id);
+		assert.equal(restored.status, "restored", JSON.stringify(restored));
+		assert.equal(await readFile(join(project, "was-file"), "utf8"), "original file");
+		assert.equal(await readFile(join(project, "was-dir", "child.txt"), "utf8"), "original child");
+	} finally {
+		await cleanup();
+	}
+});
+
+test("paths and symlink ancestors cannot escape the project or overwrite outside files", async () => {
+	const { project, service, cleanup } = await fixture();
+	try {
+		await mkdir(join(project, "folder"));
+		await writeFile(join(project, "folder", "file.txt"), "original");
+		const outside = join(project, "..", "outside");
+		await mkdir(outside);
+		await writeFile(join(outside, "file.txt"), "private outside");
+		const start = await service.begin(project, "conversation-5");
+		await writeFile(join(project, "folder", "file.txt"), "agent change");
+		await service.finish(project, start.id);
+		await rm(join(project, "folder"), { recursive: true });
+		await symlink(outside, join(project, "folder"));
+		const result = await service.restore(project, start.id);
+		assert.equal(result.status, "conflict");
+		assert.equal(await readFile(join(outside, "file.txt"), "utf8"), "private outside");
+		await assert.rejects(service.restore(project, start.id, ["../outside/file.txt"]), /路径/);
+		await assert.rejects(service.diff(project, start.id, ".git/index"), /路径/);
+		await assert.rejects(service.restore(project, "../../escape"), /ID/);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("corrupt snapshot blobs are rejected before replacing the original file", async () => {
+	const { project, data, service, cleanup } = await fixture();
+	try {
+		const start = await service.begin(project, "conversation-6");
+		await writeFile(join(project, "tracked.txt"), "agent changed file");
+		await writeFile(join(project, "agent-created.txt"), "agent-created content");
+		await service.finish(project, start.id);
+		const blobs = join(data, "git-snapshots", "blobs");
+		for (const name of await readdir(blobs)) await writeFile(join(blobs, name), "corrupt");
+		const result = await service.restore(project, start.id);
+		assert.equal(result.status, "conflict");
+		assert.equal(await readFile(join(project, "tracked.txt"), "utf8"), "agent changed file");
+		assert.equal(await readFile(join(project, "agent-created.txt"), "utf8"), "agent-created content");
+	} finally {
+		await cleanup();
+	}
+});
+
+test("valid unusual Git filenames do not collide with JavaScript object properties", async () => {
+	const { project, data, service, cleanup } = await fixture();
+	try {
+		const paths = ["__proto__", "constructor", "toString", "space name.txt", "line\nbreak.txt"];
+		for (const path of paths) await writeFile(join(project, path), `original ${path}`);
+		const start = await service.begin(project, "conversation-7");
+		for (const path of paths) await writeFile(join(project, path), `agent ${path}`);
+		await service.finish(project, start.id);
+		assert.equal((await new GitSnapshots(data).restore(project, start.id)).status, "restored");
+		for (const path of paths) assert.equal(await readFile(join(project, path), "utf8"), `original ${path}`);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("corrupt manifests cannot inject a filesystem path or omit the baseline", async () => {
+	const { project, data, service, cleanup } = await fixture();
+	try {
+		const start = await service.begin(project, "conversation-8");
+		const directories = (await readdir(join(data, "git-snapshots"))).filter((name) => name !== "blobs");
+		const manifestPath = join(data, "git-snapshots", directories[0], `${start.id}.json`);
+		const original = await readFile(manifestPath, "utf8");
+		const corrupted = JSON.parse(original) as { before?: Record<string, unknown> };
+		corrupted.before = { "../outside.txt": { kind: "missing" } };
+		await writeFile(manifestPath, JSON.stringify(corrupted));
+		await assert.rejects(service.list(project), /路径/);
+		delete corrupted.before;
+		await writeFile(manifestPath, JSON.stringify(corrupted));
+		await assert.rejects(service.list(project), /任务前状态/);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("archived checkpoint metadata and diffs remain readable after the original project is removed", async () => {
+	const { project, data, service, cleanup } = await fixture();
+	try {
+		const checkpoint = await service.begin(project, "archived-conversation");
+		await writeFile(join(project, "tracked.txt"), "completed task content\n");
+		await service.finish(project, checkpoint.id);
+		await rm(project, { recursive: true });
+		const reloaded = new GitSnapshots(data);
+		assert.equal((await reloaded.list(checkpoint.project))[0].id, checkpoint.id);
+		assert.equal((await reloaded.list(project, "archived-conversation"))[0].id, checkpoint.id);
+		const diff = await reloaded.diff(checkpoint.project, checkpoint.id, "tracked.txt");
+		assert.match(diff.files[0].diff, /-user's unstaged work/);
+		assert.match(diff.files[0].diff, /\+completed task content/);
+		await assert.rejects(reloaded.restore(checkpoint.project, checkpoint.id), { code: "ENOENT" });
+		await assert.rejects(reloaded.diff(join(checkpoint.project, "different-project"), checkpoint.id), {
+			code: "ENOENT",
+		});
+	} finally {
+		await cleanup();
+	}
+});
+
+test("selected-file restore recreates missing ancestor permissions and remains compatible with a later full restore", async () => {
+	const { project, service, cleanup } = await fixture();
+	try {
+		await mkdir(join(project, "private"), { mode: 0o700 });
+		await writeFile(join(project, "private", "file.txt"), "private original");
+		const checkpoint = await service.begin(project, "private-directory");
+		await rm(join(project, "private"), { recursive: true });
+		await service.finish(project, checkpoint.id);
+		assert.equal((await service.restore(project, checkpoint.id, ["private/file.txt"])).status, "restored");
+		assert.equal((await lstat(join(project, "private"))).mode & 0o777, 0o700);
+		assert.equal(await readFile(join(project, "private", "file.txt"), "utf8"), "private original");
+		assert.equal((await service.restore(project, checkpoint.id)).checkpoint.status, "restored");
+	} finally {
+		await cleanup();
+	}
+});

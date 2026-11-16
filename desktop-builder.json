@@ -1,0 +1,30 @@
+{
+	"appId": "dev.pi.desktop",
+	"productName": "Pi Desktop",
+	"electronVersion": "45.3.2",
+	"directories": { "app": "dist", "output": "release/desktop" },
+	"files": [
+		"main.cjs",
+		"preload.cjs",
+		"app.js",
+		"app.css",
+		"index.html",
+		"version.json",
+		"package.json",
+		"!node_modules/**/*"
+	],
+	"extraResources": [
+		{ "from": "dist/native", "to": "native" },
+		{ "from": "dist/runtime", "to": "runtime" },
+		{ "from": "dist/runtime/node_modules/jiti", "to": "runtime/node_modules/jiti", "filter": ["**/*"] },
+		{
+			"from": "dist/runtime/node_modules/@silvia-odwyer/photon-node",
+			"to": "runtime/node_modules/@silvia-odwyer/photon-node",
+			"filter": ["**/*"]
+		}
+	],
+	"npmRebuild": false,
+	"mac": { "identity": null, "category": "public.app-category.developer-tools", "target": ["zip"] },
+	"win": { "target": ["nsis"] },
+	"linux": { "target": ["AppImage"], "category": "Development" }
+}

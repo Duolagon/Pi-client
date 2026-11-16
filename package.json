@@ -1,0 +1,85 @@
+{
+	"name": "@pi/desktop",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Pi coding agent desktop workspace",
+	"author": "Pi Desktop contributors",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Duolagon/Pi-client.git"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"type": "module",
+	"main": "dist/main.cjs",
+	"scripts": {
+		"prototype": "node scripts/prototype.mjs --serve",
+		"prototype:build": "node scripts/prototype.mjs",
+		"prototype:app": "node scripts/prototype.mjs && electron-builder --config prototype-builder.json --mac --dir",
+		"build": "node scripts/build.mjs",
+		"build:backend": "node scripts/build.mjs --backend-only",
+		"start": "electron .",
+		"dev": "node scripts/build.mjs && electron .",
+		"check": "tsc --noEmit",
+		"test:backend": "node --test test/*.test.ts",
+		"package": "node scripts/build.mjs && electron-builder --config desktop-builder.json --dir",
+		"dist:mac": "node scripts/build.mjs && electron-builder --config desktop-builder.json --mac zip"
+	},
+	"dependencies": {
+		"@earendil-works/pi-agent-core": "1.5.2",
+		"@earendil-works/pi-ai": "1.5.2",
+		"@earendil-works/pi-coding-agent": "1.5.2",
+		"lucide-react": "1.72.0",
+		"react": "19.3.0",
+		"react-dom": "19.3.0",
+		"react-markdown": "10.1.0"
+	},
+	"devDependencies": {
+		"@types/node": "22.19.19",
+		"@types/react": "19.3.0",
+		"@types/react-dom": "19.3.0",
+		"electron": "45.3.2",
+		"electron-builder": "26.18.0",
+		"esbuild": "0.28.2",
+		"playwright": "1.64.0",
+		"typescript": "7.0.2"
+	},
+	"build": {
+		"appId": "dev.pi.desktop",
+		"productName": "Pi Desktop",
+		"directories": {
+			"output": "release"
+		},
+		"files": [
+			"dist/**/*",
+			"package.json"
+		],
+		"npmRebuild": false,
+		"extraResources": [
+			{
+				"from": "dist/runtime",
+				"to": "runtime"
+			}
+		],
+		"mac": {
+			"category": "public.app-category.developer-tools",
+			"target": [
+				"zip"
+			],
+			"identity": null
+		},
+		"win": {
+			"target": [
+				"nsis"
+			]
+		},
+		"linux": {
+			"target": [
+				"AppImage"
+			],
+			"category": "Development"
+		}
+	}
+}
