@@ -93,10 +93,13 @@
 	flex-direction: column;
 	align-items: center;
 	gap: 3px;
-	padding: 46px 0 12px;
+	padding: 52px 0 12px;
 	background: var(--cl-side);
 	border-right: 1px solid var(--cl-line);
 	z-index: 50;
+}
+:root[data-native="true"] .cl-rail {
+	padding-top: 20px;
 }
 .cl-rail .icon-button {
 	width: 34px;
@@ -126,8 +129,12 @@
 	display: flex;
 	align-items: center;
 	padding: 0 16px;
+	padding-left: 80px;
 	flex-shrink: 0;
 	-webkit-app-region: drag;
+}
+:root[data-native="true"] .cl-side-head {
+	padding-left: 80px;
 }
 .cl-side-title {
 	font-size: 13px;
@@ -184,12 +191,24 @@
 	border-radius: 8px;
 	margin: 1px 0;
 	min-width: 0;
+	position: relative;
 }
 .cl-conv:hover {
 	background: var(--cl-hover);
 }
 .cl-conv.selected {
-	background: var(--cl-active);
+	background: var(--cl-hover);
+	position: relative;
+}
+.cl-conv.selected::before {
+	content: "";
+	position: absolute;
+	left: 0;
+	top: 4px;
+	bottom: 4px;
+	width: 3px;
+	background: var(--cl-clay);
+	border-radius: 0 2px 2px 0;
 }
 .cl-conv-title {
 	font-size: 13px;
@@ -773,6 +792,8 @@
 	font-size: 15px;
 	line-height: 1.6;
 	min-height: 62px;
+	max-height: 200px;
+	field-sizing: content;
 }
 .cl-composer-row {
 	display: flex;
@@ -1197,4 +1218,9 @@
 	.cl-user-bubble {
 		max-width: 88%;
 	}
+}
+
+body {
+	background: var(--cl-bg);
+	color: var(--cl-text);
 }

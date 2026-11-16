@@ -4,6 +4,19 @@ macOS 优先的 Pi 桌面客户端。当前版本接入真实 Pi RPC 编码引�
 
 这是独立客户端源码仓库。Pi 引擎通过精确版本的 npm 依赖集成，当前固定为 `1.5.2`；依赖版本与发布包完整性记录在 `package-lock.json`。上游来源及升级流程见 [UPSTREAM.md](UPSTREAM.md)，许可与归属见 [NOTICE.md](NOTICE.md) 和 [LICENSE](LICENSE)。
 
+## 客户端截图
+
+正式 Electron 客户端的实际运行界面。截图使用本地演示模型和临时示例项目，展示真实 Pi 文件／命令工具、会话和 Git 差异。
+
+![Pi Desktop 浅色界面：会话、工具调用与编码结果](docs/screenshots/client-light.png)
+
+<details>
+<summary>深色模式与代码差异</summary>
+
+![Pi Desktop 深色界面：审核真实项目代码差异](docs/screenshots/client-dark.png)
+
+</details>
+
 ## 启动与打包
 
 开发环境需要 Node.js **22.19.0 或更新版本**、npm、Git 和 C 编译器。macOS 可使用 Xcode Command Line Tools 提供的编译器。测试直接运行 TypeScript 源码，类型检查使用仓库锁定的 TypeScript 与 Node 类型包。
@@ -47,7 +60,7 @@ DeepSeek 默认使用 `deepseek-flash`，并提供 `deepseek-v4-pro`；模型与
 
 ## 已接入
 
-以下同时列出界面已有功能和已完成的后端接口。Git 检查点、PTY、后台任务／Worktree、会话分支／树导航／CLI 历史导入已提供接口，完整前端入口仍待接入。
+以下同时列出界面已有功能和已完成的后端接口。发送任务和执行单命令会自动捕获 Git 检查点；检查点审核／恢复、PTY、后台任务／Worktree、会话分支／树导航／CLI 历史导入当前提供后端接口，界面入口仍待接入。
 
 - 本地项目选择；新建、切换、重命名会话；会话持久化与重启恢复。
 - 真实模型列表、模型切换、支持的思考强度、流式文本和思考内容。
@@ -83,6 +96,17 @@ node --test test/*.test.ts
 ```
 
 首次校验前先执行 `npm ci --ignore-scripts` 和 `npm run build`。类型检查不启动模型；测试使用的原生 PTY helper 由构建步骤生成。
+
+macOS 实际窗口与前后端互通验证：
+
+```sh
+npm run package
+npm run verify:client
+# 同时重新生成上方的客户端截图：
+npm run verify:client -- --screenshots
+```
+
+交互验证会启动正式打包应用，使用独立临时目录和本地演示模型，检查模型／思考选择、附件隔离与限制、工具审批、流式重载恢复与停止、文件修改与 Git 差异、命令面板，以及真实 preload 的会话树、检查点、PTY、后台任务和 Worktree 接口。
 
 测试使用独立临时目录与脚本化本地测试模型，运行真实 Pi Agent 循环和读写/命令工具，不使用真实模型凭据或付费 API。
 

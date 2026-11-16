@@ -15,7 +15,9 @@
 | `pi.sessions` | `fork / clone / entries / tree / forkMessages / navigate / history / importHistory` | 会话分支、树导航和 CLI 历史导入 |
 | `pi.onEvent` | 原接口保留 | 所有会话的 Pi 流式事件，按 `conversationId` 路由 |
 
-原有前台接口继续工作。切换项目或会话现在保留正在运行的旧会话；前端不得再假设“只有当前会话会产生事件”。修改全局模型连接、权限等设置前，需要停止全部运行中或排队中的任务。
+原有前台接口继续工作。后端切换项目或会话会保留正在运行的旧会话；前端不得再假设“只有当前会话会产生事件”。当前正式界面仍在运行时禁用项目／会话切换，后台任务、独立 PTY 和会话树等入口待接入。修改全局模型连接、权限等设置前，需要停止全部运行中或排队中的任务。
+
+流式恢复使用 `Snapshot.liveTranscript / eventSequence` 和 `DesktopEvent.sequence`。`messages` 是 Pi 已结束的消息，`liveTranscript` 补充当前生成中的 assistant 与未完成工具进度；页面重载时应一起恢复。事件序号在本次桌面宿主进程内递增，前端只重放同一 `conversationId`、且晚于快照序号的事件，避免漏接或重复追加。正式界面通过共享的 `src/transcript.ts` 和有界事件窗口处理这一过程；完整会话历史仍由 Pi 持久化。
 
 ## 会话分支、克隆和树导航
 

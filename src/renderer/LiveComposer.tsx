@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ArrowUp, Brain, Paperclip, ShieldCheck, Square, X } from "lucide-react";
 import type { Command, PermissionMode, Snapshot, ThinkingLevel } from "../shared.ts";
 
@@ -10,6 +10,23 @@ interface Attachment {
 }
 const DEFAULT_DESKTOP_KEYBINDINGS = { submit: "Enter" };
 const PERMISSION_LABEL: Record<PermissionMode, string> = { ask: "手动确认", auto: "自动执行", read: "只读模式" };
+// Keep attachment checks aligned with the main process prompt wire limits.
+const maximumImageDataLength = 10 * 1024 * 1024;
+function promptInput(draft: string, attachments: Attachment[]): Extract<Command, { type: "prompt" }> {
+	const images = attachments.flatMap((item) => (item.image ? [item.image] : []));
+	if (images.length > 10) throw new Error("每条任务最多添加 10 张图片，请移除多余图片。");
+	if (images.some((image) => image.data.length > maximumImageDataLength))
+		throw new Error("图片编码后超过 10 MB，请压缩图片后重试。");
+	const message =
+		draft.trim() +
+		attachments
+			.filter((item) => item.text !== undefined)
+			.map((item) => `\n\n附件 ${item.name}：\n${item.text}`)
+			.join("");
+	if (message.length > 2 * 1024 * 1024)
+		throw new Error("任务正文与文本附件合计超过 2 MB，请精简内容后重试。");
+	return { type: "prompt", message: message || "请查看这些图片。", images };
+}
 export function LiveComposer({
 	snapshot,
 	draft,
@@ -37,15 +54,42 @@ export function LiveComposer({
 }) {
 	const [attachments, setAttachments] = useState<Attachment[]>([]);
 	const [sending, setSending] = useState(false);
+	const attachmentList = useRef<Attachment[]>([]);
+	const currentDraft = useRef(draft);
+	currentDraft.current = draft;
+	const active = useRef(true);
+	useEffect(() => {
+		active.current = true;
+		return () => {
+			active.current = false;
+		};
+	}, []);
 	const fileInput = useRef<HTMLInputElement>(null);
+	const textarea = useRef<HTMLTextAreaElement>(null);
+	useLayoutEffect(() => {
+		const input = textarea.current;
+		if (!input) return;
+		input.style.height = "auto";
+		input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
+	}, [draft]);
 	const hasModel = snapshot.models.length > 0 && Boolean(snapshot.state?.model);
 	const disabled = changing || sending || snapshot.engineStatus !== "ready" || !snapshot.active || !hasModel;
+	const updateAttachments = (items: Attachment[]) => {
+		attachmentList.current = items;
+		setAttachments(items);
+	};
 	const attach = async (files: File[]) => {
 		try {
 			const added: Attachment[] = [];
 			for (const file of files) {
 				if (file.size > 10 * 1024 * 1024) throw new Error(`${file.name} 超过 10 MB，请缩小后再添加。`);
 				if (/^image\/(png|jpeg|webp|gif)$/.test(file.type)) {
+					if (4 * Math.ceil(file.size / 3) > maximumImageDataLength)
+						throw new Error(`${file.name} 编码后超过 10 MB，请压缩图片后再添加。`);
+					if (
+						attachmentList.current.filter((item) => item.image).length + added.filter((item) => item.image).length >= 10
+					)
+						throw new Error("每条任务最多添加 10 张图片，请移除多余图片。");
 					const data = await new Promise<string>((resolve, reject) => {
 						const reader = new FileReader();
 						reader.onload = () => resolve(String(reader.result).split(",")[1]);
@@ -61,27 +105,28 @@ export function LiveComposer({
 					added.push({ name: file.name, text });
 				}
 			}
-			setAttachments((items) => [...items, ...added]);
+			if (!active.current) return;
+			const next = [...attachmentList.current, ...added];
+			promptInput(currentDraft.current, next);
+			updateAttachments(next);
 		} catch (error) {
-			fail(error);
+			if (active.current) fail(error);
 		}
 	};
 	const submit = async () => {
 		if (disabled || (!draft.trim() && !attachments.length)) return;
-		setSending(true);
-		const text =
-			draft.trim() +
-			attachments
-				.filter((item) => item.text !== undefined)
-				.map((item) => `\n\n附件 ${item.name}：\n${item.text}`)
-				.join("");
+		let input: Extract<Command, { type: "prompt" }>;
 		try {
-			await send({
-				type: "prompt",
-				message: text || "请查看这些图片。",
-				images: attachments.flatMap((item) => (item.image ? [item.image] : [])),
-			});
-			setAttachments([]);
+			input = promptInput(draft, attachments);
+		} catch (error) {
+			fail(error);
+			return;
+		}
+		setSending(true);
+		const submitted = new Set(attachments);
+		try {
+			await send(input);
+			if (active.current) updateAttachments(attachmentList.current.filter((item) => !submitted.has(item)));
 		} catch {
 			/* The controller keeps the draft and displays the failure. */
 		} finally {
@@ -111,7 +156,7 @@ export function LiveComposer({
 								<button
 									type="button"
 									aria-label={`移除附件 ${item.name}`}
-									onClick={() => setAttachments((items) => items.filter((_, at) => at !== index))}
+										onClick={() => updateAttachments(attachmentList.current.filter((_, at) => at !== index))}
 								>
 									<X size={13} />
 								</button>
@@ -120,9 +165,10 @@ export function LiveComposer({
 					</div>
 				)}
 				<textarea
+					ref={textarea}
 					aria-label="输入任务"
 					value={draft}
-					rows={3}
+					style={{ minHeight: "62px", maxHeight: "200px" }}
 					placeholder={
 						snapshot.active
 							? hasModel

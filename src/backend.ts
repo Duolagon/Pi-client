@@ -9,6 +9,7 @@ import { GitSnapshots } from "./git-snapshots.ts";
 import { TerminalService } from "./terminal-service.ts";
 import { WorktreeService } from "./worktree-service.ts";
 import { SessionHistoryService } from "./session-history.ts";
+import { applyLiveEvent, type LiveTranscript } from "./transcript.ts";
 import type {
 	SessionCopyInput,
 	SessionCopyResult,
@@ -69,6 +70,9 @@ interface StoredState {
 }
 interface SessionRuntime {
 	conversationId: string;
+	liveTranscript: LiveTranscript;
+	eventSequence: number;
+	transcriptRevision: number;
 	agent?: AgentProcess;
 	state?: RpcSessionState;
 	models: Model[];
@@ -130,6 +134,7 @@ export class DesktopService {
 	private commands = new Set<Promise<unknown>>();
 	private operation: Promise<void> = Promise.resolve();
 	private persistence: Promise<void> = Promise.resolve();
+	private eventSequence = 0;
 
 	constructor(options: ServiceOptions) {
 		this.options = options;
@@ -1407,6 +1412,9 @@ export class DesktopService {
 		if (!runtime) {
 			runtime = {
 				conversationId: conversation.id,
+				liveTranscript: { tools: {} },
+				eventSequence: this.eventSequence,
+				transcriptRevision: 0,
 				models: [],
 				engineStatus: "starting",
 				busy: false,
@@ -1559,6 +1567,22 @@ export class DesktopService {
 
 	private onEvent(runtime: SessionRuntime, event: DesktopEvent["event"]): void {
 		const conversationId = runtime.conversationId;
+		const sequence = ++this.eventSequence;
+		runtime.eventSequence = sequence;
+		runtime.liveTranscript = applyLiveEvent(runtime.liveTranscript, event);
+		// Deltas change the live projection, but not the finalized get_messages list.
+		if (
+			[
+				"message_start",
+				"message_end",
+				"agent_start",
+				"agent_settled",
+				"compaction_start",
+				"compaction_end",
+				"desktop_error",
+			].includes(event.type)
+		)
+			runtime.transcriptRevision++;
 		const task = this.store.tasks.find((item) => item.conversationId === conversationId);
 		if (event.type === "extension_ui_request" && ["confirm", "select", "input", "editor"].includes(event.method)) {
 			runtime.pendingUI.set(event.id, event);
@@ -1581,6 +1605,7 @@ export class DesktopService {
 			if (runtime.state) runtime.state.isStreaming = false;
 			runtime.pendingUI.clear();
 			runtime.settling = this.finishRuntime(runtime, event.aborted, runtime.lastError);
+			// Settlement is emitted after host cleanup; allocate its delivery sequence at that point.
 			void runtime.settling.finally(() => this.emit({ conversationId, event }));
 			return;
 		}
@@ -1596,10 +1621,15 @@ export class DesktopService {
 			const conversation = this.conversation(conversationId);
 			if (conversation && event.name) conversation.title = event.name;
 		}
-		this.emit({ conversationId, event });
+		this.emit({ conversationId, event, sequence });
 	}
 
 	private emit(event: DesktopEvent): void {
+		const runtime = this.runtimes.get(event.conversationId);
+		if (event.sequence === undefined && runtime) {
+			runtime.eventSequence = ++this.eventSequence;
+			event = { ...event, sequence: runtime.eventSequence };
+		}
 		for (const listener of this.listeners) listener(event);
 	}
 
@@ -1627,19 +1657,32 @@ export class DesktopService {
 		let stats: SessionStats | undefined;
 		let thinkingLevels: ThinkingLevel[] = [];
 		let commands: SlashCommand[] = [];
+		let liveTranscript: LiveTranscript | undefined;
+		let eventSequence: number | undefined;
 		const conversation = conversationId ? this.conversation(conversationId) : undefined;
 		const archived = Boolean(conversation && !(await this.projectAvailable(conversation)));
 		if (runtime && runtime.agent && runtime.engineStatus === "ready") {
 			const agent = runtime.agent;
 			try {
-				const [state, transcript, usage, levels, slash] = await Promise.all([
-					agent.request<RpcSessionState>({ type: "get_state" }),
-					agent.request<{ messages: Message[] }>({ type: "get_messages" }),
+				const [usage, levels, slash] = await Promise.all([
 					agent.request<SessionStats>({ type: "get_session_stats" }),
 					agent.request<{ levels: ThinkingLevel[] }>({ type: "get_available_thinking_levels" }),
 					agent.request<{ commands: SlashCommand[] }>({ type: "get_commands" }),
 				]);
+				let state: RpcSessionState;
+				let transcript: { messages: Message[] };
+				// Retry only when messages are appended/replaced, never for ordinary token deltas.
+				for (;;) {
+					const revision = runtime.transcriptRevision;
+					[state, transcript] = await Promise.all([
+						agent.request<RpcSessionState>({ type: "get_state" }),
+						agent.request<{ messages: Message[] }>({ type: "get_messages" }),
+					]);
+					if (revision === runtime.transcriptRevision || agent !== runtime.agent) break;
+				}
 				if (agent !== runtime.agent) return this.buildSnapshot(conversationId);
+				liveTranscript = runtime.liveTranscript;
+				eventSequence = runtime.eventSequence;
 				runtime.state = safeState(state);
 				messages = transcript.messages;
 				stats = usage;
@@ -1673,6 +1716,8 @@ export class DesktopService {
 			messages = storedMessages as Message[];
 		}
 		return {
+			eventSequence,
+			liveTranscript,
 			projects: this.store.projects,
 			conversations: this.store.conversations,
 			active: conversationId ? this.conversation(conversationId) : undefined,

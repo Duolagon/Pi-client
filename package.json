@@ -24,6 +24,7 @@
 		"dev": "node scripts/build.mjs && electron .",
 		"check": "tsc --noEmit",
 		"test:backend": "node --test test/*.test.ts",
+		"verify:client": "node scripts/verify-client.mjs",
 		"package": "node scripts/build.mjs && electron-builder --config desktop-builder.json --dir",
 		"dist:mac": "node scripts/build.mjs && electron-builder --config desktop-builder.json --mac zip"
 	},

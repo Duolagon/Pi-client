@@ -16,37 +16,75 @@ export function useDesktop(api: DesktopAPI) {
 	const [revision, setRevision] = useState(0);
 	const activeId = useRef<string | undefined>(undefined);
 	const generation = useRef(0);
-	const eventRevision = useRef(0);
+	const appliedSequence = useRef(0);
+	const buffered = useRef<{ packet: DesktopEvent; bytes: number }[]>([]);
+	const bufferedBytes = useRef(0);
+	const droppedThrough = useRef(new Map<string, number>());
+	const refreshLatest = useRef<() => Promise<void>>(async () => {});
+	const listener = useRef<(packet: DesktopEvent, replay?: boolean) => void>(() => {});
 	const fail = useCallback((cause: unknown) => {
 		setError(cause instanceof Error ? cause.message : String(cause));
 	}, []);
 	const apply = useCallback((next: Snapshot) => {
+		const id = next.active?.id;
+		const sequence = next.eventSequence ?? 0;
+		if (id && (droppedThrough.current.get(id) ?? 0) > sequence) {
+			// A long IPC pause exceeded the bounded replay window. Fetch a new full projection.
+			void refreshLatest.current();
+			return;
+		}
 		const changed = activeId.current !== next.active?.id;
 		activeId.current = next.active?.id;
+		appliedSequence.current = sequence;
 		setSnapshot(next);
-		setHistory(transcript(next.messages));
+		setHistory(transcript(next.messages, next.liveTranscript));
 		setRunning(Boolean(next.state?.isStreaming || next.state?.isCompacting));
 		setRequests(next.pendingUI.filter((request) => ["confirm", "select", "input", "editor"].includes(request.method)));
 		if (changed) {
 			setTerminal("");
 			setDraft("");
 		}
+		if (id && next.eventSequence !== undefined) {
+			for (const { packet } of buffered.current) {
+				if (packet.conversationId === id && packet.sequence !== undefined && packet.sequence > sequence)
+					listener.current(packet, true);
+			}
+			droppedThrough.current.delete(id);
+		}
 		setRevision((value) => value + 1);
 	}, []);
 	const refresh = useCallback(async () => {
 		const token = ++generation.current;
-		const revision = eventRevision.current;
 		try {
 			const next = await api.snapshot();
-			if (token === generation.current && revision === eventRevision.current) apply(next);
+			if (token === generation.current) apply(next);
 		} catch (cause) {
 			if (token === generation.current) fail(cause);
 		}
 	}, [api, apply, fail]);
-	const listener = useRef<(packet: DesktopEvent) => void>(() => {});
-	listener.current = ({ conversationId, event }) => {
+	refreshLatest.current = refresh;
+	listener.current = (packet, replay = false) => {
+		const { conversationId, event, sequence } = packet;
+		if (!replay && sequence !== undefined) {
+			const bytes = JSON.stringify(packet).length * 2;
+			buffered.current.push({ packet, bytes });
+			bufferedBytes.current += bytes;
+			while (buffered.current.length > 512 || bufferedBytes.current > 4 * 1024 * 1024) {
+				const removed = buffered.current.shift()!;
+				bufferedBytes.current -= removed.bytes;
+				droppedThrough.current.set(
+					removed.packet.conversationId,
+					Math.max(droppedThrough.current.get(removed.packet.conversationId) ?? 0, removed.packet.sequence!),
+				);
+				if (droppedThrough.current.size > 32)
+					droppedThrough.current.delete(droppedThrough.current.keys().next().value!);
+			}
+		}
 		if (conversationId !== activeId.current) return;
-		eventRevision.current += 1;
+		if (sequence !== undefined) {
+			if (sequence <= appliedSequence.current) return;
+			appliedSequence.current = sequence;
+		}
 		if (event.type === "desktop_error") {
 			fail(event.message);
 			setRunning(false);

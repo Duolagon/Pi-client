@@ -12,6 +12,7 @@ import type { TerminalCreateInput, TerminalEvent, TerminalInfo, TerminalReplay }
 import type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRemoveResult } from "./worktree-types.ts";
 import type { DesktopTask, TaskEvent, TaskStartInput } from "./task-types.ts";
 import type { DesktopSessionAPI } from "./session-types.ts";
+import type { LiveTranscript } from "./transcript.ts";
 
 export type * from "./session-types.ts";
 export type * from "./session-history-types.ts";
@@ -159,6 +160,10 @@ export interface Workspace {
 	isGit: boolean;
 }
 export interface Snapshot {
+	/** Sequence of the last host event included in this snapshot. */
+	eventSequence?: number;
+	/** Current output omitted from Pi's finalized get_messages transcript. */
+	liveTranscript?: LiveTranscript;
 	archived?: boolean;
 	projects: Project[];
 	conversations: Conversation[];
@@ -177,6 +182,8 @@ export interface Snapshot {
 }
 export type DesktopEvent = {
 	conversationId: string;
+	/** Monotonic within this desktop host; used to replay events crossing a snapshot. */
+	sequence?: number;
 	event:
 		| JsonAgentSessionEvent
 		| RpcExtensionUIRequest

@@ -319,6 +319,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							)}
 						</div>
 						<LiveComposer
+							key={snapshot.active?.id ?? "no-conversation"}
 							snapshot={snapshot}
 							draft={app.draft}
 							setDraft={app.setDraft}
