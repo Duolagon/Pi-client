@@ -121,11 +121,12 @@ export function TranscriptView({ transcript: state }: { transcript: Transcript }
 							</div>
 						)}
 						{aborted && <p className="cl-stopped">本次回复已停止。</p>}
-						<footer className="cl-ai-meta">
-							{isStreaming && <span className="cl-streaming-dot" aria-label="正在生成" />}
-							{last.model && <span>{last.model}</span>}
-							<span>{formatTime(last.timestamp)}</span>
-						</footer>
+						{(!isStreaming && last.model) && (
+							<footer className="cl-ai-meta">
+								<span>{last.model}</span>
+								<span>{formatTime(last.timestamp)}</span>
+							</footer>
+						)}
 					</article>
 				);
 			})}
@@ -145,8 +146,8 @@ function TurnBlocks({ message, state }: { message: Assistant; state: Transcript 
 			return block.thinking ? (
 				<details className="cl-think" key={part}>
 					<summary>
-						思考过程
 						<ChevronRight size={13} className="cl-tool-chevron" />
+						思考过程
 					</summary>
 					<div className="cl-markdown">
 						<ReactMarkdown>{block.thinking}</ReactMarkdown>
@@ -206,8 +207,14 @@ function ToolCard({
 				<ChevronRight size={13} className="cl-tool-chevron" />
 			</summary>
 			<div className="cl-tool-body">
-				<pre className="cl-tool-args">{JSON.stringify(args, null, 2)}</pre>
+				{!output && <pre className="cl-tool-args">{JSON.stringify(args, null, 2)}</pre>}
 				{output && <pre>{output}</pre>}
+				{output && args != null && (
+					<details style={{ borderTop: "1px solid var(--cl-line-soft)" }}>
+						<summary style={{ padding: "6px 14px", fontSize: "11px", color: "var(--cl-3)", cursor: "pointer", listStyle: "none" }}>参数</summary>
+						<pre className="cl-tool-args">{JSON.stringify(args, null, 2)}</pre>
+					</details>
+				)}
 			</div>
 		</details>
 	);

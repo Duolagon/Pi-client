@@ -15,6 +15,7 @@ import {
 	X,
 	ShieldCheck,
 	SquarePen,
+	Archive,
 } from "lucide-react";
 import type { Conversation, DesktopAPI, PermissionMode, Snapshot } from "../shared.ts";
 import { IconButton, Modal, PiMark } from "../prototype/ui.tsx";
@@ -222,6 +223,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					</div>
 					<div className="cl-top-tools">
 						<IconButton icon={RefreshCw} label="刷新会话" disabled={blocked} onClick={() => void app.refresh()} />
+						<IconButton icon={Archive} label="压缩上下文" disabled={blocked || !history.messages.length} onClick={() => void app.command({ type: "compact" })} />
 						<IconButton
 							icon={Download}
 							label="导出会话"
@@ -332,18 +334,6 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							openSettings={() => setSettings(true)}
 							fail={app.fail}
 						/>
-						<div className="cl-statusbar">
-							<span>{project?.name ?? "未选择项目"}</span>
-							<span>
-								{snapshot.stats
-									? `Token ${snapshot.stats.tokens.total.toLocaleString()} · $${snapshot.stats.cost.toFixed(4)}`
-									: ""}
-							</span>
-							<button disabled={blocked || !history.messages.length} onClick={() => void app.command({ type: "compact" })}>
-								压缩上下文
-							</button>
-							<span className="cl-status-state">{running ? "执行中" : ready ? "准备就绪" : "连接异常"}</span>
-						</div>
 					</div>
 					{terminalOpen && (
 						<section className="terminal-panel" aria-label="集成终端">

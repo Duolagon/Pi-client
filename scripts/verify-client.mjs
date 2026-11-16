@@ -265,6 +265,7 @@ try {
 		await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
 		await page.getByRole("button", { name: "代码修改", exact: true }).click();
 		await page.locator(".changed-file-list button").filter({ hasText: "greeting.mjs" }).click();
+		await page.locator(".live-diff").filter({ hasText: "你好" }).waitFor();
 		await page.screenshot({ path: join(screenshots, "client-dark.png"), scale: "css" });
 		await page.getByRole("button", { name: "关闭工作区面板", exact: true }).click();
 	}
