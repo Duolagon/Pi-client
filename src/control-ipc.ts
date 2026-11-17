@@ -1,6 +1,8 @@
 import type { DesktopService } from "./backend.ts";
 import { validatePermissionRule } from "./permission-policy.ts";
 import type { ToolToggleInput } from "./control-types.ts";
+import type { AgentRemoveInput, AgentSaveInput } from "./agent-types.ts";
+import type { McpRemoveInput, McpSaveInput } from "./mcp-types.ts";
 import { isAbsolute } from "node:path";
 
 type Handle = (channel: string, action: (...args: unknown[]) => Promise<unknown>) => void;
@@ -33,6 +35,70 @@ export function installControlHandlers(handle: Handle, service: DesktopService):
 		if (input.timeout !== undefined && (!Number.isSafeInteger(input.timeout) || Number(input.timeout) < 0 || Number(input.timeout) > 60000)) throw new Error("timeout 必须为 0–60000 毫秒。");
 		return service.delegatedTaskResult(text(id, 200), { block: input.block as boolean | undefined, timeout: input.timeout as number | undefined });
 	});
+	handle("pi:agents:list", (project) => service.listAgents(optionalPath(project)));
+	handle("pi:agents:save", (value) => {
+		const input = object(value);
+		if (input.scope !== "project" && input.scope !== "user") throw new Error("Agent 作用域无效。");
+		const tools = input.tools === undefined ? undefined : stringArray(input.tools, 50, 80);
+		const thinkingLevel = input.thinkingLevel;
+		if (
+			thinkingLevel !== undefined &&
+			!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(thinkingLevel))
+		)
+			throw new Error("Agent 思考强度无效。");
+		const request: AgentSaveInput = {
+			name: text(input.name, 64),
+			description: text(input.description, 500),
+			prompt: text(input.prompt, 64 * 1024),
+			tools,
+			model: input.model === undefined ? undefined : text(input.model, 300),
+			thinkingLevel: thinkingLevel as AgentSaveInput["thinkingLevel"],
+			scope: input.scope,
+			project: optionalPath(input.project),
+		};
+		return service.saveAgent(request);
+	});
+	handle("pi:agents:remove", (value) => {
+		const input = object(value);
+		if (input.scope !== "project" && input.scope !== "user") throw new Error("Agent 作用域无效。");
+		const request: AgentRemoveInput = {
+			name: text(input.name, 64),
+			scope: input.scope,
+			project: optionalPath(input.project),
+		};
+		return service.removeAgent(request);
+	});
+	handle("pi:mcp:list", (project) => service.listMcpServers(optionalPath(project)));
+	handle("pi:mcp:save", (value) => {
+		const input = object(value);
+		if (input.scope !== "project" && input.scope !== "user") throw new Error("MCP 作用域无效。");
+		if (input.transport !== "stdio" && input.transport !== "http") throw new Error("MCP 传输方式无效。");
+		if (input.enabled !== undefined && typeof input.enabled !== "boolean") throw new Error("MCP enabled 格式错误。");
+		if (input.overrideOnly !== undefined && typeof input.overrideOnly !== "boolean") throw new Error("MCP overrideOnly 格式错误。");
+		const request: McpSaveInput = {
+			name: text(input.name, 64),
+			scope: input.scope,
+			transport: input.transport,
+			command: input.command === undefined ? undefined : text(input.command, 4096),
+			args: input.args === undefined ? undefined : stringArray(input.args, 100, 4096),
+			url: input.url === undefined ? undefined : text(input.url, 4096),
+			description: input.description === undefined ? undefined : text(input.description, 500),
+			enabled: input.enabled as boolean | undefined,
+			overrideOnly: input.overrideOnly as boolean | undefined,
+			project: optionalPath(input.project),
+		};
+		return service.saveMcpServer(request);
+	});
+	handle("pi:mcp:remove", (value) => {
+		const input = object(value);
+		if (input.scope !== "project" && input.scope !== "user") throw new Error("MCP 作用域无效。");
+		const request: McpRemoveInput = {
+			name: text(input.name, 64),
+			scope: input.scope,
+			project: optionalPath(input.project),
+		};
+		return service.removeMcpServer(request);
+	});
 }
 function object(value: unknown): Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("请求必须是对象。");
@@ -47,4 +113,14 @@ function optionalId(value: unknown): string | undefined {
 	const id = text(value, 200);
 	if (!/^[a-zA-Z0-9._-]+$/.test(id)) throw new Error("会话标识无效。");
 	return id;
+}
+function optionalPath(value: unknown): string | undefined {
+	if (value === undefined) return;
+	const path = text(value, 32768);
+	if (!isAbsolute(path)) throw new Error("项目目录需要绝对路径。");
+	return path;
+}
+function stringArray(value: unknown, maxItems: number, maxLength: number): string[] {
+	if (!Array.isArray(value) || value.length > maxItems) throw new Error("Agent 工具列表无效。");
+	return value.map((item) => text(item, maxLength));
 }

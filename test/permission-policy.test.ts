@@ -45,6 +45,23 @@ test("default asks only for project-external reads, writes and custom tools", as
 	} finally { await f.cleanup(); }
 });
 
+test("acceptEdits allows project edits but keeps command and external path prompts", async () => {
+	const f = await fixture();
+	try {
+		const policy = f.policy({ mode: "acceptEdits" });
+		assert.equal((await evaluatePermission(policy, { toolName: "write", input: { path: "new.txt" } })).action, "allow");
+		assert.equal((await evaluatePermission(policy, { toolName: "edit", input: { path: "src/seed.txt" } })).action, "allow");
+		assert.equal((await evaluatePermission(policy, { toolName: "write", input: { path: "../outside/new.txt" } })).action, "ask");
+		assert.equal((await evaluatePermission(policy, { toolName: "bash", input: { command: "touch new.txt" } })).action, "ask");
+		assert.equal((await evaluatePermission(policy, { toolName: "read", input: { path: "../outside/secret.txt" } })).action, "ask");
+		const denied = await evaluatePermission(
+			f.policy({ mode: "acceptEdits", rules: [f.rule({ action: "deny", tool: "edit", path: "src/**" })] }),
+			{ toolName: "edit", input: { path: "src/seed.txt" } },
+		);
+		assert.equal(denied.action, "deny");
+	} finally { await f.cleanup(); }
+});
+
 test("read mode and disabled tools take precedence over all allow rules", async () => {
 	const f = await fixture();
 	try {

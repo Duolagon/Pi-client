@@ -186,7 +186,7 @@ function installHandlers() {
 	handle("pi:settings", (input) => {
 		const settings = object(input);
 		if (
-			!["ask", "auto", "read"].includes(String(settings.permission)) ||
+			!["ask", "acceptEdits", "auto", "read"].includes(String(settings.permission)) ||
 			!["light", "dark", "system"].includes(String(settings.theme))
 		)
 			throw new Error("设置格式错误。");

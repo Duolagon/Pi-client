@@ -34,7 +34,7 @@ export interface AgentToolInput {
 	executor?: "pi" | "codex" | "claude" | "kimi";
 	description: string;
 	prompt: string;
-	subagent_type: "Explore" | "Plan" | "general-purpose";
+	subagent_type: string;
 	run_in_background?: boolean;
 	isolation?: "worktree" | "shared";
 	worktree_id?: string;
@@ -81,7 +81,8 @@ export function validateDesktopToolInput(tool: DesktopModelToolName, value: unkn
 	if (tool === "Agent") {
 		text(input.description, "description", 160);
 		text(input.prompt, "prompt", 2 * 1024 * 1024);
-		if (typeof input.subagent_type !== "string" || !["Explore", "Plan", "general-purpose"].includes(input.subagent_type)) throw new Error("Invalid subagent_type");
+		if (typeof input.subagent_type !== "string" || !input.subagent_type.trim() || input.subagent_type.length > 100)
+			throw new Error("Invalid subagent_type");
 		if (input.executor !== undefined && (typeof input.executor !== "string" || !["pi", "codex", "claude", "kimi"].includes(input.executor))) throw new Error("Invalid executor");
 		optionalBoolean(input.run_in_background, "run_in_background");
 		if (input.isolation !== undefined && input.isolation !== "worktree" && input.isolation !== "shared")

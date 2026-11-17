@@ -22,6 +22,8 @@ import {
 	SlidersHorizontal,
 	GitFork,
 	BookOpen,
+	Bot,
+	Plug,
 	Globe,
 	Command as CommandIcon,
 	Check,
@@ -53,6 +55,8 @@ import { MemoryStatusDialog } from "./MemoryStatusDialog.tsx";
 import { PreviewPanel } from "./PreviewPanel.tsx";
 import { CommandPalette, type PaletteAction } from "./CommandPalette.tsx";
 import { ProjectTrustDialog } from "./ProjectTrustDialog.tsx";
+import { AgentsDialog } from "./AgentsDialog.tsx";
+import { McpDialog } from "./McpDialog.tsx";
 import "../prototype/style.css";
 import "./style.css";
 
@@ -110,6 +114,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [planMode, setPlanMode] = useState(false);
 	const [trustOpen, setTrustOpen] = useState(false);
 	const [trustBusy, setTrustBusy] = useState(false);
+	const [agentsOpen, setAgentsOpen] = useState(false);
+	const [mcpOpen, setMcpOpen] = useState(false);
 	const [todoExpanded, setTodoExpanded] = useState(false);
 	const [tasksMap, setTasksMap] = useState<Record<string, DesktopTask>>({});
 	const [externalTasksMap, setExternalTasksMap] = useState<Record<string, ExternalTask>>({});
@@ -237,13 +243,15 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		} else if (action === "permissions") {
 			setControlsTab("permissions");
 		} else if (action === "mcp") {
-			setControlsTab("tools");
+			setMcpOpen(true);
 		} else if (action === "rewind") {
 			setRewindQuery(undefined);
 			setCheckpointsOpen(true);
 		} else if (action === "tasks") {
 			setTaskInitialId(undefined);
 			setTasksOpen(true);
+		} else if (action === "agents") {
+			setAgentsOpen(true);
 		} else if (action === "sessions") {
 			setSessionsOpen(true);
 		} else if (action === "memory") {
@@ -332,6 +340,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		{ id: "plan", label: planMode ? "退出 Plan 计划模式" : "进入 Plan 计划模式", keywords: "plan mode readonly", disabled: blocked, run: () => void togglePlanMode() },
 		{ id: "rewind", label: "检查点与代码回滚 (/rewind)", keywords: "git checkpoint restore", disabled: !snapshot.active, run: () => { setRewindQuery(undefined); setCheckpointsOpen(true); } },
 		{ id: "tasks", label: "后台任务、子 Agent 与 Worktree (/tasks)", keywords: "subagent external codex claude kimi", run: () => { setTaskInitialId(undefined); setTasksOpen(true); } },
+		{ id: "agents", label: "Agents 与子 Agent (/agents)", keywords: "agents subagent custom reviewer", run: () => setAgentsOpen(true) },
+		{ id: "mcp", label: "MCP 服务器管理 (/mcp)", keywords: "mcp servers oauth", run: () => setMcpOpen(true) },
 		{ id: "tools", label: "工具与 MCP 开关 (/mcp)", keywords: "tools mcp enable", run: () => setControlsTab("tools") },
 		{ id: "perms", label: "细粒度权限规则 (/permissions)", keywords: "allow ask deny rules", run: () => setControlsTab("permissions") },
 		{ id: "sessions", label: "会话分支树与 CLI 历史导入 (/sessions)", keywords: "tree fork clone cli", disabled: !snapshot.active, run: () => setSessionsOpen(true) },
@@ -461,6 +471,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								onClick={() => setTrustOpen(true)}
 							/>
 						)}
+						<IconButton icon={Bot} label="Agents 与子 Agent" disabled={!snapshot.active} active={agentsOpen} onClick={() => setAgentsOpen(true)} />
+						<IconButton icon={Plug} label="MCP 服务器" disabled={!snapshot.active} active={mcpOpen} onClick={() => setMcpOpen(true)} />
 						<IconButton icon={History} label="检查点与回滚" disabled={!snapshot.active} onClick={() => { setRewindQuery(undefined); setCheckpointsOpen(true); }} />
 						<span className="cc-tool-btn-wrap">
 							<IconButton icon={ListTodo} label="后台任务与 Worktree" onClick={() => { setTaskInitialId(undefined); setTasksOpen(true); }} />
@@ -683,13 +695,21 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									<button
 										type="button"
 										className="primary-button"
-										title="除规则外不再询问；命令以本机权限运行"
-										onClick={() => void approvePlanAndExecute("auto")}
+										title="项目内文件编辑自动允许；命令仍按规则询问"
+										onClick={() => void approvePlanAndExecute("acceptEdits")}
 									>
-										批准计划 · 跳过确认
+										批准计划 · 接受编辑
 									</button>
 									<button type="button" className="secondary-button" onClick={() => void approvePlanAndExecute("ask")}>
 										批准计划 · 逐项确认
+									</button>
+									<button
+										type="button"
+										className="cc-mini-btn"
+										title="除规则外不再询问；命令以本机权限运行"
+										onClick={() => void approvePlanAndExecute("auto")}
+									>
+										跳过确认（危险）
 									</button>
 									<button type="button" className="cc-mini-btn" onClick={() => void togglePlanMode()}>
 										退出 Plan
@@ -761,6 +781,23 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					busy={trustBusy || blocked}
 					close={() => setTrustOpen(false)}
 					decide={(decision) => void decideTrust(decision)}
+				/>
+			)}
+			{agentsOpen && (
+				<AgentsDialog
+					project={snapshot.active?.project}
+					close={() => setAgentsOpen(false)}
+					onNotice={(message) => app.setNotice(message)}
+					fail={app.fail}
+				/>
+			)}
+			{mcpOpen && (
+				<McpDialog
+					project={snapshot.active?.project}
+					close={() => setMcpOpen(false)}
+					onNotice={(message) => app.setNotice(message)}
+					onChanged={() => void app.refresh()}
+					fail={app.fail}
 				/>
 			)}
 			{settings && (

@@ -68,6 +68,10 @@ import type { DesktopToolInfo } from "./tool-control-types.ts";
 import { ToolHostServer } from "./tool-host-server.ts";
 import { ModelDelegation } from "./model-delegation.ts";
 import type { DelegationMetadata } from "./delegation-types.ts";
+import { AgentRegistry } from "./agent-definitions.ts";
+import type { AgentDefinition, AgentRemoveInput, AgentSaveInput } from "./agent-types.ts";
+import { McpRegistry } from "./mcp-registry.ts";
+import type { McpRemoveInput, McpSaveInput, McpServerInfo } from "./mcp-types.ts";
 import { ExternalAgents } from "./external-agents.ts";
 import { CodexAdapter } from "./external-codex.ts";
 import { ClaudeAdapter } from "./external-claude.ts";
@@ -79,6 +83,7 @@ import type { SlashCommand } from "./shared.ts";
 
 const exec = promisify(execFile);
 const providers: Provider[] = ["anthropic", "openai", "google", "openrouter", "deepseek"];
+const piBuiltinTools = new Set(["read", "write", "edit", "bash", "grep", "find", "ls", "powershell"]);
 interface StoredState {
 	projects: Project[];
 	conversations: Conversation[];
@@ -167,6 +172,8 @@ export class DesktopService {
 	private toolSettings: ToolSettingsStore;
 	private toolHost: ToolHostServer;
 	private delegation: ModelDelegation;
+	private agents: AgentRegistry;
+	private mcp: McpRegistry;
 	private controlListeners = new Set<(event: ControlEvent) => void>();
 	private worktreeOperationOwner?: string;
 	private external: ExternalAgents;
@@ -174,6 +181,8 @@ export class DesktopService {
 	constructor(options: ServiceOptions) {
 		this.options = options;
 		this.toolSettings = new ToolSettingsStore(options.dataDir);
+		this.agents = new AgentRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
+		this.mcp = new McpRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
 		this.toolHost = new ToolHostServer({ handle: async (request, context) => {
 			const decision = await evaluatePermission(this.permissionPolicy(context.conversationId), { toolName: request.tool, input: request.input });
 			if (decision.action === "deny") throw new Error(decision.reason);
@@ -185,6 +194,7 @@ export class DesktopService {
 				const runtime = await this.ensureRuntime(this.conversation(id));
 				return { model: runtime.state?.model ? { provider: runtime.state.model.provider, id: runtime.state.model.id } : undefined, thinkingLevel: runtime.state?.thinkingLevel };
 			},
+			resolveAgent: (project, name) => this.agents.resolve(project, name),
 			listTasks: () => this.listTasks(),
 			startTask: (input, metadata) => this.startTask(input, metadata),
 			cancelTask: (id) => this.cancelTask(id),
@@ -334,6 +344,73 @@ export class DesktopService {
 			}
 			return this.buildSnapshot();
 		});
+	}
+
+	async listAgents(project?: string): Promise<AgentDefinition[]> {
+		await this.operation;
+		return this.agents.list(await this.agentProject(project));
+	}
+
+	saveAgent(input: AgentSaveInput): Promise<AgentDefinition[]> {
+		return this.serialize(async () => {
+			const project = await this.agentProject(input.project);
+			return this.agents.save(project, input);
+		});
+	}
+
+	removeAgent(input: AgentRemoveInput): Promise<AgentDefinition[]> {
+		return this.serialize(async () => {
+			const project = await this.agentProject(input.project);
+			return this.agents.remove(project, input);
+		});
+	}
+
+	private async agentProject(project?: string): Promise<string> {
+		const target = project ? await realpath(project) : this.requireActive().project;
+		if (!this.store.projects.some((item) => item.path === target)) throw new Error("项目未打开。");
+		return target;
+	}
+
+	async listMcpServers(project?: string): Promise<McpServerInfo[]> {
+		await this.operation;
+		return this.mcp.list(await this.agentProject(project));
+	}
+
+	saveMcpServer(input: McpSaveInput): Promise<McpServerInfo[]> {
+		return this.serialize(async () => {
+			const project = await this.agentProject(input.project);
+			this.assertProjectRestartable(project);
+			await this.mcp.save(project, input);
+			await this.restartProject(project);
+			return this.mcp.list(project);
+		});
+	}
+
+	removeMcpServer(input: McpRemoveInput): Promise<McpServerInfo[]> {
+		return this.serialize(async () => {
+			const project = await this.agentProject(input.project);
+			this.assertProjectRestartable(project);
+			await this.mcp.remove(project, input);
+			await this.restartProject(project);
+			return this.mcp.list(project);
+		});
+	}
+
+	private assertProjectRestartable(project: string): void {
+		for (const runtime of this.runtimes.values()) {
+			if (this.conversation(runtime.conversationId).project !== project) continue;
+			if (runtime.busy || runtime.bashBusy || runtime.pendingUI.size)
+				throw new Error("请先停止该项目的任务与审批，再更改 MCP 配置。");
+		}
+	}
+
+	private async restartProject(project: string): Promise<void> {
+		const runtimes = [...this.runtimes.values()].filter(
+			(runtime) => this.conversation(runtime.conversationId).project === project,
+		);
+		for (const runtime of runtimes) await this.stopRuntime(runtime);
+		const active = this.active();
+		if (active?.project === project && (await this.projectAvailable(active))) await this.ensureRuntime(active);
 	}
 
 	newConversation(): Promise<Snapshot> {
@@ -1333,8 +1410,19 @@ export class DesktopService {
 		for (const name of inherited?.disabledTools ?? []) disabledTools.add(name);
 		for (const name of parent?.disabledTools ?? []) disabledTools.add(name);
 		if (task?.parentConversationId) { disabledTools.add("Agent"); disabledTools.add("AgentSend"); }
-		const mode = task?.readOnly || this.store.settings.permission === "read" || inherited?.mode === "read" || parent?.mode === "read" ? "read"
-			: this.store.settings.permission === "ask" || inherited?.mode === "ask" || parent?.mode === "ask" ? "ask" : "auto";
+		const modes = [
+			task?.readOnly ? "read" : undefined,
+			this.store.settings.permission,
+			inherited?.mode,
+			parent?.mode,
+		].filter((mode): mode is RuntimePermissionPolicy["mode"] => Boolean(mode));
+		const mode = modes.includes("read")
+			? "read"
+			: modes.includes("ask")
+				? "ask"
+				: modes.includes("acceptEdits")
+					? "acceptEdits"
+					: "auto";
 		return { version: 1, mode, rules, disabledTools: [...disabledTools], project: conversation.project };
 	}
 
@@ -1415,6 +1503,13 @@ export class DesktopService {
 		return this.serialize(async () => {
 			if (this.closed) throw new Error("桌面服务已关闭。");
 			if (!input.message.trim()) throw new Error("请输入任务内容。");
+			if (input.allowedTools !== undefined) {
+				if (!Array.isArray(input.allowedTools) || input.allowedTools.length > 50)
+					throw new Error("Agent 工具列表无效。");
+				for (const name of input.allowedTools)
+					if (typeof name !== "string" || !/^[A-Za-z0-9_.:-]{1,80}$/.test(name))
+						throw new Error("Agent 工具名称无效。");
+			}
 			const existing = input.worktreeId
 				? (await this.worktrees.list()).find((item) => item.id === input.worktreeId)
 				: undefined;
@@ -1454,6 +1549,7 @@ export class DesktopService {
 				revision: 0,
 				model: input.model,
 				thinkingLevel: input.thinkingLevel,
+				allowedTools: input.allowedTools,
 				...delegation,
 			};
 			if (delegation) {
@@ -2058,8 +2154,14 @@ export class DesktopService {
 				const model = this.store.settings.defaultModel;
 				args.push("--provider", model.provider, "--model", model.id);
 			}
-			if (this.permissionPolicy(conversation.id).mode === "read")
+			const task = this.store.tasks.find((item) => item.conversationId === conversation.id);
+			const allowedTools = task?.allowedTools?.filter((name) => piBuiltinTools.has(name));
+			if (allowedTools?.length) {
+				args.push("--tools", allowedTools.join(","));
+				if (this.permissionPolicy(conversation.id).mode === "read") args.push("--exclude-tools", "mcp__*");
+			} else if (this.permissionPolicy(conversation.id).mode === "read") {
 				args.push("--tools", "read,grep,find,ls", "--exclude-tools", "mcp__*");
+			}
 			const agent = new AgentProcess({
 				executable: this.options.executable,
 				entry: this.options.entry ?? join(runtimeDir, "dist/bundle/rpc-entry.js"),
@@ -2365,7 +2467,7 @@ function validateStore(input: unknown): StoredState {
 	)
 		throw new Error("会话配置格式错误。");
 	if (
-		!["ask", "read", "auto"].includes(value.settings.permission) ||
+		!["ask", "acceptEdits", "read", "auto"].includes(value.settings.permission) ||
 		!["light", "dark", "system"].includes(value.settings.theme)
 	)
 		throw new Error("设置格式错误。");

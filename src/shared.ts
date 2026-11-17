@@ -16,7 +16,11 @@ import type { LiveTranscript } from "./transcript.ts";
 import type { DesktopToolsAPI, DesktopPermissionsAPI } from "./control-types.ts";
 import type { DelegatedTaskResult } from "./delegation-types.ts";
 import type { DesktopExternalAgentsAPI } from "./external-types.ts";
+import type { DesktopAgentsAPI } from "./agent-types.ts";
+import type { DesktopMcpAPI } from "./mcp-types.ts";
 export type * from "./external-types.ts";
+export type * from "./agent-types.ts";
+export type * from "./mcp-types.ts";
 export type * from "./control-types.ts";
 export type * from "./permission-types.ts";
 export type * from "./tool-control-types.ts";
@@ -76,7 +80,7 @@ export interface DesktopWorktreeAPI {
 	merge(id: string): Promise<WorktreeMergeResult>;
 }
 
-export type PermissionMode = "ask" | "auto" | "read";
+export type PermissionMode = "ask" | "acceptEdits" | "auto" | "read";
 export type ProjectTrustDecision = "trusted" | "untrusted";
 export interface ProjectTrustState {
 	project: string;
@@ -224,6 +228,8 @@ export type DesktopEvent = {
 export type Command = RpcCommand;
 export interface DesktopAPI {
 	externalAgents: DesktopExternalAgentsAPI;
+	agents: DesktopAgentsAPI;
+	mcp: DesktopMcpAPI;
 	tools: DesktopToolsAPI;
 	permissions: DesktopPermissionsAPI;
 	sessions: DesktopSessionAPI;

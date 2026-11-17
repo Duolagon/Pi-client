@@ -21,7 +21,7 @@ const toolSchemas: Record<DesktopModelToolName, JsonSchema> = {
 	Agent: schema({
 		executor: { type: "string", enum: ["pi", "codex", "claude", "kimi"] },
 		description: boundedText(160), prompt: boundedText(2 * 1024 * 1024),
-		subagent_type: { type: "string", enum: ["Explore", "Plan", "general-purpose"] },
+		subagent_type: boundedText(100),
 		run_in_background: { type: "boolean" }, isolation: { type: "string", enum: ["worktree", "shared"] },
 		worktree_id: taskId,
 	}, ["description", "prompt", "subagent_type"]),
@@ -34,7 +34,7 @@ const toolSchemas: Record<DesktopModelToolName, JsonSchema> = {
 	WorktreeRemove: schema({ worktree_id: taskId }, ["worktree_id"]),
 };
 const descriptions: Record<DesktopModelToolName, string> = {
-	Agent: "Delegate an independent task to a subagent with its own context. Use executor=pi (default), codex, claude, or kimi; first use AgentExecutors to inspect locally available engines and their permission capabilities. Proactively delegate focused research or implementation with a self-contained prompt. Explore and Plan require enforced read-only support; general-purpose writes in an isolated Git worktree. Use run_in_background=true for independent parallel work, then TaskOutput to collect results. Foreground calls wait. No automatic merge. Use AgentSend to continue an external agent's native conversation after it completes.",
+	Agent: "Delegate an independent task to a subagent with its own context. Use executor=pi (default), codex, claude, or kimi; first use AgentExecutors to inspect locally available engines and their permission capabilities. subagent_type accepts general-purpose, Explore, Plan, or a custom agent name from .pi/agents or .claude/agents; a custom definition can set its prompt, model, thinking level and tool allowlist. Proactively delegate focused research or implementation with a self-contained prompt. Explore, Plan and read-only custom agents use shared read-only context; writable agents run in an isolated Git worktree. Use run_in_background=true for independent parallel work, then TaskOutput to collect results. Foreground calls wait. No automatic merge. Use AgentSend to continue an external agent's native conversation after it completes.",
 	AgentSend: "Continue an external Codex/Claude/Kimi child conversation with another self-contained instruction or a message from another collaborator. The task must belong to this parent and its previous turn must be finished. Preserves native session and worktree; cannot change executor, project or permissions. Use run_in_background for asynchronous collaboration.",
 	AgentExecutors: "Discover available local Codex, Claude Code and Kimi Code executors, versions, enabled status and supported permissions before delegating. Does not run a model or expose credentials.",
 	TaskOutput: "Read the status, bounded result, and approval count of a child task created by this conversation. Set block=true to wait up to timeout milliseconds (maximum 60000); a still-running response is not a failure. Use the returned task_id to poll again.",

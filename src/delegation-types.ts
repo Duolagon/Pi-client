@@ -1,4 +1,5 @@
 import type { Conversation, Message, Snapshot, ThinkingLevel } from "./shared.ts";
+import type { AgentDefinition } from "./agent-types.ts";
 import type { DesktopTask, TaskStartInput, TaskStatus } from "./task-types.ts";
 import type {
 	WorktreeCreateInput,
@@ -7,7 +8,8 @@ import type {
 	WorktreeRemoveResult,
 } from "./worktree-types.ts";
 
-export type SubagentType = "Explore" | "Plan" | "general-purpose";
+/** Built-in names are conventional; the host also resolves user-defined agents. */
+export type SubagentType = string;
 export interface DelegationMetadata {
 	parentConversationId: string;
 	parentToolCallId: string;
@@ -58,6 +60,8 @@ export interface DelegationCallbacks {
 		thinkingLevel?: ThinkingLevel;
 	}>;
 	listTasks(): Promise<DesktopTask[]>;
+	/** Resolve a project/user agent definition; built-ins are available when absent. */
+	resolveAgent?(project: string, name: string): Promise<AgentDefinition | undefined>;
 	/** Persist metadata and apply inherited permissions before the task is scheduled. */
 	startTask(input: TaskStartInput, metadata: DelegationMetadata): Promise<DesktopTask>;
 	cancelTask(id: string): Promise<DesktopTask>;

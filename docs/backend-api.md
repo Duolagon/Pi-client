@@ -17,6 +17,8 @@
 | `pi.worktrees` | `create / list / remove / merge` | 托管 Worktree 生命周期 |
 | `pi.sessions` | `fork / clone / entries / tree / forkMessages / navigate / history / importHistory` | 会话分支、树导航和 CLI 历史导入 |
 | `pi.setProjectTrust` | `setProjectTrust({ project, decision })` | 保存项目信任决定、重启相关会话并返回新快照 |
+| `pi.agents` | `list / save / remove` | 自定义 Agent 定义（`.pi/agents`、`.claude/agents`） |
+| `pi.mcp` | `list / save / remove` | MCP 服务器增删与启停 |
 | `pi.onEvent` | 原接口保留 | 所有会话的 Pi 流式事件，按 `conversationId` 路由 |
 
 原有前台接口继续工作。后端切换项目或会话会保留正在运行的旧会话；前端不得再假设“只有当前会话会产生事件”。当前正式界面仍在运行时禁用项目／会话切换，后台任务、独立 PTY 和会话树等入口待接入。修改全局模型连接、权限等设置前，需要停止全部运行中或排队中的任务。
@@ -45,6 +47,43 @@ if (snapshot.trust?.required && !snapshot.trust.decision) {
 启动 Pi RPC 时，存在受保护资源则显式传 `--approve`（信任）或 `--no-approve`（未信任/未决定）。这避免 RPC 模式无法弹 trust 提示时静默跳过项目配置，也避免把“未决定”误当成信任。
 
 `setProjectTrust` 要求项目已打开、路径为绝对路径、决定为 `trusted / untrusted`；该项目存在运行中任务、直接命令或待审批时拒绝。决定变化会停止并重建该项目的运行时，使 Pi 重新读取项目资源；决定持久化在 `desktop.json` 的 `projectTrust`。信任只控制 Pi 是否加载项目配置，不是 OS 沙箱，也不限制已加载扩展/命令的系统权限。
+
+## 自定义 Agent
+
+```ts
+const agents = await window.pi.agents.list(project);
+await window.pi.agents.save({
+  name: "reviewer",
+  description: "Reviews correctness and missing tests",
+  prompt: "You are a strict code reviewer. Do not edit files.",
+  tools: ["read", "grep", "find"],
+  model: "anthropic/claude-opus-5-5", // 可选，provider/model-id
+  thinkingLevel: "high",             // 可选
+  scope: "project",                  // .pi/agents；user 写入 ~/.pi/agent/agents
+  project,
+});
+```
+
+定义格式为 Markdown frontmatter + 正文提示词；兼容 Claude Code 的 `Read/Grep/Glob/Edit/Write/Bash` 工具名，并归一化为 Pi 工具名。`tools` 为工具白名单，仅内置 Pi 工具会传给 `--tools`；只含只读工具的定义按只读子 Agent 运行，其余默认 Worktree。`model` 留空继承父会话；`thinkingLevel` 留空继承父会话。`.claude/agents` 条目只读展示，保存会在 `.pi/agents` 创建同名覆盖。内置 `general-purpose / Explore / Plan` 不可覆盖或删除。
+
+`Agent` 工具的 `subagent_type` 接受内置名或自定义名；未知名称会被拒绝。自定义提示词会前置到子任务正文，模型/思考强度/工具白名单按定义应用。
+
+## MCP 服务器
+
+```ts
+const servers = await window.pi.mcp.list(project);
+await window.pi.mcp.save({
+  name: "docs",
+  scope: "project",
+  transport: "http",
+  url: "https://example.com/mcp",
+  description: "Product documentation",
+  enabled: true,
+  project,
+});
+```
+
+`pi.mcp.list` 合并用户 `~/.pi/agent/mcp.json` 与项目 `.pi/mcp.json`；项目条目可只写 `enabled/exposure` 覆盖用户条目。`save` 保留已有 `env/headers/oauth/timeout` 等字段，只更新名称、命令、参数、URL、描述和启停；保存或删除后重启当前项目会话以重新加载 MCP。OAuth 型服务器仍需在终端运行 `pi mcp login <server>`；项目级 MCP 还要求项目信任。
 
 ## 会话分支、克隆和树导航
 

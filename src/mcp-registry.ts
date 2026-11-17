@@ -1,0 +1,190 @@
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import type { McpRemoveInput, McpSaveInput, McpScope, McpServerInfo, McpTransport } from "./mcp-types.ts";
+
+type JsonObject = Record<string, unknown>;
+interface McpConfig {
+	data: JsonObject;
+	servers: Record<string, JsonObject>;
+}
+
+const namePattern = /^[A-Za-z0-9_-]{1,64}$/;
+
+function object(value: unknown, label: string): JsonObject {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label}必须是对象。`);
+	return value as JsonObject;
+}
+
+function text(value: unknown, label: string, max: number): string {
+	if (typeof value !== "string" || !value.trim() || value.length > max || value.includes("\0"))
+		throw new Error(`${label}无效。`);
+	return value.trim();
+}
+
+function optionalText(value: unknown, label: string, max: number): string | undefined {
+	if (value === undefined) return undefined;
+	return text(value, label, max);
+}
+
+function stringArray(value: unknown, label: string, maxItems: number, maxLength: number): string[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || value.length > maxItems) throw new Error(`${label}无效。`);
+	return value.map((item) => text(item, label, maxLength));
+}
+
+function transportOf(entry: JsonObject): McpTransport | undefined {
+	if (typeof entry.command === "string" && entry.command.trim()) return "stdio";
+	if (typeof entry.url === "string" && entry.url.trim()) return "http";
+	if (entry.type === "stdio") return "stdio";
+	if (entry.type === "http" || entry.type === "streamable-http") return "http";
+	return undefined;
+}
+
+async function readConfig(file: string): Promise<McpConfig> {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(await readFile(file, "utf8"));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { data: {}, servers: {} };
+		throw new Error(`无法读取 MCP 配置 ${file}：${error instanceof Error ? error.message : String(error)}`);
+	}
+	const data = object(parsed, "MCP 配置");
+	const servers = data.mcpServers === undefined ? {} : object(data.mcpServers, "mcpServers");
+	const result: Record<string, JsonObject> = {};
+	for (const [name, value] of Object.entries(servers)) {
+		if (!namePattern.test(name)) continue;
+		try {
+			result[name] = object(value, `MCP 服务器 ${name}`);
+		} catch {
+			// One malformed entry must not hide the rest; Pi reports it separately.
+		}
+	}
+	return { data, servers: result };
+}
+
+async function writeConfig(file: string, data: JsonObject, servers: Record<string, JsonObject>): Promise<void> {
+	await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+	const output = { ...data, mcpServers: servers };
+	const temporary = `${file}.tmp`;
+	await writeFile(temporary, JSON.stringify(output, null, 2) + "\n", { mode: 0o600 });
+	await rename(temporary, file);
+}
+
+/** Manage the Pi-compatible mcp.json files without rewriting unrelated entries. */
+export class McpRegistry {
+	private agentDir: () => string;
+
+	constructor(options: { agentDir: () => string }) {
+		this.agentDir = options.agentDir;
+	}
+
+	private path(scope: McpScope, project: string): string {
+		return scope === "project" ? join(project, ".pi", "mcp.json") : join(this.agentDir(), "mcp.json");
+	}
+
+	async list(project: string): Promise<McpServerInfo[]> {
+		const userPath = this.path("user", project);
+		const projectPath = this.path("project", project);
+		const user = await readConfig(userPath);
+		const local = await readConfig(projectPath);
+		const merged = new Map<string, McpServerInfo>();
+		for (const [name, entry] of Object.entries(user.servers)) {
+			const transport = transportOf(entry);
+			if (!transport) continue;
+			merged.set(name, {
+				name,
+				scope: "user",
+				transport,
+				command: typeof entry.command === "string" ? entry.command : undefined,
+				args: Array.isArray(entry.args) ? entry.args.filter((item): item is string => typeof item === "string") : undefined,
+				url: typeof entry.url === "string" ? entry.url : undefined,
+				description: typeof entry.description === "string" ? entry.description : undefined,
+				enabled: entry.enabled !== false,
+				source: userPath,
+				overridden: false,
+			});
+		}
+		for (const [name, entry] of Object.entries(local.servers)) {
+			const base = merged.get(name);
+			const transport = transportOf(entry) ?? base?.transport;
+			if (!transport) continue;
+			const inherits = !transportOf(entry) && Boolean(base);
+			const source = inherits ? base!.source : projectPath;
+			const effective = inherits ? { ...(base ?? {}), ...entry } : entry;
+			merged.set(name, {
+				name,
+				scope: "project",
+				transport,
+				command: inherits ? base?.command : typeof effective.command === "string" ? effective.command : undefined,
+				args: inherits ? base?.args : Array.isArray(effective.args) ? effective.args.filter((item): item is string => typeof item === "string") : undefined,
+				url: inherits ? base?.url : typeof effective.url === "string" ? effective.url : undefined,
+				description: typeof effective.description === "string" ? effective.description : undefined,
+				enabled: entry.enabled === undefined ? (base?.enabled ?? true) : entry.enabled !== false,
+				source,
+				overridden: inherits,
+			});
+		}
+		return [...merged.values()].sort((left, right) => left.name.localeCompare(right.name));
+	}
+
+	async save(project: string, input: McpSaveInput): Promise<McpServerInfo[]> {
+		const name = text(input.name, "MCP 服务器名称", 64);
+		if (!namePattern.test(name)) throw new Error("MCP 服务器名称只能包含字母、数字、下划线和短横线。");
+		if (input.scope !== "user" && input.scope !== "project") throw new Error("MCP 作用域无效。");
+		const file = this.path(input.scope, project);
+		const config = await readConfig(file);
+		if (input.overrideOnly) {
+			const existing = config.servers[name];
+			if (!existing) throw new Error("项目覆盖条目不存在。");
+			if (input.enabled !== undefined) existing.enabled = input.enabled;
+			const description = optionalText(input.description, "MCP 描述", 500);
+			if (description === undefined) delete existing.description;
+			else existing.description = description;
+			config.servers[name] = existing;
+			await writeConfig(file, config.data, config.servers);
+			return this.list(project);
+		}
+		if (input.transport !== "stdio" && input.transport !== "http") throw new Error("MCP 传输方式无效。");
+		const entry: JsonObject = { ...(config.servers[name] ?? {}) };
+		entry.enabled = input.enabled !== false;
+		const description = optionalText(input.description, "MCP 描述", 500);
+		if (description === undefined) delete entry.description;
+		else entry.description = description;
+		if (input.transport === "stdio") {
+			entry.command = text(input.command, "MCP 命令", 4096);
+			const args = stringArray(input.args, "MCP 参数", 100, 4096);
+			if (args?.length) entry.args = args;
+			else delete entry.args;
+			delete entry.url;
+			delete entry.type;
+		} else {
+			const url = text(input.url, "MCP 地址", 4096);
+			let parsed: URL;
+			try {
+				parsed = new URL(url);
+			} catch {
+				throw new Error("MCP 地址不是有效 URL。");
+			}
+			if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("MCP 地址必须使用 http 或 https。");
+			entry.url = parsed.toString();
+			delete entry.command;
+			delete entry.args;
+			delete entry.type;
+		}
+		config.servers[name] = entry;
+		await writeConfig(file, config.data, config.servers);
+		return this.list(project);
+	}
+
+	async remove(project: string, input: McpRemoveInput): Promise<McpServerInfo[]> {
+		const name = text(input.name, "MCP 服务器名称", 64);
+		if (!namePattern.test(name)) throw new Error("MCP 服务器名称无效。");
+		if (input.scope !== "user" && input.scope !== "project") throw new Error("MCP 作用域无效。");
+		const file = this.path(input.scope, project);
+		const config = await readConfig(file);
+		if (!config.servers[name]) throw new Error("MCP 服务器不存在于此作用域。");
+		delete config.servers[name];
+		await writeConfig(file, config.data, config.servers);
+		return this.list(project);
+	}
+}

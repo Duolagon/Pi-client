@@ -1,6 +1,7 @@
 import { isAbsolute, relative, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { DesktopTask } from "./task-types.ts";
+import type { AgentDefinition } from "./agent-types.ts";
 import type { WorktreeInfo } from "./worktree-types.ts";
 import { finalAssistantText } from "./delegation-types.ts";
 import type {
@@ -149,7 +150,8 @@ export class ModelDelegation {
 			if (tasks.filter((task) => task.parentConversationId === context.conversationId && activeStatuses.has(task.status)).length >= maxOutstanding)
 				throw new Error("This conversation already has 8 outstanding subagents; collect or stop one first");
 			const owner = await this.callbacks.getConversation(context.conversationId);
-			const readOnly = input.subagent_type !== "general-purpose";
+			const definition = await this.resolveAgent(owner.project, input.subagent_type);
+			const readOnly = definition?.readOnly ?? input.subagent_type !== "general-purpose";
 			const selection = await this.callbacks.getSelection(owner.id);
 			const isolation = input.isolation ?? (readOnly ? "shared" : (await this.callbacks.isGit(owner.project)) ? "worktree" : "shared");
 			if (input.worktree_id) await this.ownedWorktree(owner.id, input.worktree_id);
@@ -157,20 +159,22 @@ export class ModelDelegation {
 			if (isolation === "shared" && !(await this.callbacks.canRunShared?.(owner.id, readOnly)))
 				throw new Error("Shared subagent work cannot run alongside this parent; choose worktree isolation or a read-only Explore/Plan agent");
 			this.checkAbort(context.signal);
+			const message = definition && definition.scope !== "builtin" && definition.prompt ? `${definition.prompt}\n\n---\n\nTask:\n${input.prompt}` : input.prompt;
 			return this.callbacks.startTask(
 				{
 					project: owner.project,
-					message: input.prompt,
+					message,
 					title: input.description,
 					isolation,
 					worktreeId: input.worktree_id,
-					model: selection.model,
-					thinkingLevel: selection.thinkingLevel,
+					model: definition?.model ?? selection.model,
+					thinkingLevel: definition?.thinkingLevel ?? selection.thinkingLevel,
+					...(definition?.tools ? { allowedTools: definition.tools } : {}),
 				},
 				{
 					parentConversationId: owner.id,
 					parentToolCallId: context.toolCallId,
-					subagentType: input.subagent_type,
+					subagentType: definition?.name ?? input.subagent_type,
 					delegationDepth: 1,
 					readOnly,
 					runInBackground: input.run_in_background ?? false,
@@ -200,6 +204,23 @@ export class ModelDelegation {
 			if (context.signal?.aborted) await this.callbacks.cancelTask(task.id);
 			throw error;
 		}
+	}
+
+	private async resolveAgent(project: string, name: string): Promise<AgentDefinition | undefined> {
+		if (this.callbacks.resolveAgent) {
+			const definition = await this.callbacks.resolveAgent(project, name);
+			if (!definition) throw new Error("Unknown subagent_type");
+			return definition;
+		}
+		if (name === "general-purpose" || name === "Explore" || name === "Plan")
+			return {
+				name,
+				description: name,
+				prompt: "",
+				readOnly: name !== "general-purpose",
+				scope: "builtin",
+			};
+		throw new Error("Unknown subagent_type");
 	}
 
 	private watch(owner: string, id: string): void {
@@ -280,12 +301,12 @@ function optionalBoolean(value: unknown, name: string): boolean | undefined {
 }
 function parseAgent(value: Record<string, unknown>): AgentToolInput {
 	only(value, ["description", "prompt", "subagent_type", "run_in_background", "isolation", "worktree_id"]);
-	if (!["Explore", "Plan", "general-purpose"].includes(value.subagent_type as string)) throw new Error("Invalid subagent_type");
+	const subagent = text(value.subagent_type, "subagent_type", 100);
 	if (value.isolation !== undefined && value.isolation !== "shared" && value.isolation !== "worktree") throw new Error("Invalid isolation");
 	return {
 		description: text(value.description, "description", 160),
 		prompt: text(value.prompt, "prompt", 128 * 1024),
-		subagent_type: value.subagent_type as SubagentType,
+		subagent_type: subagent,
 		run_in_background: optionalBoolean(value.run_in_background, "run_in_background"),
 		isolation: value.isolation as AgentToolInput["isolation"],
 		worktree_id: value.worktree_id === undefined ? undefined : text(value.worktree_id, "worktree_id", 200),

@@ -21,6 +21,16 @@ const api: DesktopAPI = {
 		replay: (id, afterSequence) => ipcRenderer.invoke("pi:external:replay", id, afterSequence),
 		onEvent: (listener) => listen("pi:external:event", listener),
 	},
+	agents: {
+		list: (project) => ipcRenderer.invoke("pi:agents:list", project),
+		save: (input) => ipcRenderer.invoke("pi:agents:save", input),
+		remove: (input) => ipcRenderer.invoke("pi:agents:remove", input),
+	},
+	mcp: {
+		list: (project) => ipcRenderer.invoke("pi:mcp:list", project),
+		save: (input) => ipcRenderer.invoke("pi:mcp:save", input),
+		remove: (input) => ipcRenderer.invoke("pi:mcp:remove", input),
+	},
 	tools: {
 		list: (conversationId) => ipcRenderer.invoke("pi:tools:list", conversationId),
 		setEnabled: (input) => ipcRenderer.invoke("pi:tools:set-enabled", input),

@@ -2539,3 +2539,148 @@ body {
 	color: var(--cl-3);
 	flex-shrink: 0;
 }
+
+/* ── Agents manager ── */
+.cc-agents {
+	display: grid;
+	grid-template-columns: 300px minmax(0, 1fr);
+	gap: 16px;
+	min-height: 460px;
+}
+.cc-agent-list {
+	display: flex;
+	min-width: 0;
+	flex-direction: column;
+	gap: 4px;
+	max-height: 560px;
+	overflow: auto;
+	padding-right: 6px;
+	border-right: 1px solid var(--cl-line);
+}
+.cc-agent-list-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	padding: 0 4px 8px;
+	color: var(--cl-3);
+	font-size: 11px;
+}
+.cc-agent-item {
+	display: flex;
+	align-items: flex-start;
+	gap: 8px;
+	padding: 8px;
+	border: 1px solid transparent;
+	border-radius: 8px;
+	background: transparent;
+	color: var(--cl-text);
+	text-align: left;
+}
+.cc-agent-item:hover {
+	background: var(--cl-hover);
+}
+.cc-agent-item.active {
+	background: var(--cl-active);
+	border-color: var(--cl-line);
+}
+.cc-agent-item > svg {
+	flex-shrink: 0;
+	margin-top: 2px;
+	color: var(--cl-clay);
+}
+.cc-agent-item-main {
+	display: flex;
+	min-width: 0;
+	flex: 1;
+	flex-direction: column;
+	gap: 2px;
+}
+.cc-agent-item-main strong {
+	font-size: 12px;
+}
+.cc-agent-item-main small {
+	display: -webkit-box;
+	overflow: hidden;
+	color: var(--cl-3);
+	font-size: 11px;
+	line-height: 1.4;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+}
+.cc-agent-tag {
+	flex-shrink: 0;
+	padding: 1px 5px;
+	border-radius: 5px;
+	background: var(--cl-soft);
+	color: var(--cl-3);
+	font-size: 10px;
+}
+.cc-agent-tag.project {
+	color: var(--cl-clay);
+	background: var(--cl-clay-soft);
+}
+.cc-agent-tag.user {
+	color: var(--cl-green);
+	background: var(--cl-add);
+}
+.cc-agent-editor {
+	display: flex;
+	min-width: 0;
+	flex-direction: column;
+	gap: 10px;
+}
+.cc-agent-editor-head {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 10px;
+}
+.cc-agent-editor-head > div {
+	display: flex;
+	min-width: 0;
+	flex-direction: column;
+	gap: 3px;
+}
+.cc-agent-editor-head small {
+	overflow-wrap: anywhere;
+	color: var(--cl-3);
+	font-size: 10px;
+}
+.cc-agent-row {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+	gap: 10px;
+}
+.cc-agent-prompt textarea {
+	resize: vertical;
+	font-family: var(--mono);
+	font-size: 11px;
+	line-height: 1.5;
+}
+.cc-agent-note {
+	margin: 0;
+	color: var(--cl-3);
+	font-size: 11px;
+	line-height: 1.5;
+}
+.cc-agent-error {
+	margin: 0;
+	color: var(--cl-red);
+	font-size: 11px;
+}
+@media (max-width: 820px) {
+	.cc-agents {
+		grid-template-columns: 1fr;
+	}
+	.cc-agent-list {
+		max-height: 220px;
+		border-right: 0;
+		border-bottom: 1px solid var(--cl-line);
+		padding-right: 0;
+		padding-bottom: 8px;
+	}
+	.cc-agent-row {
+		grid-template-columns: 1fr;
+	}
+}

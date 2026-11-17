@@ -32,6 +32,8 @@ export interface DesktopTask {
 	subagentType?: SubagentType;
 	delegationDepth?: 1;
 	readOnly?: boolean;
+	/** Explicit tool allowlist for a custom agent; built-in Pi tools only. */
+	allowedTools?: string[];
 	runInBackground?: boolean;
 	result?: { text: string; truncated: boolean };
 }
@@ -45,6 +47,7 @@ export interface TaskStartInput {
 	worktreeId?: string;
 	model?: { provider: string; id: string };
 	thinkingLevel?: ThinkingLevel;
+	allowedTools?: string[];
 }
 
 export type TaskEvent = { type: "task_updated"; task: DesktopTask };

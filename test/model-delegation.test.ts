@@ -102,6 +102,36 @@ test("Explore and Plan are shared read-only children; writable shared work fails
 	await assert.rejects(data.service.handle({ ...context, toolCallId: "call-2" }, "Agent", { ...background, isolation: "shared" }), /cannot run alongside/);
 });
 
+test("custom agents control prompt, model, thinking and read-only isolation", async (t) => {
+	const data = fixture();
+	t.after(() => data.service.dispose());
+	data.callbacks.resolveAgent = async (_project, name) =>
+		name === "reviewer"
+			? {
+					name: "reviewer",
+					description: "Reviews changes",
+					prompt: "You are a strict reviewer.",
+					readOnly: true,
+					scope: "project",
+					model: { provider: "fixture", id: "reviewer-model" },
+					thinkingLevel: "low",
+				}
+			: undefined;
+	await data.service.handle(context, "Agent", { ...background, subagent_type: "reviewer" });
+	const sent = data.inputs[0] as { input: { message: string; isolation: string; model: unknown; thinkingLevel: string }; metadata: { readOnly: boolean; subagentType: string } };
+	assert.match(sent.input.message, /You are a strict reviewer\./);
+	assert.match(sent.input.message, /Add a function and test it/);
+	assert.equal(sent.input.isolation, "shared");
+	assert.deepEqual(sent.input.model, { provider: "fixture", id: "reviewer-model" });
+	assert.equal(sent.input.thinkingLevel, "low");
+	assert.equal(sent.metadata.readOnly, true);
+	assert.equal(sent.metadata.subagentType, "reviewer");
+	await assert.rejects(
+		data.service.handle({ ...context, toolCallId: "call-unknown" }, "Agent", { ...background, subagent_type: "missing" }),
+		/Unknown subagent_type/,
+	);
+});
+
 test("task output, cancellation and task listing are scoped to the immutable delegating conversation", async (t) => {
 	const data = fixture();
 	t.after(() => data.service.dispose());

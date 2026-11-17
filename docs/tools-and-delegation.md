@@ -67,7 +67,7 @@ await window.pi.permissions.remove("allow-project-tests");
 - command 支持 `{type:"exact",value:"npm test"}` 或 `{type:"prefix",argv:["npm","test"]}`。prefix 至少含可执行文件和一个参数，按参数边界匹配，不能用字符串前缀把 `npm test-malicious` 当成 `npm test`。
 - 命令 allow 只适用于单个可解析的直接命令；管道、重定向、替换、包装器等不能借窄命令 allow 扩权。deny/ask 会检查复合命令并对不透明语法保守处理。
 - ask：项目内内置读取默认放行，越出项目的读取需要确认；其他工具默认询问。安全的 TaskOutput/TaskList/TaskStop/WorktreeList 默认无需写操作审批。
-- auto：除显式规则和上限外直接授权，**没有风险分类器**。read：只允许读取和安全状态工具，不能通过 allow 规则提升为写模式。
+- auto：除显式规则和上限外直接授权，**没有风险分类器**。acceptEdits：项目内 `edit/write` 自动允许，项目外写入与命令仍按规则询问。read：只允许读取和安全状态工具，不能通过 allow 规则提升为写模式。
 - 人工在客户端提交的单条 Bash 已是用户指令，不再产生模型工具确认弹窗，但仍执行 deny/停用/只读限制。PTY 是独立的人机终端接口，不经过每条模型工具规则。
 
 沿用 `pendingUI`、`respond`、`tasks.respond` 处理确认。“始终允许”可由前端创建明确的规则后再确认本次调用；不要把任何确认都保存成 `tool:*`。当前无独立 OS 沙箱；允许的 Shell、扩展和 MCP 仍使用其进程的系统权限。工具规则不承诺约束恶意本地扩展的任意进程代码。
@@ -78,7 +78,7 @@ await window.pi.permissions.remove("allow-project-tests");
 
 | 工具 | 参数与结果 |
 | --- | --- |
-| Agent | `{description,prompt,subagent_type,executor?,run_in_background?,isolation?,worktree_id?}`，默认 Pi，也可选择本机 codex/claude/kimi |
+| Agent | `{description,prompt,subagent_type,executor?,run_in_background?,isolation?,worktree_id?}`，`subagent_type` 可为内置或自定义 Agent；默认 Pi，也可选择本机 codex/claude/kimi |
 | AgentExecutors | `{}`，探测本机外部执行器与权限能力 |
 | AgentSend | `{task_id,message,run_in_background?}`，继续属于本父会话的外部原生会话 |
 | TaskOutput | `{task_id,block?,timeout?}`，timeout 毫秒，最多 60000，支持轮询或等待 |
@@ -89,7 +89,7 @@ await window.pi.permissions.remove("allow-project-tests");
 | WorktreeMerge | `{worktree_id}`，有保护的快进合并，不自动提交 |
 | WorktreeRemove | `{worktree_id}`，保留有未合并提交的分支；脏/忽略文件阻止删除 |
 
-Agent 的 `subagent_type`：`Explore / Plan / general-purpose`。Explore/Plan 使用只读工具上限，默认共享项目读取；general-purpose 默认 Git Worktree。无 Git 时可做只读探索；共享目录的可写委派会立即报错，避免父任务等子任务、子任务又等父任务释放目录。显式 Worktree 引用必须属于本父会话。
+Agent 的 `subagent_type`：`general-purpose / Explore / Plan`，或 `.pi/agents`、`.claude/agents` 中定义的自定义 Agent 名称。Explore/Plan/只读自定义 Agent 使用只读工具上限，默认共享项目读取；general-purpose 与可写自定义 Agent 默认 Git Worktree。无 Git 时可做只读探索；共享目录的可写委派会立即报错，避免父任务等子任务、子任务又等父任务释放目录。显式 Worktree 引用必须属于本父会话。
 
 子会话使用独立 Pi 进程、独立上下文，只收到子任务 prompt 和正常 Pi 项目资源，不复制父聊天全文。继承父模型和思考级别、创建时权限上限，并继续接收父任务后续收紧的规则/停用。Worktree 内绝对项目路径规则映射到对应工作区。子任务不能自行选择更高权限或再创建子 Agent。
 

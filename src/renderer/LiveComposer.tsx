@@ -11,6 +11,7 @@ interface Attachment {
 const DEFAULT_DESKTOP_KEYBINDINGS = { submit: "Enter" };
 const PERMISSION_LABEL: Record<PermissionMode, string> = {
 	ask: "手动确认",
+	acceptEdits: "接受编辑",
 	auto: "跳过确认（危险）",
 	read: "只读模式",
 };
@@ -38,6 +39,7 @@ export type BuiltinSlashAction =
 	| "mcp"
 	| "rewind"
 	| "tasks"
+	| "agents"
 	| "sessions"
 	| "cost"
 	| "plan"
@@ -54,6 +56,7 @@ const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[
 	{ name: "permissions", description: "管理细粒度权限规则" },
 	{ name: "mcp", description: "查看工具清单与 MCP 服务" },
 	{ name: "tasks", description: "查看后台任务、子 Agent 与 Worktree" },
+	{ name: "agents", description: "查看或创建自定义子 Agent" },
 	{ name: "sessions", description: "查看会话分支树与导入 CLI 历史" },
 	{ name: "memory", description: "查看或编辑项目 AGENTS.md / CLAUDE.md" },
 	{ name: "status", description: "查看当前模型、上下文与工具挂载状态" },
@@ -395,7 +398,7 @@ export function LiveComposer({
 					onKeyDown={(event) => {
 						if (event.key === "Tab" && event.shiftKey && !changing && !running) {
 							event.preventDefault();
-							const order: PermissionMode[] = ["ask", "auto", "read"];
+							const order: PermissionMode[] = ["ask", "acceptEdits", "auto", "read"];
 							const next = order[(order.indexOf(snapshot.settings.permission) + 1) % order.length];
 							setPermission(next);
 							return;

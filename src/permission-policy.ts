@@ -12,6 +12,7 @@ import type {
 } from "./permission-types.ts";
 
 const readingTools = new Set(["read", "grep", "find", "ls"]);
+const editTools = new Set(["edit", "write"]);
 const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite"]);
 const pathTools = new Set([...readingTools, "edit", "write"]);
 const wrappers = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", ".", "env", "sudo", "doas", "exec", "command", "xargs"]);
@@ -85,7 +86,7 @@ export function validatePermissionRule(value: unknown): PermissionRule {
 export function validateRuntimePolicy(value: unknown): RuntimePermissionPolicy {
 	const record = object(value, "运行时权限配置");
 	keys(record, ["version", "mode", "rules", "disabledTools", "project"], "运行时权限配置");
-	if (record.version !== 1 || !["ask", "auto", "read"].includes(record.mode as string))
+	if (record.version !== 1 || !["ask", "acceptEdits", "auto", "read"].includes(record.mode as string))
 		throw new Error("运行时权限版本或模式无效。");
 	if (!Array.isArray(record.rules) || record.rules.length > 2000) throw new Error("权限规则列表无效。");
 	if (!Array.isArray(record.disabledTools) || record.disabledTools.length > 10000) throw new Error("停用工具列表无效。");
@@ -344,6 +345,8 @@ export async function evaluatePermission(
 	}
 	const result = (action: PermissionAction, reason: string): PermissionDecision => ({ action, reason, ...(targets.length ? { targets } : {}) });
 	if (policy.mode === "auto") return result("allow", "自动执行模式。");
+	if (policy.mode === "acceptEdits" && editTools.has(call.toolName) && targets.length && targets.every((target) => contained(project, target)))
+		return result("allow", "接受编辑模式：项目内文件编辑自动允许。");
 	if (shell && (shell.compound || shell.opaque)) return result("ask", "复杂 Shell 命令需要单次确认。不能通过字面命令授权推断其副作用。");
 	if (readingTools.has(call.toolName) && targets.every((target) => contained(project, target)))
 		return result("allow", "项目目录内的读取工具。");

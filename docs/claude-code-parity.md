@@ -4,17 +4,18 @@
 > 对比对象：Pi Desktop `0.1.0`（Pi 引擎 `1.5.2`） vs Claude Code `2.1.280`（本机 CLI）与官方 Desktop / IDE / Web 文档
 > 结论口径：只比较“能力面”和“交互面”，不比较底层模型谁更聪明；服务依赖型能力单独标注。
 > 2026-11-17 修复：已补工作区信任 UI 与 `--approve`/`--no-approve` 启动参数；`auto` 已改名为“跳过确认（危险）”并加常驻警告。第 3.4、4.1、4.2、4.8 节相关条目已部分关闭，其余仍是差距。
+> 2026-11-18 第二阶段：新增 `acceptEdits`、自定义 Agent（`.claude/agents`、`.pi/agents`、工具白名单、模型/思考强度）与 MCP 服务器管理（用户/项目 `mcp.json`、stdio/HTTP、启停）。第 3.4、3.6、4.4、4.5、4.8 节的部分条目已关闭。
 
 ## 0. 一分钟结论
 
 | 层面 | 判断 | 说明 |
 | --- | --- | --- |
 | 视觉与消息流 | **约 80%** | `>` 提示块、工具树、`⎿` 摘要、内联 Diff、Thought、Todo、Plan 审批条都已具备，观感接近原生客户端 |
-| 日常本地编码 | **约 55%** | 读写、命令、权限规则、检查点、Git、PTY、Worktree 可用；安全边界、Hooks、自定义 Agent、MCP 管理、后台会话仍是硬伤 |
+| 日常本地编码 | **约 55%** | 读写、命令、权限规则、检查点、Git、PTY、Worktree、自定义 Agent 与 MCP 管理可用；OS 沙箱、Hooks、插件、记忆/上下文、后台会话仍是硬伤 |
 | 平台与生态 | **约 20%** | 无 IDE/LSP、Chrome、语音、云会话、Remote Control、插件市场、企业策略 |
 | 综合（15 个能力面简单平均） | **约 48%** | 详见第 2 节；这是排序用的主观评分，不是厂商基准 |
 
-**最需要补的五件事**：工作区信任与 OS 沙箱、Hooks/插件/自定义 Agent 扩展体系、MCP 全生命周期、记忆与上下文可视化、后台会话与系统通知。
+**最需要补的五件事**：OS 沙箱与安全边界、Hooks/插件扩展体系、记忆与上下文可视化、后台会话与系统通知、真正的 Plan 模式与项目规则共享。
 
 **最不应该丢掉的三件事**：多模型/多协议接入、本机 Codex/Claude/Kimi 外部 Agent 协作、Git/Worktree/PTY/检查点组成的 GUI 工作台。
 
@@ -60,7 +61,7 @@
 | 权限/沙箱/信任 | 2 | 规则细，但没有安全边界 | 无 OS 沙箱、无工作区信任、auto 模式没有分类器 |
 | 记忆/规则 | 2 | 能编辑根目录两个文件 | 无子目录按需加载、无 `.claude/rules`、无自动记忆、无 `@import` |
 | 扩展体系 | 2 | Skills 可用，其余基本没有 | 无 Hooks、无插件市场、无自定义命令管理 |
-| 子 Agent/编排 | 2 | 三种固定子 Agent + 后台任务 | 无自定义 Agent、无 fork 子 Agent、无 Agent Teams、无 Workflows |
+| 子 Agent/编排 | 3 | 内置 + 自定义 Agent + 后台任务 | 无 fork 子 Agent、Agent Teams、Workflows、批量 Worktree |
 | 会话生命周期 | 3 | 本地分支/克隆/导入很强 | 无后台挂起/接管、无云会话、无跨端共享、无 PR 会话 |
 | 检查点/Git | 4 | Git 检查点与分栏 Diff 是强项 | 会话级 rewind 语义不如原生细；无评审/PR/CI |
 | MCP/集成 | 2 | 只能看和开关工具 | 无服务器增删、OAuth、作用域、资源；无 IDE/Chrome/Slack |
@@ -119,7 +120,7 @@
 
 | 能力 | Claude Code 原生 | Pi Desktop | 差距 |
 | --- | --- | --- | --- |
-| 权限模式 | `manual`、`acceptEdits`、`auto`、`bypassPermissions`、`dontAsk`、`plan` | `ask`、`auto`、`read` | 缺 acceptEdits、真正的 plan、bypass 的显式危险语义 |
+| 权限模式 | `manual`、`acceptEdits`、`auto`、`bypassPermissions`、`dontAsk`、`plan` | `ask`、`acceptEdits`、`auto`、`read` | 缺真正的 plan、bypass/dontAsk 的显式语义 |
 | 规则 | allow/ask/deny，工具/参数/路径/命令，项目 `.claude/settings.json` 可共享 | allow/ask/deny，工具/路径/命令，存应用数据 `tool-settings.json` | 规则能力强，但不可随仓库共享 |
 | OS 沙箱 | macOS Seatbelt / Linux Bubblewrap，文件系统与网络隔离，凭据掩码 | **没有**；允许的命令、扩展、MCP 使用启动用户权限 | 最大安全差距 |
 | 工作区信任 | 首次打开文件夹的 trust 对话框；受保护资源按信任加载 | 已有信任 UI；按决定传 `--approve`/`--no-approve`；未决定时显示横幅 | 剩余：项目配置共享、撤销粒度、批量信任 |
@@ -145,8 +146,8 @@
 
 | 能力 | Claude Code 原生 | Pi Desktop | 差距 |
 | --- | --- | --- | --- |
-| 内置子 Agent | general-purpose、Explore、Plan，可自定义 | Explore、Plan、general-purpose 三种固定类型 | 类型不可扩展 |
-| 自定义 Agent | `.claude/agents`，每 Agent 可配模型、工具、Skills、Hooks、权限 | 无 | 不能沉淀“评审员/调试员/迁移专家”等角色 |
+| 内置子 Agent | general-purpose、Explore、Plan，可自定义 | general-purpose、Explore、Plan + 自定义 Agent | 类型可扩展；缺 fork/Teams |
+| 自定义 Agent | `.claude/agents`，每 Agent 可配模型、工具、Skills、Hooks、权限 | 支持 `.claude/agents`/`.pi/agents`、工具白名单、模型与思考强度 | 无 per-agent Hooks/权限、Agent Teams、fork 模式 |
 | 后台子 Agent | 前台/后台、`/subtask`、fork 当前会话 | 后台任务、审批、结果回传 | 无 fork 子 Agent，子任务不继承父会话全文 |
 | 并行编排 | Agent Teams、跨会话消息、`/batch` 5–30 个 worktree 子任务 | 后台任务 + Worktree，手动串行编排 | 复杂任务编排能力弱 |
 | Workflows | Claude 写脚本、批量 fan-out、断点恢复 | 无 | 大规模审计/迁移场景缺 |
@@ -269,11 +270,11 @@
 
 **原生**：`.claude/agents` 可定义每个子 Agent 的说明、系统提示、模型、effort、工具、Skills、Hooks、权限；支持前台/后台、fork 当前会话、Agent Teams、跨会话消息、`/batch` 批量 worktree 子任务、Workflows 脚本编排。
 
-**客户端**：只有 `Explore / Plan / general-purpose` 三种固定类型；子 Agent 使用独立 Pi 进程、独立上下文，支持后台、审批、结果回传、Worktree；但没有自定义 Agent 文件、没有 fork 模式、没有 Teams/Workflows/批量编排。
+**客户端**：已有 `general-purpose / Explore / Plan` 与 `.claude/agents`、`.pi/agents` 自定义定义；支持 per-agent 工具白名单、模型、思考强度和提示词，子 Agent 使用独立 Pi 进程、独立上下文、后台、审批、结果回传、Worktree。仍没有 fork 当前会话为子 Agent、Agent Teams、Workflows 与 `/batch` 式批量 Worktree 编排。
 
-**影响**：不能沉淀团队角色（评审员、调试员、迁移专家、安全审计员）；复杂任务只能手动拆；大规模迁移/审计效率低。
+**影响（基础版已缓解）**：已能沉淀评审员/调试员等角色；但仍不能把当前会话 fork 成子 Agent，也没有 Agent Teams/Workflows 的自动编排。
 
-**建议**：优先解析 `.claude/agents`（或 `.pi/agents`），支持 per-agent 模型、工具、提示词、Hooks；加一个 Agent 管理 UI；再做 fork 子 Agent 与 `/batch` 式批量 Worktree 编排。Teams/Workflows 可以后置。
+**后续建议**：~~解析 `.claude/agents`/`.pi/agents` 并加管理 UI~~（已完成）；继续补 per-agent Hooks/权限、fork 子 Agent、`/batch` 式批量 Worktree、Teams/Workflows。
 
 **归属**：客户端为主；工作量 M–L。
 
@@ -281,11 +282,11 @@
 
 **原生**：`claude mcp add/list/get/login/logout/remove/serve`；`.mcp.json` 项目作用域；OAuth 登录与 token 刷新；资源与提示；`/mcp` 交互管理；健康检查与失败重连。
 
-**客户端**：只有 [ControlsDialog.tsx](../src/renderer/ControlsDialog.tsx) 的工具列表与启停；没有服务器增删、OAuth、作用域、资源、健康检查。项目 `.pi/mcp.json` 还受 4.2 的信任问题影响。
+**客户端**：已支持用户 `~/.pi/agent/mcp.json` 与项目 `.pi/mcp.json` 的服务器增删、启停、stdio/HTTP、描述与项目覆盖；保存后重启项目会话。仍没有应用内 OAuth 登录、连接健康状态、资源/提示浏览与工具暴露管理；项目级 MCP 仍受信任门控。
 
-**影响**：用户必须离开客户端去改配置文件或跑 `pi mcp`；OAuth 型 MCP（Sentry、Figma 等）基本不可用；项目级 MCP 可能静默不加载。
+**影响（基础版已缓解）**：普通 stdio/HTTP 服务器可在客户端增删启停；OAuth 型 MCP 仍需离开客户端执行 `pi mcp login`；项目级 MCP 仍受信任门控。
 
-**建议**：做 MCP 管理页：添加/删除/启停、stdio/HTTP、OAuth 登录、作用域（用户/项目）、工具暴露、健康状态、资源浏览；兼容 `.mcp.json` 与 `.pi/mcp.json`；与 trust 流程整合。
+**后续建议**：~~MCP 管理页~~（基础版已完成）；继续补应用内 OAuth、连接健康状态、资源/提示浏览、工具暴露管理与 `.mcp.json` 兼容。
 
 **归属**：客户端；工作量 M。
 
@@ -317,11 +318,11 @@
 
 **原生**：6 种模式，尤其 `acceptEdits`（自动接受编辑、命令仍询问）是日常效率关键；`plan` 是引擎级权限模式；规则写在 `.claude/settings.json`，可随仓库共享；`dontAsk`/`bypassPermissions` 有明确语义。
 
-**客户端**：只有 `ask/auto/read`；没有 `acceptEdits`，每次编辑都要确认；`plan` 是 UI 约定（切只读 + 填提示词 + 最后一条消息后显示审批条，见 [main.tsx](../src/renderer/main.tsx)），不是引擎级模式，也没有计划文件、计划编辑与工具级 `ExitPlanMode` 审批。而且只读判定只放行 `read/grep/find/ls` 与少量任务工具，`WebFetch` 与 `Agent` 会被拒绝，计划阶段查文档/派探索子 Agent 会受限。规则存应用数据（[tool-settings.ts](../src/tool-settings.ts)），团队无法共享。
+**客户端**：已有 `ask/acceptEdits/auto/read`；`acceptEdits` 只自动允许项目内 `edit/write`，命令仍按规则询问；`plan` 仍是 UI 约定（切只读 + 填提示词 + 最后一条消息后显示审批条，见 [main.tsx](../src/renderer/main.tsx)），不是引擎级模式，也没有计划文件、计划编辑与工具级 `ExitPlanMode` 审批。而且只读判定只放行 `read/grep/find/ls` 与少量任务工具，`WebFetch` 与 `Agent` 会被拒绝，计划阶段查文档/派探索子 Agent 会受限。规则存应用数据（[tool-settings.ts](../src/tool-settings.ts)），团队无法共享。
 
 **影响**：日常编辑摩擦大；Plan 模式容易被误用为“只读模式”；团队策略无法版本化。
 
-**建议**：增加 `acceptEdits`（编辑自动允许，bash 仍按规则）；把 `plan` 做成真正的权限模式（只读工具集 + 计划产物 + 审批后切换）；项目规则写入 `.pi/settings.json` 或 `.claude/settings.json`，支持导入/导出/继承。
+**建议**：~~增加 `acceptEdits`~~（已完成）；把 `plan` 做成真正的权限模式（只读工具集 + 计划产物 + 审批后切换）；项目规则写入 `.pi/settings.json` 或 `.claude/settings.json`，支持导入/导出/继承。
 
 **归属**：客户端 + Pi 引擎；工作量 S–M。
 
@@ -372,11 +373,11 @@
 | 交付物 | 归属 | 验收标准 |
 | --- | --- | --- |
 | Claude 兼容 Hooks 子集：PreToolUse、PostToolUse、SessionStart、Stop、UserPromptSubmit、Notification + `/hooks` UI | 客户端 + 引擎 | 能配置“编辑后 lint”“禁止改 .env”“会话结束通知”，并在工具调用处生效 |
-| 自定义 Agent：解析 `.claude/agents`/`.pi/agents`，per-agent 模型/工具/提示词/Hooks + 管理 UI | 客户端 | 用户能创建“reviewer/debugger”并在聊天中委派；模型/工具按定义生效 |
-| MCP 管理：增删/启停、stdio/HTTP、OAuth、作用域、健康状态、资源浏览 | 客户端 | 不离开客户端即可添加 Sentry/Figma 等 OAuth MCP 并看到工具/资源 |
+| 自定义 Agent（基础版已完成）：解析 `.claude/agents`/`.pi/agents`，per-agent 模型/工具/提示词 + 管理 UI；Hooks/权限待做 | 客户端 | 用户能创建“reviewer/debugger”并在聊天中委派；模型/工具按定义生效 |
+| MCP 管理（基础版已完成）：增删/启停、stdio/HTTP、作用域；OAuth/健康状态/资源浏览待做 | 客户端 | 可在客户端添加普通 MCP；OAuth 仍需 `pi mcp login` |
 | 记忆层级：根/子目录/`.claude/rules`/`@import` + 自动记忆 + `/context` 面板 + 自动压缩设置 | 客户端 + 引擎 | 子目录规范能自动加载；用户能看到上下文构成并调整压缩窗口 |
 | 后台会话：挂起/接管、运行中切换、持久化 supervisor、系统通知 | 客户端 | 长任务可后台运行；离开电脑能收到完成通知；重启后可接管 |
-| 权限：`acceptEdits`、真正的 `plan` 模式、项目规则共享/导入导出 | 客户端 + 引擎 | 编辑不再每次确认；Plan 有明确产物与审批；团队规则可随仓库走 |
+| 权限：`acceptEdits`（已完成）、真正的 `plan` 模式、项目规则共享/导入导出 | 客户端 + 引擎 | 编辑不再每次确认；Plan 有明确产物与审批；团队规则可随仓库走 |
 
 ### P2：生态与平台（一个季度+）
 
