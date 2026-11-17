@@ -12,7 +12,7 @@ import type {
 } from "./permission-types.ts";
 
 const readingTools = new Set(["read", "grep", "find", "ls"]);
-const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList"]);
+const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite"]);
 const pathTools = new Set([...readingTools, "edit", "write"]);
 const wrappers = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", ".", "env", "sudo", "doas", "exec", "command", "xargs"]);
 

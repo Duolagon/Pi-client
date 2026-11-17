@@ -210,3 +210,48 @@ test("tool hook rechecks revocation after an approval and blocks invalid configu
 		await f.cleanup();
 	}
 });
+
+test("TodoWrite and WebFetch follow policy modes and SSRF host guards", async () => {
+	const f = await fixture();
+	const previousHost = process.env.PI_DESKTOP_HOST_URL;
+	const previousTest = process.env.PI_DESKTOP_CONNECTION_TEST;
+	const previousChild = process.env.PI_DESKTOP_CHILD;
+	try {
+		assert.equal((await evaluatePermission(f.policy({ mode: "read" }), { toolName: "TodoWrite", input: { todos: [] } })).action, "allow");
+		assert.equal((await evaluatePermission(f.policy({ mode: "ask" }), { toolName: "TodoWrite", input: { todos: [] } })).action, "allow");
+		assert.equal((await evaluatePermission(f.policy({ mode: "auto", disabledTools: ["TodoWrite"] }), { toolName: "TodoWrite", input: { todos: [] } })).action, "deny");
+
+		assert.equal((await evaluatePermission(f.policy({ mode: "read" }), { toolName: "WebFetch", input: { url: "https://example.com" } })).action, "deny");
+		assert.equal((await evaluatePermission(f.policy({ mode: "ask" }), { toolName: "WebFetch", input: { url: "https://example.com" } })).action, "ask");
+		assert.equal((await evaluatePermission(f.policy({ mode: "auto" }), { toolName: "WebFetch", input: { url: "https://example.com" } })).action, "allow");
+
+		process.env.PI_DESKTOP_HOST_URL = "http://127.0.0.1:45555";
+		delete process.env.PI_DESKTOP_CONNECTION_TEST;
+		delete process.env.PI_DESKTOP_CHILD;
+		const registered = new Map<string, { execute: (id: string, input: unknown) => Promise<unknown> }>();
+		permissions({
+			registerTool(def: { name: string; execute: (id: string, input: unknown) => Promise<unknown> }) {
+				registered.set(def.name, def);
+			},
+			registerProvider() {},
+			on() {},
+		} as unknown as ExtensionAPI);
+		assert.ok(registered.has("TodoWrite"));
+		assert.ok(registered.has("WebFetch"));
+		const todoResult = await registered.get("TodoWrite")!.execute("tc-1", {
+			todos: [{ id: "1", content: "Write tests", status: "in_progress" }],
+		}) as { details: { todos: unknown[] } };
+		assert.equal(todoResult.details.todos.length, 1);
+		await assert.rejects(registered.get("WebFetch")!.execute("tc-2", { url: "http://127.0.0.1:8080" }), /private or loopback/);
+		await assert.rejects(registered.get("WebFetch")!.execute("tc-3", { url: "http://localhost/admin" }), /private or loopback/);
+		await assert.rejects(registered.get("WebFetch")!.execute("tc-4", { url: "file:///etc/passwd" }), /http and https/);
+	} finally {
+		if (previousHost === undefined) delete process.env.PI_DESKTOP_HOST_URL;
+		else process.env.PI_DESKTOP_HOST_URL = previousHost;
+		if (previousTest === undefined) delete process.env.PI_DESKTOP_CONNECTION_TEST;
+		else process.env.PI_DESKTOP_CONNECTION_TEST = previousTest;
+		if (previousChild === undefined) delete process.env.PI_DESKTOP_CHILD;
+		else process.env.PI_DESKTOP_CHILD = previousChild;
+		await f.cleanup();
+	}
+});

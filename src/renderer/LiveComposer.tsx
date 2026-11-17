@@ -9,7 +9,11 @@ interface Attachment {
 	image?: Image;
 }
 const DEFAULT_DESKTOP_KEYBINDINGS = { submit: "Enter" };
-const PERMISSION_LABEL: Record<PermissionMode, string> = { ask: "手动确认", auto: "自动执行", read: "只读模式" };
+const PERMISSION_LABEL: Record<PermissionMode, string> = {
+	ask: "手动确认",
+	auto: "跳过确认（危险）",
+	read: "只读模式",
+};
 // Keep attachment checks aligned with the main process prompt wire limits.
 const maximumImageDataLength = 10 * 1024 * 1024;
 function promptInput(draft: string, attachments: Attachment[]): Extract<Command, { type: "prompt" }> {
@@ -27,18 +31,35 @@ function promptInput(draft: string, attachments: Attachment[]): Extract<Command,
 		throw new Error("任务正文与文本附件合计超过 2 MB，请精简内容后重试。");
 	return { type: "prompt", message: message || "请查看这些图片。", images };
 }
-export type BuiltinSlashAction = "compact" | "new" | "permissions" | "mcp" | "rewind" | "tasks" | "sessions" | "cost" | "plan";
+export type BuiltinSlashAction =
+	| "compact"
+	| "new"
+	| "permissions"
+	| "mcp"
+	| "rewind"
+	| "tasks"
+	| "sessions"
+	| "cost"
+	| "plan"
+	| "memory"
+	| "status"
+	| "init"
+	| "preview";
 
 const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[] = [
 	{ name: "compact", description: "压缩当前会话上下文" },
 	{ name: "new", description: "新建会话" },
+	{ name: "plan", description: "进入/退出只读计划模式（调研方案并待审批后执行）" },
 	{ name: "rewind", description: "打开 Git 检查点与代码回滚" },
 	{ name: "permissions", description: "管理细粒度权限规则" },
 	{ name: "mcp", description: "查看工具清单与 MCP 服务" },
 	{ name: "tasks", description: "查看后台任务、子 Agent 与 Worktree" },
 	{ name: "sessions", description: "查看会话分支树与导入 CLI 历史" },
+	{ name: "memory", description: "查看或编辑项目 AGENTS.md / CLAUDE.md" },
+	{ name: "status", description: "查看当前模型、上下文与工具挂载状态" },
+	{ name: "init", description: "AI 分析仓库并生成 AGENTS.md 项目指南" },
+	{ name: "preview", description: "打开本地应用网页预览面板" },
 	{ name: "cost", description: "查看当前会话 Token 与费用统计" },
-	{ name: "plan", description: "以只读计划模式调研并输出方案" },
 ];
 
 export function LiveComposer({
@@ -47,6 +68,8 @@ export function LiveComposer({
 	setDraft,
 	running,
 	changing,
+	planMode,
+	onTogglePlanMode,
 	send,
 	stop,
 	command,
@@ -60,6 +83,8 @@ export function LiveComposer({
 	setDraft: (value: string) => void;
 	running: boolean;
 	changing: boolean;
+	planMode?: boolean;
+	onTogglePlanMode?: () => void;
 	send: (prompt: Extract<Command, { type: "prompt" }>) => Promise<void>;
 	stop: () => void;
 	command: (value: Command) => Promise<void>;
@@ -534,6 +559,17 @@ export function LiveComposer({
 							</select>
 						</span>
 					</label>
+					{onTogglePlanMode && (
+						<button
+							type="button"
+							className={`cl-pill cc-plan-pill ${planMode ? "active" : ""}`}
+							onClick={onTogglePlanMode}
+							disabled={changing || running}
+							title="切换 Plan 计划模式（先只读调研与出方案，确认后再执行）"
+						>
+							Plan
+						</button>
+					)}
 				</div>
 				<div className="cc-bar-right">
 					{stats && (stats.tokens.total > 0 || contextPct !== undefined) && (

@@ -1,10 +1,16 @@
 import { useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
-import { Check, CircleAlert, ChevronRight, Copy } from "lucide-react";
-import type { Message } from "../shared.ts";
+import { Check, Circle, CircleAlert, ChevronRight, Copy, Eye, GitFork, LoaderCircle, RotateCcw } from "lucide-react";
+import type { DesktopTask, ExternalTask, Message } from "../shared.ts";
 import type { Transcript, ToolProgress } from "./messages.ts";
 import { CodeLines, InlineEditDiff, computeLineDiff } from "./DiffView.tsx";
 import { highlightCode } from "./highlight.tsx";
+
+export interface TodoItem {
+	id: string;
+	content: string;
+	status: "pending" | "in_progress" | "completed";
+}
 
 type Assistant = Extract<Message, { role: "assistant" }>;
 type AnyMessage = Transcript["messages"][number];
@@ -82,13 +88,35 @@ function CodeBlock({ className, children }: { className?: string; children?: Rea
 	);
 }
 
-function MarkdownContent({ text }: { text: string }) {
+function MarkdownContent({ text, onOpenPreview }: { text: string; onOpenPreview?: (url: string) => void }) {
 	return (
 		<div className="cl-markdown">
 			<ReactMarkdown
 				components={{
 					pre({ children }) {
 						return <>{children}</>;
+					},
+					a({ href, children, ...props }) {
+						const isLocal = typeof href === "string" && /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?/i.test(href);
+						if (isLocal && onOpenPreview && href) {
+							return (
+								<a
+									href={href}
+									onClick={(event) => {
+										event.preventDefault();
+										onOpenPreview(href);
+									}}
+									{...props}
+								>
+									{children}
+								</a>
+							);
+						}
+						return (
+							<a href={href} target="_blank" rel="noreferrer" {...props}>
+								{children}
+							</a>
+						);
 					},
 					code({ className, children, ...props }) {
 						const isBlock = Boolean(className) || String(children).includes("\n");
@@ -109,7 +137,44 @@ function MarkdownContent({ text }: { text: string }) {
 	);
 }
 
-export function TranscriptView({ transcript: state }: { transcript: Transcript }) {
+function CopyTurnButton({ text }: { text: string }) {
+	const [copied, setCopied] = useState(false);
+	if (!text.trim()) return null;
+	return (
+		<button
+			type="button"
+			className="cc-meta-action"
+			onClick={() => {
+				void navigator.clipboard?.writeText(text).then(() => {
+					setCopied(true);
+					setTimeout(() => setCopied(false), 1400);
+				});
+			}}
+			title="复制回复 Markdown"
+		>
+			{copied ? <Check size={11} /> : <Copy size={11} />}
+			<span>{copied ? "已复制" : "复制"}</span>
+		</button>
+	);
+}
+
+export function TranscriptView({
+	transcript: state,
+	tasks = [],
+	externalTasks = [],
+	onOpenTask,
+	onRewindPrompt,
+	onForkPrompt,
+	onOpenPreview,
+}: {
+	transcript: Transcript;
+	tasks?: DesktopTask[];
+	externalTasks?: ExternalTask[];
+	onOpenTask?: (taskId: string) => void;
+	onRewindPrompt?: (text: string) => void;
+	onForkPrompt?: (text: string) => void;
+	onOpenPreview?: (url: string) => void;
+}) {
 	return (
 		<div className="cl-transcript">
 			{units(state.messages).map((unit, index) => {
@@ -141,6 +206,13 @@ export function TranscriptView({ transcript: state }: { transcript: Transcript }
 							</details>
 						);
 					}
+					const promptText =
+						typeof message.content === "string"
+							? message.content
+							: message.content
+									.filter((b) => b.type === "text")
+									.map((b) => b.text)
+									.join("\n");
 					return (
 						<div className="cl-msg cl-msg-user" key={`user-${message.timestamp}-${index}`}>
 							<div className="cl-user-bubble">
@@ -160,6 +232,20 @@ export function TranscriptView({ transcript: state }: { transcript: Transcript }
 										)
 									)}
 								</div>
+								{(onRewindPrompt || onForkPrompt) && promptText.trim() && (
+									<div className="cc-user-actions">
+										{onForkPrompt && (
+											<button type="button" title="从此处分叉对话" onClick={() => onForkPrompt(promptText)}>
+												<GitFork size={12} />
+											</button>
+										)}
+										{onRewindPrompt && (
+											<button type="button" title="回滚到此检查点" onClick={() => onRewindPrompt(promptText)}>
+												<RotateCcw size={12} />
+											</button>
+										)}
+									</div>
+								)}
 							</div>
 						</div>
 					);
@@ -196,6 +282,11 @@ export function TranscriptView({ transcript: state }: { transcript: Transcript }
 				const errorMessage = [...unit.messages].reverse().find((message) => message.errorMessage)?.errorMessage;
 				const aborted = unit.messages.some((message) => message.stopReason === "aborted");
 				const usage = last.usage;
+				const turnText = unit.messages
+					.flatMap((m) => m.content)
+					.filter((b): b is Extract<typeof b, { type: "text" }> => b.type === "text")
+					.map((b) => b.text)
+					.join("\n\n");
 				return (
 					<article className="cl-msg cl-msg-ai" key={`turn-${last.timestamp}-${index}`}>
 						{unit.messages.map((message, part) => (
@@ -205,6 +296,10 @@ export function TranscriptView({ transcript: state }: { transcript: Transcript }
 								state={state}
 								isStreaming={isStreaming && part === unit.messages.length - 1}
 								isFirst={part === 0}
+								tasks={tasks}
+								externalTasks={externalTasks}
+								onOpenTask={onOpenTask}
+								onOpenPreview={onOpenPreview}
 							/>
 						))}
 						{errorMessage && (
@@ -224,6 +319,7 @@ export function TranscriptView({ transcript: state }: { transcript: Transcript }
 									</span>
 								)}
 								<span>{formatTime(last.timestamp)}</span>
+								<CopyTurnButton text={turnText} />
 							</footer>
 						)}
 					</article>
@@ -238,11 +334,19 @@ function TurnBlocks({
 	state,
 	isStreaming,
 	isFirst,
+	tasks,
+	externalTasks,
+	onOpenTask,
+	onOpenPreview,
 }: {
 	message: Assistant;
 	state: Transcript;
 	isStreaming: boolean;
 	isFirst: boolean;
+	tasks: DesktopTask[];
+	externalTasks: ExternalTask[];
+	onOpenTask?: (taskId: string) => void;
+	onOpenPreview?: (url: string) => void;
 }) {
 	return message.content.map((block, part) => {
 		if (block.type === "text") {
@@ -251,7 +355,7 @@ function TurnBlocks({
 				<div className="cc-ai-text" key={part}>
 					<span className="cc-ai-bullet" aria-hidden="true" />
 					<div className="cc-ai-text-inner">
-						<MarkdownContent text={block.text} />
+						<MarkdownContent text={block.text} onOpenPreview={onOpenPreview} />
 					</div>
 				</div>
 			);
@@ -276,7 +380,18 @@ function TurnBlocks({
 			(item): item is Extract<Message, { role: "toolResult" }> => item.role === "toolResult" && item.toolCallId === block.id,
 		);
 		const progress = state.tools[block.id];
-		return <ToolCard key={block.id} name={block.name} args={block.arguments} progress={progress} result={result} />;
+		const matchedTask = tasks.find((t) => t.parentToolCallId === block.id) ?? externalTasks.find((t) => t.parentToolCallId === block.id);
+		return (
+			<ToolCard
+				key={block.id}
+				name={block.name}
+				args={block.arguments}
+				progress={progress}
+				result={result}
+				matchedTask={matchedTask}
+				onOpenTask={onOpenTask}
+			/>
+		);
 	});
 }
 
@@ -287,6 +402,7 @@ interface ToolPresentation {
 	treeSummary?: string;
 	editPairs?: { oldText: string; newText: string }[];
 	lineContent?: { content: string; startLine?: number };
+	todos?: TodoItem[];
 }
 
 function asRecord(args: unknown): Record<string, unknown> {
@@ -426,6 +542,29 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 		};
 	}
 
+	if (name === "TodoWrite") {
+		const rawTodos = Array.isArray(a.todos) ? (a.todos as TodoItem[]) : [];
+		const doneCount = rawTodos.filter((t) => t.status === "completed").length;
+		const inProgress = rawTodos.find((t) => t.status === "in_progress");
+		return {
+			verb: "Todos",
+			target: `${doneCount}/${rawTodos.length} completed`,
+			badge: inProgress ? "active" : "updated",
+			treeSummary: inProgress ? `正在进行：${inProgress.content}` : `已更新 ${rawTodos.length} 项任务清单`,
+			todos: rawTodos,
+		};
+	}
+
+	if (name === "WebFetch") {
+		const rawUrl = typeof a.url === "string" ? a.url : "";
+		return {
+			verb: "Fetch",
+			target: rawUrl,
+			badge: status === "done" && output ? `${output.length} chars` : status,
+			treeSummary: status === "running" ? "正在抓取网页内容…" : output?.trim().split("\n")[0].slice(0, 110) || "已读取",
+		};
+	}
+
 	if (name === "Agent" || name === "AgentSend") {
 		const subType = typeof a.subagent_type === "string" ? a.subagent_type : "general-purpose";
 		const desc = typeof a.description === "string" ? a.description : typeof a.task_id === "string" ? a.task_id : "Subagent task";
@@ -512,11 +651,15 @@ function ToolCard({
 	args,
 	progress,
 	result,
+	matchedTask,
+	onOpenTask,
 }: {
 	name: string;
 	args: unknown;
 	progress?: ToolProgress;
 	result?: Extract<Message, { role: "toolResult" }>;
+	matchedTask?: DesktopTask | ExternalTask;
+	onOpenTask?: (taskId: string) => void;
 }) {
 	const output = result
 		? result.content
@@ -529,25 +672,60 @@ function ToolCard({
 		: [];
 	const status = result ? (result.isError ? "error" : "done") : (progress?.status ?? "running");
 	const info = presentTool(name, args, output, status);
-	const dotClass = status === "error" ? "err" : status === "done" ? "ok" : "run";
+	const effectiveStatus = matchedTask
+		? matchedTask.status === "failed" || matchedTask.status === "cancelled"
+			? "error"
+			: matchedTask.status === "completed"
+				? "done"
+				: "running"
+		: status;
+	const dotClass = effectiveStatus === "error" ? "err" : effectiveStatus === "done" ? "ok" : "run";
 	const [open, setOpen] = useState(false);
 	const isOpen = open || status === "running";
 
 	return (
-		<div className={`cl-tool ${status} ${isOpen ? "is-open" : ""}`}>
+		<div className={`cl-tool ${effectiveStatus} ${isOpen ? "is-open" : ""}`}>
 			<button type="button" className="cc-tool-row" onClick={() => setOpen((v) => !v)} aria-expanded={isOpen}>
 				<span className={`cc-dot ${dotClass}`} />
 				<span className="cc-tool-head">
 					<span className="cc-tool-verb">{info.verb}</span>
 					{info.target && <span className="cl-tool-name">({info.target})</span>}
 				</span>
-				{info.badge && <span className={`cc-tool-badge ${status === "error" ? "err" : ""}`}>{info.badge}</span>}
+				{matchedTask && (
+					<span className="cc-tool-badge">
+						{"executor" in matchedTask ? matchedTask.executor : "pi"} · {matchedTask.status}
+					</span>
+				)}
+				{!matchedTask && info.badge && <span className={`cc-tool-badge ${status === "error" ? "err" : ""}`}>{info.badge}</span>}
 				<ChevronRight size={13} className="cl-tool-chevron" />
 			</button>
 			{info.treeSummary && (
 				<div className="cc-tree-summary">
 					<span className="cc-tree-arm">⎿</span>
-					<span className="cc-tree-text">{info.treeSummary}</span>
+					<span className="cc-tree-text">
+						{matchedTask ? `${matchedTask.status} · ${matchedTask.workingDirectory}` : info.treeSummary}
+					</span>
+					{matchedTask && onOpenTask && (
+						<button type="button" className="cc-inline-task-btn" onClick={() => onOpenTask(matchedTask.id)}>
+							<Eye size={11} /> 查看子会话
+						</button>
+					)}
+				</div>
+			)}
+			{info.todos && info.todos.length > 0 && (
+				<div className="cl-tool-body cc-inline-edit-body cc-todo-card">
+					{info.todos.map((item) => (
+						<div key={item.id} className={`cc-todo-row ${item.status}`}>
+							{item.status === "completed" ? (
+								<Check size={12} className="ok" />
+							) : item.status === "in_progress" ? (
+								<LoaderCircle size={12} className="spin run" />
+							) : (
+								<Circle size={11} className="pending" />
+							)}
+							<span>{item.content}</span>
+						</div>
+					))}
 				</div>
 			)}
 			{info.editPairs && info.editPairs.length > 0 && (
@@ -559,7 +737,7 @@ function ToolCard({
 					))}
 				</div>
 			)}
-			{isOpen && (!info.editPairs || info.editPairs.length === 0) && (
+			{isOpen && (!info.editPairs || info.editPairs.length === 0) && !info.todos && (
 				<div className="cl-tool-body">
 					{images.map((img, idx) => (
 						<img key={idx} className="cc-tool-image" alt="工具返回图片" src={`data:${img.mimeType};base64,${img.data}`} />

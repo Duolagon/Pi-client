@@ -37,10 +37,14 @@ import type {
 	Conversation,
 	DesktopEvent,
 	FileEntry,
+	GitCommitResult,
+	MemoryFileEntry,
 	Message,
 	Model,
 	PermissionMode,
 	Project,
+	ProjectTrustDecision,
+	ProjectTrustState,
 	Provider,
 	RpcExtensionUIRequest,
 	RpcSessionState,
@@ -55,6 +59,7 @@ import type {
 } from "./shared.ts";
 import { connectionMode, validateEndpoint } from "./model-connections.ts";
 import { providerModels, providerPresets } from "./provider-presets.ts";
+import { detectProjectTrustResources } from "./project-trust.ts";
 import { ToolSettingsStore } from "./tool-settings.ts";
 import { evaluatePermission, validatePermissionRule, validateRuntimePolicy } from "./permission-policy.ts";
 import type { PermissionRule, RuntimePermissionPolicy } from "./permission-types.ts";
@@ -82,6 +87,8 @@ interface StoredState {
 	keys: Partial<Record<Provider, string>>;
 	tasks: DesktopTask[];
 	taskPolicies?: Record<string, RuntimePermissionPolicy>;
+	/** Canonical project path to the user's explicit trust decision. */
+	projectTrust?: Record<string, ProjectTrustDecision>;
 }
 interface SessionRuntime {
 	conversationId: string;
@@ -138,6 +145,7 @@ export class DesktopService {
 		settings: { permission: "ask", theme: "light", connections: {} },
 		keys: {},
 		tasks: [],
+		projectTrust: {},
 	};
 	private runtimes = new Map<string, SessionRuntime>();
 	private git: GitSnapshots;
@@ -296,6 +304,34 @@ export class DesktopService {
 				.sort((a, b) => b.updatedAt - a.updatedAt)[0];
 			const conversation = recent ?? this.createConversation(projectPath);
 			await this.activate(conversation);
+			return this.buildSnapshot();
+		});
+	}
+
+	setProjectTrust(input: { project: string; decision: ProjectTrustDecision }): Promise<Snapshot> {
+		return this.serialize(async () => {
+			if (!isAbsolute(input.project)) throw new Error("项目路径必须为绝对路径。");
+			if (input.decision !== "trusted" && input.decision !== "untrusted")
+				throw new Error("项目信任决定无效。");
+			const project = await realpath(input.project);
+			if (!this.store.projects.some((item) => item.path === project)) throw new Error("项目未打开。");
+			const runtimes = [...this.runtimes.values()].filter(
+				(runtime) => this.conversation(runtime.conversationId).project === project,
+			);
+			for (const runtime of runtimes) {
+				if (runtime.busy || runtime.bashBusy || runtime.pendingUI.size)
+					throw new Error("请先停止该项目的任务与审批，再更改项目信任。");
+			}
+			const changed = (this.store.projectTrust?.[project] ?? undefined) !== input.decision;
+			this.store.projectTrust = { ...(this.store.projectTrust ?? {}), [project]: input.decision };
+			await this.persist();
+			if (changed) {
+				// Pi reads project resources once at startup, so an explicit decision
+				// only takes effect after the affected runtimes are recreated.
+				for (const runtime of runtimes) await this.stopRuntime(runtime);
+				const active = this.active();
+				if (active?.project === project && (await this.projectAvailable(active))) await this.ensureRuntime(active);
+			}
 			return this.buildSnapshot();
 		});
 	}
@@ -820,7 +856,14 @@ export class DesktopService {
 				const field = fields[index];
 				if (!field) continue;
 				const code = field.slice(0, 2);
-				changes.push({ status: code.trim() || "M", path: field.slice(3) });
+				const x = code[0] ?? " ";
+				const y = code[1] ?? " ";
+				changes.push({
+					status: code.trim() || "M",
+					path: field.slice(3),
+					staged: x !== " " && x !== "?",
+					unstaged: y !== " " || code === "??",
+				});
 				if (code.includes("R") || code.includes("C")) index++;
 			}
 			return { branch: branch.trim() || "HEAD", changes, isGit: true };
@@ -863,6 +906,130 @@ export class DesktopService {
 			[staged && `# 已暂存\n${staged}`, unstaged && `# 未暂存\n${unstaged}`].filter(Boolean).join("\n") ||
 			"没有可显示的文本差异。"
 		);
+	}
+
+	private gitPaths(cwd: string, paths: string[]): string[] {
+		return paths.map((p) => {
+			if (!p || p.includes("\0")) throw new Error("文件路径格式错误。");
+			const abs = resolve(cwd, p);
+			if (!inside(cwd, abs)) throw new Error("文件路径超出项目目录。");
+			const rel = relative(cwd, abs);
+			if (!rel || rel === ".git" || rel.startsWith(`.git${sep}`) || rel.startsWith(".git/"))
+				throw new Error("不允许操作 .git 元数据目录。");
+			return rel;
+		});
+	}
+
+	async gitStage(paths?: string[], conversationId?: string): Promise<Workspace> {
+		if (this.store.settings.permission === "read") throw new Error("只读模式下不可修改 Git 暂存区。");
+		const cwd = this.conversation(conversationId).project;
+		const rels = paths?.length ? this.gitPaths(cwd, paths) : [];
+		const args = rels.length ? ["add", "--", ...rels] : ["add", "-A"];
+		await exec("git", args, { cwd, maxBuffer: 2 * 1024 * 1024, timeout: 10000 });
+		return this.workspace(conversationId);
+	}
+
+	async gitUnstage(paths?: string[], conversationId?: string): Promise<Workspace> {
+		if (this.store.settings.permission === "read") throw new Error("只读模式下不可修改 Git 暂存区。");
+		const cwd = this.conversation(conversationId).project;
+		const rels = paths?.length ? this.gitPaths(cwd, paths) : [];
+		try {
+			await exec("git", rels.length ? ["reset", "-q", "HEAD", "--", ...rels] : ["reset", "-q", "HEAD"], {
+				cwd,
+				maxBuffer: 2 * 1024 * 1024,
+				timeout: 10000,
+			});
+		} catch (error) {
+			// Unborn repository (no commits yet) has no HEAD; unstage via git rm --cached.
+			const stderr = (error as { stderr?: string }).stderr ?? "";
+			if (/ambiguous argument 'HEAD'|unknown revision|bad default revision/i.test(stderr)) {
+				await exec("git", rels.length ? ["rm", "--cached", "-r", "-q", "--", ...rels] : ["rm", "--cached", "-r", "-q", "."], {
+					cwd,
+					maxBuffer: 2 * 1024 * 1024,
+					timeout: 10000,
+				});
+			} else {
+				throw error;
+			}
+		}
+		return this.workspace(conversationId);
+	}
+
+	async gitDiscard(paths: string[], conversationId?: string): Promise<Workspace> {
+		if (this.store.settings.permission === "read") throw new Error("只读模式下不可还原工作区文件。");
+		if (!paths.length) throw new Error("请指定要还原的文件路径。");
+		const cwd = this.conversation(conversationId).project;
+		this.assertProjectIdle(cwd);
+		const rels = this.gitPaths(cwd, paths);
+		const ws = await this.workspace(conversationId);
+		const untracked = new Set(ws.changes.filter((c) => c.status === "??").map((c) => c.path));
+		const toRemove = rels.filter((r) => untracked.has(r));
+		const toCheckout = rels.filter((r) => !untracked.has(r));
+		for (const item of toRemove) {
+			const target = await this.scopedPath(item, conversationId);
+			await rm(target, { recursive: true, force: true });
+		}
+		if (toCheckout.length) {
+			await exec("git", ["checkout", "--", ...toCheckout], { cwd, maxBuffer: 2 * 1024 * 1024, timeout: 10000 });
+		}
+		return this.workspace(conversationId);
+	}
+
+	async gitCommit(message: string, conversationId?: string): Promise<GitCommitResult> {
+		if (this.store.settings.permission === "read") throw new Error("只读模式下不可执行 Git 提交。");
+		const trimmed = message.trim();
+		if (!trimmed) throw new Error("请输入提交说明。");
+		const cwd = this.conversation(conversationId).project;
+		const { stdout } = await exec("git", ["commit", "-m", trimmed], {
+			cwd,
+			env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+			maxBuffer: 2 * 1024 * 1024,
+			timeout: 15000,
+		});
+		const { stdout: hash } = await exec("git", ["rev-parse", "--short", "HEAD"], { cwd, timeout: 5000 });
+		return { hash: hash.trim(), summary: stdout.trim(), workspace: await this.workspace(conversationId) };
+	}
+
+	async readMemory(conversationId?: string): Promise<MemoryFileEntry[]> {
+		const cwd = this.conversation(conversationId).project;
+		const names: ("AGENTS.md" | "CLAUDE.md")[] = ["AGENTS.md", "CLAUDE.md"];
+		const out: MemoryFileEntry[] = [];
+		for (const file of names) {
+			const target = resolve(cwd, file);
+			try {
+				const real = await realpath(target);
+				if (!inside(cwd, real)) throw new Error("记忆文件路径超出项目目录。");
+				const info = await stat(real);
+				if (!info.isFile()) {
+					out.push({ file, path: target, content: "", exists: false });
+					continue;
+				}
+				const content = await readFile(real, "utf8");
+				out.push({ file, path: target, content, exists: true });
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+					out.push({ file, path: target, content: "", exists: false });
+				} else {
+					throw error;
+				}
+			}
+		}
+		return out;
+	}
+
+	async writeMemory(file: "AGENTS.md" | "CLAUDE.md", content: string, conversationId?: string): Promise<MemoryFileEntry> {
+		if (this.store.settings.permission === "read") throw new Error("只读模式下不可修改项目记忆文件。");
+		if (file !== "AGENTS.md" && file !== "CLAUDE.md") throw new Error("仅支持 AGENTS.md 或 CLAUDE.md。");
+		const cwd = this.conversation(conversationId).project;
+		const target = resolve(cwd, file);
+		try {
+			const real = await realpath(target);
+			if (!inside(cwd, real)) throw new Error("记忆文件路径超出项目目录。");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		await writeFile(target, content, "utf8");
+		return { file, path: target, content, exists: true };
 	}
 
 	saveSettings(settings: {
@@ -1872,6 +2039,10 @@ export class DesktopService {
 				env.PI_DESKTOP_NAVIGATION_TOKEN = runtime.navigation.token;
 				env.PI_DESKTOP_NAVIGATION_COMMAND = runtime.navigation.command;
 			}
+			// Pi reads protected project resources once at startup. Pass an explicit
+			// decision so RPC mode never silently falls back to its "ask" default.
+			const trustResources = await detectProjectTrustResources(conversation.project);
+			const trustDecision = this.store.projectTrust?.[conversation.project];
 			const args = [
 				"--session-dir",
 				sessionDir,
@@ -1880,6 +2051,7 @@ export class DesktopService {
 				this.options.permissionExtension ?? join(runtimeDir, "permission-extension.mjs"),
 				...(navigationInstalled ? ["--extension", navigationExtension] : []),
 				...(toolsInstalled ? ["--extension", toolExtension] : []),
+				...(trustResources.length ? [trustDecision === "trusted" ? "--approve" : "--no-approve"] : []),
 				...(this.options.args ?? []),
 			];
 			if (!sessionFile && this.store.settings.defaultModel) {
@@ -2083,6 +2255,7 @@ export class DesktopService {
 			if (!Array.isArray(storedMessages)) throw new Error("会话存档返回格式无效。");
 			messages = storedMessages as Message[];
 		}
+		const trust = conversation ? await this.projectTrustState(conversation.project) : undefined;
 		return {
 			eventSequence,
 			liveTranscript,
@@ -2105,6 +2278,17 @@ export class DesktopService {
 			thinkingLevels,
 			commands,
 			archived,
+			trust,
+		};
+	}
+
+	private async projectTrustState(project: string): Promise<ProjectTrustState> {
+		const resources = await detectProjectTrustResources(project);
+		return {
+			project,
+			resources,
+			required: resources.length > 0,
+			decision: this.store.projectTrust?.[project],
 		};
 	}
 
@@ -2191,6 +2375,16 @@ function validateStore(input: unknown): StoredState {
 		(!defaultModel || typeof defaultModel.provider !== "string" || typeof defaultModel.id !== "string")
 	)
 		throw new Error("默认模型配置格式错误。");
+	const projectTrust: Record<string, ProjectTrustDecision> = {};
+	if (value.projectTrust !== undefined) {
+		if (!value.projectTrust || typeof value.projectTrust !== "object" || Array.isArray(value.projectTrust))
+			throw new Error("项目信任配置格式错误。");
+		for (const [project, decision] of Object.entries(value.projectTrust)) {
+			if (!isAbsolute(project) || (decision !== "trusted" && decision !== "untrusted"))
+				throw new Error("项目信任配置格式错误。");
+			projectTrust[project] = decision;
+		}
+	}
 	return {
 		projects: value.projects,
 		conversations: value.conversations,
@@ -2205,6 +2399,7 @@ function validateStore(input: unknown): StoredState {
 		keys: value.keys,
 		tasks: value.tasks ?? [],
 		taskPolicies: value.taskPolicies ? Object.fromEntries(Object.entries(value.taskPolicies).map(([id, policy]) => [id, validateRuntimePolicy(policy)])) : {},
+		projectTrust,
 	};
 }
 

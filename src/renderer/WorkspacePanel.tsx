@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import { ArrowLeft, FileCode2, Folder, RefreshCw, X } from "lucide-react";
+import { ArrowLeft, Check, Columns2, FileCode2, Folder, Minus, Plus, RefreshCw, RotateCcw, X } from "lucide-react";
 import { IconButton } from "../prototype/ui.tsx";
 import { CodeLines, UnifiedDiffView } from "./DiffView.tsx";
-import type { FileEntry, Workspace } from "../shared.ts";
+import type { Change, FileEntry, Workspace } from "../shared.ts";
 
 export function WorkspacePanel({
 	pane,
@@ -10,26 +10,37 @@ export function WorkspacePanel({
 	close,
 	revision,
 	project,
+	readOnly = false,
 	onReferenceFile,
+	onWorkspaceMutated,
+	onNotice,
 }: {
 	pane: "files" | "changes";
 	setPane: (pane: "files" | "changes") => void;
 	close: () => void;
 	revision: number;
 	project?: string;
+	readOnly?: boolean;
 	onReferenceFile?: (path: string) => void;
+	onWorkspaceMutated?: () => void;
+	onNotice?: (message: string) => void;
 }) {
 	const [entries, setEntries] = useState<FileEntry[]>([]);
 	const [directory, setDirectory] = useState("");
 	const [workspace, setWorkspace] = useState<Workspace | null>(null);
 	const [content, setContent] = useState<{ path: string; content: string } | null>(null);
+	const [diffMode, setDiffMode] = useState<"unified" | "split">("unified");
+	const [commitMessage, setCommitMessage] = useState("");
+	const [mutating, setMutating] = useState(false);
 	const [error, setError] = useState("");
 	const [loading, setLoading] = useState(false);
 	const [refresh, setRefresh] = useState(0);
+
 	useEffect(() => {
 		setDirectory("");
 		setContent(null);
 	}, [project, pane]);
+
 	useEffect(() => {
 		let active = true;
 		setLoading(true);
@@ -54,6 +65,7 @@ export function WorkspacePanel({
 			active = false;
 		};
 	}, [directory, pane, revision, refresh, project]);
+
 	const open = async (path: string) => {
 		setError("");
 		setLoading(true);
@@ -65,6 +77,43 @@ export function WorkspacePanel({
 			setLoading(false);
 		}
 	};
+
+	const runGit = async (op: () => Promise<Workspace>, notice?: string) => {
+		setMutating(true);
+		setError("");
+		try {
+			const next = await op();
+			setWorkspace(next);
+			onWorkspaceMutated?.();
+			if (notice) onNotice?.(notice);
+		} catch (cause) {
+			setError(cause instanceof Error ? cause.message : String(cause));
+		} finally {
+			setMutating(false);
+		}
+	};
+
+	const commit = async (e: React.FormEvent) => {
+		e.preventDefault();
+		if (!commitMessage.trim()) return;
+		setMutating(true);
+		setError("");
+		try {
+			const res = await window.pi.gitCommit(commitMessage);
+			setWorkspace(res.workspace);
+			setCommitMessage("");
+			onWorkspaceMutated?.();
+			onNotice?.(`已提交 ${res.hash}`);
+		} catch (cause) {
+			setError(cause instanceof Error ? cause.message : String(cause));
+		} finally {
+			setMutating(false);
+		}
+	};
+
+	const stagedChanges: Change[] = workspace?.changes.filter((c) => c.staged) ?? [];
+	const unstagedChanges: Change[] = workspace?.changes.filter((c) => c.unstaged || !c.staged) ?? [];
+
 	return (
 		<aside className="inspector" aria-label="真实项目工作区">
 			<header className="inspector-header">
@@ -101,6 +150,16 @@ export function WorkspacePanel({
 							返回
 						</button>
 						<span title={content.path}>{content.path}</span>
+						{pane === "changes" && (
+							<button
+								type="button"
+								className={`cc-mini-btn ${diffMode === "split" ? "active" : ""}`}
+								onClick={() => setDiffMode((m) => (m === "unified" ? "split" : "unified"))}
+								title="切换统一/分栏对比"
+							>
+								<Columns2 size={12} /> {diffMode === "split" ? "分栏" : "统一"}
+							</button>
+						)}
 						{onReferenceFile && (
 							<button type="button" className="cc-mini-btn" onClick={() => onReferenceFile(content.path)} title="插入 @文件引用 到输入框">
 								@引用
@@ -109,7 +168,7 @@ export function WorkspacePanel({
 					</div>
 					{pane === "changes" ? (
 						<div className="live-file-content live-diff">
-							<UnifiedDiffView diff={content.content} />
+							<UnifiedDiffView diff={content.content} mode={diffMode} />
 						</div>
 					) : (
 						<div className="live-file-content">
@@ -141,16 +200,102 @@ export function WorkspacePanel({
 				</>
 			) : (
 				<>
-					<div className="changes-overview">
+					<div className="changes-overview cc-git-overview">
 						<p>{workspace?.isGit ? `分支：${workspace.branch}` : "当前目录不是 Git 仓库"}</p>
+						{workspace?.isGit && workspace.changes.length > 0 && !readOnly && (
+							<div className="cc-git-bulk">
+								<button type="button" className="cc-mini-btn" disabled={mutating} onClick={() => void runGit(() => window.pi.gitStage())}>
+									<Plus size={12} /> 全部暂存
+								</button>
+								{stagedChanges.length > 0 && (
+									<button type="button" className="cc-mini-btn" disabled={mutating} onClick={() => void runGit(() => window.pi.gitUnstage())}>
+										<Minus size={12} /> 全部取消
+									</button>
+								)}
+							</div>
+						)}
 					</div>
-					<div className="changed-file-list">
-						{workspace?.changes.map((change) => (
-							<button key={change.path} onClick={() => void open(change.path)}>
-								<FileCode2 size={14} />
-								<span className="file-name">{change.path}</span>
-								<span>{change.status}</span>
+
+					{workspace?.isGit && !readOnly && (stagedChanges.length > 0 || workspace.changes.length > 0) && (
+						<form className="cc-commit-box" onSubmit={(e) => void commit(e)}>
+							<input
+								aria-label="Git 提交说明"
+								placeholder={stagedChanges.length ? `提交 ${stagedChanges.length} 个已暂存文件…` : "先暂存修改后填写提交说明…"}
+								value={commitMessage}
+								onChange={(e) => setCommitMessage(e.target.value)}
+								disabled={mutating || !stagedChanges.length}
+							/>
+							<button
+								type="submit"
+								className="primary-button"
+								disabled={mutating || !stagedChanges.length || !commitMessage.trim()}
+							>
+								<Check size={13} /> 提交
 							</button>
+						</form>
+					)}
+
+					<div className="changed-file-list">
+						{stagedChanges.length > 0 && (
+							<div className="cc-change-section">已暂存 ({stagedChanges.length})</div>
+						)}
+						{stagedChanges.map((change) => (
+							<div key={`staged-${change.path}`} className="cc-change-row">
+								<button type="button" className="cc-change-open" onClick={() => void open(change.path)}>
+									<FileCode2 size={14} />
+									<span className="file-name">{change.path}</span>
+									<span>{change.status}</span>
+								</button>
+								{!readOnly && (
+									<button
+										type="button"
+										className="cc-git-icon"
+										title="取消暂存"
+										aria-label={`取消暂存 ${change.path}`}
+										disabled={mutating}
+										onClick={() => void runGit(() => window.pi.gitUnstage([change.path]))}
+									>
+										<Minus size={13} />
+									</button>
+								)}
+							</div>
+						))}
+
+						{unstagedChanges.length > 0 && (
+							<div className="cc-change-section">未暂存与未跟踪 ({unstagedChanges.length})</div>
+						)}
+						{unstagedChanges.map((change) => (
+							<div key={`unstaged-${change.path}`} className="cc-change-row">
+								<button type="button" className="cc-change-open" onClick={() => void open(change.path)}>
+									<FileCode2 size={14} />
+									<span className="file-name">{change.path}</span>
+									<span>{change.status}</span>
+								</button>
+								{!readOnly && (
+									<div className="cc-git-row-btns">
+										<button
+											type="button"
+											className="cc-git-icon"
+											title="暂存修改"
+											aria-label={`暂存 ${change.path}`}
+											disabled={mutating}
+											onClick={() => void runGit(() => window.pi.gitStage([change.path]))}
+										>
+											<Plus size={13} />
+										</button>
+										<button
+											type="button"
+											className="cc-git-icon danger"
+											title="放弃修改"
+											aria-label={`放弃修改 ${change.path}`}
+											disabled={mutating}
+											onClick={() => void runGit(() => window.pi.gitDiscard([change.path]), `已还原 ${change.path}`)}
+										>
+											<RotateCcw size={12} />
+										</button>
+									</div>
+								)}
+							</div>
 						))}
 						{!loading && workspace?.isGit && !workspace.changes.length && (
 							<p className="subtle-note">工作区没有修改。</p>

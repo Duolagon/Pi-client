@@ -16,11 +16,35 @@
 | `pi.tasks` | `start / list / snapshot / result / cancel / command / respond / files / readFile / workspace / diff / onEvent` | 后台任务、模型委派结果与指定会话操作 |
 | `pi.worktrees` | `create / list / remove / merge` | 托管 Worktree 生命周期 |
 | `pi.sessions` | `fork / clone / entries / tree / forkMessages / navigate / history / importHistory` | 会话分支、树导航和 CLI 历史导入 |
+| `pi.setProjectTrust` | `setProjectTrust({ project, decision })` | 保存项目信任决定、重启相关会话并返回新快照 |
 | `pi.onEvent` | 原接口保留 | 所有会话的 Pi 流式事件，按 `conversationId` 路由 |
 
 原有前台接口继续工作。后端切换项目或会话会保留正在运行的旧会话；前端不得再假设“只有当前会话会产生事件”。当前正式界面仍在运行时禁用项目／会话切换，后台任务、独立 PTY 和会话树等入口待接入。修改全局模型连接、权限等设置前，需要停止全部运行中或排队中的任务。
 
 流式恢复使用 `Snapshot.liveTranscript / eventSequence` 和 `DesktopEvent.sequence`。`messages` 是 Pi 已结束的消息，`liveTranscript` 补充当前生成中的 assistant 与未完成工具进度；页面重载时应一起恢复。事件序号在本次桌面宿主进程内递增，前端只重放同一 `conversationId`、且晚于快照序号的事件，避免漏接或重复追加。正式界面通过共享的 `src/transcript.ts` 和有界事件窗口处理这一过程；完整会话历史仍由 Pi 持久化。
+
+## 项目信任
+
+```ts
+const snapshot = await window.pi.snapshot();
+if (snapshot.trust?.required && !snapshot.trust.decision) {
+  // 展示资源清单，由用户决定；不要默认信任。
+  await window.pi.setProjectTrust({ project: snapshot.trust.project, decision: "trusted" });
+}
+```
+
+`Snapshot.trust` 只在存在前台会话时返回：
+
+- `project`：规范化后的项目绝对路径。
+- `required`：是否检测到受保护项目资源。
+- `resources`：项目相对路径列表，可能包含祖先 `.agents/skills` 的 `../` 路径。
+- `decision`：`trusted / untrusted`，未决定时省略。
+
+检测范围包括 `.pi/settings.json`、`.pi/mcp.json`、`.pi/SYSTEM.md`、`.pi/APPEND_SYSTEM.md`、`.pi/extensions`、`.pi/skills`、`.pi/prompts`、`.pi/themes`，以及工作目录到仓库根（有 `.git` 时）的祖先 `.agents/skills`。上下文文件 `AGENTS.md` / `CLAUDE.md` 不受信任门控。
+
+启动 Pi RPC 时，存在受保护资源则显式传 `--approve`（信任）或 `--no-approve`（未信任/未决定）。这避免 RPC 模式无法弹 trust 提示时静默跳过项目配置，也避免把“未决定”误当成信任。
+
+`setProjectTrust` 要求项目已打开、路径为绝对路径、决定为 `trusted / untrusted`；该项目存在运行中任务、直接命令或待审批时拒绝。决定变化会停止并重建该项目的运行时，使 Pi 重新读取项目资源；决定持久化在 `desktop.json` 的 `projectTrust`。信任只控制 Pi 是否加载项目配置，不是 OS 沙箱，也不限制已加载扩展/命令的系统权限。
 
 ## 会话分支、克隆和树导航
 

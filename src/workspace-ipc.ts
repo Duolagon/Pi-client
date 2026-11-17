@@ -111,6 +111,23 @@ export function installWorkspaceHandlers(
 	handle("pi:worktree:list", (project) => service.listWorktrees(optionalText(project, "项目目录")));
 	handle("pi:worktree:remove", (worktreeId) => service.removeWorktree(id(worktreeId)));
 	handle("pi:worktree:merge", (worktreeId) => service.mergeWorktree(id(worktreeId)));
+	handle("pi:workspace:stage", (paths) => service.gitStage(optionalPathArray(paths)));
+	handle("pi:workspace:unstage", (paths) => service.gitUnstage(optionalPathArray(paths)));
+	handle("pi:workspace:discard", (paths) => service.gitDiscard(pathArray(paths)));
+	handle("pi:workspace:commit", (message) => service.gitCommit(string(message, "提交说明", 32768)));
+	handle("pi:workspace:read-memory", () => service.readMemory());
+	handle("pi:workspace:write-memory", (file, content) => {
+		if (file !== "AGENTS.md" && file !== "CLAUDE.md") throw new Error("记忆文件名无效。");
+		return service.writeMemory(file, string(content, "记忆内容", 1024 * 1024));
+	});
+}
+
+function pathArray(value: unknown): string[] {
+	if (!Array.isArray(value) || value.length > 5000) throw new Error("文件路径列表无效。");
+	return value.map((item) => string(item, "文件路径"));
+}
+function optionalPathArray(value: unknown): string[] | undefined {
+	return value === undefined ? undefined : pathArray(value);
 }
 
 function object(value: unknown): Record<string, unknown> {

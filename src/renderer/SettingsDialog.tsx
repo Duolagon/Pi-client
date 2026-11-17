@@ -368,7 +368,7 @@ export function SettingsDialog({
 								onChange={(event) => setPermission(event.target.value as PermissionMode)}
 							>
 								<option value="ask">手动确认：写文件和运行工具前询问</option>
-								<option value="auto">自动执行：授权 Pi 连续执行任务</option>
+								<option value="auto">跳过确认（危险）：除规则外不再询问，命令以本机权限运行</option>
 								<option value="read">只读：仅允许读取与搜索</option>
 							</select>
 						</label>

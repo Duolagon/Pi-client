@@ -16,7 +16,9 @@ import type {
 	DesktopTask,
 	GitCheckpoint,
 	GitCheckpointDiff,
+	GitCommitResult,
 	GitRestoreResult,
+	MemoryFileEntry,
 	Snapshot,
 	TerminalEvent,
 	TerminalInfo,
@@ -330,12 +332,78 @@ test("workspace IPC rejects malformed wire input and forged approvals without mu
 			{ label: "Worktree project type", channel: "pi:worktree:create", args: [{ project: 1 }], pattern: /项目目录格式/ },
 			{ label: "Worktree unsafe base ref", channel: "pi:worktree:create", args: [{ project: data.project, baseRef: "--bad-option" }], pattern: /引用无效/ },
 			{ label: "Worktree removal traversal", channel: "pi:worktree:remove", args: ["../outside"], pattern: /标识符格式/ },
+			{ label: "Workspace stage paths type", channel: "pi:workspace:stage", args: ["bad"], pattern: /文件路径列表无效/ },
+			{ label: "Workspace stage traversal", channel: "pi:workspace:stage", args: [["../outside"]], pattern: /超出/ },
+			{ label: "Workspace stage .git metadata", channel: "pi:workspace:stage", args: [[".git/config"]], pattern: /\.git/ },
+			{ label: "Workspace discard empty", channel: "pi:workspace:discard", args: [[]], pattern: /指定/ },
+			{ label: "Workspace commit empty", channel: "pi:workspace:commit", args: ["   "], pattern: /提交说明/ },
+			{ label: "Workspace memory name allowlist", channel: "pi:workspace:write-memory", args: ["README.md", "hi"], pattern: /记忆文件名无效/ },
 		];
 		for (const item of cases) await assert.rejects(data.invoke(item.channel, ...item.args), item.pattern, item.label);
 		assert.equal(await readFile(join(data.project, "seed.txt"), "utf8"), before);
 		assert.deepEqual(await data.invoke<DesktopTask[]>("pi:task:list"), []);
 		assert.deepEqual(await data.invoke<WorktreeInfo[]>("pi:worktree:list"), []);
 		assert.deepEqual(await data.invoke<TerminalInfo[]>("pi:terminal:list"), []);
+	} finally {
+		await data.service.close();
+		await data.fixture.cleanup();
+	}
+});
+
+test("workspace IPC handles Git stage/unstage/discard/commit and project memory with read-only guards", { timeout: 30000 }, async () => {
+	const data = await setup();
+	try {
+		const originalSeed = await readFile(join(data.project, "seed.txt"), "utf8");
+		await git(data.project, "config", "user.name", "Desktop Test");
+		await git(data.project, "config", "user.email", "desktop@example.invalid");
+		await git(data.project, "config", "commit.gpgSign", "false");
+
+		await writeFile(join(data.project, "seed.txt"), `${originalSeed}modified\n`);
+		await writeFile(join(data.project, "notes.txt"), "scratch note\n");
+
+		const afterStageOne = await data.invoke<Workspace>("pi:workspace:stage", ["notes.txt"]);
+		const stagedNote = afterStageOne.changes.find((c) => c.path === "notes.txt");
+		const unstagedSeed = afterStageOne.changes.find((c) => c.path === "seed.txt");
+		assert.equal(stagedNote?.staged, true);
+		assert.equal(stagedNote?.unstaged, false);
+		assert.equal(unstagedSeed?.staged, false);
+		assert.equal(unstagedSeed?.unstaged, true);
+
+		const afterUnstage = await data.invoke<Workspace>("pi:workspace:unstage", ["notes.txt"]);
+		assert.equal(afterUnstage.changes.find((c) => c.path === "notes.txt")?.staged, false);
+
+		await data.invoke<Workspace>("pi:workspace:discard", ["notes.txt"]);
+		await assert.rejects(access(join(data.project, "notes.txt")));
+
+		await data.invoke<Workspace>("pi:workspace:discard", ["seed.txt"]);
+		assert.equal(await readFile(join(data.project, "seed.txt"), "utf8"), originalSeed);
+
+		await writeFile(join(data.project, "seed.txt"), `${originalSeed}committed\n`);
+		await data.invoke<Workspace>("pi:workspace:stage");
+		const committed = await data.invoke<GitCommitResult>("pi:workspace:commit", "feat: commit staged seed change");
+		assert.ok(committed.hash.length >= 4);
+		assert.equal(committed.workspace.changes.length, 0);
+		assert.equal(await git(data.project, "log", "-1", "--pretty=%s"), "feat: commit staged seed change");
+
+		const initialMemory = await data.invoke<MemoryFileEntry[]>("pi:workspace:read-memory");
+		assert.deepEqual(initialMemory.map((m) => [m.file, m.exists]), [["AGENTS.md", false], ["CLAUDE.md", false]]);
+
+		const written = await data.invoke<MemoryFileEntry>("pi:workspace:write-memory", "AGENTS.md", "# Project Rules\nUse node:test.\n");
+		assert.equal(written.exists, true);
+		const reloadedMemory = await data.invoke<MemoryFileEntry[]>("pi:workspace:read-memory");
+		assert.equal(reloadedMemory.find((m) => m.file === "AGENTS.md")?.exists, true);
+		assert.equal(reloadedMemory.find((m) => m.file === "AGENTS.md")?.content, "# Project Rules\nUse node:test.\n");
+
+		const current = await data.service.snapshot();
+		data.service.saveSettings({ ...current.settings, permission: "read" });
+		await writeFile(join(data.project, "seed.txt"), `${originalSeed}blocked-in-readonly\n`);
+		await assert.rejects(data.invoke("pi:workspace:stage", ["seed.txt"]), /只读模式/);
+		await assert.rejects(data.invoke("pi:workspace:unstage", ["seed.txt"]), /只读模式/);
+		await assert.rejects(data.invoke("pi:workspace:discard", ["seed.txt"]), /只读模式/);
+		await assert.rejects(data.invoke("pi:workspace:commit", "should fail"), /只读模式/);
+		await assert.rejects(data.invoke("pi:workspace:write-memory", "CLAUDE.md", "nope"), /只读模式/);
+		const readableInReadMode = await data.invoke<MemoryFileEntry[]>("pi:workspace:read-memory");
+		assert.equal(readableInReadMode.find((m) => m.file === "AGENTS.md")?.exists, true);
 	} finally {
 		await data.service.close();
 		await data.fixture.cleanup();

@@ -77,6 +77,14 @@ export interface DesktopWorktreeAPI {
 }
 
 export type PermissionMode = "ask" | "auto" | "read";
+export type ProjectTrustDecision = "trusted" | "untrusted";
+export interface ProjectTrustState {
+	project: string;
+	/** Resources that Pi would load only after a trust decision. */
+	resources: string[];
+	required: boolean;
+	decision?: ProjectTrustDecision;
+}
 export type Message = Extract<RpcResponse, { command: "get_messages"; success: true }>["data"]["messages"][number];
 export type BashResult = Extract<RpcResponse, { command: "bash"; success: true }>["data"];
 export type ThinkingLevel = RpcSessionState["thinkingLevel"];
@@ -161,11 +169,24 @@ export interface FileEntry {
 export interface Change {
 	path: string;
 	status: string;
+	staged?: boolean;
+	unstaged?: boolean;
 }
 export interface Workspace {
 	branch: string;
 	changes: Change[];
 	isGit: boolean;
+}
+export interface GitCommitResult {
+	hash: string;
+	summary: string;
+	workspace: Workspace;
+}
+export interface MemoryFileEntry {
+	file: "AGENTS.md" | "CLAUDE.md";
+	path: string;
+	content: string;
+	exists: boolean;
 }
 export interface Snapshot {
 	/** Sequence of the last host event included in this snapshot. */
@@ -187,6 +208,8 @@ export interface Snapshot {
 	pendingUI: RpcExtensionUIRequest[];
 	thinkingLevels: ThinkingLevel[];
 	commands: SlashCommand[];
+	/** Trust state for the active project; absent when no project is active. */
+	trust?: ProjectTrustState;
 }
 export type DesktopEvent = {
 	conversationId: string;
@@ -211,6 +234,7 @@ export interface DesktopAPI {
 	snapshot(): Promise<Snapshot>;
 	openProject(): Promise<Snapshot | null>;
 	selectProject(path: string): Promise<Snapshot>;
+	setProjectTrust(input: { project: string; decision: ProjectTrustDecision }): Promise<Snapshot>;
 	newConversation(): Promise<Snapshot>;
 	selectConversation(id: string): Promise<Snapshot>;
 	renameConversation(id: string, title: string): Promise<Snapshot>;
@@ -220,6 +244,12 @@ export interface DesktopAPI {
 	readFile(path: string): Promise<{ path: string; content: string }>;
 	workspace(): Promise<Workspace>;
 	diff(path: string): Promise<string>;
+	gitStage(paths?: string[]): Promise<Workspace>;
+	gitUnstage(paths?: string[]): Promise<Workspace>;
+	gitDiscard(paths: string[]): Promise<Workspace>;
+	gitCommit(message: string): Promise<GitCommitResult>;
+	readMemory(): Promise<MemoryFileEntry[]>;
+	writeMemory(file: "AGENTS.md" | "CLAUDE.md", content: string): Promise<MemoryFileEntry>;
 	saveSettings(settings: {
 		agentDir?: string;
 		permission: PermissionMode;

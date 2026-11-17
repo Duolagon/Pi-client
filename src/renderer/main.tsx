@@ -14,17 +14,32 @@ import {
 	RefreshCw,
 	X,
 	ShieldCheck,
+	ShieldAlert,
 	SquarePen,
 	Archive,
 	History,
 	ListTodo,
 	SlidersHorizontal,
 	GitFork,
+	BookOpen,
+	Globe,
+	Command as CommandIcon,
+	Check,
+	Circle,
+	LoaderCircle,
 } from "lucide-react";
-import type { Conversation, DesktopAPI, DesktopTask, ExternalTask, PermissionMode, Snapshot } from "../shared.ts";
+import type {
+	Conversation,
+	DesktopAPI,
+	DesktopTask,
+	ExternalTask,
+	PermissionMode,
+	ProjectTrustDecision,
+	Snapshot,
+} from "../shared.ts";
 import { IconButton, Modal, PiMark } from "../prototype/ui.tsx";
 import { useDesktop } from "./useDesktop.ts";
-import { TranscriptView } from "./TranscriptView.tsx";
+import { TranscriptView, type TodoItem } from "./TranscriptView.tsx";
 import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
 import { PermissionDialog } from "./PermissionDialog.tsx";
 import { SettingsDialog } from "./SettingsDialog.tsx";
@@ -34,6 +49,10 @@ import { CheckpointsDialog } from "./CheckpointsDialog.tsx";
 import { TasksDrawer } from "./TasksDrawer.tsx";
 import { SessionsDialog } from "./SessionsDialog.tsx";
 import { TerminalPanel } from "./TerminalPanel.tsx";
+import { MemoryStatusDialog } from "./MemoryStatusDialog.tsx";
+import { PreviewPanel } from "./PreviewPanel.tsx";
+import { CommandPalette, type PaletteAction } from "./CommandPalette.tsx";
+import { ProjectTrustDialog } from "./ProjectTrustDialog.tsx";
 import "../prototype/style.css";
 import "./style.css";
 
@@ -81,8 +100,17 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [terminalOpen, setTerminalOpen] = useState(false);
 	const [controlsTab, setControlsTab] = useState<"tools" | "permissions" | "executors" | null>(null);
 	const [checkpointsOpen, setCheckpointsOpen] = useState(false);
+	const [rewindQuery, setRewindQuery] = useState<string | undefined>(undefined);
 	const [tasksOpen, setTasksOpen] = useState(false);
+	const [taskInitialId, setTaskInitialId] = useState<string | undefined>(undefined);
 	const [sessionsOpen, setSessionsOpen] = useState(false);
+	const [memoryTab, setMemoryTab] = useState<"memory" | "status" | null>(null);
+	const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+	const [paletteOpen, setPaletteOpen] = useState(false);
+	const [planMode, setPlanMode] = useState(false);
+	const [trustOpen, setTrustOpen] = useState(false);
+	const [trustBusy, setTrustBusy] = useState(false);
+	const [todoExpanded, setTodoExpanded] = useState(false);
 	const [tasksMap, setTasksMap] = useState<Record<string, DesktopTask>>({});
 	const [externalTasksMap, setExternalTasksMap] = useState<Record<string, ExternalTask>>({});
 	const [gitSummary, setGitSummary] = useState<{ branch: string; count: number; isGit: boolean } | null>(null);
@@ -92,6 +120,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	useEffect(() => {
 		stickToEnd.current = true;
 	}, [snapshot?.active?.id]);
+	useEffect(() => {
+		setTrustOpen(false);
+	}, [snapshot?.active?.project]);
 	useEffect(() => {
 		if (stickToEnd.current) scroll.current?.scrollTo({ top: scroll.current.scrollHeight });
 	}, [history, running]);
@@ -162,7 +193,41 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	};
 	const savePermission = async (permission: PermissionMode) => {
 		if (!snapshot) return;
+		if (permission !== "read" && planMode) setPlanMode(false);
 		await app.switchTo(() => api.saveSettings({ permission, theme: snapshot.settings.theme }));
+	};
+	const decideTrust = async (decision: ProjectTrustDecision) => {
+		if (!snapshot?.trust || trustBusy) return;
+		setTrustBusy(true);
+		try {
+			app.apply(await api.setProjectTrust({ project: snapshot.trust.project, decision }));
+			app.setNotice(decision === "trusted" ? "项目配置已加载。" : "项目配置已禁用。");
+			setTrustOpen(false);
+		} catch (error) {
+			app.fail(error);
+		} finally {
+			setTrustBusy(false);
+		}
+	};
+	const togglePlanMode = async () => {
+		if (!snapshot) return;
+		if (planMode) {
+			setPlanMode(false);
+			await savePermission("ask");
+		} else {
+			setPlanMode(true);
+			if (snapshot.settings.permission !== "read") await savePermission("read");
+			if (!app.draft.trim()) app.setDraft("请先以只读方式调研相关代码并输出详细实现计划，待我确认后再修改文件：\n");
+		}
+	};
+	const approvePlanAndExecute = async (mode: PermissionMode) => {
+		if (!snapshot) return;
+		setPlanMode(false);
+		await app.switchTo(() => api.saveSettings({ permission: mode, theme: snapshot.settings.theme }));
+		await app.send({ type: "prompt", message: "计划已批准。请严格按上述计划实施代码修改并运行相关测试验证。", images: [] });
+	};
+	const sendInitPrompt = () => {
+		app.setDraft("请分析当前项目结构、构建脚本、测试命令和代码规范，创建或更新根目录的 AGENTS.md 项目指南文件。");
 	};
 	const handleBuiltinSlash = (action: BuiltinSlashAction) => {
 		if (action === "compact") {
@@ -174,11 +239,22 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		} else if (action === "mcp") {
 			setControlsTab("tools");
 		} else if (action === "rewind") {
+			setRewindQuery(undefined);
 			setCheckpointsOpen(true);
 		} else if (action === "tasks") {
+			setTaskInitialId(undefined);
 			setTasksOpen(true);
 		} else if (action === "sessions") {
 			setSessionsOpen(true);
+		} else if (action === "memory") {
+			setMemoryTab("memory");
+		} else if (action === "status") {
+			setMemoryTab("status");
+		} else if (action === "init") {
+			sendInitPrompt();
+		} else if (action === "preview") {
+			setPane(null);
+			setPreviewUrl((prev) => prev ?? "http://localhost:3000");
 		} else if (action === "cost") {
 			const s = snapshot?.stats;
 			if (s) {
@@ -189,19 +265,23 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				app.setNotice("当前会话暂无 Token 统计。");
 			}
 		} else if (action === "plan") {
-			if (snapshot && snapshot.settings.permission !== "read") void savePermission("read");
-			app.setDraft("请先以只读方式调研相关代码并输出详细实现计划，待我确认后再修改文件：\n");
+			void togglePlanMode();
 		}
 	};
 	useEffect(() => {
 		const onKey = (event: KeyboardEvent) => {
 			if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
-			if (event.key.toLowerCase() === "k") {
+			const lower = event.key.toLowerCase();
+			if (lower === "k") {
 				event.preventDefault();
 				setQuery("");
 				setSearching(true);
 			}
-			if (event.key.toLowerCase() === "n" && snapshot?.active && !blocked) {
+			if (lower === "p") {
+				event.preventDefault();
+				setPaletteOpen((open) => !open);
+			}
+			if (lower === "n" && snapshot?.active && !blocked) {
 				event.preventDefault();
 				switchTo(() => api.newConversation());
 			}
@@ -224,8 +304,49 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		);
 	const ready = snapshot.engineStatus === "ready";
 	const groups = grouped(snapshot);
+	const latestTodos: TodoItem[] = (() => {
+		for (let i = history.messages.length - 1; i >= 0; i--) {
+			const msg = history.messages[i];
+			if (msg.role !== "assistant") continue;
+			for (let j = msg.content.length - 1; j >= 0; j--) {
+				const block = msg.content[j];
+				if (block.type === "toolCall" && block.name === "TodoWrite" && block.arguments && typeof block.arguments === "object") {
+					const todos = (block.arguments as { todos?: TodoItem[] }).todos;
+					if (Array.isArray(todos)) return todos;
+				}
+			}
+		}
+		return [];
+	})();
+	const lastMessage = history.messages[history.messages.length - 1];
+	const showPlanApproval =
+		planMode &&
+		snapshot.settings.permission === "read" &&
+		!running &&
+		!blocked &&
+		Boolean(lastMessage && lastMessage.role === "assistant");
+	const paletteActions: PaletteAction[] = [
+		{ id: "new", label: "新建会话", shortcut: "⌘N", keywords: "new session clear", disabled: blocked || !snapshot.active, run: () => switchTo(() => api.newConversation()) },
+		{ id: "search", label: "搜索历史会话", shortcut: "⌘K", keywords: "search find", run: () => { setQuery(""); setSearching(true); } },
+		{ id: "open", label: "打开项目文件夹", keywords: "open project folder", disabled: blocked, run: () => void app.switchTo(() => api.openProject()) },
+		{ id: "plan", label: planMode ? "退出 Plan 计划模式" : "进入 Plan 计划模式", keywords: "plan mode readonly", disabled: blocked, run: () => void togglePlanMode() },
+		{ id: "rewind", label: "检查点与代码回滚 (/rewind)", keywords: "git checkpoint restore", disabled: !snapshot.active, run: () => { setRewindQuery(undefined); setCheckpointsOpen(true); } },
+		{ id: "tasks", label: "后台任务、子 Agent 与 Worktree (/tasks)", keywords: "subagent external codex claude kimi", run: () => { setTaskInitialId(undefined); setTasksOpen(true); } },
+		{ id: "tools", label: "工具与 MCP 开关 (/mcp)", keywords: "tools mcp enable", run: () => setControlsTab("tools") },
+		{ id: "perms", label: "细粒度权限规则 (/permissions)", keywords: "allow ask deny rules", run: () => setControlsTab("permissions") },
+		{ id: "sessions", label: "会话分支树与 CLI 历史导入 (/sessions)", keywords: "tree fork clone cli", disabled: !snapshot.active, run: () => setSessionsOpen(true) },
+		{ id: "memory", label: "项目记忆 AGENTS.md / CLAUDE.md (/memory)", keywords: "memory rules instructions", disabled: !snapshot.active, run: () => setMemoryTab("memory") },
+		{ id: "status", label: "运行与上下文状态 (/status)", keywords: "status tokens cost model", run: () => setMemoryTab("status") },
+		{ id: "init", label: "/init 生成项目 AGENTS.md 指南", keywords: "init onboard agents.md", disabled: !snapshot.active, run: () => sendInitPrompt() },
+		{ id: "preview", label: previewUrl ? "关闭本地网页预览" : "打开本地网页预览 (/preview)", keywords: "web preview localhost", run: () => { setPane(null); setPreviewUrl((v) => (v ? null : "http://localhost:3000")); } },
+		{ id: "terminal", label: terminalOpen ? "关闭终端面板" : "打开终端 / PTY 面板", keywords: "terminal bash pty", run: () => setTerminalOpen((v) => !v) },
+		{ id: "changes", label: "查看 Git 修改与暂存提交", keywords: "git diff stage commit", run: () => { setPreviewUrl(null); setPane(pane === "changes" ? null : "changes"); } },
+		{ id: "files", label: "浏览项目文件", keywords: "files explorer", run: () => { setPreviewUrl(null); setPane(pane === "files" ? null : "files"); } },
+		{ id: "compact", label: "压缩会话上下文 (/compact)", keywords: "compact context", disabled: blocked || !history.messages.length, run: () => void app.command({ type: "compact" }) },
+		{ id: "settings", label: "打开客户端与模型设置", keywords: "settings model api key theme", run: () => setSettings(true) },
+	];
 	return (
-		<div className={`desktop-app live-app ${sidebar ? "" : "cl-side-hidden"} ${pane ? "has-inspector" : ""}`}>
+		<div className={`desktop-app live-app ${sidebar ? "" : "cl-side-hidden"} ${pane || previewUrl ? "has-inspector" : ""}`}>
 			<nav className="cl-rail" aria-label="主导航">
 				{sidebar ? (
 					<IconButton icon={PanelLeftClose} label="收起侧栏" onClick={() => setSidebar(false)} />
@@ -326,9 +447,23 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						)}
 					</div>
 					<div className="cl-top-tools">
-						<IconButton icon={History} label="检查点与回滚" disabled={!snapshot.active} onClick={() => setCheckpointsOpen(true)} />
+						{snapshot.trust?.required && (
+							<IconButton
+								icon={ShieldCheck}
+								label={
+									snapshot.trust.decision === "trusted"
+										? "项目配置：已信任"
+										: snapshot.trust.decision === "untrusted"
+											? "项目配置：已禁用"
+											: "项目配置：待决定"
+								}
+								active={trustOpen}
+								onClick={() => setTrustOpen(true)}
+							/>
+						)}
+						<IconButton icon={History} label="检查点与回滚" disabled={!snapshot.active} onClick={() => { setRewindQuery(undefined); setCheckpointsOpen(true); }} />
 						<span className="cc-tool-btn-wrap">
-							<IconButton icon={ListTodo} label="后台任务与 Worktree" onClick={() => setTasksOpen(true)} />
+							<IconButton icon={ListTodo} label="后台任务与 Worktree" onClick={() => { setTaskInitialId(undefined); setTasksOpen(true); }} />
 							{(activeTaskCount > 0 || waitingTaskCount > 0) && (
 								<span className={`cc-topbar-badge ${waitingTaskCount > 0 ? "warn" : ""}`}>
 									{waitingTaskCount > 0 ? `!${waitingTaskCount}` : activeTaskCount}
@@ -337,6 +472,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						</span>
 						<IconButton icon={SlidersHorizontal} label="工具与权限" onClick={() => setControlsTab("tools")} />
 						<IconButton icon={GitFork} label="会话分支树" disabled={!snapshot.active} onClick={() => setSessionsOpen(true)} />
+						<IconButton icon={BookOpen} label="项目记忆与状态" disabled={!snapshot.active} onClick={() => setMemoryTab("memory")} />
+						<IconButton icon={Globe} label="本地网页预览" onClick={() => { setPane(null); setPreviewUrl((v) => (v ? null : "http://localhost:3000")); }} active={Boolean(previewUrl)} />
+						<IconButton icon={CommandIcon} label="命令面板" onClick={() => setPaletteOpen(true)} />
 						<IconButton icon={RefreshCw} label="刷新会话" disabled={blocked} onClick={() => void app.refresh()} />
 						<IconButton icon={Archive} label="压缩上下文" disabled={blocked || !history.messages.length} onClick={() => void app.command({ type: "compact" })} />
 						<IconButton
@@ -356,13 +494,13 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						<IconButton
 							icon={GitCompareArrows}
 							label="代码修改"
-							onClick={() => setPane(pane === "changes" ? null : "changes")}
+							onClick={() => { setPreviewUrl(null); setPane(pane === "changes" ? null : "changes"); }}
 							active={pane === "changes"}
 						/>
 						<IconButton
 							icon={Files}
 							label="项目文件"
-							onClick={() => setPane(pane === "files" ? null : "files")}
+							onClick={() => { setPreviewUrl(null); setPane(pane === "files" ? null : "files"); }}
 							active={pane === "files"}
 						/>
 					</div>
@@ -389,6 +527,44 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						</button>
 					</div>
 				)}
+				{snapshot.trust?.required && !snapshot.trust.decision && (
+					<div className="cl-trust-banner" role="alert">
+						<ShieldCheck size={16} />
+						<div className="cl-trust-text">
+							<strong>项目配置尚未加载</strong>
+							<span>
+								检测到 {snapshot.trust.resources.join("、")}。信任后才会加载项目 MCP、Skills 与设置。
+							</span>
+						</div>
+						<button
+							type="button"
+							className="secondary-button"
+							disabled={trustBusy || blocked}
+							onClick={() => void decideTrust("trusted")}
+						>
+							信任并加载
+						</button>
+						<button
+							type="button"
+							className="cc-mini-btn"
+							disabled={trustBusy || blocked}
+							onClick={() => void decideTrust("untrusted")}
+						>
+							保持禁用
+						</button>
+					</div>
+				)}
+				{snapshot.settings.permission === "auto" && (
+					<div className="cl-auto-warning" role="status">
+						<ShieldAlert size={16} />
+						<span>
+							<strong>跳过确认模式</strong>：Pi 可在不询问的情况下执行命令；当前没有 OS 沙箱。
+						</span>
+						<button type="button" className="secondary-button" disabled={blocked} onClick={() => void savePermission("ask")}>
+							切回手动确认
+						</button>
+					</div>
+				)}
 				{!snapshot.models.length && (
 					<div className="cl-connect">
 						<ShieldCheck size={17} />
@@ -409,7 +585,37 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							}}
 						>
 							{history.messages.length ? (
-								<TranscriptView transcript={history} />
+								<TranscriptView
+									transcript={history}
+									tasks={Object.values(tasksMap)}
+									externalTasks={Object.values(externalTasksMap)}
+									onOpenTask={(id) => {
+										setTaskInitialId(id);
+										setTasksOpen(true);
+									}}
+									onRewindPrompt={(promptText) => {
+										setRewindQuery(promptText);
+										setCheckpointsOpen(true);
+									}}
+									onForkPrompt={(promptText) => {
+										void api.sessions
+											.forkMessages(snapshot.active?.id)
+											.then(async ({ messages }) => {
+												const match = messages.find((m) => m.text.trim() === promptText.trim() || promptText.includes(m.text.slice(0, 40)));
+												if (match) {
+													await api.sessions.fork({ conversationId: snapshot.active?.id, entryId: match.entryId, activate: true });
+													await app.refresh();
+												} else {
+													setSessionsOpen(true);
+												}
+											})
+											.catch(app.fail);
+									}}
+									onOpenPreview={(url) => {
+										setPane(null);
+										setPreviewUrl(url);
+									}}
+								/>
 							) : (
 								<div className="cl-empty">
 									<PiMark />
@@ -441,6 +647,56 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								</div>
 							)}
 						</div>
+						{latestTodos.length > 0 && (
+							<div className="cc-pinned-todos">
+								<button type="button" className="cc-pinned-todos-head" onClick={() => setTodoExpanded((v) => !v)}>
+									<span>
+										任务进度 ({latestTodos.filter((t) => t.status === "completed").length}/{latestTodos.length})
+										{latestTodos.find((t) => t.status === "in_progress")
+											? ` · ${latestTodos.find((t) => t.status === "in_progress")!.content}`
+											: ""}
+									</span>
+									<span>{todoExpanded ? "收起" : "展开"}</span>
+								</button>
+								{todoExpanded && (
+									<div className="cc-pinned-todos-list">
+										{latestTodos.map((item) => (
+											<div key={item.id} className={`cc-todo-row ${item.status}`}>
+												{item.status === "completed" ? (
+													<Check size={12} className="ok" />
+												) : item.status === "in_progress" ? (
+													<LoaderCircle size={12} className="spin run" />
+												) : (
+													<Circle size={11} className="pending" />
+												)}
+												<span>{item.content}</span>
+											</div>
+										))}
+									</div>
+								)}
+							</div>
+						)}
+						{showPlanApproval && (
+							<div className="cc-plan-bar" role="region" aria-label="计划审批">
+								<span>Plan 模式调研已完成，是否按计划开始实施？</span>
+								<div className="cc-plan-bar-actions">
+									<button
+										type="button"
+										className="primary-button"
+										title="除规则外不再询问；命令以本机权限运行"
+										onClick={() => void approvePlanAndExecute("auto")}
+									>
+										批准计划 · 跳过确认
+									</button>
+									<button type="button" className="secondary-button" onClick={() => void approvePlanAndExecute("ask")}>
+										批准计划 · 逐项确认
+									</button>
+									<button type="button" className="cc-mini-btn" onClick={() => void togglePlanMode()}>
+										退出 Plan
+									</button>
+								</div>
+							</div>
+						)}
 						<LiveComposer
 							key={snapshot.active?.id ?? "no-conversation"}
 							snapshot={snapshot}
@@ -448,6 +704,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							setDraft={app.setDraft}
 							running={running}
 							changing={changing || bashBusy}
+							planMode={planMode}
+							onTogglePlanMode={() => void togglePlanMode()}
 							send={app.send}
 							stop={() => void app.command({ type: "abort" })}
 							command={app.command}
@@ -482,10 +740,27 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					close={() => setPane(null)}
 					revision={app.revision}
 					project={snapshot.active?.project}
+					readOnly={snapshot.settings.permission === "read"}
 					onReferenceFile={(filePath) => {
 						const prefix = app.draft && !app.draft.endsWith(" ") && !app.draft.endsWith("\n") ? `${app.draft} ` : app.draft;
 						app.setDraft(`${prefix}@${filePath} `);
 					}}
+					onWorkspaceMutated={() => void app.refresh()}
+					onNotice={(msg) => app.setNotice(msg)}
+				/>
+			)}
+			{!pane && previewUrl && (
+				<PreviewPanel
+					initialUrl={previewUrl}
+					close={() => setPreviewUrl(null)}
+				/>
+			)}
+			{trustOpen && snapshot.trust?.required && (
+				<ProjectTrustDialog
+					trust={snapshot.trust}
+					busy={trustBusy || blocked}
+					close={() => setTrustOpen(false)}
+					decide={(decision) => void decideTrust(decision)}
 				/>
 			)}
 			{settings && (
@@ -579,6 +854,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			{checkpointsOpen && (
 				<CheckpointsDialog
 					conversationId={snapshot.active?.id}
+					initialQuery={rewindQuery}
 					close={() => setCheckpointsOpen(false)}
 					onRestored={(msg) => {
 						app.setNotice(msg);
@@ -590,6 +866,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			{tasksOpen && (
 				<TasksDrawer
 					project={snapshot.active?.project}
+					initialTaskId={taskInitialId}
 					close={() => setTasksOpen(false)}
 					onNotice={(msg) => app.setNotice(msg)}
 					fail={app.fail}
@@ -603,6 +880,23 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					onEditorText={(text) => app.setDraft(text)}
 					close={() => setSessionsOpen(false)}
 					fail={app.fail}
+				/>
+			)}
+			{memoryTab && (
+				<MemoryStatusDialog
+					initialTab={memoryTab}
+					snapshot={snapshot}
+					gitBranch={gitSummary?.branch}
+					onInitPrompt={sendInitPrompt}
+					onNotice={(msg) => app.setNotice(msg)}
+					close={() => setMemoryTab(null)}
+					fail={app.fail}
+				/>
+			)}
+			{paletteOpen && (
+				<CommandPalette
+					actions={paletteActions}
+					close={() => setPaletteOpen(false)}
 				/>
 			)}
 		</div>

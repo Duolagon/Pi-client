@@ -7,11 +7,13 @@ import type { DesktopTask, ExternalTask, Snapshot, WorktreeInfo } from "../share
 
 export function TasksDrawer({
 	project,
+	initialTaskId,
 	close,
 	onNotice,
 	fail,
 }: {
 	project?: string;
+	initialTaskId?: string;
 	close: () => void;
 	onNotice: (msg: string) => void;
 	fail: (error: unknown) => void;
@@ -35,9 +37,19 @@ export function TasksDrawer({
 				window.pi.externalAgents.list(),
 				window.pi.worktrees.list(project),
 			]);
-			setTasks([...taskList].sort((a, b) => b.updatedAt - a.updatedAt));
-			setExternalTasks([...extList].sort((a, b) => b.updatedAt - a.updatedAt));
+			const sortedTasks = [...taskList].sort((a, b) => b.updatedAt - a.updatedAt);
+			const sortedExt = [...extList].sort((a, b) => b.updatedAt - a.updatedAt);
+			setTasks(sortedTasks);
+			setExternalTasks(sortedExt);
 			setWorktrees(wtList);
+			if (initialTaskId && !detail && !extDetail) {
+				const piMatch = sortedTasks.find((t) => t.id === initialTaskId);
+				if (piMatch) void openDetail(piMatch);
+				else {
+					const extMatch = sortedExt.find((t) => t.id === initialTaskId);
+					if (extMatch) void openExternalDetail(extMatch);
+				}
+			}
 		} catch (error) {
 			fail(error);
 		}

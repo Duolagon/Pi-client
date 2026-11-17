@@ -404,6 +404,65 @@ try {
 	await page.getByRole("button", { name: "关闭终端", exact: true }).click();
 	checks.push("Claude Code UI modals, autocomplete and PTY panel");
 
+	await page.getByRole("button", { name: "代码修改", exact: true }).click();
+	await page.getByRole("button", { name: "暂存 src/greeting.mjs", exact: true }).click();
+	await page.locator(".cc-change-section").filter({ hasText: "已暂存 (1)" }).waitFor();
+	await page.getByRole("button", { name: "取消暂存 src/greeting.mjs", exact: true }).click();
+	await page.getByRole("button", { name: "暂存 src/greeting.mjs", exact: true }).waitFor();
+	await page.locator(".changed-file-list button.cc-change-open").filter({ hasText: "greeting.mjs" }).click();
+	await page.locator(".live-diff").filter({ hasText: "你好" }).waitFor();
+	await page.locator('button[title="切换统一/分栏对比"]').click();
+	await page.locator(".cc-diff-split").waitFor();
+	await page.getByRole("button", { name: "关闭工作区面板", exact: true }).click();
+
+	await page.getByRole("button", { name: "项目记忆与状态", exact: true }).click();
+	await page.getByRole("dialog", { name: "项目记忆与会话状态", exact: true }).waitFor();
+	await page.getByRole("textbox", { name: "编辑 AGENTS.md", exact: true }).fill("# Verify Project Rules\n");
+	await page.getByRole("button", { name: "保存 AGENTS.md", exact: true }).click();
+	await until(async () => {
+		try {
+			return (await readFile(join(project, "AGENTS.md"), "utf8")) === "# Verify Project Rules\n";
+		} catch {
+			return false;
+		}
+	}, "AGENTS.md write");
+	await page.getByRole("tab", { name: /运行状态/ }).click();
+	await page.getByText("工具与 MCP 挂载", { exact: true }).waitFor();
+	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
+
+	await page.getByRole("button", { name: "本地网页预览", exact: true }).click();
+	await page.locator("aside[aria-label='本地应用预览']").waitFor();
+	await page.getByRole("textbox", { name: "预览地址", exact: true }).fill("https://example.com");
+	await page.getByRole("button", { name: "访问", exact: true }).click();
+	await page.getByRole("alert").filter({ hasText: /localhost/ }).waitFor();
+	await page.getByRole("textbox", { name: "预览地址", exact: true }).fill("http://127.0.0.1:4173");
+	await page.getByRole("button", { name: "访问", exact: true }).click();
+	assert.equal(await page.locator("aside.cc-preview-panel iframe").getAttribute("src"), "http://127.0.0.1:4173/");
+	await page.getByRole("button", { name: "关闭预览面板", exact: true }).click();
+
+	await page.getByRole("button", { name: "命令面板", exact: true }).click();
+	await page.getByRole("dialog", { name: "命令面板 (⌘P)", exact: true }).waitFor();
+	await page.getByRole("textbox", { name: "搜索客户端命令", exact: true }).fill("AGENTS.md");
+	await page.locator(".search-results button").filter({ hasText: "/memory" }).waitFor();
+	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
+
+	await page.locator("button.cc-plan-pill").click();
+	await until(
+		async () => (await page.getByRole("combobox", { name: "权限模式", exact: true }).inputValue()) === "read",
+		"Plan mode read-only switch",
+	);
+	await submit("请以只读方式分析实现计划。");
+	await page.getByText("已收到补充指令，客户端与 Pi 引擎连接正常。", { exact: true }).waitFor();
+	await idle();
+	await page.getByRole("region", { name: "计划审批", exact: true }).waitFor();
+	await page.getByRole("button", { name: "退出 Plan", exact: true }).click();
+	await until(
+		async () => (await page.getByRole("combobox", { name: "权限模式", exact: true }).inputValue()) === "ask",
+		"Plan mode restore ask",
+	);
+	await input.fill("");
+	checks.push("Git stage/unstage, split diff, memory/status, localhost preview, command palette and Plan mode");
+
 	assert.deepEqual(pageErrors, []);
 	if (capture)
 		for (const name of ["client-light.png", "client-dark.png"])

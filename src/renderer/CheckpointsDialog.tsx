@@ -10,11 +10,13 @@ function formatTime(ts: number): string {
 
 export function CheckpointsDialog({
 	conversationId,
+	initialQuery,
 	close,
 	onRestored,
 	fail,
 }: {
 	conversationId?: string;
+	initialQuery?: string;
 	close: () => void;
 	onRestored: (message: string) => void;
 	fail: (error: unknown) => void;
@@ -32,8 +34,11 @@ export function CheckpointsDialog({
 			const sorted = [...list].sort((a, b) => b.createdAt - a.createdAt);
 			setCheckpoints(sorted);
 			if (sorted.length && !selected) {
+				const matched = initialQuery
+					? sorted.find((c) => c.label.includes(initialQuery.slice(0, 40)))
+					: undefined;
 				const withChanges = sorted.find((c) => c.changes.length > 0);
-				setSelected((withChanges ?? sorted[0]).id);
+				setSelected((matched ?? withChanges ?? sorted[0]).id);
 			}
 		} catch (error) {
 			fail(error);

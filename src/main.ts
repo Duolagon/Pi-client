@@ -155,6 +155,13 @@ function installHandlers() {
 		return result.canceled || !result.filePaths[0] ? null : service.selectProject(result.filePaths[0]);
 	});
 	handle("pi:select-project", (path) => service.selectProject(string(path, "项目路径")));
+	handle("pi:project-trust", (input) => {
+		const record = object(input);
+		const project = string(record.project, "项目路径", 4096);
+		if (record.decision !== "trusted" && record.decision !== "untrusted")
+			throw new Error("项目信任决定无效。");
+		return service.setProjectTrust({ project, decision: record.decision });
+	});
 	handle("pi:new-conversation", () => service.newConversation());
 	handle("pi:select-conversation", (id) => service.selectConversation(string(id, "会话 ID", 200)));
 	handle("pi:rename", (id, title) =>

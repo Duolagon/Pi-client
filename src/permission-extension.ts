@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ModelRegistry, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ModelRegistry, ProviderModelConfig, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ConnectionMode, ConnectionProtocol, Provider } from "./shared.ts";
 import { connectionDefaults, connectionMode } from "./model-connections.ts";
 import { providerModels } from "./provider-presets.ts";
@@ -17,6 +17,109 @@ export default function permissions(pi: ExtensionAPI) {
 	// This JSON is supplied by the desktop host, separate from the user's Pi files.
 	const connections = JSON.parse(process.env.PI_DESKTOP_CONNECTIONS ?? "{}") as Partial<Record<Provider, Connection>>;
 	const testingConnection = process.env.PI_DESKTOP_CONNECTION_TEST === "1";
+	const isChild = process.env.PI_DESKTOP_CHILD === "1" || process.env.PI_DESKTOP_READ_ONLY_CHILD === "1";
+	if (!testingConnection && !isChild && process.env.PI_DESKTOP_HOST_URL) {
+		pi.registerTool({
+			name: "TodoWrite",
+			label: "TodoWrite",
+			description: "Manage a structured task checklist for multi-step coding work so the user can track progress.",
+			promptSnippet: "Track multi-step task progress with a structured checklist",
+			parameters: {
+				type: "object",
+				additionalProperties: false,
+				required: ["todos"],
+				properties: {
+					todos: {
+						type: "array",
+						maxItems: 50,
+						items: {
+							type: "object",
+							additionalProperties: false,
+							required: ["id", "content", "status"],
+							properties: {
+								id: { type: "string", minLength: 1, maxLength: 100 },
+								content: { type: "string", minLength: 1, maxLength: 500 },
+								status: { type: "string", enum: ["pending", "in_progress", "completed"] },
+							},
+						},
+					},
+				},
+			} as ToolDefinition["parameters"],
+			exposure: "model-only",
+			defaultActive: true,
+			executionMode: "sequential",
+			async execute(_toolCallId, input) {
+				const rec = input as { todos?: Array<{ id: string; content: string; status: string }> };
+				const todos = Array.isArray(rec?.todos) ? rec.todos.slice(0, 50) : [];
+				return { content: [{ type: "text", text: JSON.stringify({ todos }) }], details: { todos } };
+			},
+		});
+		pi.registerTool({
+			name: "WebFetch",
+			label: "WebFetch",
+			description: "Fetch text or documentation from a public HTTP/HTTPS URL and return readable content.",
+			promptSnippet: "Fetch public web documentation via HTTP/HTTPS",
+			parameters: {
+				type: "object",
+				additionalProperties: false,
+				required: ["url"],
+				properties: {
+					url: { type: "string", minLength: 1, maxLength: 4096 },
+					max_chars: { type: "integer", minimum: 200, maximum: 100000 },
+				},
+			} as ToolDefinition["parameters"],
+			exposure: "model-only",
+			defaultActive: true,
+			executionMode: "parallel",
+			async execute(_toolCallId, input, signal) {
+				const rec = input as { url?: string; max_chars?: number };
+				const rawUrl = typeof rec?.url === "string" ? rec.url.trim() : "";
+				const parsed = new URL(rawUrl);
+				if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+					throw new Error("Only http and https URLs are supported.");
+				const hostName = parsed.hostname.toLowerCase();
+				if (
+					hostName === "localhost" ||
+					hostName === "::1" ||
+					hostName === "[::1]" ||
+					hostName.endsWith(".local") ||
+					/^(127\.|10\.|192\.168\.|169\.254\.|0\.|172\.(1[6-9]|2\d|3[01])\.)/.test(hostName)
+				) {
+					throw new Error("Refusing to fetch private or loopback network addresses.");
+				}
+				const maxChars = typeof rec.max_chars === "number" ? Math.min(Math.max(200, rec.max_chars), 100000) : 24000;
+				const controller = new AbortController();
+				const timer = setTimeout(() => controller.abort(), 15000);
+				const onAbort = () => controller.abort();
+				signal?.addEventListener("abort", onAbort, { once: true });
+				try {
+					const res = await fetch(parsed.toString(), {
+						signal: controller.signal,
+						headers: { "user-agent": "Pi-Desktop/0.1" },
+					});
+					if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+					const text = (await res.text()).slice(0, 2 * 1024 * 1024);
+					const contentType = res.headers.get("content-type") ?? "";
+					const readable = contentType.includes("html")
+						? text
+								.replace(/<script[\s\S]*?<\/script>/gi, " ")
+								.replace(/<style[\s\S]*?<\/style>/gi, " ")
+								.replace(/<[^>]+>/g, " ")
+								.replace(/\s+/g, " ")
+								.trim()
+						: text;
+					const truncated = readable.length > maxChars;
+					return {
+						content: [{ type: "text", text: readable.slice(0, maxChars) + (truncated ? "\n\n[Truncated]" : "") }],
+						details: { url: parsed.toString(), status: res.status, truncated },
+					};
+				} finally {
+					clearTimeout(timer);
+					signal?.removeEventListener("abort", onAbort);
+				}
+			},
+		});
+	}
 	function registerConnection(provider: Provider, connection: Connection, registry?: ModelRegistry) {
 		const definition = connectionDefaults[provider];
 		if (!definition) return;
