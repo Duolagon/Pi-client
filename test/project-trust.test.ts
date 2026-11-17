@@ -72,3 +72,15 @@ test("project trust gates .pi settings and persists across restarts", { timeout:
 		await fixture.cleanup();
 	}
 });
+
+test("detects project agent directories as trust-gated resources", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-desktop-trust-agents-"));
+	try {
+		const project = join(root, "project");
+		await mkdir(join(project, ".pi", "agents"), { recursive: true });
+		await mkdir(join(project, ".claude", "agents"), { recursive: true });
+		assert.deepEqual(await detectProjectTrustResources(project), [".claude/agents", ".pi/agents"]);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});

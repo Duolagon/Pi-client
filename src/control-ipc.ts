@@ -79,10 +79,10 @@ export function installControlHandlers(handle: Handle, service: DesktopService):
 			name: text(input.name, 64),
 			scope: input.scope,
 			transport: input.transport,
-			command: input.command === undefined ? undefined : text(input.command, 4096),
+			command: optionalText(input.command, 4096),
 			args: input.args === undefined ? undefined : stringArray(input.args, 100, 4096),
-			url: input.url === undefined ? undefined : text(input.url, 4096),
-			description: input.description === undefined ? undefined : text(input.description, 500),
+			url: optionalText(input.url, 4096),
+			description: optionalText(input.description, 500),
 			enabled: input.enabled as boolean | undefined,
 			overrideOnly: input.overrideOnly as boolean | undefined,
 			project: optionalPath(input.project),
@@ -113,6 +113,13 @@ function optionalId(value: unknown): string | undefined {
 	const id = text(value, 200);
 	if (!/^[a-zA-Z0-9._-]+$/.test(id)) throw new Error("会话标识无效。");
 	return id;
+}
+function optionalText(value: unknown, maxLength: number): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string" || value.length > maxLength || value.includes("\0"))
+		throw new Error("参数字符串无效。");
+	const trimmed = value.trim();
+	return trimmed || undefined;
 }
 function optionalPath(value: unknown): string | undefined {
 	if (value === undefined) return;

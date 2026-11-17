@@ -15,6 +15,8 @@ export interface AgentDefinition {
 	source?: string;
 	/** Custom definitions from `.claude/agents` are read-only in this manager. */
 	removable?: boolean;
+	/** Unknown frontmatter fields preserved across edits. */
+	extra?: Record<string, string>;
 }
 
 export interface AgentSaveInput {

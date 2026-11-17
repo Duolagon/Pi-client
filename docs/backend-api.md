@@ -42,7 +42,7 @@ if (snapshot.trust?.required && !snapshot.trust.decision) {
 - `resources`：项目相对路径列表，可能包含祖先 `.agents/skills` 的 `../` 路径。
 - `decision`：`trusted / untrusted`，未决定时省略。
 
-检测范围包括 `.pi/settings.json`、`.pi/mcp.json`、`.pi/SYSTEM.md`、`.pi/APPEND_SYSTEM.md`、`.pi/extensions`、`.pi/skills`、`.pi/prompts`、`.pi/themes`，以及工作目录到仓库根（有 `.git` 时）的祖先 `.agents/skills`。上下文文件 `AGENTS.md` / `CLAUDE.md` 不受信任门控。
+检测范围包括 `.pi/settings.json`、`.pi/mcp.json`、`.pi/agents`、`.claude/agents`、`.pi/SYSTEM.md`、`.pi/APPEND_SYSTEM.md`、`.pi/extensions`、`.pi/skills`、`.pi/prompts`、`.pi/themes`，以及工作目录到仓库根（有 `.git` 时）的祖先 `.agents/skills`。上下文文件 `AGENTS.md` / `CLAUDE.md` 不受信任门控。
 
 启动 Pi RPC 时，存在受保护资源则显式传 `--approve`（信任）或 `--no-approve`（未信任/未决定）。这避免 RPC 模式无法弹 trust 提示时静默跳过项目配置，也避免把“未决定”误当成信任。
 
@@ -64,7 +64,7 @@ await window.pi.agents.save({
 });
 ```
 
-定义格式为 Markdown frontmatter + 正文提示词；兼容 Claude Code 的 `Read/Grep/Glob/Edit/Write/Bash` 工具名，并归一化为 Pi 工具名。`tools` 为工具白名单，仅内置 Pi 工具会传给 `--tools`；只含只读工具的定义按只读子 Agent 运行，其余默认 Worktree。`model` 留空继承父会话；`thinkingLevel` 留空继承父会话。`.claude/agents` 条目只读展示，保存会在 `.pi/agents` 创建同名覆盖。内置 `general-purpose / Explore / Plan` 不可覆盖或删除。
+定义格式为 Markdown frontmatter + 正文提示词；兼容 Claude Code 的 `Read/Grep/Glob/Edit/Write/Bash` 工具名，并归一化为 Pi 工具名。`tools` 为工具白名单，仅内置 Pi 工具会传给 `--tools`；显式白名单过滤为空时传空工具集，不会退化为全部工具。只含只读工具的定义按只读子 Agent 运行，其余默认 Worktree。项目级 `.pi/agents`/`.claude/agents` 仅在项目信任后加载，未信任时只返回内置和用户级 Agent。`model` 留空继承父会话；`thinkingLevel` 留空继承父会话。`.claude/agents` 条目只读展示，保存会在 `.pi/agents` 创建同名覆盖。内置 `general-purpose / Explore / Plan` 不可覆盖或删除。
 
 `Agent` 工具的 `subagent_type` 接受内置名或自定义名；未知名称会被拒绝。自定义提示词会前置到子任务正文，模型/思考强度/工具白名单按定义应用。
 

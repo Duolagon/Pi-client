@@ -84,6 +84,11 @@ import type { SlashCommand } from "./shared.ts";
 const exec = promisify(execFile);
 const providers: Provider[] = ["anthropic", "openai", "google", "openrouter", "deepseek"];
 const piBuiltinTools = new Set(["read", "write", "edit", "bash", "grep", "find", "ls", "powershell"]);
+
+/** An explicit empty result means deny all built-in tools, not "unset". */
+export function piToolAllowlist(tools: string[] | undefined): string[] | undefined {
+	return tools?.filter((name) => piBuiltinTools.has(name));
+}
 interface StoredState {
 	projects: Project[];
 	conversations: Conversation[];
@@ -194,7 +199,7 @@ export class DesktopService {
 				const runtime = await this.ensureRuntime(this.conversation(id));
 				return { model: runtime.state?.model ? { provider: runtime.state.model.provider, id: runtime.state.model.id } : undefined, thinkingLevel: runtime.state?.thinkingLevel };
 			},
-			resolveAgent: (project, name) => this.agents.resolve(project, name),
+			resolveAgent: (project, name) => this.agents.resolve(project, name, this.projectTrusted(project)),
 			listTasks: () => this.listTasks(),
 			startTask: (input, metadata) => this.startTask(input, metadata),
 			cancelTask: (id) => this.cancelTask(id),
@@ -348,27 +353,34 @@ export class DesktopService {
 
 	async listAgents(project?: string): Promise<AgentDefinition[]> {
 		await this.operation;
-		return this.agents.list(await this.agentProject(project));
+		const target = await this.agentProject(project);
+		return this.agents.list(target, this.projectTrusted(target));
 	}
 
 	saveAgent(input: AgentSaveInput): Promise<AgentDefinition[]> {
 		return this.serialize(async () => {
 			const project = await this.agentProject(input.project);
-			return this.agents.save(project, input);
+			return this.agents.save(project, input, this.projectTrusted(project));
 		});
 	}
 
 	removeAgent(input: AgentRemoveInput): Promise<AgentDefinition[]> {
 		return this.serialize(async () => {
 			const project = await this.agentProject(input.project);
-			return this.agents.remove(project, input);
+			return this.agents.remove(project, input, this.projectTrusted(project));
 		});
+	}
+
+	private projectTrusted(project: string): boolean {
+		return this.store.projectTrust?.[project] === "trusted";
 	}
 
 	private async agentProject(project?: string): Promise<string> {
 		const target = project ? await realpath(project) : this.requireActive().project;
-		if (!this.store.projects.some((item) => item.path === target)) throw new Error("项目未打开。");
-		return target;
+		if (this.store.projects.some((item) => item.path === target)) return target;
+		const task = this.store.tasks.find((item) => item.workingDirectory === target);
+		if (task && this.store.projects.some((item) => item.path === task.project)) return task.project;
+		throw new Error("项目未打开。");
 	}
 
 	async listMcpServers(project?: string): Promise<McpServerInfo[]> {
@@ -1057,6 +1069,7 @@ export class DesktopService {
 		const trimmed = message.trim();
 		if (!trimmed) throw new Error("请输入提交说明。");
 		const cwd = this.conversation(conversationId).project;
+		this.assertProjectIdle(cwd);
 		const { stdout } = await exec("git", ["commit", "-m", trimmed], {
 			cwd,
 			env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
@@ -2138,7 +2151,8 @@ export class DesktopService {
 			// Pi reads protected project resources once at startup. Pass an explicit
 			// decision so RPC mode never silently falls back to its "ask" default.
 			const trustResources = await detectProjectTrustResources(conversation.project);
-			const trustDecision = this.store.projectTrust?.[conversation.project];
+			const trustProject = await this.trustProjectFor(conversation.project);
+			const trustDecision = this.store.projectTrust?.[trustProject];
 			const args = [
 				"--session-dir",
 				sessionDir,
@@ -2155,9 +2169,11 @@ export class DesktopService {
 				args.push("--provider", model.provider, "--model", model.id);
 			}
 			const task = this.store.tasks.find((item) => item.conversationId === conversation.id);
-			const allowedTools = task?.allowedTools?.filter((name) => piBuiltinTools.has(name));
-			if (allowedTools?.length) {
-				args.push("--tools", allowedTools.join(","));
+			const definedTools = piToolAllowlist(task?.allowedTools);
+			if (definedTools !== undefined) {
+				// An explicit empty allowlist must deny all built-in tools instead of
+				// falling back to Pi's unrestricted default.
+				args.push("--tools", definedTools.join(","));
 				if (this.permissionPolicy(conversation.id).mode === "read") args.push("--exclude-tools", "mcp__*");
 			} else if (this.permissionPolicy(conversation.id).mode === "read") {
 				args.push("--tools", "read,grep,find,ls", "--exclude-tools", "mcp__*");
@@ -2384,13 +2400,20 @@ export class DesktopService {
 		};
 	}
 
+	private async trustProjectFor(project: string): Promise<string> {
+		if (this.store.projects.some((item) => item.path === project)) return project;
+		const task = this.store.tasks.find((item) => item.workingDirectory === project);
+		return task?.project ?? project;
+	}
+
 	private async projectTrustState(project: string): Promise<ProjectTrustState> {
+		const trustProject = await this.trustProjectFor(project);
 		const resources = await detectProjectTrustResources(project);
 		return {
-			project,
+			project: trustProject,
 			resources,
 			required: resources.length > 0,
-			decision: this.store.projectTrust?.[project],
+			decision: this.store.projectTrust?.[trustProject],
 		};
 	}
 

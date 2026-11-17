@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { McpRegistry } from "../src/mcp-registry.ts";
@@ -131,6 +131,27 @@ test("rejects invalid names, URLs and missing remove targets", async () => {
 		await assert.rejects(
 			() => registry.remove(f.project, { name: "missing", scope: "user" }),
 			/不存在/,
+		);
+	} finally {
+		await f.cleanup();
+	}
+});
+
+test("rejects symlinked project MCP directories instead of writing outside the project", async () => {
+	const f = await fixture();
+	try {
+		const outside = join(f.root, "outside");
+		await mkdir(outside);
+		await symlink(outside, join(f.project, ".pi"), "dir");
+		const registry = f.registry();
+		await assert.rejects(
+			() => registry.save(f.project, { name: "escape", scope: "project", transport: "stdio", command: "echo" }),
+			/符号链接|项目目录/,
+		);
+		await assert.rejects(() => registry.list(f.project), /符号链接|项目目录/);
+		await assert.rejects(
+			() => registry.list(f.project),
+			/符号链接|项目目录/,
 		);
 	} finally {
 		await f.cleanup();

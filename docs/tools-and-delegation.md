@@ -89,7 +89,7 @@ await window.pi.permissions.remove("allow-project-tests");
 | WorktreeMerge | `{worktree_id}`，有保护的快进合并，不自动提交 |
 | WorktreeRemove | `{worktree_id}`，保留有未合并提交的分支；脏/忽略文件阻止删除 |
 
-Agent 的 `subagent_type`：`general-purpose / Explore / Plan`，或 `.pi/agents`、`.claude/agents` 中定义的自定义 Agent 名称。Explore/Plan/只读自定义 Agent 使用只读工具上限，默认共享项目读取；general-purpose 与可写自定义 Agent 默认 Git Worktree。无 Git 时可做只读探索；共享目录的可写委派会立即报错，避免父任务等子任务、子任务又等父任务释放目录。显式 Worktree 引用必须属于本父会话。
+Agent 的 `subagent_type`：`general-purpose / Explore / Plan`，或 `.pi/agents`、`.claude/agents` 中定义的自定义 Agent 名称（项目级定义需项目信任）。Explore/Plan/只读自定义 Agent 使用只读工具上限，默认共享项目读取；general-purpose 与可写自定义 Agent 默认 Git Worktree。无 Git 时可做只读探索；共享目录的可写委派会立即报错，避免父任务等子任务、子任务又等父任务释放目录。显式 Worktree 引用必须属于本父会话。
 
 子会话使用独立 Pi 进程、独立上下文，只收到子任务 prompt 和正常 Pi 项目资源，不复制父聊天全文。继承父模型和思考级别、创建时权限上限，并继续接收父任务后续收紧的规则/停用。Worktree 内绝对项目路径规则映射到对应工作区。子任务不能自行选择更高权限或再创建子 Agent。
 

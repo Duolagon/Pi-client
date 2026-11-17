@@ -53,9 +53,9 @@ export function McpDialog({
 			name: server.name,
 			scope: server.scope === "user" ? "user" : "project",
 			transport: server.transport,
-			command: server.command ?? "",
+			command: server.transport === "stdio" ? (server.command ?? "") : undefined,
 			args: server.args ?? [],
-			url: server.url ?? "",
+			url: server.transport === "http" ? (server.url ?? "") : undefined,
 			description: server.description ?? "",
 			enabled: server.enabled,
 		});
@@ -93,15 +93,27 @@ export function McpDialog({
 		setBusy(true);
 		setError("");
 		try {
-			const list = await window.pi.mcp.save({
-				...form,
-				args: argsText
-					.split("\n")
-					.map((item) => item.trim())
-					.filter(Boolean),
+			const payload: McpSaveInput = {
+				name: form.name.trim(),
+				scope: form.scope,
+				transport: form.transport,
+				enabled: form.enabled,
 				overrideOnly,
 				project,
-			});
+				...(overrideOnly
+					? {}
+					: form.transport === "stdio"
+						? {
+								command: form.command?.trim() || undefined,
+								args: argsText
+									.split("\n")
+									.map((item) => item.trim())
+									.filter(Boolean),
+							}
+						: { url: form.url?.trim() || undefined }),
+				...(form.description?.trim() ? { description: form.description.trim() } : {}),
+			};
+			const list = await window.pi.mcp.save(payload);
 			setServers(list);
 			const next = list.find((item) => item.name === form.name.trim());
 			if (next) select(next);

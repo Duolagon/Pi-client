@@ -480,17 +480,25 @@ try {
 	await page.getByRole("textbox", { name: "Agent 名称", exact: true }).fill("e2e-reviewer");
 	await page.getByRole("textbox", { name: "描述（模型据此决定何时委派）", exact: true }).fill("E2E reviewer");
 	await page.getByRole("textbox", { name: "系统提示词", exact: true }).fill("Review only. Do not edit files.");
+	await page.getByRole("combobox", { name: "保存位置", exact: true }).selectOption("user");
 	await page.getByRole("button", { name: "保存 Agent", exact: true }).click();
 	await page.getByText("e2e-reviewer", { exact: true }).waitFor();
-	assert.match(await readFile(join(project, ".pi", "agents", "e2e-reviewer.md"), "utf8"), /name: e2e-reviewer/);
+	assert.match(await readFile(join(agentDir, "agents", "e2e-reviewer.md"), "utf8"), /name: e2e-reviewer/);
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
 	await page.getByRole("button", { name: "MCP 服务器", exact: true }).click();
 	await page.getByRole("dialog", { name: "MCP 服务器", exact: true }).waitFor();
 	await page.getByRole("button", { name: "新建", exact: true }).click();
+	await page.getByRole("textbox", { name: "名称", exact: true }).fill("e2e-mcp");
+	await page.getByRole("combobox", { name: "作用域", exact: true }).selectOption("user");
+	await page.getByRole("combobox", { name: "传输方式", exact: true }).selectOption("http");
+	await page.getByRole("textbox", { name: "URL", exact: true }).fill("https://example.com/mcp");
+	await page.getByRole("button", { name: "保存并重载", exact: true }).click();
+	await page.getByText("e2e-mcp", { exact: true }).waitFor();
+	assert.match(await readFile(join(agentDir, "mcp.json"), "utf8"), /e2e-mcp/);
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
-	checks.push("acceptEdits, custom Agents and MCP server dialog");
+	checks.push("acceptEdits, custom Agents and MCP save");
 	checks.push("Git stage/unstage, split diff, memory/status, localhost preview, command palette and Plan mode");
 
 	assert.deepEqual(pageErrors, []);
