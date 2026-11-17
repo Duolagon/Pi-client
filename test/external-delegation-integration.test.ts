@@ -1,0 +1,197 @@
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { access, appendFile, chmod, cp, readFile, realpath, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
+import { test } from "node:test";
+import { promisify } from "node:util";
+import { DesktopService } from "../src/backend.ts";
+import type { DesktopEvent, Message, Snapshot } from "../src/shared.ts";
+import type { ExternalAdapter, ExternalEvent, ExternalProvider, ExternalSessionOptions, ExternalTurnResult } from "../src/external-types.ts";
+import { createCoreFixture } from "./fixtures/core-fixture.ts";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const exec = promisify(execFile);
+const gitEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
+function text(message: Message): string { return !("content" in message) ? "" : typeof message.content === "string" ? message.content : message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n"); }
+function contains(snapshot: Snapshot, marker: string): boolean { return snapshot.messages.some((message) => message.role === "assistant" && text(message).includes(marker)); }
+async function until<T>(read: () => Promise<T> | T, check: (value: T) => boolean, label: string, timeout = 15000): Promise<T> {
+	const started = Date.now(); let value!: T;
+	do { value = await read(); if (check(value)) return value; await delay(25); } while (Date.now() - started < timeout);
+	throw new Error(`Timed out ${label}: ${String(JSON.stringify(value)).slice(-2200)}`);
+}
+
+function adapters() {
+	const opened: { executor: ExternalProvider; cwd: string; resume?: string; nativeId: string }[] = [];
+	let serial = 0;
+	const create = (executor: ExternalProvider): ExternalAdapter => ({
+		async open(options: ExternalSessionOptions) {
+			const nativeId = options.resumeSessionId ?? `${executor}-native-${++serial}`;
+			opened.push({ executor, cwd: options.cwd, resume: options.resumeSessionId, nativeId });
+			options.onEvent({ type: "session", sessionId: nativeId });
+			let stopped: (() => void) | undefined;
+			return {
+				sessionId: nativeId,
+				async run(prompt, signal): Promise<ExternalTurnResult> {
+					if (prompt === "BLOCK") return new Promise((resolve) => {
+						stopped = () => resolve({ status: "cancelled", text: "external cancelled", sessionId: nativeId });
+						signal?.addEventListener("abort", stopped, { once: true });
+						if (signal?.aborted) stopped();
+					});
+					if (prompt === "SLOW_DONE") await delay(400, undefined, { signal });
+					const path = join(options.cwd, "external-result.txt");
+					options.onEvent({ type: "tool_start", id: "native-write", name: "write", input: { path } });
+					const decision = await options.onPermission({ id: "native-request", kind: "file", toolName: "write", input: { path, content: prompt } }, signal);
+					if (signal?.aborted) return { status: "cancelled", text: "external cancelled", sessionId: nativeId };
+					if (decision.decision === "allow") await appendFile(path, `${executor}:${prompt}\n`);
+					options.onEvent({ type: "tool_end", id: "native-write", isError: decision.decision !== "allow" });
+					const result = `${executor}:${decision.decision}:${prompt}:${nativeId}`;
+					options.onEvent({ type: "text_delta", text: result });
+					return { status: "completed", text: result, sessionId: nativeId };
+				},
+				async interrupt() { stopped?.(); },
+				async close() { stopped?.(); },
+			};
+		},
+	});
+	return { values: { codex: create("codex"), claude: create("claude"), kimi: create("kimi") }, opened };
+}
+
+async function setup(permission: "auto" | "ask" = "auto", maxConcurrentTasks = 4) {
+	const fixture = await createCoreFixture(); const project = await realpath(fixture.project);
+	await cp(join(here, "fixtures/external-delegation-provider.js"), join(fixture.agentDir, "extensions/external-delegation-provider.js"));
+	await writeFile(join(fixture.agentDir, "settings.json"), JSON.stringify({ defaultProvider: "external-delegation-test", defaultModel: "external-parent", thinkingLevel: "off", retry: { enabled: false }, compaction: { enabled: false } }));
+	const git = (...args: string[]) => exec("git", args, { cwd: project, env: gitEnv });
+	await git("-c", "init.defaultBranch=main", "init"); await git("add", "--", "seed.txt");
+	await git("-c", "user.name=Desktop Test", "-c", "user.email=desktop@example.invalid", "-c", "commit.gpgSign=false", "commit", "-m", "Initialize external delegation fixture");
+	const executable = join(fixture.root, "external-version");
+	await writeFile(executable, "#!/usr/bin/env node\nconsole.log('external-fixture 1.0.0');\n", { mode: 0o700 }); await chmod(executable, 0o700);
+	const native = adapters();
+	const options = { dataDir: fixture.dataDir, executable: process.execPath, entry: fixture.entry, permissionExtension: resolve(here, "../src/permission-extension.ts"), toolControlExtension: resolve(here, "../src/tool-control-extension.ts"), env: fixture.env, initialProject: project, externalAdapters: native.values, maxConcurrentTasks };
+	const service = new DesktopService(options);
+	const packets: DesktopEvent[] = []; const external: ExternalEvent[] = [];
+	service.subscribe((event) => packets.push(event)); service.subscribeExternal((event) => external.push(event));
+	try {
+		const initial = await service.initialize(); assert.equal(initial.engineStatus, "ready", initial.engineError);
+		await service.saveSettings({ permission, theme: "light" });
+		for (const id of ["codex", "claude", "kimi"] as const) await service.configureExternal({ id, executable, enabled: true });
+		if (permission === "ask") await service.upsertPermission({ id: "allow-parent-delegation", scope: "global", action: "allow", tool: "Agent" });
+		return { fixture, project, options, service, native, packets, external, parentId: initial.active!.id };
+	} catch (error) { await service.close(); await fixture.cleanup(); throw error; }
+}
+async function run(service: DesktopService, prompt: string, marker: string) {
+	await service.command({ type: "prompt", message: prompt });
+	return until(() => service.snapshot(), (snapshot) => contains(snapshot, marker) && !snapshot.state?.isStreaming, marker);
+}
+
+test("real Pi model discovers local executors, delegates to each native adapter and continues its native session", { timeout: 60000 }, async () => {
+	const data = await setup();
+	try {
+		for (const provider of ["codex", "claude", "kimi"] as const) {
+			const result = await run(data.service, `EXTERNAL_CONTINUE ${provider}`, "EXTERNAL_CONTINUE_COMPLETE");
+			const tasks = data.service.listExternal(result.active!.id); const task = tasks.find((item) => item.executor === provider)!;
+			assert.ok(task, `No external ${provider} task for ${result.active!.id}`); assert.equal(task.status, "completed", task.error); assert.equal(task.turn, 2);
+			assert.ok(task.worktreeId); assert.notEqual(task.workingDirectory, data.project);
+			assert.equal(await readFile(join(task.workingDirectory, "external-result.txt"), "utf8"), `${provider}:WRITE first\n${provider}:WRITE second\n`);
+			await assert.rejects(access(join(data.project, "external-result.txt")));
+			const opened = data.native.opened.filter((item) => item.executor === provider);
+			assert.equal(opened.length, 2); assert.equal(opened[1].resume, opened[0].nativeId); assert.equal(opened[1].cwd, opened[0].cwd);
+			assert.equal(task.nativeSessionId, opened[0].nativeId);
+			assert.ok(result.messages.some((message) => message.role === "toolResult" && message.toolName === "AgentSend" && text(message).includes(`${provider}:allow:WRITE second`)));
+			assert.ok(result.messages.some((message) => message.role === "toolResult" && message.toolName === "AgentExecutors" && !message.isError && text(message).includes("external-fixture")));
+			const replay = await data.service.replayExternal(task.id); assert.ok(replay.events.some((event) => event.event.type === "tool_start"));
+			if (provider !== "kimi") await data.service.newConversation();
+		}
+	} finally { await data.service.close(); await data.fixture.cleanup(); }
+});
+
+test("native approval waits on the external task, resumes after a response and hands back once", { timeout: 45000 }, async () => {
+	const data = await setup("ask");
+	try {
+		const pending = await run(data.service, "EXTERNAL_APPROVAL claude", "EXTERNAL_APPROVAL_RETURNED");
+		const [task] = data.service.listExternal(data.parentId);
+		assert.equal(task.status, "waiting_for_input"); assert.equal(task.pendingApprovals.length, 1);
+		await assert.rejects(access(join(task.workingDirectory, "external-result.txt")));
+		assert.ok(contains(pending, '"pending_approvals":1'));
+		await data.service.respondExternal(task.id, task.pendingApprovals[0].id, { decision: "allow" });
+		await until(() => data.service.externalSnapshot(task.id), (value) => value.status === "completed", "native task complete");
+		const completed = await until(() => data.service.snapshot(), (value) => contains(value, "EXTERNAL_HANDBACK_COMPLETE") && !value.state?.isStreaming, "approval handback");
+		assert.equal(completed.messages.filter((message) => "customType" in message && message.customType === "desktop_task_result").length, 1);
+		await assert.rejects(data.service.respondExternal(task.id, task.pendingApprovals[0].id, { decision: "allow" }), /失效/);
+	} finally { await data.service.close(); await data.fixture.cleanup(); }
+});
+
+test("background native results reach the parent once and another conversation cannot continue the task", { timeout: 45000 }, async () => {
+	const data = await setup();
+	try {
+		await run(data.service, "EXTERNAL_BACKGROUND codex", "EXTERNAL_BACKGROUND_LAUNCHED");
+		const completed = await until(() => data.service.snapshot(), (value) => contains(value, "EXTERNAL_HANDBACK_COMPLETE") && !value.state?.isStreaming, "native background handback");
+		const [task] = data.service.listExternal(data.parentId); assert.equal(task.status, "completed");
+		assert.equal(completed.messages.filter((message) => "customType" in message && message.customType === "desktop_task_result").length, 1);
+		await data.service.newConversation();
+		const denied = await run(data.service, `EXTERNAL_FOREIGN ${task.id}`, "EXTERNAL_FOREIGN_COMPLETE DENIED");
+		assert.ok(contains(denied, "没有该外部子任务"));
+		assert.equal(data.service.externalSnapshot(task.id).turn, 1);
+	} finally { await data.service.close(); await data.fixture.cleanup(); }
+});
+
+test("TaskStop and explicit parent abort cancel external children while preserving an independent Pi task", { timeout: 45000 }, async () => {
+	const data = await setup();
+	try {
+		await run(data.service, "EXTERNAL_CANCEL_TOOL kimi", "EXTERNAL_CANCEL_COMPLETE");
+		assert.equal(data.service.listExternal(data.parentId)[0].status, "cancelled");
+		const independent = await data.service.startTask({ message: "PI_MANUAL_SLOW", isolation: "worktree" });
+		await until(() => data.service.taskSnapshot(independent.id), (snapshot) => Boolean(snapshot.state?.isStreaming), "independent Pi task started");
+		await run(data.service, "EXTERNAL_BLOCK codex", "EXTERNAL_BLOCK_LAUNCHED");
+		await until(() => data.service.listExternal(data.parentId), (tasks) => tasks.some((task) => task.executor === "codex" && task.status === "running"), "external child started");
+		await data.service.command({ type: "abort" });
+		assert.ok(data.service.listExternal(data.parentId).every((task) => task.status === "cancelled"));
+		assert.equal((await data.service.listTasks()).find((task) => task.id === independent.id)?.status, "running");
+	} finally { await data.service.close(); await data.fixture.cleanup(); }
+});
+
+test("external queue wakes after a Pi task releases the shared concurrency slot", { timeout: 45000 }, async () => {
+	const data = await setup("auto", 1);
+	try {
+		const independent = await data.service.startTask({ message: "PI_MANUAL_SLOW", isolation: "worktree" });
+		await until(() => data.service.taskSnapshot(independent.id), (snapshot) => Boolean(snapshot.state?.isStreaming), "Pi capacity occupied");
+		await run(data.service, "EXTERNAL_BLOCK codex", "EXTERNAL_BLOCK_LAUNCHED");
+		const [task] = data.service.listExternal(data.parentId); assert.equal(task.status, "queued");
+		await data.service.cancelTask(independent.id);
+		await until(() => data.service.externalSnapshot(task.id), (value) => value.status === "running", "external queue resumes after Pi cancellation", 5000);
+		await data.service.cancelExternal(task.id);
+	} finally { await data.service.close(); await data.fixture.cleanup(); }
+});
+
+test("desktop restart preserves the external native session and worktree for an explicit later message", { timeout: 45000 }, async () => {
+	const data = await setup(); let current = data.service;
+	try {
+		await run(current, "EXTERNAL_CONTINUE codex", "EXTERNAL_CONTINUE_COMPLETE");
+		const [original] = current.listExternal(data.parentId);
+		await current.close();
+		current = new DesktopService({ ...data.options, initialProject: undefined });
+		const restored = await current.initialize(); assert.equal(restored.engineStatus, "ready", restored.engineError);
+		assert.equal(current.externalSnapshot(original.id).nativeSessionId, original.nativeSessionId);
+		await current.sendExternal({ taskId: original.id, message: "WRITE third" });
+		const completed = await until(() => current.externalSnapshot(original.id), (task) => task.status === "completed", "resumed external task after restart");
+		assert.equal(completed.nativeSessionId, original.nativeSessionId); assert.equal(completed.turn, 3);
+		assert.equal(data.native.opened.at(-1)?.resume, original.nativeSessionId);
+		assert.equal(await readFile(join(completed.workingDirectory, "external-result.txt"), "utf8"), "codex:WRITE first\ncodex:WRITE second\ncodex:WRITE third\n");
+		const replay = await current.replayExternal(original.id, original.eventSequence);
+		assert.ok(replay.events.length); assert.ok(replay.events.every((event) => event.sequence > original.eventSequence && event.turn === 3));
+	} finally { await current.close(); await data.fixture.cleanup(); }
+});
+
+test("a running external task durably records its native session before completion", { timeout: 45000 }, async () => {
+	const data = await setup();
+	try {
+		await run(data.service, "EXTERNAL_BLOCK codex", "EXTERNAL_BLOCK_LAUNCHED");
+		const task = await until(() => data.service.listExternal(data.parentId)[0], (value) => Boolean(value?.nativeSessionId) && value.status === "running", "native session established");
+		await until(async () => {
+			const stored = JSON.parse(await readFile(join(data.fixture.dataDir, "external-agents.json"), "utf8"));
+			return stored.tasks.find((item: { task: { id: string } }) => item.task.id === task.id)?.task.nativeSessionId;
+		}, (value) => value === task.nativeSessionId, "running native session persisted", 2500);
+		await data.service.cancelExternal(task.id);
+	} finally { await data.service.close(); await data.fixture.cleanup(); }
+});

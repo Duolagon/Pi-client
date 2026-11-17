@@ -8,6 +8,31 @@ function listen<T>(channel: string, listener: (event: T) => void): () => void {
 }
 
 const api: DesktopAPI = {
+	externalAgents: {
+		executors: () => ipcRenderer.invoke("pi:external:executors"),
+		configure: (input) => ipcRenderer.invoke("pi:external:configure", input),
+		start: (input) => ipcRenderer.invoke("pi:external:start", input),
+		list: (conversationId) => ipcRenderer.invoke("pi:external:list", conversationId),
+		snapshot: (id) => ipcRenderer.invoke("pi:external:snapshot", id),
+		send: (input) => ipcRenderer.invoke("pi:external:send", input),
+		result: (id, options) => ipcRenderer.invoke("pi:external:result", id, options),
+		cancel: (id) => ipcRenderer.invoke("pi:external:cancel", id),
+		respond: (id, requestId, response) => ipcRenderer.invoke("pi:external:respond", id, requestId, response),
+		replay: (id, afterSequence) => ipcRenderer.invoke("pi:external:replay", id, afterSequence),
+		onEvent: (listener) => listen("pi:external:event", listener),
+	},
+	tools: {
+		list: (conversationId) => ipcRenderer.invoke("pi:tools:list", conversationId),
+		setEnabled: (input) => ipcRenderer.invoke("pi:tools:set-enabled", input),
+		onEvent: (listener) => listen("pi:controls:event", listener),
+	},
+	permissions: {
+		list: (conversationId) => ipcRenderer.invoke("pi:permissions:list", conversationId),
+		upsert: (rule) => ipcRenderer.invoke("pi:permissions:upsert", rule),
+		remove: (id) => ipcRenderer.invoke("pi:permissions:remove", id),
+		check: (input) => ipcRenderer.invoke("pi:permissions:check", input),
+		onEvent: (listener) => listen("pi:controls:event", listener),
+	},
 	sessions: {
 		fork: (input) => ipcRenderer.invoke("pi:session:fork", input),
 		clone: (input) => ipcRenderer.invoke("pi:session:clone", input),
@@ -39,6 +64,7 @@ const api: DesktopAPI = {
 		list: () => ipcRenderer.invoke("pi:task:list"),
 		snapshot: (id) => ipcRenderer.invoke("pi:task:snapshot", id),
 		cancel: (id) => ipcRenderer.invoke("pi:task:cancel", id),
+		result: (id, options) => ipcRenderer.invoke("pi:task:result", id, options),
 		command: (id, command) => ipcRenderer.invoke("pi:task:command", id, command),
 		respond: (id, response) => ipcRenderer.invoke("pi:task:respond", id, response),
 		files: (id, path) => ipcRenderer.invoke("pi:task:files", id, path),

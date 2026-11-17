@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID, createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, writeFile, rename, realpath, stat, readdir, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -55,6 +55,20 @@ import type {
 } from "./shared.ts";
 import { connectionMode, validateEndpoint } from "./model-connections.ts";
 import { providerModels, providerPresets } from "./provider-presets.ts";
+import { ToolSettingsStore } from "./tool-settings.ts";
+import { evaluatePermission, validatePermissionRule, validateRuntimePolicy } from "./permission-policy.ts";
+import type { PermissionRule, RuntimePermissionPolicy } from "./permission-types.ts";
+import type { ToolToggleInput, ControlEvent, PermissionSettings, PermissionCheckInput } from "./control-types.ts";
+import type { DesktopToolInfo } from "./tool-control-types.ts";
+import { ToolHostServer } from "./tool-host-server.ts";
+import { ModelDelegation } from "./model-delegation.ts";
+import type { DelegationMetadata } from "./delegation-types.ts";
+import { ExternalAgents } from "./external-agents.ts";
+import { CodexAdapter } from "./external-codex.ts";
+import { ClaudeAdapter } from "./external-claude.ts";
+import { KimiAdapter } from "./external-kimi.ts";
+import type { ExternalAdapter, ExternalApprovalResponse, ExternalEvent, ExternalExecutorInput, ExternalProvider, ExternalTask, ExternalTaskSendInput, ExternalTaskStartInput } from "./external-types.ts";
+import type { DesktopToolInvocation, ToolHostContext } from "./tool-control-types.ts";
 import type { RpcExtensionUIResponse, SessionStats } from "@earendil-works/pi-coding-agent";
 import type { SlashCommand } from "./shared.ts";
 
@@ -67,6 +81,7 @@ interface StoredState {
 	settings: Omit<Settings, "configuredProviders">;
 	keys: Partial<Record<Provider, string>>;
 	tasks: DesktopTask[];
+	taskPolicies?: Record<string, RuntimePermissionPolicy>;
 }
 interface SessionRuntime {
 	conversationId: string;
@@ -88,6 +103,9 @@ interface SessionRuntime {
 	stopping: boolean;
 	replacing?: boolean;
 	navigation?: { directory: string; token: string; command: string };
+	controls?: { directory: string; token: string; command: string; hostToken: string; operation: Promise<void> };
+	policyFile?: string;
+	controlWrites?: Promise<void>;
 }
 export interface ServiceOptions {
 	dataDir: string;
@@ -103,6 +121,9 @@ export interface ServiceOptions {
 	archiveEntry?: string;
 	historyEntry?: string;
 	navigationExtension?: string;
+	toolControlExtension?: string;
+	externalAdapters?: Record<ExternalProvider, ExternalAdapter>;
+	claudeHelperPath?: string;
 	maxConcurrentTasks?: number;
 	encrypt?: (value: string) => string;
 	decrypt?: (value: string) => string;
@@ -135,9 +156,46 @@ export class DesktopService {
 	private operation: Promise<void> = Promise.resolve();
 	private persistence: Promise<void> = Promise.resolve();
 	private eventSequence = 0;
+	private toolSettings: ToolSettingsStore;
+	private toolHost: ToolHostServer;
+	private delegation: ModelDelegation;
+	private controlListeners = new Set<(event: ControlEvent) => void>();
+	private worktreeOperationOwner?: string;
+	private external: ExternalAgents;
 
 	constructor(options: ServiceOptions) {
 		this.options = options;
+		this.toolSettings = new ToolSettingsStore(options.dataDir);
+		this.toolHost = new ToolHostServer({ handle: async (request, context) => {
+			const decision = await evaluatePermission(this.permissionPolicy(context.conversationId), { toolName: request.tool, input: request.input });
+			if (decision.action === "deny") throw new Error(decision.reason);
+			return this.modelTool(request, context);
+		} });
+		this.delegation = new ModelDelegation({
+			getConversation: (id) => this.conversation(id),
+			getSelection: async (id) => {
+				const runtime = await this.ensureRuntime(this.conversation(id));
+				return { model: runtime.state?.model ? { provider: runtime.state.model.provider, id: runtime.state.model.id } : undefined, thinkingLevel: runtime.state?.thinkingLevel };
+			},
+			listTasks: () => this.listTasks(),
+			startTask: (input, metadata) => this.startTask(input, metadata),
+			cancelTask: (id) => this.cancelTask(id),
+			taskSnapshot: (id) => this.taskSnapshot(id),
+			listWorktrees: (project) => this.listWorktrees(project),
+			createWorktree: (input) => this.createWorktree(input),
+			removeWorktree: (id, owner, callId) => this.modelWorktreeMutation("remove", id, owner, callId),
+			mergeWorktree: (id, owner, callId) => this.modelWorktreeMutation("merge", id, owner, callId),
+			isGit: async (project) => {
+				try { await exec("git", ["rev-parse", "--show-toplevel"], { cwd: project }); return true; } catch { return false; }
+			},
+			canRunShared: (_owner, readOnly) => readOnly,
+			notify: async (owner, result) => {
+				const runtime = this.runtimes.get(owner);
+				if (!runtime?.controls || runtime.stopping || this.closed || ["cancelled", "interrupted"].includes(result.status)) return;
+				await runtime.settling;
+				await this.controlRequest(runtime, "notify", result);
+			},
+		});
 		this.git = new GitSnapshots(join(options.dataDir, "checkpoints"));
 		const runtimeDir =
 			options.runtimeDir ?? (options.entry ? dirname(dirname(dirname(options.entry))) : options.dataDir);
@@ -158,12 +216,35 @@ export class DesktopService {
 		});
 		this.worktrees = new WorktreeService({
 			dataDir: join(options.dataDir, "worktrees"),
-			isActive: (item) => this.pathActive(item.path) || this.pathActive(item.repository),
+			isActive: (item) => this.pathActive(item.path, this.worktreeOperationOwner) || this.pathActive(item.repository, this.worktreeOperationOwner),
+		});
+		this.external = new ExternalAgents({
+			dataDir: options.dataDir, env: { ...process.env, ...options.env }, nodeExecutable: options.executable,
+			claudeHelperPath: options.claudeHelperPath ?? join(runtimeDir, "external-claude-helper.mjs"),
+			adapters: options.externalAdapters ?? { codex: new CodexAdapter(), claude: new ClaudeAdapter(), kimi: new KimiAdapter() },
+			maxConcurrent: options.maxConcurrentTasks ?? 4,
+			project: (id) => this.conversation(id).project,
+			policy: (id) => this.permissionPolicy(id),
+			delegated: (id) => this.store.tasks.some((task) => task.conversationId === id && task.parentConversationId),
+			createWorktree: (input) => this.createWorktree(input), listWorktrees: () => this.listWorktrees(),
+			capacity: () => (options.maxConcurrentTasks ?? 4) - this.store.tasks.filter((task) => ["running", "waiting_for_input"].includes(task.status)).length,
+			canStart: (task) => {
+				if (task.readOnly) return true;
+				try { this.assertPathAvailable(task.workingDirectory, undefined, task.id); return true; } catch { return false; }
+			},
+			notify: async (owner, result) => {
+				const runtime = this.runtimes.get(owner);
+				if (!runtime?.controls || runtime.stopping || this.closed) return;
+				await runtime.settling; await this.controlRequest(runtime, "notify", result);
+			},
+			onActivityChange: () => { void this.scheduleTasks(); },
 		});
 	}
 
 	async initialize(): Promise<Snapshot> {
 		await mkdir(this.options.dataDir, { recursive: true, mode: 0o700 });
+		await this.toolSettings.initialize();
+		await this.external.initialize();
 		const runtimeDir =
 			this.options.runtimeDir ??
 			(this.options.entry ? dirname(dirname(dirname(this.options.entry))) : this.options.dataDir);
@@ -507,6 +588,49 @@ export class DesktopService {
 		else conversation.sessionLeafId = result.leafId;
 	}
 
+	private async modelTool(request: DesktopToolInvocation, context: ToolHostContext): Promise<unknown> {
+		if (this.closed) throw new Error("桌面服务已关闭。");
+		const input = request.input;
+		if (request.tool === "AgentExecutors") return { executors: await this.external.executors() };
+		if (request.tool === "Agent" && input.executor && input.executor !== "pi") {
+			const task = await this.external.start({ executor: input.executor as ExternalProvider,
+				description: input.description as string, prompt: input.prompt as string,
+				subagent_type: input.subagent_type as ExternalTaskStartInput["subagent_type"], isolation: input.isolation as ExternalTaskStartInput["isolation"],
+				worktree_id: input.worktree_id as string | undefined, run_in_background: input.run_in_background as boolean | undefined }, context.conversationId, context.toolCallId);
+			return this.external.awaitModelResult(task.id, context.conversationId, Boolean(input.run_in_background), context.signal);
+		}
+		if (request.tool === "AgentSend") {
+			await this.external.send({ taskId: input.task_id as string, message: input.message as string, runInBackground: input.run_in_background as boolean | undefined }, context.conversationId);
+			return this.external.awaitModelResult(input.task_id as string, context.conversationId, Boolean(input.run_in_background), context.signal);
+		}
+		if (request.tool === "TaskOutput" && this.external.has(input.task_id as string))
+			return this.external.result(input.task_id as string, { block: input.block as boolean | undefined, timeout: input.timeout as number | undefined }, context.conversationId, context.signal);
+		if (request.tool === "TaskStop" && this.external.has(input.task_id as string)) {
+			await this.external.cancel(input.task_id as string, context.conversationId);
+			return this.external.result(input.task_id as string, {}, context.conversationId);
+		}
+		if (request.tool === "TaskList") {
+			const pi = await this.delegation.handle(context, request.tool, input) as { tasks: unknown[]; truncated: boolean };
+			const external = this.external.list(context.conversationId);
+			return { tasks: [...pi.tasks, ...external.slice(0, 128).map((task) => ({ task_id: task.id, executor: task.executor,
+				description: task.title, status: task.status, turn: task.turn, worktree_id: task.worktreeId, pending_approvals: task.pendingApprovals.length }))], truncated: pi.truncated || external.length > 128 };
+		}
+		if (request.tool === "Agent" && input.executor === "pi") { const { executor: _executor, ...args } = input; return this.delegation.handle(context, request.tool, args); }
+		return this.delegation.handle(context, request.tool, input);
+	}
+
+	subscribeExternal(listener: (event: ExternalEvent) => void): () => void { return this.external.subscribe(listener); }
+	externalExecutors() { return this.external.executors(); }
+	configureExternal(input: ExternalExecutorInput) { return this.external.configure(input); }
+	async startExternal(input: ExternalTaskStartInput) { await this.operation; return this.external.start(input, this.conversation(input.conversationId).id); }
+	listExternal(conversationId?: string) { if (conversationId) this.conversation(conversationId); return this.external.list(conversationId); }
+	externalSnapshot(id: string) { return this.external.snapshot(id); }
+	sendExternal(input: ExternalTaskSendInput) { return this.external.send(input); }
+	externalResult(id: string, options?: { block?: boolean; timeout?: number }) { return this.external.result(id, options); }
+	cancelExternal(id: string) { return this.external.cancel(id); }
+	respondExternal(id: string, requestId: string, response: ExternalApprovalResponse) { return this.external.respond(id, requestId, response); }
+	replayExternal(id: string, afterSequence?: number) { return this.external.replay(id, afterSequence); }
+
 	command(command: Command, conversationId?: string, launch?: number): Promise<unknown> {
 		const result = this.executeCommand(command, conversationId, launch);
 		this.commands.add(result);
@@ -552,7 +676,8 @@ export class DesktopService {
 		if (!allowed.has(command.type) && command.type !== "bash") throw new Error("此命令请通过桌面会话操作执行。");
 		if (["set_model", "set_thinking_level", "compact"].includes(command.type)) this.assertRuntimeIdle(runtime);
 		if (command.type === "bash") {
-			if (this.store.settings.permission === "read") throw new Error("只读模式禁止执行终端命令。");
+			const decision = await evaluatePermission(this.permissionPolicy(active.id), { toolName: "bash", input: { command: command.command } });
+			if (decision.action === "deny") throw new Error(decision.reason);
 			this.assertRuntimeIdle(runtime);
 			this.assertPathAvailable(active.project, active.id);
 			runtime.bashBusy = true;
@@ -566,6 +691,8 @@ export class DesktopService {
 			}
 		}
 		if (command.type === "abort") {
+			await this.delegation.cancelChildren(active.id);
+			await this.external.cancelChildren(active.id);
 			await this.cancelDialogs(runtime);
 			const result = await agent.request(command);
 			return result;
@@ -633,7 +760,7 @@ export class DesktopService {
 		if (command.type === "get_commands")
 			return {
 				commands: (result as { commands: SlashCommand[] }).commands.filter(
-					(item) => item.name !== runtime.navigation?.command,
+					(item) => item.name !== runtime.navigation?.command && item.name !== runtime.controls?.command,
 				),
 			};
 		return result;
@@ -950,6 +1077,164 @@ export class DesktopService {
 		return () => this.taskListeners.delete(listener);
 	}
 
+	subscribeControls(listener: (event: ControlEvent) => void): () => void {
+		this.controlListeners.add(listener);
+		return () => this.controlListeners.delete(listener);
+	}
+
+	async listTools(conversationId?: string): Promise<DesktopToolInfo[]> {
+		await this.operation;
+		const runtime = await this.ensureRuntime(this.conversation(conversationId));
+		return this.controlRequest(runtime, "list");
+	}
+
+	setToolEnabled(input: ToolToggleInput): Promise<DesktopToolInfo[]> {
+		return this.serialize(async () => {
+			const conversation = this.conversation(input.conversationId);
+			const runtime = await this.ensureRuntime(conversation);
+			const tools = await this.controlRequest(runtime, "list");
+			if (!tools.some((tool) => tool.name === input.name)) throw new Error("工具未在此会话注册。");
+			const scope = input.scope ?? "conversation";
+			if (input.project !== undefined && !isAbsolute(input.project)) throw new Error("项目目录需要绝对路径。");
+			const project = scope === "project" ? await realpath(input.project ?? conversation.project) : undefined;
+			await this.toolSettings.toggle({ name: input.name, enabled: input.enabled, scope, project,
+				conversationId: scope === "conversation" ? conversation.id : undefined });
+			await this.refreshControls("tools_changed");
+			return this.controlRequest(runtime, "list");
+		});
+	}
+
+	async permissionSettings(conversationId?: string): Promise<PermissionSettings> {
+		await this.operation;
+		return { rules: this.toolSettings.rules(), effective: this.permissionPolicy(this.conversation(conversationId).id) };
+	}
+
+	upsertPermission(input: PermissionRule): Promise<PermissionSettings> {
+		return this.serialize(async () => {
+			let rule = validatePermissionRule(input);
+			if (rule.scope === "project") rule = { ...rule, project: await realpath(rule.project!) };
+			if (rule.scope === "conversation") this.conversation(rule.conversationId);
+			await this.toolSettings.upsert(rule);
+			await this.refreshControls("permissions_changed");
+			return { rules: this.toolSettings.rules(), effective: this.permissionPolicy(this.requireActive().id) };
+		});
+	}
+
+	removePermission(id: string): Promise<PermissionSettings> {
+		return this.serialize(async () => {
+			await this.toolSettings.remove(id);
+			await this.refreshControls("permissions_changed");
+			return { rules: this.toolSettings.rules(), effective: this.permissionPolicy(this.requireActive().id) };
+		});
+	}
+
+	async checkPermission(input: PermissionCheckInput) {
+		await this.operation;
+		return evaluatePermission(this.permissionPolicy(this.conversation(input.conversationId).id), input);
+	}
+
+	async delegatedTaskResult(id: string, options: { block?: boolean; timeout?: number } = {}) {
+		await this.operation;
+		const task = this.task(id);
+		if (!task.parentConversationId) throw new Error("此任务不是模型委派任务。");
+		return this.delegation.result(task.parentConversationId, { task_id: id, ...options });
+	}
+
+	private permissionPolicy(conversationId: string): RuntimePermissionPolicy {
+		const conversation = this.conversation(conversationId);
+		const task = this.store.tasks.find((item) => item.conversationId === conversationId);
+		const own = this.toolSettings.effective(conversation.project, conversationId);
+		const inherited = this.store.taskPolicies?.[conversationId];
+		const parent = task?.parentConversationId ? this.permissionPolicy(task.parentConversationId) : undefined;
+		const translate = (policy: RuntimePermissionPolicy | undefined): PermissionRule[] => (policy?.rules ?? []).map((rule) => {
+			if (!rule.path || !policy || !isAbsolute(rule.path) || !inside(policy.project, rule.path)) return rule;
+			return { ...rule, path: join(conversation.project, relative(policy.project, rule.path)) };
+		});
+		// A child keeps its spawn ceiling and also receives later parent revocations.
+		const unique = new Map<string, PermissionRule>();
+		for (const rule of [...translate(inherited), ...translate(parent), ...own.rules]) {
+			const signature = JSON.stringify(rule);
+			if (!unique.has(signature)) unique.set(signature, rule);
+		}
+		const ids = new Set<string>();
+		const rules = [...unique.values()].map((rule) => {
+			const result = ids.has(rule.id) ? { ...rule, id: `${rule.id.slice(0, 170)}.${createHash("sha256").update(JSON.stringify(rule)).digest("hex").slice(0, 16)}` } : rule;
+			ids.add(result.id);
+			return result;
+		});
+		const disabledTools = new Set(Object.entries(this.toolOverrides(conversationId)).filter(([, enabled]) => !enabled).map(([name]) => name));
+		for (const name of inherited?.disabledTools ?? []) disabledTools.add(name);
+		for (const name of parent?.disabledTools ?? []) disabledTools.add(name);
+		if (task?.parentConversationId) { disabledTools.add("Agent"); disabledTools.add("AgentSend"); }
+		const mode = task?.readOnly || this.store.settings.permission === "read" || inherited?.mode === "read" || parent?.mode === "read" ? "read"
+			: this.store.settings.permission === "ask" || inherited?.mode === "ask" || parent?.mode === "ask" ? "ask" : "auto";
+		return { version: 1, mode, rules, disabledTools: [...disabledTools], project: conversation.project };
+	}
+
+	private toolOverrides(conversationId: string): Record<string, boolean> {
+		const conversation = this.conversation(conversationId);
+		const task = this.store.tasks.find((item) => item.conversationId === conversationId);
+		const own = this.toolSettings.effective(conversation.project, conversationId).overrides;
+		if (!task?.parentConversationId) return own;
+		const parent = this.conversation(task.parentConversationId);
+		const inherited = this.toolSettings.effective(parent.project, parent.id).overrides;
+		const combined: Record<string, boolean> = { ...inherited, ...own, Agent: false, AgentSend: false };
+		for (const [name, enabled] of Object.entries(inherited)) if (!enabled) combined[name] = false;
+		for (const name of this.store.taskPolicies?.[conversationId]?.disabledTools ?? []) combined[name] = false;
+		return combined;
+	}
+
+	private writeRuntimeControls(runtime: SessionRuntime): Promise<void> {
+		const write = (runtime.controlWrites ?? Promise.resolve()).catch(() => {}).then(async () => {
+			if (runtime.policyFile) await this.atomicJson(runtime.policyFile, this.permissionPolicy(runtime.conversationId));
+			if (runtime.controls) await this.atomicJson(join(runtime.controls.directory, "tools.json"), { overrides: this.toolOverrides(runtime.conversationId) });
+		});
+		runtime.controlWrites = write;
+		return write;
+	}
+
+	private async atomicJson(path: string, value: unknown): Promise<void> {
+		const temporary = `${path}.${randomBytes(8).toString("hex")}.tmp`;
+		try {
+			await writeFile(temporary, JSON.stringify(value), { mode: 0o600 });
+			await rename(temporary, path);
+		} finally { await rm(temporary, { force: true }); }
+	}
+
+	private async refreshControls(type: ControlEvent["type"]): Promise<void> {
+		const runtimes = [...this.runtimes.values()].filter((runtime) => !runtime.stopping);
+		// Write all guards before attempting to refresh model-visible tool declarations.
+		for (const runtime of runtimes) await this.writeRuntimeControls(runtime);
+		await this.external.invalidatePolicies();
+		const updates = await Promise.allSettled(runtimes.filter((runtime) => runtime.controls && runtime.engineStatus === "ready").map((runtime) => this.controlRequest(runtime, "apply")));
+		for (const listener of this.controlListeners) listener({ type, conversationIds: runtimes.map((runtime) => runtime.conversationId) });
+		const failed = updates.find((update) => update.status === "rejected");
+		if (failed?.status === "rejected") throw new Error(`设置已保存，工具声明刷新失败，请重开会话：${String(failed.reason)}`);
+	}
+
+	private controlRequest(runtime: SessionRuntime, operation: "list" | "apply" | "notify", result?: unknown): Promise<DesktopToolInfo[]> {
+		const bridge = runtime.controls;
+		if (!bridge) return Promise.reject(new Error("工具管理扩展未加载，请重新构建桌面运行时。"));
+		const action = bridge.operation.then(async () => {
+			const requestId = randomUUID();
+			const requestFile = join(bridge.directory, "request.json");
+			const responseFile = join(bridge.directory, "response.json");
+			try {
+				await rm(responseFile, { force: true });
+				await this.atomicJson(requestFile, { requestId, operation, ...(operation === "notify" ? { result } : {}) });
+				const response = await this.requireAgent(runtime).request<{ disposition: string }>({ type: "prompt", message: `/${bridge.command} ${bridge.token} ${requestId}` });
+				if (response.disposition !== "handled") throw new Error("工具管理命令未被处理。");
+				const data = JSON.parse(await readFile(responseFile, "utf8"));
+				if (data?.requestId !== requestId || typeof data.ok !== "boolean") throw new Error("工具管理返回格式错误。");
+				if (!data.ok) throw new Error(String(data.error));
+				if (!Array.isArray(data.tools)) throw new Error("工具清单格式错误。");
+				return data.tools as DesktopToolInfo[];
+			} finally { await Promise.all([rm(requestFile, { force: true }), rm(responseFile, { force: true })]); }
+		});
+		bridge.operation = action.then(() => {}, () => {});
+		return action;
+	}
+
 	subscribeTerminals(listener: (event: TerminalEvent) => void): () => void {
 		return this.terminals.subscribe(listener);
 	}
@@ -959,7 +1244,7 @@ export class DesktopService {
 		return structuredClone(this.store.tasks);
 	}
 
-	startTask(input: TaskStartInput): Promise<DesktopTask> {
+	startTask(input: TaskStartInput, delegation?: DelegationMetadata): Promise<DesktopTask> {
 		return this.serialize(async () => {
 			if (this.closed) throw new Error("桌面服务已关闭。");
 			if (!input.message.trim()) throw new Error("请输入任务内容。");
@@ -1002,7 +1287,13 @@ export class DesktopService {
 				revision: 0,
 				model: input.model,
 				thinkingLevel: input.thinkingLevel,
+				...delegation,
 			};
+			if (delegation) {
+				const inherited = this.permissionPolicy(delegation.parentConversationId);
+				this.store.taskPolicies ??= {};
+				this.store.taskPolicies[task.id] = inherited;
+			}
 			this.store.tasks.unshift(task);
 			this.updateTask(task, "queued");
 			await this.persist();
@@ -1025,6 +1316,8 @@ export class DesktopService {
 	async cancelTask(id: string): Promise<DesktopTask> {
 		await this.operation;
 		const task = this.task(id);
+		await this.delegation.cancelChildren(task.conversationId);
+		await this.external.cancelChildren(task.conversationId);
 		if (!["queued", "running", "waiting_for_input"].includes(task.status)) return structuredClone(task);
 		this.updateTask(task, "cancelled");
 		this.launches.set(task.conversationId, (this.launches.get(task.conversationId) ?? 0) + 1);
@@ -1045,8 +1338,8 @@ export class DesktopService {
 	): Promise<TerminalInfo> {
 		return this.serialize(async () => {
 			if (this.closed) throw new Error("桌面服务已关闭。");
-			if (this.store.settings.permission === "read") throw new Error("只读模式禁止创建交互终端。");
 			const conversation = this.conversation(input.conversationId);
+			if (this.permissionPolicy(conversation.id).mode === "read") throw new Error("只读模式禁止创建交互终端。");
 			return this.terminals.create({ ...input, conversationId: conversation.id, project: conversation.project });
 		});
 	}
@@ -1057,7 +1350,8 @@ export class DesktopService {
 	}
 
 	async writeTerminal(id: string, data: string): Promise<void> {
-		if (this.closed || this.store.settings.permission === "read") throw new Error("当前不可向终端输入。");
+		const terminal = this.terminals.list().find((item) => item.id === id);
+		if (this.closed || this.store.settings.permission === "read" || (terminal && this.permissionPolicy(terminal.conversationId).mode === "read")) throw new Error("当前不可向终端输入。");
 		await this.terminals.write(id, data);
 	}
 
@@ -1151,10 +1445,37 @@ export class DesktopService {
 		});
 	}
 
+	private modelWorktreeMutation(operation: "merge", id: string, owner: string, callId: string): Promise<WorktreeMergeResult>;
+	private modelWorktreeMutation(operation: "remove", id: string, owner: string, callId: string): Promise<WorktreeRemoveResult>;
+	private modelWorktreeMutation(operation: "merge" | "remove", id: string, owner: string, callId: string): Promise<WorktreeMergeResult | WorktreeRemoveResult> {
+		return this.serialize(async () => {
+			const runtime = this.runtimes.get(owner);
+			const tool = operation === "merge" ? "WorktreeMerge" : "WorktreeRemove";
+			const calls = Object.values(runtime?.liveTranscript.tools ?? {});
+			if (!runtime || runtime.stopping || runtime.bashBusy || calls.length !== 1 || calls[0].id !== callId || calls[0].name !== tool)
+				throw new Error("Worktree 操作必须是该会话唯一执行中的工具。");
+			const decision = await evaluatePermission(this.permissionPolicy(owner), { toolName: tool, input: { worktree_id: id } });
+			if (decision.action === "deny") throw new Error(decision.reason);
+			const item = (await this.worktrees.list()).find((tree) => tree.id === id);
+			if (!item) throw new Error("Worktree 不存在。");
+			if (operation === "remove" && item.conversationId && item.conversationId !== owner) {
+				const child = this.runtimes.get(item.conversationId);
+				if (child) { this.assertRuntimeIdle(child); await this.stopRuntime(child); }
+			}
+			// Exempt only the waiting tool's owner. Every other task, shell and PTY still blocks.
+			this.worktreeOperationOwner = owner;
+			try { return operation === "merge" ? await this.worktrees.merge(id) : await this.worktrees.remove(id); }
+			finally { this.worktreeOperationOwner = undefined; }
+		});
+	}
+
 	async close(): Promise<void> {
 		this.closed = true;
+		this.delegation.dispose();
+		await this.toolHost.close();
 		this.connectionCheck?.cancel(new Error("桌面服务已关闭，连接测试已取消。"));
 		await this.operation;
+		await this.external.close();
 		await this.terminals.dispose();
 		for (const task of this.store.tasks) {
 			if (["queued", "running", "waiting_for_input"].includes(task.status))
@@ -1168,6 +1489,7 @@ export class DesktopService {
 		await this.persistence;
 		this.listeners.clear();
 		this.taskListeners.clear();
+		this.controlListeners.clear();
 	}
 
 	private active(): Conversation | undefined {
@@ -1190,6 +1512,7 @@ export class DesktopService {
 		return runtime.agent;
 	}
 	private assertIdle(): void {
+		if (this.external.list().some((task) => ["queued", "running", "waiting_for_input"].includes(task.status))) throw new Error("请先停止外部 Agent，再修改全局设置。");
 		for (const runtime of this.runtimes.values()) this.assertRuntimeIdle(runtime);
 		if (this.store.tasks.some((item) => ["queued", "running", "waiting_for_input"].includes(item.status)))
 			throw new Error("请先停止后台任务，再修改全局设置。");
@@ -1216,12 +1539,15 @@ export class DesktopService {
 		task.revision = (task.revision ?? 0) + 1;
 		for (const listener of this.taskListeners) listener({ type: "task_updated", task: structuredClone(task) });
 		void this.persist().catch(() => {});
+		this.delegation.observeTask(task);
+		this.external?.pump();
 	}
-	private pathActive(path: string): boolean {
+	private pathActive(path: string, exceptId?: string): boolean {
 		return (
+			Boolean(this.external?.activeInPath(path)) ||
 			[...this.runtimes.values()].some(
 				(runtime) =>
-					(runtime.engineStatus === "starting" ||
+					runtime.conversationId !== exceptId && (runtime.engineStatus === "starting" ||
 						runtime.busy ||
 						runtime.bashBusy ||
 						Boolean(runtime.settling) ||
@@ -1230,12 +1556,15 @@ export class DesktopService {
 			) ||
 			this.store.tasks.some(
 				(task) =>
-					["queued", "running", "waiting_for_input"].includes(task.status) && overlaps(path, task.workingDirectory),
+					task.conversationId !== exceptId && ["queued", "running", "waiting_for_input"].includes(task.status) && overlaps(path, task.workingDirectory),
 			) ||
 			this.terminals.list().some((terminal) => terminal.status !== "exited" && overlaps(path, terminal.project))
 		);
 	}
-	private assertPathAvailable(project: string, exceptId?: string): void {
+	private assertPathAvailable(project: string, exceptId?: string, externalExceptId?: string): void {
+		// Explore/Plan have a host-enforced read-only ceiling and never write checkpoints.
+		if (exceptId && this.store.tasks.some((task) => task.conversationId === exceptId && task.parentConversationId && task.readOnly)) return;
+		if (this.external?.conflicts(project, externalExceptId)) throw new Error("此目录有运行中的外部 Agent，请使用独立 Worktree。");
 		for (const runtime of this.runtimes.values()) {
 			if (runtime.conversationId === exceptId) continue;
 			if (
@@ -1262,6 +1591,7 @@ export class DesktopService {
 		this.assertPathAvailable(project);
 	}
 	private async startCheckpoint(runtime: SessionRuntime, label: string): Promise<void> {
+		if (this.store.tasks.some((task) => task.conversationId === runtime.conversationId && task.readOnly)) return;
 		if (runtime.checkpointId) return;
 		const workspace = await this.workspace(runtime.conversationId);
 		if (!workspace.isGit) return;
@@ -1281,6 +1611,12 @@ export class DesktopService {
 			await this.saveSessionLeaf(runtime).catch(() => {});
 			this.conversation(runtime.conversationId).updatedAt = Date.now();
 			const task = this.store.tasks.find((item) => item.conversationId === runtime.conversationId);
+			if (task?.parentConversationId && runtime.agent) {
+				const { messages } = await runtime.agent.request<{ messages: Message[] }>({ type: "get_messages" });
+				const final = [...messages].reverse().find((message) => message.role === "assistant");
+				const text = final?.role === "assistant" ? final.content.filter((block) => block.type === "text").map((block) => block.text).join("\n") : "";
+				task.result = { text: text.slice(0, 48 * 1024), truncated: text.length > 48 * 1024 };
+			}
 			if (task && ["running", "waiting_for_input"].includes(task.status))
 				this.updateTask(task, error ? "failed" : aborted ? "cancelled" : "completed", error);
 			await this.persist();
@@ -1293,6 +1629,7 @@ export class DesktopService {
 		} finally {
 			runtime.settling = undefined;
 			void this.scheduleTasks();
+			this.external?.pump();
 		}
 	}
 	private async stopRuntime(runtime: SessionRuntime, cursor: "capture" | "preserve" = "capture"): Promise<void> {
@@ -1318,6 +1655,11 @@ export class DesktopService {
 		if (runtime.checkpointId) await this.finishRuntime(runtime, true);
 		runtime.pendingUI.clear();
 		if (runtime.navigation) await rm(runtime.navigation.directory, { recursive: true, force: true });
+		if (runtime.controls) {
+			this.toolHost.revoke(runtime.controls.hostToken);
+			await rm(runtime.controls.directory, { recursive: true, force: true });
+		}
+		if (runtime.policyFile) await rm(runtime.policyFile, { force: true });
 		if (this.runtimes.get(runtime.conversationId) === runtime) this.runtimes.delete(runtime.conversationId);
 	}
 	private async scheduleTasks(): Promise<void> {
@@ -1325,7 +1667,7 @@ export class DesktopService {
 		this.scheduling = true;
 		try {
 			await this.operation;
-			let active = this.store.tasks.filter((task) => ["running", "waiting_for_input"].includes(task.status)).length;
+			let active = this.store.tasks.filter((task) => ["running", "waiting_for_input"].includes(task.status)).length + this.external.countRunning();
 			for (const task of this.store.tasks.filter((item) => item.status === "queued").reverse()) {
 				if (active >= (this.options.maxConcurrentTasks ?? 4) || this.closed) break;
 				try {
@@ -1341,6 +1683,7 @@ export class DesktopService {
 			}
 		} finally {
 			this.scheduling = false;
+			this.external?.pump();
 		}
 	}
 	private async runTask(task: DesktopTask, launch: number): Promise<void> {
@@ -1486,6 +1829,30 @@ export class DesktopService {
 					};
 			}
 			env.PI_DESKTOP_CONNECTIONS = JSON.stringify(connections);
+			runtime.policyFile = join(this.options.dataDir, `policy-${conversation.id}-${randomBytes(8).toString("hex")}.json`);
+			env.PI_DESKTOP_POLICY_FILE = runtime.policyFile;
+			const delegated = this.store.tasks.find((task) => task.conversationId === conversation.id && task.parentConversationId);
+			// Set these explicitly so an inherited shell environment cannot change a session's role.
+			env.PI_DESKTOP_CHILD = delegated ? "1" : "0";
+			env.PI_DESKTOP_READ_ONLY_CHILD = delegated?.readOnly ? "1" : "0";
+			const toolExtension = this.options.toolControlExtension ?? join(runtimeDir, "tool-control-extension.mjs");
+			const toolsInstalled = await stat(toolExtension).then((info) => info.isFile(), (error: NodeJS.ErrnoException) => {
+				if (error.code === "ENOENT") return false;
+				throw error;
+			});
+			if (toolsInstalled) {
+				await this.toolHost.start();
+				const host = this.toolHost.register(conversation.id);
+				runtime.controls = { directory: await mkdtemp(join(this.options.dataDir, "tools-")), token: randomBytes(32).toString("hex"), command: `desktop-tools-${randomBytes(16).toString("hex")}`, hostToken: host.token, operation: Promise.resolve() };
+				env.PI_DESKTOP_TOOLS_DIR = runtime.controls.directory;
+				env.PI_DESKTOP_TOOLS_TOKEN = runtime.controls.token;
+				env.PI_DESKTOP_TOOLS_COMMAND = runtime.controls.command;
+				env.PI_DESKTOP_TOOLS_FILE = join(runtime.controls.directory, "tools.json");
+				env.PI_DESKTOP_TOOLS_BASELINE_FILE = join(this.options.dataDir, `tool-baseline-${conversation.id}.json`);
+				env.PI_DESKTOP_HOST_URL = host.url;
+				env.PI_DESKTOP_HOST_TOKEN = host.token;
+			}
+			await this.writeRuntimeControls(runtime);
 			const navigationExtension =
 				this.options.navigationExtension ?? join(runtimeDir, "session-navigation-extension.mjs");
 			const navigationInstalled = await stat(navigationExtension).then(
@@ -1512,13 +1879,14 @@ export class DesktopService {
 				"--extension",
 				this.options.permissionExtension ?? join(runtimeDir, "permission-extension.mjs"),
 				...(navigationInstalled ? ["--extension", navigationExtension] : []),
+				...(toolsInstalled ? ["--extension", toolExtension] : []),
 				...(this.options.args ?? []),
 			];
 			if (!sessionFile && this.store.settings.defaultModel) {
 				const model = this.store.settings.defaultModel;
 				args.push("--provider", model.provider, "--model", model.id);
 			}
-			if (this.store.settings.permission === "read")
+			if (this.permissionPolicy(conversation.id).mode === "read")
 				args.push("--tools", "read,grep,find,ls", "--exclude-tools", "mcp__*");
 			const agent = new AgentProcess({
 				executable: this.options.executable,
@@ -1687,7 +2055,7 @@ export class DesktopService {
 				messages = transcript.messages;
 				stats = usage;
 				thinkingLevels = levels.levels;
-				commands = slash.commands.filter((item) => item.name !== runtime.navigation?.command);
+				commands = slash.commands.filter((item) => item.name !== runtime.navigation?.command && item.name !== runtime.controls?.command);
 			} catch (error) {
 				runtime.engineStatus = "error";
 				runtime.engineError = error instanceof Error ? error.message : String(error);
@@ -1836,6 +2204,7 @@ function validateStore(input: unknown): StoredState {
 		},
 		keys: value.keys,
 		tasks: value.tasks ?? [],
+		taskPolicies: value.taskPolicies ? Object.fromEntries(Object.entries(value.taskPolicies).map(([id, policy]) => [id, validateRuntimePolicy(policy)])) : {},
 	};
 }
 

@@ -4,6 +4,12 @@ Pi Desktop 是集成 Pi 编码引擎的独立桌面客户端。Pi 上游项目�
 
 以下保留 Pi 上游的 MIT 版权及许可声明。其他依赖的版权及许可分别以其发布包内的文件为准；此声明不将所有第三方依赖统一许可为 MIT。
 
+## Anthropic Claude Agent SDK
+
+客户端使用 `@anthropic-ai/claude-agent-sdk@0.3.325` 的 JavaScript core 接口驱动用户配置的本机 Claude Code CLI，不附带 SDK 可选的原生 Claude 二进制。发布包在 `runtime/licenses/claude-agent-sdk-LICENSE.md` 保留该依赖的许可声明：
+
+© Anthropic PBC. All rights reserved. Use is subject to the Legal Agreements outlined here: https://code.claude.com/docs/en/legal-and-compliance.
+
 ## Pi upstream — MIT License
 
 Copyright (c) 2025 Mario Zechner

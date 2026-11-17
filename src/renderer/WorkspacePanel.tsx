@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { ArrowLeft, FileCode2, Folder, RefreshCw, X } from "lucide-react";
 import { IconButton } from "../prototype/ui.tsx";
+import { CodeLines, UnifiedDiffView } from "./DiffView.tsx";
 import type { FileEntry, Workspace } from "../shared.ts";
 
 export function WorkspacePanel({
@@ -9,12 +10,14 @@ export function WorkspacePanel({
 	close,
 	revision,
 	project,
+	onReferenceFile,
 }: {
 	pane: "files" | "changes";
 	setPane: (pane: "files" | "changes") => void;
 	close: () => void;
 	revision: number;
 	project?: string;
+	onReferenceFile?: (path: string) => void;
 }) {
 	const [entries, setEntries] = useState<FileEntry[]>([]);
 	const [directory, setDirectory] = useState("");
@@ -98,10 +101,21 @@ export function WorkspacePanel({
 							返回
 						</button>
 						<span title={content.path}>{content.path}</span>
+						{onReferenceFile && (
+							<button type="button" className="cc-mini-btn" onClick={() => onReferenceFile(content.path)} title="插入 @文件引用 到输入框">
+								@引用
+							</button>
+						)}
 					</div>
-					<pre className={`live-file-content ${pane === "changes" ? "live-diff" : ""}`}>
-						{content.content || (pane === "changes" ? "此文件没有可显示的文本差异。" : "空文件")}
-					</pre>
+					{pane === "changes" ? (
+						<div className="live-file-content live-diff">
+							<UnifiedDiffView diff={content.content} />
+						</div>
+					) : (
+						<div className="live-file-content">
+							{content.content ? <CodeLines content={content.content} /> : <p className="subtle-note">空文件</p>}
+						</div>
+					)}
 				</>
 			) : pane === "files" ? (
 				<>

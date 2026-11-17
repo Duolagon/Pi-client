@@ -16,15 +16,24 @@ import {
 	ShieldCheck,
 	SquarePen,
 	Archive,
+	History,
+	ListTodo,
+	SlidersHorizontal,
+	GitFork,
 } from "lucide-react";
-import type { Conversation, DesktopAPI, PermissionMode, Snapshot } from "../shared.ts";
+import type { Conversation, DesktopAPI, DesktopTask, ExternalTask, PermissionMode, Snapshot } from "../shared.ts";
 import { IconButton, Modal, PiMark } from "../prototype/ui.tsx";
 import { useDesktop } from "./useDesktop.ts";
 import { TranscriptView } from "./TranscriptView.tsx";
-import { LiveComposer } from "./LiveComposer.tsx";
+import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
 import { PermissionDialog } from "./PermissionDialog.tsx";
 import { SettingsDialog } from "./SettingsDialog.tsx";
 import { WorkspacePanel } from "./WorkspacePanel.tsx";
+import { ControlsDialog } from "./ControlsDialog.tsx";
+import { CheckpointsDialog } from "./CheckpointsDialog.tsx";
+import { TasksDrawer } from "./TasksDrawer.tsx";
+import { SessionsDialog } from "./SessionsDialog.tsx";
+import { TerminalPanel } from "./TerminalPanel.tsx";
 import "../prototype/style.css";
 import "./style.css";
 
@@ -70,10 +79,15 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [query, setQuery] = useState("");
 	const [pane, setPane] = useState<"changes" | "files" | null>(null);
 	const [terminalOpen, setTerminalOpen] = useState(false);
-	const [shellInput, setShellInput] = useState("");
+	const [controlsTab, setControlsTab] = useState<"tools" | "permissions" | "executors" | null>(null);
+	const [checkpointsOpen, setCheckpointsOpen] = useState(false);
+	const [tasksOpen, setTasksOpen] = useState(false);
+	const [sessionsOpen, setSessionsOpen] = useState(false);
+	const [tasksMap, setTasksMap] = useState<Record<string, DesktopTask>>({});
+	const [externalTasksMap, setExternalTasksMap] = useState<Record<string, ExternalTask>>({});
+	const [gitSummary, setGitSummary] = useState<{ branch: string; count: number; isGit: boolean } | null>(null);
 	const [rename, setRename] = useState<string | null>(null);
 	const scroll = useRef<HTMLDivElement>(null);
-	const shell = useRef<HTMLDivElement>(null);
 	const stickToEnd = useRef(true);
 	useEffect(() => {
 		stickToEnd.current = true;
@@ -82,10 +96,65 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		if (stickToEnd.current) scroll.current?.scrollTo({ top: scroll.current.scrollHeight });
 	}, [history, running]);
 	useEffect(() => {
-		shell.current?.scrollTo({ top: shell.current.scrollHeight });
-	}, [app.terminal]);
+		let active = true;
+		void api.tasks.list().then((list) => {
+			if (!active) return;
+			const next: Record<string, DesktopTask> = {};
+			for (const t of list) next[t.id] = t;
+			setTasksMap(next);
+		}).catch(() => {});
+		void api.externalAgents.list().then((list) => {
+			if (!active) return;
+			const next: Record<string, ExternalTask> = {};
+			for (const t of list) next[t.id] = t;
+			setExternalTasksMap(next);
+		}).catch(() => {});
+		const unsub = api.tasks.onEvent((event) => {
+			if (event.type === "task_updated") {
+				setTasksMap((prev) => {
+					const current = prev[event.task.id];
+					if (current && current.revision >= event.task.revision) return prev;
+					return { ...prev, [event.task.id]: event.task };
+				});
+			}
+		});
+		const unsubExt = api.externalAgents.onEvent((packet) => {
+			if (packet.event.type === "task_updated") {
+				const t = packet.event.task;
+				setExternalTasksMap((prev) => {
+					const current = prev[t.id];
+					if (current && current.revision >= t.revision) return prev;
+					return { ...prev, [t.id]: t };
+				});
+			}
+		});
+		return () => {
+			active = false;
+			unsub();
+			unsubExt();
+		};
+	}, [api]);
+	useEffect(() => {
+		if (!snapshot?.active?.project) {
+			setGitSummary(null);
+			return;
+		}
+		let active = true;
+		void api
+			.workspace()
+			.then((ws) => {
+				if (active) setGitSummary({ branch: ws.branch, count: ws.changes.length, isGit: ws.isGit });
+			})
+			.catch(() => {});
+		return () => {
+			active = false;
+		};
+	}, [snapshot?.active?.project, app.revision]);
 	const blocked = running || changing || bashBusy;
 	const project = snapshot?.projects.find((item) => item.path === snapshot.active?.project);
+	const taskList = [...Object.values(tasksMap), ...Object.values(externalTasksMap)];
+	const activeTaskCount = taskList.filter((t) => t.status === "running" || t.status === "queued").length;
+	const waitingTaskCount = taskList.filter((t) => t.status === "waiting_for_input").length;
 	const switchTo = (operation: () => ReturnType<DesktopAPI["snapshot"]>) => {
 		setSearching(false);
 		setPane(null);
@@ -94,6 +163,35 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const savePermission = async (permission: PermissionMode) => {
 		if (!snapshot) return;
 		await app.switchTo(() => api.saveSettings({ permission, theme: snapshot.settings.theme }));
+	};
+	const handleBuiltinSlash = (action: BuiltinSlashAction) => {
+		if (action === "compact") {
+			if (!blocked && history.messages.length) void app.command({ type: "compact" });
+		} else if (action === "new") {
+			if (!blocked && snapshot?.active) switchTo(() => api.newConversation());
+		} else if (action === "permissions") {
+			setControlsTab("permissions");
+		} else if (action === "mcp") {
+			setControlsTab("tools");
+		} else if (action === "rewind") {
+			setCheckpointsOpen(true);
+		} else if (action === "tasks") {
+			setTasksOpen(true);
+		} else if (action === "sessions") {
+			setSessionsOpen(true);
+		} else if (action === "cost") {
+			const s = snapshot?.stats;
+			if (s) {
+				app.setNotice(
+					`会话统计：输入 ${s.tokens.input} · 输出 ${s.tokens.output} · 总计 ${s.tokens.total} tokens · 费用 $${s.cost.toFixed(4)}`,
+				);
+			} else {
+				app.setNotice("当前会话暂无 Token 统计。");
+			}
+		} else if (action === "plan") {
+			if (snapshot && snapshot.settings.permission !== "read") void savePermission("read");
+			app.setDraft("请先以只读方式调研相关代码并输出详细实现计划，待我确认后再修改文件：\n");
+		}
 	};
 	useEffect(() => {
 		const onKey = (event: KeyboardEvent) => {
@@ -220,8 +318,25 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						>
 							{snapshot.active?.title ?? "打开一个项目开始"}
 						</button>
+						{project && (
+							<span className="cc-project-pill" title={project.path}>
+								{project.name}
+								{gitSummary?.isGit && gitSummary.branch ? ` · ${gitSummary.branch}` : ""}
+							</span>
+						)}
 					</div>
 					<div className="cl-top-tools">
+						<IconButton icon={History} label="检查点与回滚" disabled={!snapshot.active} onClick={() => setCheckpointsOpen(true)} />
+						<span className="cc-tool-btn-wrap">
+							<IconButton icon={ListTodo} label="后台任务与 Worktree" onClick={() => setTasksOpen(true)} />
+							{(activeTaskCount > 0 || waitingTaskCount > 0) && (
+								<span className={`cc-topbar-badge ${waitingTaskCount > 0 ? "warn" : ""}`}>
+									{waitingTaskCount > 0 ? `!${waitingTaskCount}` : activeTaskCount}
+								</span>
+							)}
+						</span>
+						<IconButton icon={SlidersHorizontal} label="工具与权限" onClick={() => setControlsTab("tools")} />
+						<IconButton icon={GitFork} label="会话分支树" disabled={!snapshot.active} onClick={() => setSessionsOpen(true)} />
 						<IconButton icon={RefreshCw} label="刷新会话" disabled={blocked} onClick={() => void app.refresh()} />
 						<IconButton icon={Archive} label="压缩上下文" disabled={blocked || !history.messages.length} onClick={() => void app.command({ type: "compact" })} />
 						<IconButton
@@ -310,6 +425,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										</button>
 									)}
 									{snapshot.active && <p className="cl-empty-path">{snapshot.active.project}</p>}
+									<div className="cc-empty-hints">
+										<span><kbd>⌘N</kbd> 新建会话</span>
+										<span><kbd>⌘K</kbd> 搜索会话</span>
+										<span><kbd>/</kbd> 斜杠命令</span>
+										<span><kbd>Shift+Enter</kbd> 换行</span>
+									</div>
 								</div>
 							)}
 							{running && (
@@ -332,45 +453,24 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							command={app.command}
 							setPermission={(permission) => void savePermission(permission)}
 							openSettings={() => setSettings(true)}
+							onBuiltinSlash={handleBuiltinSlash}
 							fail={app.fail}
 						/>
 					</div>
 					{terminalOpen && (
-						<section className="terminal-panel" aria-label="集成终端">
-							<header>
-								<span>
-									<TerminalIcon size={14} />
-									Pi 命令执行
-								</span>
-								<span className="terminal-demo">{snapshot.active?.project}</span>
-								{bashBusy && <button onClick={() => void app.command({ type: "abort_bash" })}>停止命令</button>}
-								<IconButton icon={X} label="关闭终端" onClick={() => setTerminalOpen(false)} />
-							</header>
-							<div className="terminal-output" ref={shell}>
-								<pre>{app.terminal || "直接输入命令在当前项目运行，输出会加入会话上下文。"}</pre>
-								<form
-									onSubmit={(event) => {
-										event.preventDefault();
-										if (shellInput.trim()) {
-											void app.bash(shellInput.trim());
-											setShellInput("");
-										}
-									}}
-								>
-									<label htmlFor="shell-command">$</label>
-									<input
-										id="shell-command"
-										aria-label="终端命令"
-										value={shellInput}
-										onChange={(event) => setShellInput(event.target.value)}
-										disabled={blocked || !ready || !snapshot.active || snapshot.settings.permission === "read"}
-										placeholder={
-											snapshot.settings.permission === "read" ? "只读模式下不可执行命令" : "输入命令后按 Enter"
-										}
-									/>
-								</form>
-							</div>
-						</section>
+						<TerminalPanel
+							conversationId={snapshot.active?.id}
+							project={snapshot.active?.project}
+							ready={ready}
+							blocked={blocked}
+							readOnly={snapshot.settings.permission === "read"}
+							bashBusy={bashBusy}
+							bashOutput={app.terminal}
+							onRunBash={(cmd) => app.bash(cmd)}
+							onAbortBash={() => void app.command({ type: "abort_bash" })}
+							onClose={() => setTerminalOpen(false)}
+							fail={app.fail}
+						/>
 					)}
 				</div>
 			</main>
@@ -382,6 +482,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					close={() => setPane(null)}
 					revision={app.revision}
 					project={snapshot.active?.project}
+					onReferenceFile={(filePath) => {
+						const prefix = app.draft && !app.draft.endsWith(" ") && !app.draft.endsWith("\n") ? `${app.draft} ` : app.draft;
+						app.setDraft(`${prefix}@${filePath} `);
+					}}
 				/>
 			)}
 			{settings && (
@@ -454,7 +558,52 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				</Modal>
 			)}
 			{app.requests[0] && (
-				<PermissionDialog key={app.requests[0].id} request={app.requests[0]} respond={app.respond} fail={app.fail} />
+				<PermissionDialog
+					key={app.requests[0].id}
+					request={app.requests[0]}
+					conversationId={snapshot.active?.id}
+					project={snapshot.active?.project}
+					respond={app.respond}
+					fail={app.fail}
+				/>
+			)}
+			{controlsTab && (
+				<ControlsDialog
+					conversationId={snapshot.active?.id}
+					project={snapshot.active?.project}
+					initialTab={controlsTab}
+					close={() => setControlsTab(null)}
+					fail={app.fail}
+				/>
+			)}
+			{checkpointsOpen && (
+				<CheckpointsDialog
+					conversationId={snapshot.active?.id}
+					close={() => setCheckpointsOpen(false)}
+					onRestored={(msg) => {
+						app.setNotice(msg);
+						void app.refresh();
+					}}
+					fail={app.fail}
+				/>
+			)}
+			{tasksOpen && (
+				<TasksDrawer
+					project={snapshot.active?.project}
+					close={() => setTasksOpen(false)}
+					onNotice={(msg) => app.setNotice(msg)}
+					fail={app.fail}
+				/>
+			)}
+			{sessionsOpen && (
+				<SessionsDialog
+					conversationId={snapshot.active?.id}
+					project={snapshot.active?.project}
+					onSnapshot={() => void app.refresh()}
+					onEditorText={(text) => app.setDraft(text)}
+					close={() => setSessionsOpen(false)}
+					fail={app.fail}
+				/>
 			)}
 		</div>
 	);

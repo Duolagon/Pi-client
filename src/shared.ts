@@ -13,6 +13,13 @@ import type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRe
 import type { DesktopTask, TaskEvent, TaskStartInput } from "./task-types.ts";
 import type { DesktopSessionAPI } from "./session-types.ts";
 import type { LiveTranscript } from "./transcript.ts";
+import type { DesktopToolsAPI, DesktopPermissionsAPI } from "./control-types.ts";
+import type { DelegatedTaskResult } from "./delegation-types.ts";
+import type { DesktopExternalAgentsAPI } from "./external-types.ts";
+export type * from "./external-types.ts";
+export type * from "./control-types.ts";
+export type * from "./permission-types.ts";
+export type * from "./tool-control-types.ts";
 
 export type * from "./session-types.ts";
 export type * from "./session-history-types.ts";
@@ -53,6 +60,7 @@ export interface DesktopTaskAPI {
 	list(): Promise<DesktopTask[]>;
 	snapshot(id: string): Promise<Snapshot>;
 	cancel(id: string): Promise<DesktopTask>;
+	result(id: string, options?: { block?: boolean; timeout?: number }): Promise<DelegatedTaskResult>;
 	command(id: string, command: Command): Promise<unknown>;
 	respond(id: string, response: RpcExtensionUIResponse): Promise<void>;
 	files(id: string, path: string): Promise<FileEntry[]>;
@@ -192,6 +200,9 @@ export type DesktopEvent = {
 };
 export type Command = RpcCommand;
 export interface DesktopAPI {
+	externalAgents: DesktopExternalAgentsAPI;
+	tools: DesktopToolsAPI;
+	permissions: DesktopPermissionsAPI;
 	sessions: DesktopSessionAPI;
 	git: DesktopGitAPI;
 	terminals: DesktopTerminalAPI;

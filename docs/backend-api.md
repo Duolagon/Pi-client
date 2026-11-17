@@ -8,9 +8,12 @@
 
 | 命名空间 | 方法 | 用途 |
 | --- | --- | --- |
+| `pi.tools` | `list / setEnabled / onEvent` | 真实工具清单、分范围启停和恢复继承 |
+| `pi.permissions` | `list / upsert / remove / check / onEvent` | 细粒度规则、授权预览与热更新 |
+| `pi.externalAgents` | `executors / configure / start / list / snapshot / send / result / cancel / respond / replay / onEvent` | 本机 Codex／Claude／Kimi 协作与独立审批流 |
 | `pi.git` | `begin / finish / list / diff / restore` | 工作树检查点与安全恢复 |
 | `pi.terminals` | `create / list / write / resize / close / replay / onEvent` | 真正 PTY 与输出回放 |
-| `pi.tasks` | `start / list / snapshot / cancel / command / respond / files / readFile / workspace / diff / onEvent` | 后台任务与指定会话操作 |
+| `pi.tasks` | `start / list / snapshot / result / cancel / command / respond / files / readFile / workspace / diff / onEvent` | 后台任务、模型委派结果与指定会话操作 |
 | `pi.worktrees` | `create / list / remove / merge` | 托管 Worktree 生命周期 |
 | `pi.sessions` | `fork / clone / entries / tree / forkMessages / navigate / history / importHistory` | 会话分支、树导航和 CLI 历史导入 |
 | `pi.onEvent` | 原接口保留 | 所有会话的 Pi 流式事件，按 `conversationId` 路由 |
@@ -228,3 +231,9 @@ Pi 引擎来自精确锁定的 `@earendil-works/pi-coding-agent@1.5.2` 与 `@ear
 `test/packaged-backend-smoke.ts` 可用 esbuild 打包为独立脚本，再由目标 `.app/Contents/MacOS/Pi Desktop` 以 `ELECTRON_RUN_AS_NODE=1` 执行。参数依次为目标 `Contents/Resources` 和 `test/fixtures/faux-provider.js` 的绝对路径。已从 `/tmp` 验收打包后的两路 Pi 运行时、自动检查点与恢复、Worktree 清理后存档读取，以及包内原生 PTY，未启动或修改前端。
 
 `test/packaged-session-smoke.ts` 使用同样的参数和执行方式，另已从 `/tmp` 验证包内的分支、克隆、树查询、私有原生导航扩展、所选分支重启恢复与 CLI 历史导入。两类验收仅使用临时数据和本地 faux 模型。
+
+## 工具控制与主动委派补充
+
+新增 `window.pi.tools`、`window.pi.permissions` 和 `window.pi.tasks.result`；真实模型工具 Agent、TaskOutput/Stop/List 及 Worktree 工具已接入。完整参数、权限规则、热更新语义、父子事件路由和前端卡片约定见 [tools-and-delegation.md](tools-and-delegation.md)。前端页面没有随本次后端接入修改。
+
+本机外部执行器另见 [local-external-agents.md](local-external-agents.md)。外部 Agent 的审批和事件使用独立命名空间，不能用 Pi tasks.respond/snapshot 代替；主模型使用 Agent 的 executor 和 AgentSend 持续协作。SSH 尚未接入。

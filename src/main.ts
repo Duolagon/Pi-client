@@ -1,9 +1,11 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, safeStorage, shell } from "electron";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { DesktopService } from "./backend.ts";
 import { installWorkspaceHandlers } from "./workspace-ipc.ts";
 import { installSessionHandlers } from "./session-ipc.ts";
+import { installControlHandlers } from "./control-ipc.ts";
+import { installExternalHandlers } from "./external-ipc.ts";
 import type { Command, ConnectionInput, DesktopAPI } from "./shared.ts";
 import { captureToolPath } from "./tool-path.ts";
 import type { RpcExtensionUIResponse } from "@earendil-works/pi-coding-agent";
@@ -25,7 +27,7 @@ function createWindow() {
 		title: "Pi Desktop",
 		titleBarStyle: "hidden",
 		trafficLightPosition: { x: 20, y: 17 },
-		backgroundColor: "#fafaf7",
+		backgroundColor: nativeTheme.shouldUseDarkColors ? "#1f1e1a" : "#fafaf7",
 		webPreferences: {
 			preload: join(__dirname, "preload.cjs"),
 			nodeIntegration: false,
@@ -196,6 +198,8 @@ function installHandlers() {
 	});
 	installWorkspaceHandlers(handle, service, command);
 	installSessionHandlers(handle, service);
+	installControlHandlers(handle, service);
+	installExternalHandlers(handle, service);
 }
 
 void app.whenReady().then(() => {
@@ -226,6 +230,12 @@ void app.whenReady().then(() => {
 	});
 	service.subscribeTerminals((event) => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:terminal:event", event);
+	});
+	service.subscribeControls((event) => {
+		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:controls:event", event);
+	});
+	service.subscribeExternal((event) => {
+		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:external:event", event);
 	});
 	installHandlers();
 	Menu.setApplicationMenu(

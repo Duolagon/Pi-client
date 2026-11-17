@@ -334,6 +334,76 @@ try {
 	assert.equal((await snapshot()).active.id, state.active.id);
 	await page.evaluate((id) => window.pi.worktrees.remove(id), task.worktreeId);
 	checks.push("checkpoint, session tree, PTY, background task and worktree preload interfaces");
+	const tools = await page.evaluate(() => window.pi.tools.list());
+	assert.ok(tools.some((tool) => tool.name === "Agent" && tool.modelVisible && tool.source === "desktop"));
+	const enabled = await page.evaluate(() => window.pi.tools.setEnabled({ name: "grep", enabled: true }));
+	assert.ok(enabled.some((tool) => tool.name === "grep" && tool.enabled));
+	await page.evaluate(() => window.pi.permissions.upsert({
+		id: "verify-deny-write", scope: "global", action: "deny", tool: "write", path: "forbidden.txt",
+	}));
+	const decision = await page.evaluate(() => window.pi.permissions.check({ toolName: "write", input: { path: "forbidden.txt", content: "blocked" } }));
+	assert.equal(decision.action, "deny");
+	await page.evaluate(() => window.pi.permissions.remove("verify-deny-write"));
+	await page.evaluate(() => window.pi.tools.setEnabled({ name: "grep", enabled: null }));
+	checks.push("real tool inventory, scoped enablement and permission rule preload interfaces");
+	const executors = await page.evaluate(() => window.pi.externalAgents.executors());
+	assert.deepEqual(executors.map((item) => item.id), ["codex", "claude", "kimi"]);
+	assert.equal(executors.find((item) => item.id === "kimi").capabilities.readOnly, false);
+	assert.deepEqual(await page.evaluate(() => window.pi.externalAgents.list()), []);
+	const configured = await page.evaluate(() => window.pi.externalAgents.configure({ id: "codex", enabled: false }));
+	assert.equal(configured.find((item) => item.id === "codex").enabled, false);
+	await page.evaluate(() => window.pi.externalAgents.configure({ id: "codex", enabled: true }));
+	checks.push("local external executor discovery, configuration and task namespace through real preload");
+
+	// Verify Claude Code UI modals, autocomplete, and interactive PTY tab
+	await page.getByRole("button", { name: "检查点与回滚", exact: true }).click();
+	await page.getByRole("dialog", { name: "检查点与代码回滚 (/rewind)", exact: true }).waitFor();
+	await page.locator(".cc-rewind-file-bar").filter({ hasText: "greeting.mjs" }).waitFor();
+	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
+
+	await page.getByRole("button", { name: "工具与权限", exact: true }).click();
+	await page.getByRole("dialog", { name: "工具、MCP 与权限规则", exact: true }).waitFor();
+	await page.locator(".cc-tool-ctrl-name strong").getByText("Agent", { exact: true }).waitFor();
+	await page.getByRole("tab", { name: /权限规则/ }).click();
+	await page.getByRole("tab", { name: /外部执行器/ }).click();
+	await page.locator(".cc-tool-ctrl-name strong").getByText("codex", { exact: true }).waitFor();
+	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
+
+	await page.getByRole("button", { name: "后台任务与 Worktree", exact: true }).click();
+	await page.getByRole("dialog", { name: "后台任务、子 Agent 与 Worktree (/tasks)", exact: true }).waitFor();
+	await page.getByRole("tab", { name: /Worktrees/ }).click();
+	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
+
+	await page.getByRole("button", { name: "会话分支树", exact: true }).click();
+	await page.getByRole("dialog", { name: "会话分支树与 CLI 历史导入 (/sessions)", exact: true }).waitFor();
+	await page.getByRole("tab", { name: /Pi CLI 历史/ }).click();
+	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
+
+	await input.fill("/");
+	await page.getByRole("listbox", { name: "斜杠命令", exact: true }).waitFor();
+	await input.fill("@greeting");
+	await page.getByRole("listbox", { name: "引用项目文件", exact: true }).filter({ hasText: "src/greeting.mjs" }).waitFor();
+	await input.fill("");
+
+	await page.locator(".cc-skills-trigger").click();
+	await page.locator(".cl-skills-list").waitFor();
+	const skillsBox = await page.locator(".cl-skills-list").boundingBox();
+	assert.ok(skillsBox && skillsBox.width <= 460 && skillsBox.x >= 0, `Skills popover must stay bounded (${JSON.stringify(skillsBox)})`);
+	await page.getByRole("textbox", { name: "搜索技能或命令", exact: true }).fill("demo-note");
+	await page.locator(".cc-skills-items button").filter({ hasText: "/demo-note" }).click();
+	assert.equal(await input.inputValue(), "/demo-note ");
+	assert.equal(await page.locator(".cl-skills-list").count(), 0);
+	await input.fill("");
+
+	await page.getByRole("button", { name: "终端", exact: true }).click();
+	await page.getByRole("button", { name: /^交互 PTY/ }).click();
+	await page.getByRole("textbox", { name: "PTY 输入", exact: true }).waitFor();
+	await page.getByRole("textbox", { name: "PTY 输入", exact: true }).fill("echo UI_PTY_PANEL_OK");
+	await page.getByRole("textbox", { name: "PTY 输入", exact: true }).press("Enter");
+	await page.locator(".terminal-output").filter({ hasText: "UI_PTY_PANEL_OK" }).waitFor();
+	await page.getByRole("button", { name: "关闭终端", exact: true }).click();
+	checks.push("Claude Code UI modals, autocomplete and PTY panel");
+
 	assert.deepEqual(pageErrors, []);
 	if (capture)
 		for (const name of ["client-light.png", "client-dark.png"])

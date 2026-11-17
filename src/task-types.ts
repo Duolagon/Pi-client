@@ -1,4 +1,5 @@
 import type { Command, ThinkingLevel } from "./shared.ts";
+import type { SubagentType } from "./delegation-types.ts";
 
 export type TaskStatus =
 	| "queued"
@@ -25,6 +26,14 @@ export interface DesktopTask {
 	checkpointId?: string;
 	model?: { provider: string; id: string };
 	thinkingLevel?: ThinkingLevel;
+	/** Present only on model-delegated children; manual tasks have no parent. */
+	parentConversationId?: string;
+	parentToolCallId?: string;
+	subagentType?: SubagentType;
+	delegationDepth?: 1;
+	readOnly?: boolean;
+	runInBackground?: boolean;
+	result?: { text: string; truncated: boolean };
 }
 
 export interface TaskStartInput {

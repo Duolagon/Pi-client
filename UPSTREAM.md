@@ -9,10 +9,13 @@
 | `@earendil-works/pi-coding-agent` | `1.5.2` | RPC 进程、原生会话管理及扩展 API |
 | `@earendil-works/pi-ai` | `1.5.2` | 模型类型、目录和内容处理 |
 | `@earendil-works/pi-agent-core` | `1.5.2` | 消息协议类型 |
+| `@anthropic-ai/claude-agent-sdk` | `0.3.325` | 本机 Claude Code 的 core SDK / helper |
 
 `package.json` 使用精确版本，不使用 `^`、`~` 或 `latest`。`package-lock.json` 同时锁定传递依赖、下载来源及 npm 发布包的 `integrity`，应与依赖修改一起提交。`npm ci --ignore-scripts` 根据锁文件安装，并校验下载包的完整性。
 
 构建脚本从已安装 Pi 包读取 RPC bundle、运行时资源和辅助模块，再复制到应用内。开发者无需预先构建 Pi 上游源码；用户运行打包后的应用也无需全局安装 Pi。
+
+外部 Codex／Claude Code／Kimi Code 使用用户本机安装的官方 CLI。Claude SDK core 被单独打包为约 950 KiB 的 helper；其可选平台 CLI 不进入应用资源。锁文件包含 SDK 的 peer/optional 解析记录，不包含实际依赖目录或原生二进制。许可保留在 NOTICE 与 runtime/licenses；升级 SDK 或原生协议时需同步验证握手、审批 hook、取消和连续会话。
 
 ## 安装与构建
 

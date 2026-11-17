@@ -1,0 +1,418 @@
+import { randomUUID } from "node:crypto";
+import { appendFile, mkdir, readFile, rename, realpath, stat, writeFile } from "node:fs/promises";
+import { isAbsolute, join, relative, sep } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { discoverExecutors, executablePath, validateExecutorInput } from "./external-executors.ts";
+import type { ExternalExecutorSettings } from "./external-executors.ts";
+import { evaluatePermission, validateRuntimePolicy } from "./permission-policy.ts";
+import type { PermissionRule, RuntimePermissionPolicy } from "./permission-types.ts";
+import type { WorktreeCreateInput, WorktreeInfo } from "./worktree-types.ts";
+import type {
+	ExternalAdapter, ExternalAdapterEvent, ExternalApprovalRequest, ExternalApprovalResponse, ExternalEvent,
+	ExternalExecutor, ExternalExecutorInput, ExternalProvider, ExternalReplay, ExternalSession,
+	ExternalTask, ExternalTaskResult, ExternalTaskSendInput, ExternalTaskStartInput,
+} from "./external-types.ts";
+
+const active = new Set(["queued", "running", "waiting_for_input"]);
+const outputLimit = 48 * 1024;
+interface StoredTask { task: ExternalTask; policy: RuntimePermissionPolicy; prompt: string; notify: boolean; notifiedTurn?: number }
+interface Runtime {
+	session?: ExternalSession;
+	abort?: AbortController;
+	running?: Promise<void>;
+	closing?: Promise<void>;
+	events: ExternalEvent[];
+	logBytes: number;
+	logWrites: Promise<void>;
+	approvals: Map<string, { request: ExternalApprovalRequest; resolve(response: ExternalApprovalResponse): void }>;
+}
+export interface ExternalAgentOptions {
+	dataDir: string;
+	env: NodeJS.ProcessEnv;
+	nodeExecutable: string;
+	claudeHelperPath: string;
+	adapters: Record<ExternalProvider, ExternalAdapter>;
+	maxConcurrent?: number;
+	project(conversationId: string): string;
+	policy(conversationId: string): RuntimePermissionPolicy;
+	delegated(conversationId: string): boolean;
+	createWorktree(input: WorktreeCreateInput): Promise<WorktreeInfo>;
+	listWorktrees(): Promise<WorktreeInfo[]>;
+	canStart(task: ExternalTask): boolean;
+	capacity(): number;
+	notify(conversationId: string, result: ExternalTaskResult): Promise<void>;
+	onActivityChange(): void;
+}
+
+/** Own external processes independently of Pi sessions, while preserving immutable parent identity. */
+export class ExternalAgents {
+	private options: ExternalAgentOptions;
+	private settings: ExternalExecutorSettings = {};
+	private tasks = new Map<string, StoredTask>();
+	private runtimes = new Map<string, Runtime>();
+	private listeners = new Set<(event: ExternalEvent) => void>();
+	private operation: Promise<void> = Promise.resolve();
+	private persistence: Promise<void> = Promise.resolve();
+	private pumping = false;
+	private initialized = false;
+	private closed = false;
+	private executorsCache?: { at: number; values: ExternalExecutor[] };
+	constructor(options: ExternalAgentOptions) { this.options = options; }
+
+	async initialize(): Promise<void> {
+		await mkdir(join(this.options.dataDir, "external-events"), { recursive: true, mode: 0o700 });
+		try {
+			const raw = JSON.parse(await readFile(join(this.options.dataDir, "external-agents.json"), "utf8"));
+			if (!raw || raw.version !== 1 || !Array.isArray(raw.tasks) || raw.tasks.length > 500 || !raw.settings || typeof raw.settings !== "object") throw new Error("外部 Agent 存档无效。");
+			for (const [id, entry] of Object.entries(raw.settings)) {
+				const input = validateExecutorInput({ ...(entry as object), id });
+				this.settings[input.id] = { enabled: input.enabled ?? true, executable: input.executable ?? undefined };
+			}
+			for (const record of raw.tasks) {
+				const task = record?.task;
+				if (!task || typeof task.id !== "string" || !/^external-[a-f0-9-]{36}$/.test(task.id) || !["codex", "claude", "kimi"].includes(task.executor) ||
+					typeof task.parentConversationId !== "string" || !/^[a-zA-Z0-9._-]{1,200}$/.test(task.parentConversationId) ||
+					!["queued", "running", "waiting_for_input", "completed", "failed", "cancelled", "interrupted"].includes(task.status) ||
+					typeof task.workingDirectory !== "string" || !isAbsolute(task.workingDirectory) || typeof task.project !== "string" || !isAbsolute(task.project) ||
+					typeof task.output !== "string" || task.output.length > outputLimit || !Number.isSafeInteger(task.turn) || task.turn < 1 ||
+					!Number.isSafeInteger(task.eventSequence) || task.eventSequence < 0 || typeof record.prompt !== "string" || record.prompt.length > 2 * 1024 * 1024)
+					throw new Error("外部任务存档无效。");
+				if (task.nativeSessionId !== undefined && (typeof task.nativeSessionId !== "string" || task.nativeSessionId.length > 500 || task.nativeSessionId.includes("\0"))) throw new Error("外部会话标识无效。");
+				task.pendingApprovals = [];
+				if (active.has(task.status)) { task.status = "interrupted"; task.error = "应用已重启；未重放任务，可显式发送新指令恢复原生会话。"; }
+				this.tasks.set(task.id, { task, policy: validateRuntimePolicy(record.policy), prompt: record.prompt, notify: Boolean(record.notify), notifiedTurn: record.notifiedTurn });
+				// The event log can be newer than the last atomic task snapshot after a crash.
+				const recovered = await this.replay(task.id);
+				task.eventSequence = Math.max(task.eventSequence, recovered.latestSequence);
+				const session = [...recovered.events].reverse().find((event) => event.event.type === "session")?.event;
+				if (session?.type === "session" && typeof session.sessionId === "string" && session.sessionId.length <= 500) task.nativeSessionId = session.sessionId;
+				const runtime = this.runtime(task.id);
+				runtime.logBytes = await stat(join(this.options.dataDir, "external-events", `${task.id}.jsonl`)).then((info) => info.size, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return 0; throw error; });
+			}
+		} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+		this.initialized = true;
+		await this.persist();
+	}
+
+	subscribe(listener: (event: ExternalEvent) => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
+	has(id: string): boolean { return this.tasks.has(id); }
+	countRunning(): number { return [...this.tasks.values()].filter(({ task }) => ["running", "waiting_for_input"].includes(task.status)).length; }
+	activeInPath(path: string): boolean { return [...this.tasks.values()].some(({ task }) => active.has(task.status) && overlaps(path, task.workingDirectory)); }
+	conflicts(path: string, exceptId?: string): boolean { return [...this.tasks.values()].some(({ task }) => task.id !== exceptId && ["running", "waiting_for_input"].includes(task.status) && overlaps(path, task.workingDirectory)); }
+	list(owner?: string): ExternalTask[] { return structuredClone([...this.tasks.values()].map(({ task }) => task).filter((task) => !owner || task.parentConversationId === owner).reverse()); }
+	snapshot(id: string): ExternalTask { return structuredClone(this.record(id).task); }
+	async executors(): Promise<ExternalExecutor[]> {
+		if (!this.executorsCache || Date.now() - this.executorsCache.at > 10000) this.executorsCache = { at: Date.now(), values: await discoverExecutors(this.settings, this.options.env) };
+		return structuredClone(this.executorsCache.values);
+	}
+	configure(value: ExternalExecutorInput): Promise<ExternalExecutor[]> {
+		return this.serialize(async () => {
+			const input = validateExecutorInput(value);
+			if ([...this.tasks.values()].some(({ task }) => task.executor === input.id && active.has(task.status))) throw new Error("请先停止该执行器的活动任务。");
+			const executable = input.executable === undefined ? this.settings[input.id]?.executable : input.executable === null ? undefined : await executablePath(input.executable);
+			this.settings[input.id] = { enabled: input.enabled ?? this.settings[input.id]?.enabled ?? true, executable };
+			for (const [id, runtime] of this.runtimes) if (this.record(id).task.executor === input.id) { await runtime.session?.close(); runtime.session = undefined; }
+			this.executorsCache = undefined;
+			await this.persist();
+			return this.executors();
+		});
+	}
+
+	start(input: ExternalTaskStartInput, owner: string, toolCallId?: string): Promise<ExternalTask> {
+		return this.serialize(async () => {
+			if (this.options.delegated(owner)) throw new Error("子任务不能再委派外部 Agent。");
+			validatePrompt(input.prompt); validateDescription(input.description);
+			if (!["codex", "claude", "kimi"].includes(input.executor)) throw new Error("未知外部执行器。");
+			const previous = toolCallId && [...this.tasks.values()].find(({ task }) => task.parentConversationId === owner && task.parentToolCallId === toolCallId);
+			if (previous) return structuredClone(previous.task);
+			if (this.tasks.size >= 500 || this.list(owner).filter((task) => active.has(task.status)).length >= 8) throw new Error("外部任务数量已达上限，请先完成或停止已有子任务。");
+			const executor = (await this.executors()).find((item) => item.id === input.executor)!;
+			if (!executor.enabled || !executor.available) throw new Error(executor.error ?? "执行器已停用。");
+			const subagentType = input.subagent_type ?? "general-purpose";
+			if (!["Explore", "Plan", "general-purpose"].includes(subagentType)) throw new Error("未知子任务类型。");
+			const project = await realpath(this.options.project(owner));
+			const policy = structuredClone(this.options.policy(owner));
+			const readOnly = policy.mode === "read" || subagentType !== "general-purpose";
+			if (readOnly && !executor.capabilities.readOnly) throw new Error(`${executor.id} 当前协议无法强制只读权限，不能启动 Explore/Plan。`);
+			const isolation = input.isolation ?? (readOnly ? "shared" : "worktree");
+			if (!["shared", "worktree"].includes(isolation) || (!readOnly && isolation === "shared")) throw new Error("外部可写任务必须使用独立 Worktree。");
+			let tree: WorktreeInfo | undefined;
+			if (input.worktree_id) {
+				tree = (await this.options.listWorktrees()).find((item) => item.id === input.worktree_id && item.conversationId === owner && item.status === "ready");
+				if (!tree || isolation !== "worktree" || !contains(tree.repository, project) || this.activeInPath(tree.path)) throw new Error("Worktree 不属于此父会话或仍在使用。");
+			} else if (isolation === "worktree") tree = await this.options.createWorktree({ project, conversationId: owner });
+			const workingDirectory = tree ? await realpath(join(tree.path, relative(tree.repository, project))) : project;
+			const now = Date.now();
+			const task: ExternalTask = { id: `external-${randomUUID()}`, executor: input.executor, parentConversationId: owner, parentToolCallId: toolCallId,
+				title: input.description, project, workingDirectory, worktreeId: tree?.id, subagentType, readOnly, status: "queued", createdAt: now, updatedAt: now,
+				revision: 0, turn: 1, eventSequence: 0, output: "", truncated: false, pendingApprovals: [] };
+			this.tasks.set(task.id, { task, policy, prompt: input.prompt, notify: input.run_in_background ?? false });
+			this.update(task, "queued"); await this.persist(); this.pump(); return structuredClone(task);
+		});
+	}
+
+	send(input: ExternalTaskSendInput, owner?: string): Promise<ExternalTask> {
+		return this.serialize(async () => {
+			validatePrompt(input.message);
+			const record = this.record(input.taskId, owner); const task = record.task;
+			if (active.has(task.status)) throw new Error("子任务仍在运行；请先等待完成或取消，再发送下一轮指令。");
+			await this.runtimes.get(task.id)?.running;
+			await realpath(task.workingDirectory);
+			record.prompt = input.message; record.notify = input.runInBackground ?? false;
+			task.turn++; task.output = ""; task.error = undefined; task.truncated = false;
+			this.update(task, "queued"); await this.persist(); this.pump(); return structuredClone(task);
+		});
+	}
+
+	async result(id: string, options: { block?: boolean; timeout?: number } = {}, owner?: string, signal?: AbortSignal): Promise<ExternalTaskResult> {
+		const timeout = options.block ? options.timeout ?? 60000 : 0;
+		if (!Number.isSafeInteger(timeout) || timeout < 0 || timeout > 60000) throw new Error("等待上限必须为 0–60000 毫秒。");
+		const started = Date.now();
+		let task = this.record(id, owner).task;
+		while (options.block && active.has(task.status) && task.status !== "waiting_for_input" && Date.now() - started < timeout) {
+			signal?.throwIfAborted(); await delay(Math.min(100, timeout - (Date.now() - started)), undefined, { signal }); task = this.record(id, owner).task;
+		}
+		signal?.throwIfAborted();
+		return { task_id: task.id, executor: task.executor, parent_conversation_id: task.parentConversationId, parent_tool_call_id: task.parentToolCallId,
+			status: task.status, turn: task.turn, native_session_id: task.nativeSessionId, worktree_id: task.worktreeId, working_directory: task.workingDirectory,
+			output: task.output, truncated: task.truncated, error: task.error, pending_approvals: task.pendingApprovals.length };
+	}
+	async awaitModelResult(id: string, owner: string, background: boolean, signal?: AbortSignal): Promise<ExternalTaskResult> {
+		if (background) return this.result(id, {}, owner, signal);
+		try {
+			let result: ExternalTaskResult;
+			const started = Date.now();
+			do { result = await this.result(id, { block: true, timeout: 60000 }, owner, signal); }
+			while (active.has(result.status) && !result.pending_approvals && Date.now() - started < 300000);
+			if (active.has(result.status)) this.record(id, owner).notify = true;
+			return result;
+		} catch (error) { if (signal?.aborted) await this.cancel(id, owner); throw error; }
+	}
+
+	async cancel(id: string, owner?: string): Promise<ExternalTask> {
+		const task = this.record(id, owner).task;
+		if (!active.has(task.status)) return structuredClone(task);
+		this.update(task, "cancelled");
+		const runtime = this.runtimes.get(id);
+		this.clearApprovals(task, runtime);
+		runtime?.abort?.abort(new Error("用户取消了外部任务。"));
+		await runtime?.session?.interrupt().catch(() => {});
+		await this.persist(); this.pump(); return structuredClone(task);
+	}
+	async cancelChildren(owner: string): Promise<void> {
+		await Promise.all(this.list(owner).filter((task) => active.has(task.status)).map((task) => this.cancel(task.id, owner)));
+	}
+	/** Protocols without a per-tool authorization hook cannot safely keep running after revocation. */
+	async invalidatePolicies(): Promise<void> {
+		for (const { task } of this.tasks.values()) {
+			if (task.executor === "claude") continue;
+			if (active.has(task.status)) {
+				await this.cancel(task.id);
+				task.error = "宿主权限已更改，外部任务已停止；请在新权限下显式继续。";
+				this.event(task, { type: "task_updated", task: structuredClone(task) });
+			}
+		}
+		await this.persist();
+	}
+	async respond(id: string, requestId: string, response: ExternalApprovalResponse): Promise<void> {
+		const task = this.record(id).task;
+		const runtime = this.runtimes.get(id); const pending = runtime?.approvals.get(requestId);
+		if (!pending || !active.has(task.status)) throw new Error("此外部审批已失效。");
+		if (!["allow", "deny", "cancel"].includes(response.decision)) throw new Error("审批决定无效。");
+		if (response.optionId && !pending.request.options?.some((option) => option.id === response.optionId)) throw new Error("审批选项无效。");
+		if (response.decision === "allow" && pending.request.kind !== "question") {
+			const decision = await evaluatePermission(this.policyFor(this.record(id)), normalizeCall(pending.request));
+			if (decision.action === "deny") { this.resolveApproval(task, runtime!, requestId, { decision: "deny" }); throw new Error(decision.reason); }
+		}
+		this.resolveApproval(task, runtime!, requestId, response);
+		await this.persist();
+	}
+
+	async replay(id: string, afterSequence = 0): Promise<ExternalReplay> {
+		const task = this.record(id).task;
+		if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) throw new Error("输出序号无效。");
+		const runtime = this.runtimes.get(id);
+		await runtime?.logWrites;
+		let events = runtime?.events;
+		if (!events?.length || afterSequence < events[0].sequence - 1) {
+			try {
+				const path = join(this.options.dataDir, "external-events", `${id}.jsonl`);
+				if ((await stat(path)).size > 16 * 1024 * 1024) throw new Error("外部事件日志过大。");
+				events = (await readFile(path, "utf8")).split("\n").filter(Boolean).flatMap((line) => {
+					try { const event = JSON.parse(line) as ExternalEvent; return event.taskId === id && Number.isSafeInteger(event.sequence) ? [event] : []; } catch { return []; }
+				}).slice(-2000);
+			} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; events = []; }
+		}
+		const latestSequence = Math.max(task.eventSequence, events.at(-1)?.sequence ?? 0);
+		return structuredClone({ events: events.filter((event) => event.sequence > afterSequence), latestSequence,
+			truncated: Boolean(events.length && afterSequence < events[0].sequence - 1) });
+	}
+
+	pump(): void {
+		if (this.pumping || this.closed || !this.initialized) return;
+		this.pumping = true;
+		void this.operation.then(() => {
+			for (const record of this.tasks.values()) {
+				if (this.closed || this.countRunning() >= Math.min(this.options.maxConcurrent ?? 4, this.options.capacity())) break;
+				if (record.task.status !== "queued" || !this.options.canStart(record.task)) continue;
+				const runtime = this.runtime(record.task.id);
+				if (runtime.running) continue;
+				this.update(record.task, "running");
+				runtime.abort = new AbortController();
+				runtime.running = this.run(record, runtime).finally(() => { runtime.running = undefined; this.options.onActivityChange(); this.pump(); });
+			}
+		}).finally(() => { this.pumping = false; }).catch(() => {});
+	}
+
+	async close(): Promise<void> {
+		this.closed = true;
+		for (const { task } of this.tasks.values()) {
+			const runtime = this.runtimes.get(task.id);
+			if (active.has(task.status)) { this.update(task, "interrupted", "应用已关闭；任务未自动重放。"); runtime?.abort?.abort(); }
+			this.clearApprovals(task, runtime);
+		}
+		await Promise.allSettled([...this.runtimes.values()].map(async (runtime) => { await runtime.session?.close(); await runtime.running; await runtime.logWrites; }));
+		await this.operation;
+		await this.persist(); await this.persistence;
+		this.listeners.clear();
+	}
+
+	private async run(record: StoredTask, runtime: Runtime): Promise<void> {
+		const task = record.task;
+		try {
+			await realpath(task.workingDirectory);
+			const executor = (await this.executors()).find((item) => item.id === task.executor)!;
+			if (!executor.enabled || !executor.available || !executor.executable) throw new Error(executor.error ?? "执行器不可用。");
+			const env = { ...this.options.env };
+			for (const key of Object.keys(env)) if (key.startsWith("PI_DESKTOP_") || key.startsWith("PI_CODING_")) delete env[key];
+			if (!runtime.session) runtime.session = await this.options.adapters[task.executor].open({
+				executable: executor.executable, cwd: task.workingDirectory, env, resumeSessionId: task.nativeSessionId,
+				policy: this.policyFor(record), helperPath: this.options.claudeHelperPath, nodeExecutable: this.options.nodeExecutable,
+				onEvent: (event) => this.adapterEvent(task, event), onPermission: (request, signal) => this.permission(record, runtime, request, signal),
+			});
+			if (runtime.session.sessionId) task.nativeSessionId = runtime.session.sessionId;
+			await this.persist(); // Save the native ID before submitting a prompt whenever the protocol provides it.
+			runtime.abort!.signal.throwIfAborted();
+			const result = await runtime.session.run(record.prompt, runtime.abort!.signal);
+			if (result.sessionId) task.nativeSessionId = result.sessionId;
+			if (result.text) { task.output = result.text.slice(0, outputLimit); task.truncated = result.text.length > outputLimit; }
+			if (active.has(task.status)) this.update(task, result.status === "cancelled" ? "cancelled" : "completed");
+		} catch (error) {
+			if (active.has(task.status)) this.update(task, runtime.abort?.signal.aborted ? "cancelled" : "failed", error instanceof Error ? error.message : String(error));
+		} finally {
+			this.clearApprovals(task, runtime);
+			await runtime.session?.close().catch(() => {}); runtime.session = undefined;
+			await this.persist();
+			if (!this.closed && record.notify && record.notifiedTurn !== task.turn && ["completed", "failed"].includes(task.status)) {
+				record.notifiedTurn = task.turn;
+				await this.options.notify(task.parentConversationId, await this.result(task.id)).catch(() => { record.notifiedTurn = undefined; });
+				await this.persist();
+			}
+		}
+	}
+
+	private async permission(record: StoredTask, runtime: Runtime, request: ExternalApprovalRequest, signal?: AbortSignal): Promise<ExternalApprovalResponse> {
+		const task = record.task;
+		if (runtime.abort?.signal.aborted || signal?.aborted || this.closed || !active.has(task.status)) return { decision: "cancel" };
+		if (request.kind !== "question") {
+			const decision = await evaluatePermission(this.policyFor(record), normalizeCall(request));
+			if (runtime.abort?.signal.aborted || signal?.aborted || this.closed || !active.has(task.status)) return { decision: "cancel" };
+			if (decision.action === "deny") return { decision: "deny" };
+			if (decision.action === "allow") return { decision: "allow" };
+		}
+		const id = randomUUID();
+		const pending = { ...structuredClone(request), id };
+		const cancelled = () => { this.resolveApproval(task, runtime, id, { decision: "cancel" }); };
+		return new Promise<ExternalApprovalResponse>((resolve) => {
+			runtime.approvals.set(id, { request: pending, resolve }); task.pendingApprovals.push(pending);
+			this.update(task, "waiting_for_input"); this.event(task, { type: "approval", request: pending });
+			void this.persist().catch((error) => runtime.abort?.abort(error));
+			signal?.addEventListener("abort", cancelled, { once: true });
+			if (signal?.aborted) cancelled();
+		}).finally(() => signal?.removeEventListener("abort", cancelled));
+	}
+	private resolveApproval(task: ExternalTask, runtime: Runtime, id: string, response: ExternalApprovalResponse): void {
+		const pending = runtime.approvals.get(id); if (!pending) return;
+		runtime.approvals.delete(id); task.pendingApprovals = task.pendingApprovals.filter((item) => item.id !== id);
+		this.event(task, { type: "approval_resolved", id });
+		if (!task.pendingApprovals.length && task.status === "waiting_for_input") this.update(task, "running");
+		pending.resolve(response);
+	}
+	private clearApprovals(task: ExternalTask, runtime?: Runtime): void {
+		for (const id of [...runtime?.approvals.keys() ?? []]) this.resolveApproval(task, runtime!, id, { decision: "cancel" });
+		task.pendingApprovals = [];
+	}
+	private policyFor(record: StoredTask): RuntimePermissionPolicy {
+		const task = record.task; const current = this.options.policy(task.parentConversationId);
+		const unique = new Map<string, PermissionRule>();
+		for (const source of [record.policy, current]) for (const rule of source.rules) {
+			const mapped = rule.path && isAbsolute(rule.path) && contains(source.project, rule.path)
+				? { ...rule, path: join(task.workingDirectory, relative(source.project, rule.path)) } : rule;
+			unique.set(JSON.stringify(mapped), mapped);
+		}
+		const rules = [...unique.values()].map((rule, index) => ({ ...rule, id: `external-${index}-${rule.id.slice(0, 150)}` }));
+		return { version: 1, project: task.workingDirectory, mode: task.readOnly || current.mode === "read" || record.policy.mode === "read" ? "read" : current.mode === "ask" || record.policy.mode === "ask" ? "ask" : "auto",
+			rules, disabledTools: [...new Set([...record.policy.disabledTools, ...current.disabledTools, "Agent", "AgentSend"])] };
+	}
+	private adapterEvent(task: ExternalTask, event: ExternalAdapterEvent): void {
+		if (event.type === "session") {
+			task.nativeSessionId = event.sessionId;
+			void this.persist().catch(() => this.runtimes.get(task.id)?.abort?.abort(new Error("无法保存原生会话标识。")));
+		}
+		if (event.type === "text_delta") {
+			const text = task.output + event.text; task.output = text.slice(0, outputLimit); task.truncated ||= text.length > outputLimit;
+		}
+		this.event(task, event);
+	}
+	private update(task: ExternalTask, status: ExternalTask["status"], error?: string): void {
+		task.status = status; task.error = error; task.updatedAt = Date.now(); task.revision++;
+		this.event(task, { type: "task_updated", task: structuredClone(task) }); this.options.onActivityChange();
+	}
+	private event(task: ExternalTask, event: ExternalEvent["event"]): void {
+		const runtime = this.runtime(task.id);
+		const packet: ExternalEvent = { taskId: task.id, executor: task.executor, parentConversationId: task.parentConversationId,
+			sequence: ++task.eventSequence, turn: task.turn, timestamp: Date.now(), event };
+		let line = JSON.stringify(packet);
+		if (Buffer.byteLength(line) > 256 * 1024) { packet.event = { type: "diagnostic", message: "此事件超过 256 KiB，已省略；结果可从原生会话查询。" }; line = JSON.stringify(packet); }
+		runtime.events.push(packet); while (runtime.events.length > 2000 || Buffer.byteLength(JSON.stringify(runtime.events)) > 4 * 1024 * 1024) runtime.events.shift();
+		const payload = `${line}\n`; runtime.logBytes += Buffer.byteLength(payload);
+		const rotate = runtime.logBytes > 8 * 1024 * 1024;
+		if (rotate) runtime.logBytes = Buffer.byteLength(payload);
+		runtime.logWrites = runtime.logWrites.catch(() => {}).then(() => rotate
+			? writeFile(join(this.options.dataDir, "external-events", `${task.id}.jsonl`), payload, { mode: 0o600 })
+			: appendFile(join(this.options.dataDir, "external-events", `${task.id}.jsonl`), payload, { mode: 0o600 })).catch((error) => {
+			runtime.abort?.abort(error);
+		});
+		for (const listener of this.listeners) listener(structuredClone(packet));
+	}
+	private runtime(id: string): Runtime {
+		let runtime = this.runtimes.get(id);
+		if (!runtime) { runtime = { events: [], logBytes: 0, logWrites: Promise.resolve(), approvals: new Map() }; this.runtimes.set(id, runtime); }
+		return runtime;
+	}
+	private record(id: string, owner?: string): StoredTask {
+		const record = this.tasks.get(id);
+		if (!record || owner && record.task.parentConversationId !== owner) throw new Error("此会话没有该外部子任务。");
+		return record;
+	}
+	private serialize<T>(action: () => Promise<T>): Promise<T> {
+		const promise = this.operation.then(() => { if (this.closed) throw new Error("外部执行器已关闭。"); return action(); });
+		this.operation = promise.then(() => {}, () => {}); return promise;
+	}
+	private persist(): Promise<void> {
+		const body = JSON.stringify({ version: 1, settings: this.settings, tasks: [...this.tasks.values()] });
+		this.persistence = this.persistence.catch(() => {}).then(async () => {
+			const target = join(this.options.dataDir, "external-agents.json");
+			await writeFile(`${target}.tmp`, body, { mode: 0o600 }); await rename(`${target}.tmp`, target);
+		}); return this.persistence;
+	}
+}
+
+function validatePrompt(value: string): void { if (typeof value !== "string" || !value.trim() || value.length > 2 * 1024 * 1024 || value.includes("\0")) throw new Error("外部任务指令无效。"); }
+function validateDescription(value: string): void { if (typeof value !== "string" || !value.trim() || value.length > 160 || value.includes("\0")) throw new Error("外部任务名称无效。"); }
+function contains(root: string, path: string): boolean { const part = relative(root, path); return !isAbsolute(part) && part !== ".." && !part.startsWith(`..${sep}`); }
+function overlaps(left: string, right: string): boolean { return contains(left, right) || contains(right, left); }
+function normalizeCall(request: ExternalApprovalRequest) {
+	const names: Record<string, string> = { Read: "read", Write: "write", Edit: "edit", MultiEdit: "edit", Bash: "bash", Shell: "bash", Grep: "grep", Glob: "find", List: "ls", LS: "ls" };
+	return { toolName: names[request.toolName] ?? request.toolName, input: { ...request.input, ...(typeof request.input.file_path === "string" ? { path: request.input.file_path } : {}) } };
+}

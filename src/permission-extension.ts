@@ -2,6 +2,7 @@ import type { ExtensionAPI, ModelRegistry, ProviderModelConfig } from "@earendil
 import type { ConnectionMode, ConnectionProtocol, Provider } from "./shared.ts";
 import { connectionDefaults, connectionMode } from "./model-connections.ts";
 import { providerModels } from "./provider-presets.ts";
+import { evaluatePermission, loadRuntimePermissionPolicy } from "./permission-policy.ts";
 
 interface Connection {
 	baseUrl?: string;
@@ -72,10 +73,21 @@ export default function permissions(pi: ExtensionAPI) {
 		}
 	});
 	pi.on("tool_call", async (event, ctx) => {
-		if (["read", "grep", "find", "ls"].includes(event.toolName)) return;
-		if (process.env.PI_DESKTOP_PERMISSION_MODE === "read") return { block: true, reason: "当前为只读模式。" };
-		if (process.env.PI_DESKTOP_PERMISSION_MODE === "auto") return;
-		const allowed = await ctx.ui.confirm(`允许执行 ${event.toolName}？`, JSON.stringify(event.input, null, 2));
-		if (!allowed) return { block: true, reason: "用户未批准此操作。" };
+		try {
+			const policy = await loadRuntimePermissionPolicy();
+			const decision = await evaluatePermission(policy, event);
+			if (decision.action === "deny") return { block: true, reason: decision.reason };
+			if (decision.action === "allow") return;
+			const allowed = await ctx.ui.confirm(
+				`允许执行 ${event.toolName}？`,
+				`${decision.reason}\n\n${JSON.stringify(event.input, null, 2)}`,
+			);
+			if (!allowed) return { block: true, reason: "用户未批准此操作。" };
+			// An approval dialog can stay open while the host revokes this tool or adds a deny rule.
+			const latest = await evaluatePermission(await loadRuntimePermissionPolicy(), event);
+			if (latest.action === "deny") return { block: true, reason: latest.reason };
+		} catch (error) {
+			return { block: true, reason: `无法验证工具权限：${error instanceof Error ? error.message : String(error)}` };
+		}
 	});
 }
