@@ -261,6 +261,14 @@ test("TodoWrite and WebFetch follow policy modes and SSRF host guards", async ()
 		assert.equal(todoResult.details.todos.length, 1);
 		await assert.rejects(registered.get("WebFetch")!.execute("tc-2", { url: "http://127.0.0.1:8080" }), /private or loopback/);
 		await assert.rejects(registered.get("WebFetch")!.execute("tc-3", { url: "http://localhost/admin" }), /private or loopback/);
+		await assert.rejects(
+			registered.get("WebFetch")!.execute("tc-5", { url: "http://[::ffff:127.0.0.1]:8080/" }),
+			/private or loopback/,
+		);
+		await assert.rejects(
+			registered.get("WebFetch")!.execute("tc-6", { url: "http://[fc00::1]/" }),
+			/private or loopback/,
+		);
 		await assert.rejects(registered.get("WebFetch")!.execute("tc-4", { url: "file:///etc/passwd" }), /http and https/);
 	} finally {
 		if (previousHost === undefined) delete process.env.PI_DESKTOP_HOST_URL;

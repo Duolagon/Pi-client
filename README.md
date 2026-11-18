@@ -71,9 +71,9 @@ DeepSeek 默认使用 `deepseek-flash`，并提供 `deepseek-v4-pro`；模型与
 - 文本和图片附件、可检索 Skills 浮层、`@` 文件与 `/` 命令补全、会话 HTML 导出与上下文压缩。
 - 工具清单、工具与细粒度权限管理弹窗：支持全局／项目／会话作用域启停、恢复继承以及 `allow / ask / deny` 规则增删。
 - MCP 服务器管理（`/mcp`）：读写用户 `~/.pi/agent/mcp.json` 与项目 `.pi/mcp.json`，支持 stdio/HTTP 增删、启停和描述；保存后重启当前项目会话，OAuth 登录仍使用 `pi mcp login <server>`。
-- 项目信任：打开含 `.pi/settings.json`、`.pi/mcp.json`、`.pi/extensions`、`.pi/skills`、`.pi/prompts`、`.pi/SYSTEM.md` 或祖先 `.agents/skills` 的项目时显示信任横幅与资源清单；未信任时不加载这些项目配置，信任后重启会话生效，顶栏可随时更改。`跳过确认（危险）` 模式有常驻风险提示。
+- 项目信任：打开含 `.pi/settings.json`、`.pi/mcp.json`、`.pi/agents`、`.claude/agents`、`.pi/extensions`、`.pi/skills`、`.pi/prompts`、`.pi/SYSTEM.md` 或祖先 `.agents/skills` 的项目时显示信任横幅与资源清单；未信任时不加载这些项目配置，信任后重启会话生效，顶栏可随时更改。`跳过确认（危险）` 模式有常驻风险提示。
 - 模型主动 `Agent` 委派、前台等待／后台结果回传、只读 Explore／Plan 与 Worktree 编码子任务；后台任务与 Worktree 弹窗支持查看详情、子任务审批、停止、快进合并与安全清理。
-- 自定义 Agent（`/agents`）：读取 `.claude/agents` 与 `.pi/agents`，支持名称、描述、提示词、工具白名单、模型和思考强度；`Agent` 工具可按名称委派，只读定义自动共享、可写定义默认 Worktree。
+- 自定义 Agent（`/agents`）：读取 `.claude/agents` 与 `.pi/agents`（项目级需项目信任），支持名称、描述、提示词、工具白名单、模型和思考强度；`Agent` 工具可按名称委派，只读定义自动共享、可写定义默认 Worktree。
 - 本机 Codex／Claude Code／Kimi Code 执行器：主动委派、原生会话持续协作、审批、结果回传和取消；支持在界面启用/停用、配置可执行路径并管理任务审批与续写。
 - Git 检查点（`/rewind`）：Pi 提示和直接命令自动捕获，支持弹窗差异对比、按单文件或全部安全恢复及冲突提示。
 - Git 暂存、放弃修改与提交，以及 Unified / Split（分栏）Diff 视图切换。

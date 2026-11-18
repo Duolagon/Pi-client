@@ -1,6 +1,7 @@
-import { mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, relative, sep } from "node:path";
+import { managedDirectory } from "./managed-path.ts";
 import type { AgentDefinition, AgentRemoveInput, AgentSaveInput, AgentScope } from "./agent-types.ts";
 import type { ThinkingLevel } from "./shared.ts";
 
@@ -54,7 +55,8 @@ const builtins: AgentDefinition[] = [
 
 interface AgentDirectory {
 	scope: Exclude<AgentScope, "builtin">;
-	path: string;
+	base: string;
+	segments: string[];
 	removable: boolean;
 }
 
@@ -119,6 +121,8 @@ function parseAgent(content: string, file: string, scope: Exclude<AgentScope, "b
 	const thinkingLevel = data.thinkingLevel && thinkingLevels.has(data.thinkingLevel as ThinkingLevel)
 		? (data.thinkingLevel as ThinkingLevel)
 		: undefined;
+	const known = new Set(["name", "description", "tools", "model", "thinkingLevel"]);
+	const extra = Object.fromEntries(Object.entries(data).filter(([key]) => !known.has(key)));
 	return {
 		name,
 		description,
@@ -130,14 +134,18 @@ function parseAgent(content: string, file: string, scope: Exclude<AgentScope, "b
 		scope,
 		source: file,
 		removable,
+		...(Object.keys(extra).length ? { extra } : {}),
 	};
 }
 
-function serializeAgent(input: AgentSaveInput): string {
+function serializeAgent(input: AgentSaveInput, extra: Record<string, string> = {}): string {
 	const lines = ["---", `name: ${input.name}`, `description: ${JSON.stringify(input.description)}`];
 	if (input.tools?.length) lines.push(`tools: [${input.tools.join(", ")}]`);
 	if (input.model) lines.push(`model: ${input.model}`);
 	if (input.thinkingLevel) lines.push(`thinkingLevel: ${input.thinkingLevel}`);
+	for (const [key, value] of Object.entries(extra)) {
+		if (/^[A-Za-z0-9_-]+$/.test(key)) lines.push(`${key}: ${JSON.stringify(value)}`);
+	}
 	lines.push("---", "", input.prompt.trim(), "");
 	return lines.join("\n");
 }
@@ -152,33 +160,28 @@ export class AgentRegistry {
 
 	private directories(project: string): AgentDirectory[] {
 		return [
-			{ scope: "user", path: join(homedir(), ".claude", "agents"), removable: false },
-			{ scope: "user", path: join(this.agentDir(), "agents"), removable: true },
-			{ scope: "project", path: join(project, ".claude", "agents"), removable: false },
-			{ scope: "project", path: join(project, ".pi", "agents"), removable: true },
+			{ scope: "user", base: join(homedir(), ".claude"), segments: ["agents"], removable: false },
+			{ scope: "user", base: this.agentDir(), segments: ["agents"], removable: true },
+			{ scope: "project", base: project, segments: [".claude", "agents"], removable: false },
+			{ scope: "project", base: project, segments: [".pi", "agents"], removable: true },
 		];
 	}
 
-	async list(project: string): Promise<AgentDefinition[]> {
+	async list(project: string, trusted = true): Promise<AgentDefinition[]> {
 		const merged = new Map<string, AgentDefinition>(builtins.map((agent) => [agent.name, agent]));
-		for (const directory of this.directories(project)) {
-			let names: string[];
-			let root: string;
-			try {
-				root = await realpath(directory.path);
-				names = (await readdir(root, { withFileTypes: true }))
-					.filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
-					.map((entry) => entry.name);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-				throw error;
-			}
+		for (const descriptor of this.directories(project)) {
+			if (!trusted && descriptor.scope === "project") continue;
+			const root = await managedDirectory(descriptor.base, descriptor.segments, false);
+			if (!root) continue;
+			const names = (await readdir(root, { withFileTypes: true }))
+				.filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+				.map((entry) => entry.name);
 			for (const name of names) {
 				const file = join(root, name);
 				try {
 					const actual = await realpath(file);
 					if (!inside(root, actual)) continue;
-					const definition = parseAgent(await readFile(actual, "utf8"), actual, directory.scope, directory.removable);
+					const definition = parseAgent(await readFile(actual, "utf8"), actual, descriptor.scope, descriptor.removable);
 					if (definition) merged.set(definition.name, definition);
 				} catch (error) {
 					if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
@@ -194,15 +197,16 @@ export class AgentRegistry {
 		});
 	}
 
-	async resolve(project: string, name: string): Promise<AgentDefinition | undefined> {
-		const agents = await this.list(project);
+	async resolve(project: string, name: string, trusted = true): Promise<AgentDefinition | undefined> {
+		const agents = await this.list(project, trusted);
 		return agents.find((agent) => agent.name === name);
 	}
 
-	async save(project: string, input: AgentSaveInput): Promise<AgentDefinition[]> {
+	async save(project: string, input: AgentSaveInput, trusted = true): Promise<AgentDefinition[]> {
 		const name = text(input.name, "Agent 名称", 64);
 		if (!namePattern.test(name)) throw new Error("Agent 名称只能包含字母、数字、点、下划线和短横线。");
 		if (builtins.some((agent) => agent.name === name)) throw new Error("不能覆盖内置 Agent。");
+		if (input.scope === "project" && !trusted) throw new Error("请先信任项目，再修改项目级 Agent。");
 		const description = text(input.description, "Agent 描述", 500);
 		const prompt = text(input.prompt, "Agent 提示词", 64 * 1024);
 		const tools = normalizeTools(input.tools);
@@ -210,22 +214,43 @@ export class AgentRegistry {
 		if (thinkingLevel && !thinkingLevels.has(thinkingLevel)) throw new Error("Agent 思考强度无效。");
 		const model = input.model === undefined ? undefined : text(input.model, "Agent 模型", 300);
 		if (model && !parseModel(model)) throw new Error("Agent 模型需使用 provider/model-id 格式。");
-		const directory = input.scope === "project" ? join(project, ".pi", "agents") : join(this.agentDir(), "agents");
-		await mkdir(directory, { recursive: true, mode: 0o700 });
+		const directory = await managedDirectory(
+			input.scope === "project" ? project : this.agentDir(),
+			input.scope === "project" ? [".pi", "agents"] : ["agents"],
+			true,
+		);
+		if (!directory) throw new Error("无法创建 Agent 目录。");
 		const target = join(directory, `${name}.md`);
 		const temporary = `${target}.tmp`;
-		await writeFile(temporary, serializeAgent({ ...input, name, description, prompt, tools, model }), { mode: 0o600 });
+		let extra: Record<string, string> = {};
+		try {
+			const info = await lstat(target);
+			if (info.isSymbolicLink()) throw new Error("Agent 配置文件不能是符号链接。");
+			extra = parseFrontmatter(await readFile(target, "utf8")).data;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		const known = new Set(["name", "description", "tools", "model", "thinkingLevel"]);
+		extra = Object.fromEntries(Object.entries(extra).filter(([key]) => !known.has(key)));
+		await writeFile(temporary, serializeAgent({ ...input, name, description, prompt, tools, model }, extra), { mode: 0o600 });
 		await rename(temporary, target);
 		return this.list(project);
 	}
 
-	async remove(project: string, input: AgentRemoveInput): Promise<AgentDefinition[]> {
+	async remove(project: string, input: AgentRemoveInput, trusted = true): Promise<AgentDefinition[]> {
 		const name = text(input.name, "Agent 名称", 64);
 		if (!namePattern.test(name)) throw new Error("Agent 名称无效。");
 		if (builtins.some((agent) => agent.name === name)) throw new Error("不能删除内置 Agent。");
-		const directory = input.scope === "project" ? join(project, ".pi", "agents") : join(this.agentDir(), "agents");
-		const target = resolve(directory, `${name}.md`);
+		if (input.scope === "project" && !trusted) throw new Error("请先信任项目，再删除项目级 Agent。");
+		const directory = await managedDirectory(
+			input.scope === "project" ? project : this.agentDir(),
+			input.scope === "project" ? [".pi", "agents"] : ["agents"],
+			false,
+		);
+		if (!directory) throw new Error("Agent 目录不存在。");
+		const target = join(directory, `${name}.md`);
 		if (!inside(directory, target)) throw new Error("Agent 路径越界。");
+		if ((await lstat(target)).isSymbolicLink()) throw new Error("Agent 配置文件不能是符号链接。");
 		await rm(target);
 		return this.list(project);
 	}

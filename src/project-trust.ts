@@ -9,6 +9,8 @@ export const projectTrustResources = [
 	".pi/settings.json",
 	".pi/mcp.json",
 	".pi/hooks.json",
+	".pi/agents",
+	".claude/agents",
 	".pi/SYSTEM.md",
 	".pi/APPEND_SYSTEM.md",
 	".pi/extensions",

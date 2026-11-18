@@ -1,5 +1,7 @@
+import { lookup } from "node:dns/promises";
 import { readFile, realpath, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { isIP } from "node:net";
+import { resolve } from "node:path";
 import type { ExtensionAPI, ModelRegistry, ProviderModelConfig, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ConnectionMode, ConnectionProtocol, Provider } from "./shared.ts";
 import { connectionDefaults, connectionMode } from "./model-connections.ts";
@@ -33,6 +35,120 @@ interface Connection {
 	api?: ConnectionProtocol;
 	mode?: ConnectionMode;
 	presetBaseUrl?: string;
+}
+
+
+const maxFetchBytes = 2 * 1024 * 1024;
+const maxRedirects = 5;
+
+function blockedIpv4(ip: string): boolean {
+	const parts = ip.split(".").map(Number);
+	if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return true;
+	const [a, b, c] = parts;
+	return (
+		a === 0 ||
+		a === 10 ||
+		a === 127 ||
+		a >= 224 ||
+		(a === 100 && b >= 64 && b <= 127) ||
+		(a === 169 && b === 254) ||
+		(a === 172 && b >= 16 && b <= 31) ||
+		(a === 192 && b === 168) ||
+		(a === 192 && b === 0) ||
+		(a === 198 && (b === 18 || b === 19)) ||
+		(a === 198 && b === 51 && c === 100) ||
+		(a === 203 && b === 0 && c === 113)
+	);
+}
+
+function blockedIpv6(ip: string): boolean {
+	const value = ip.toLowerCase();
+	if (value === "::" || value === "::1") return true;
+	if (value.startsWith("fc") || value.startsWith("fd")) return true;
+	if (/^fe[89ab]/.test(value)) return true;
+	if (value.startsWith("ff")) return true;
+	const dotted = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(value);
+	if (dotted) return blockedIpv4(dotted[1]);
+	const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(value);
+	if (hex) {
+		const high = Number.parseInt(hex[1], 16);
+		const low = Number.parseInt(hex[2], 16);
+		return blockedIpv4(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
+	}
+	return false;
+}
+
+function blockedAddress(address: string): boolean {
+	return isIP(address) === 4 ? blockedIpv4(address) : isIP(address) === 6 ? blockedIpv6(address) : true;
+}
+
+async function assertPublicHost(hostname: string): Promise<void> {
+	const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+	if (host === "localhost" || host.endsWith(".local"))
+		throw new Error("Refusing to fetch private or loopback network addresses.");
+	if (isIP(host)) {
+		if (blockedAddress(host)) throw new Error("Refusing to fetch private or loopback network addresses.");
+		return;
+	}
+	let addresses: Array<{ address: string; family: number }>;
+	try {
+		addresses = (await lookup(host, { all: true, verbatim: true })) as Array<{ address: string; family: number }>;
+	} catch {
+		throw new Error("无法解析目标主机。");
+	}
+	if (!addresses.length || addresses.some(({ address }) => blockedAddress(address)))
+		throw new Error("Refusing to fetch private or loopback network addresses.");
+}
+
+async function readLimited(response: Response): Promise<{ text: string; truncated: boolean }> {
+	if (!response.body) return { text: "", truncated: false };
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	let truncated = false;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!value) continue;
+			if (total + value.byteLength > maxFetchBytes) {
+				chunks.push(value.subarray(0, maxFetchBytes - total));
+				total = maxFetchBytes;
+				truncated = true;
+				await reader.cancel().catch(() => {});
+				break;
+			}
+			chunks.push(value);
+			total += value.byteLength;
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	return { text: new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)))), truncated };
+}
+
+async function fetchPublic(url: URL, signal: AbortSignal): Promise<{ response: Response; url: URL }> {
+	let current = url;
+	for (let redirects = 0; redirects <= maxRedirects; redirects++) {
+		await assertPublicHost(current.hostname);
+		const response = await fetch(current.toString(), {
+			signal,
+			redirect: "manual",
+			headers: { "user-agent": "Pi-Desktop/0.1" },
+		});
+		if ([301, 302, 303, 307, 308].includes(response.status)) {
+			const location = response.headers.get("location");
+			await response.body?.cancel().catch(() => {});
+			if (!location) throw new Error(`HTTP ${response.status} redirect without Location.`);
+			const next = new URL(location, current);
+			if (next.protocol !== "http:" && next.protocol !== "https:")
+				throw new Error("Only http and https redirects are supported.");
+			current = next;
+			continue;
+		}
+		return { response, url: current };
+	}
+	throw new Error("Too many redirects.");
 }
 
 export default function permissions(pi: ExtensionAPI) {
@@ -99,41 +215,28 @@ export default function permissions(pi: ExtensionAPI) {
 				const parsed = new URL(rawUrl);
 				if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
 					throw new Error("Only http and https URLs are supported.");
-				const hostName = parsed.hostname.toLowerCase();
-				if (
-					hostName === "localhost" ||
-					hostName === "::1" ||
-					hostName === "[::1]" ||
-					hostName.endsWith(".local") ||
-					/^(127\.|10\.|192\.168\.|169\.254\.|0\.|172\.(1[6-9]|2\d|3[01])\.)/.test(hostName)
-				) {
-					throw new Error("Refusing to fetch private or loopback network addresses.");
-				}
 				const maxChars = typeof rec.max_chars === "number" ? Math.min(Math.max(200, rec.max_chars), 100000) : 24000;
 				const controller = new AbortController();
 				const timer = setTimeout(() => controller.abort(), 15000);
 				const onAbort = () => controller.abort();
 				signal?.addEventListener("abort", onAbort, { once: true });
 				try {
-					const res = await fetch(parsed.toString(), {
-						signal: controller.signal,
-						headers: { "user-agent": "Pi-Desktop/0.1" },
-					});
-					if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-					const text = (await res.text()).slice(0, 2 * 1024 * 1024);
-					const contentType = res.headers.get("content-type") ?? "";
+					const { response, url } = await fetchPublic(parsed, controller.signal);
+					if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+					const body = await readLimited(response);
+					const contentType = response.headers.get("content-type") ?? "";
 					const readable = contentType.includes("html")
-						? text
+						? body.text
 								.replace(/<script[\s\S]*?<\/script>/gi, " ")
 								.replace(/<style[\s\S]*?<\/style>/gi, " ")
 								.replace(/<[^>]+>/g, " ")
 								.replace(/\s+/g, " ")
 								.trim()
-						: text;
-					const truncated = readable.length > maxChars;
+						: body.text;
+					const truncated = body.truncated || readable.length > maxChars;
 					return {
 						content: [{ type: "text", text: readable.slice(0, maxChars) + (truncated ? "\n\n[Truncated]" : "") }],
-						details: { url: parsed.toString(), status: res.status, truncated },
+						details: { url: url.toString(), status: response.status, truncated },
 					};
 				} finally {
 					clearTimeout(timer);

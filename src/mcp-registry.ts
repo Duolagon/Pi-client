@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { managedFile } from "./managed-path.ts";
 import type { McpRemoveInput, McpSaveInput, McpScope, McpServerInfo, McpTransport } from "./mcp-types.ts";
 
 type JsonObject = Record<string, unknown>;
@@ -78,15 +79,17 @@ export class McpRegistry {
 		this.agentDir = options.agentDir;
 	}
 
-	private path(scope: McpScope, project: string): string {
-		return scope === "project" ? join(project, ".pi", "mcp.json") : join(this.agentDir(), "mcp.json");
+	private async path(scope: McpScope, project: string, create: boolean): Promise<string | undefined> {
+		return scope === "project"
+			? managedFile(project, [".pi"], "mcp.json", create)
+			: managedFile(this.agentDir(), [], "mcp.json", create);
 	}
 
 	async list(project: string): Promise<McpServerInfo[]> {
-		const userPath = this.path("user", project);
-		const projectPath = this.path("project", project);
-		const user = await readConfig(userPath);
-		const local = await readConfig(projectPath);
+		const userPath = await this.path("user", project, false);
+		const projectPath = await this.path("project", project, false);
+		const user = userPath ? await readConfig(userPath) : { data: {}, servers: {} };
+		const local = projectPath ? await readConfig(projectPath) : { data: {}, servers: {} };
 		const merged = new Map<string, McpServerInfo>();
 		for (const [name, entry] of Object.entries(user.servers)) {
 			const transport = transportOf(entry);
@@ -100,7 +103,7 @@ export class McpRegistry {
 				url: typeof entry.url === "string" ? entry.url : undefined,
 				description: typeof entry.description === "string" ? entry.description : undefined,
 				enabled: entry.enabled !== false,
-				source: userPath,
+				source: userPath!,
 				overridden: false,
 			});
 		}
@@ -109,7 +112,7 @@ export class McpRegistry {
 			const transport = transportOf(entry) ?? base?.transport;
 			if (!transport) continue;
 			const inherits = !transportOf(entry) && Boolean(base);
-			const source = inherits ? base!.source : projectPath;
+			const source = inherits ? base!.source : projectPath!;
 			const effective = inherits ? { ...(base ?? {}), ...entry } : entry;
 			merged.set(name, {
 				name,
@@ -131,7 +134,8 @@ export class McpRegistry {
 		const name = text(input.name, "MCP 服务器名称", 64);
 		if (!namePattern.test(name)) throw new Error("MCP 服务器名称只能包含字母、数字、下划线和短横线。");
 		if (input.scope !== "user" && input.scope !== "project") throw new Error("MCP 作用域无效。");
-		const file = this.path(input.scope, project);
+		const file = await this.path(input.scope, project, true);
+		if (!file) throw new Error("无法创建 MCP 配置目录。");
 		const config = await readConfig(file);
 		if (input.overrideOnly) {
 			const existing = config.servers[name];
@@ -180,7 +184,8 @@ export class McpRegistry {
 		const name = text(input.name, "MCP 服务器名称", 64);
 		if (!namePattern.test(name)) throw new Error("MCP 服务器名称无效。");
 		if (input.scope !== "user" && input.scope !== "project") throw new Error("MCP 作用域无效。");
-		const file = this.path(input.scope, project);
+		const file = await this.path(input.scope, project, false);
+		if (!file) throw new Error("MCP 配置不存在。");
 		const config = await readConfig(file);
 		if (!config.servers[name]) throw new Error("MCP 服务器不存在于此作用域。");
 		delete config.servers[name];
