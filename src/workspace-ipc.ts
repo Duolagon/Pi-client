@@ -120,6 +120,19 @@ export function installWorkspaceHandlers(
 		if (file !== "AGENTS.md" && file !== "CLAUDE.md") throw new Error("记忆文件名无效。");
 		return service.writeMemory(file, string(content, "记忆内容", 1024 * 1024));
 	});
+	handle("pi:workspace:context-report", () => service.contextReport());
+	handle("pi:workspace:write-memory-file", (relativePath, content) =>
+		service.writeMemoryFile(string(relativePath, "记忆文件路径", 500), string(content, "记忆内容", 1024 * 1024)),
+	);
+	handle("pi:workspace:delete-memory-rule", (relativePath) =>
+		service.deleteMemoryRule(string(relativePath, "规则文件路径", 500)),
+	);
+	handle("pi:plan:read", (conversationId) => service.readPlan(optionalId(conversationId)));
+	handle("pi:plan:write", (content, conversationId) =>
+		service.writePlan(string(content, "计划内容", 512 * 1024), optionalId(conversationId)),
+	);
+	handle("pi:btw", (question) => service.askBtw(string(question, "侧问问题", 32768)));
+	handle("pi:sandbox:status", () => service.sandboxStatus());
 }
 
 function pathArray(value: unknown): string[] {

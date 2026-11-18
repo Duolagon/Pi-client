@@ -73,6 +73,8 @@ export interface DelegationCallbacks {
 	isGit(project: string): Promise<boolean>;
 	/** Shared writable work must not wait forever behind the delegating parent. */
 	canRunShared?(parentConversationId: string, readOnly: boolean): boolean | Promise<boolean>;
+	/** Return true if parent conversation is currently in engine-level plan mode. */
+	isPlanMode?(parentConversationId: string): boolean | Promise<boolean>;
 	/** Wake the parent with a compact result, without copying the child's complete transcript. */
 	notify?(parentConversationId: string, result: DelegatedTaskResult): void | Promise<void>;
 }

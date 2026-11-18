@@ -448,19 +448,63 @@ try {
 
 	await page.locator("button.cc-plan-pill").click();
 	await until(
-		async () => (await page.getByRole("combobox", { name: "权限模式", exact: true }).inputValue()) === "read",
-		"Plan mode read-only switch",
+		async () => (await page.getByRole("combobox", { name: "权限模式", exact: true }).inputValue()) === "plan",
+		"Plan mode switch",
 	);
 	await submit("请以只读方式分析实现计划。");
 	await page.getByText("已收到补充指令，客户端与 Pi 引擎连接正常。", { exact: true }).waitFor();
 	await idle();
 	await page.getByRole("region", { name: "计划审批", exact: true }).waitFor();
+	await page.getByRole("button", { name: "编写计划正文", exact: true }).click();
+	await page.getByRole("textbox", { name: "编辑计划内容", exact: true }).fill("# E2E Plan\n1. Check plan persistence\n");
 	await page.getByRole("button", { name: "退出 Plan", exact: true }).click();
 	await until(
 		async () => (await page.getByRole("combobox", { name: "权限模式", exact: true }).inputValue()) === "ask",
 		"Plan mode restore ask",
 	);
 	await input.fill("");
+
+	await page.getByRole("button", { name: "工具与权限", exact: true }).click();
+	await page.getByRole("dialog", { name: "工具、MCP 与权限规则", exact: true }).waitFor();
+	await page.getByRole("tab", { name: /^Hooks/ }).click();
+	await page.getByRole("textbox", { name: "Hook 命令", exact: true }).fill("echo HOOK_UI_OK");
+	await page.getByRole("button", { name: "添加 Hook", exact: true }).click();
+	await page.getByText("echo HOOK_UI_OK", { exact: true }).waitFor();
+	await page.getByRole("button", { name: "测试触发", exact: true }).click();
+	await page.getByText(/执行 .* 个 Hook/).waitFor();
+	await page.getByRole("tab", { name: /^Skills/ }).click();
+	await page.getByRole("textbox", { name: "Skill 名称", exact: true }).fill("e2e-skill");
+	await page.getByRole("textbox", { name: "Skill 描述", exact: true }).fill("E2E skill test");
+	await page.getByRole("textbox", { name: "Skill 指令正文", exact: true }).fill("Run tests first.");
+	await page.getByRole("button", { name: "保存 Skill", exact: true }).click();
+	await page.getByText("/e2e-skill", { exact: true }).waitFor();
+	assert.match(await readFile(join(project, ".pi", "skills", "e2e-skill", "SKILL.md"), "utf8"), /name: e2e-skill/);
+	await page.getByRole("button", { name: "删除 Skill e2e-skill", exact: true }).click();
+	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
+
+	await page.getByRole("button", { name: "项目记忆与状态", exact: true }).click();
+	await page.getByRole("dialog", { name: "项目记忆与会话状态", exact: true }).waitFor();
+	await page.getByRole("textbox", { name: "新建规则文件名", exact: true }).fill("ui-rule");
+	await page.getByRole("button", { name: "新建规则", exact: true }).click();
+	await until(async () => {
+		try {
+			await access(join(project, ".claude", "rules", "ui-rule.md"));
+			return true;
+		} catch {
+			return false;
+		}
+	}, "ui-rule.md created");
+	await page.getByRole("tab", { name: /上下文分析/ }).click();
+	await page.locator('[aria-label="上下文分段占用条"]').waitFor();
+	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
+
+	await page.getByRole("button", { name: "命令面板", exact: true }).click();
+	await page.getByRole("dialog", { name: "命令面板 (⌘P)", exact: true }).waitFor();
+	await page.locator(".search-results button").filter({ hasText: "会话内关键词搜索" }).click();
+	await page.getByRole("search", { name: "会话内查找", exact: true }).waitFor();
+	await page.getByRole("textbox", { name: "查找会话内容", exact: true }).fill("问候函数");
+	await page.getByRole("button", { name: "关闭会话查找", exact: true }).click();
+	checks.push("Hooks UI, Skills manager, rules hierarchy, /context breakdown and transcript search");
 
 	await page.getByRole("combobox", { name: "权限模式", exact: true }).selectOption("acceptEdits");
 	await until(

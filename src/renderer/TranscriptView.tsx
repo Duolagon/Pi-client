@@ -565,6 +565,35 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 		};
 	}
 
+	if (name === "AskUserQuestion") {
+		const qs = Array.isArray(a.questions) ? (a.questions as Array<{ header?: string; question?: string }>) : [];
+		return {
+			verb: "AskUser",
+			target: qs[0]?.header || qs[0]?.question || "结构化确认提问",
+			badge: `${qs.length || 1} 题`,
+			treeSummary: summarizeDesktopJson(output, status === "running" ? "等待用户选择…" : "已提交回答"),
+		};
+	}
+
+	if (name === "ExitPlanMode") {
+		return {
+			verb: "ExitPlan",
+			target: typeof a.title === "string" && a.title ? a.title : ".pi/plans/",
+			badge: status === "done" ? "plan ready" : status,
+			treeSummary: summarizeDesktopJson(output, "已保存计划文件，等待批准实施"),
+		};
+	}
+
+	if (name === "NotebookEdit") {
+		const nbPath = typeof a.notebook_path === "string" ? a.notebook_path : "notebook.ipynb";
+		return {
+			verb: "Notebook",
+			target: nbPath,
+			badge: typeof a.edit_mode === "string" ? a.edit_mode : "replace",
+			treeSummary: output?.trim().split("\n")[0].slice(0, 110) || "已更新 Notebook 单元格",
+		};
+	}
+
 	if (name === "Agent" || name === "AgentSend") {
 		const subType = typeof a.subagent_type === "string" ? a.subagent_type : "general-purpose";
 		const desc = typeof a.description === "string" ? a.description : typeof a.task_id === "string" ? a.task_id : "Subagent task";

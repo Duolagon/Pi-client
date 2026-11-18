@@ -8,12 +8,15 @@ import { dirname, join, relative } from "node:path";
 export const projectTrustResources = [
 	".pi/settings.json",
 	".pi/mcp.json",
+	".pi/hooks.json",
 	".pi/SYSTEM.md",
 	".pi/APPEND_SYSTEM.md",
 	".pi/extensions",
 	".pi/skills",
 	".pi/prompts",
 	".pi/themes",
+	".claude/settings.json",
+	".claude/settings.local.json",
 ] as const;
 
 async function exists(path: string): Promise<boolean> {

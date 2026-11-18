@@ -36,6 +36,7 @@ import type {
 	DesktopTask,
 	ExternalTask,
 	PermissionMode,
+	PlanFileState,
 	ProjectTrustDecision,
 	Snapshot,
 } from "../shared.ts";
@@ -46,7 +47,7 @@ import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
 import { PermissionDialog } from "./PermissionDialog.tsx";
 import { SettingsDialog } from "./SettingsDialog.tsx";
 import { WorkspacePanel } from "./WorkspacePanel.tsx";
-import { ControlsDialog } from "./ControlsDialog.tsx";
+import { ControlsDialog, type ControlsTab } from "./ControlsDialog.tsx";
 import { CheckpointsDialog } from "./CheckpointsDialog.tsx";
 import { TasksDrawer } from "./TasksDrawer.tsx";
 import { SessionsDialog } from "./SessionsDialog.tsx";
@@ -102,16 +103,23 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [query, setQuery] = useState("");
 	const [pane, setPane] = useState<"changes" | "files" | null>(null);
 	const [terminalOpen, setTerminalOpen] = useState(false);
-	const [controlsTab, setControlsTab] = useState<"tools" | "permissions" | "executors" | null>(null);
+	const [controlsTab, setControlsTab] = useState<ControlsTab | null>(null);
 	const [checkpointsOpen, setCheckpointsOpen] = useState(false);
 	const [rewindQuery, setRewindQuery] = useState<string | undefined>(undefined);
 	const [tasksOpen, setTasksOpen] = useState(false);
 	const [taskInitialId, setTaskInitialId] = useState<string | undefined>(undefined);
 	const [sessionsOpen, setSessionsOpen] = useState(false);
-	const [memoryTab, setMemoryTab] = useState<"memory" | "status" | null>(null);
+	const [memoryTab, setMemoryTab] = useState<"memory" | "context" | "status" | null>(null);
 	const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 	const [paletteOpen, setPaletteOpen] = useState(false);
 	const [planMode, setPlanMode] = useState(false);
+	const [planState, setPlanState] = useState<PlanFileState | null>(null);
+	const [planEditorOpen, setPlanEditorOpen] = useState(false);
+	const [planDraft, setPlanDraft] = useState("");
+	const [btwState, setBtwState] = useState<{ loading: boolean; question: string; answer?: string; error?: string; model?: string } | null>(null);
+	const [findOpen, setFindOpen] = useState(false);
+	const [findQuery, setFindQuery] = useState("");
+	const [findIndex, setFindIndex] = useState(0);
 	const [trustOpen, setTrustOpen] = useState(false);
 	const [trustBusy, setTrustBusy] = useState(false);
 	const [agentsOpen, setAgentsOpen] = useState(false);
@@ -199,7 +207,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	};
 	const savePermission = async (permission: PermissionMode) => {
 		if (!snapshot) return;
-		if (permission !== "read" && planMode) setPlanMode(false);
+		if (permission !== "plan" && planMode) setPlanMode(false);
+		if (permission === "plan" && !planMode) setPlanMode(true);
 		await app.switchTo(() => api.saveSettings({ permission, theme: snapshot.settings.theme }));
 	};
 	const decideTrust = async (decision: ProjectTrustDecision) => {
@@ -217,27 +226,53 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	};
 	const togglePlanMode = async () => {
 		if (!snapshot) return;
-		if (planMode) {
+		const inPlan = planMode || snapshot.settings.permission === "plan";
+		if (inPlan) {
 			setPlanMode(false);
+			setPlanEditorOpen(false);
 			await savePermission("ask");
 		} else {
 			setPlanMode(true);
-			if (snapshot.settings.permission !== "read") await savePermission("read");
-			if (!app.draft.trim()) app.setDraft("请先以只读方式调研相关代码并输出详细实现计划，待我确认后再修改文件：\n");
+			if (snapshot.settings.permission !== "plan") await savePermission("plan");
+			if (!app.draft.trim()) app.setDraft("请先调研相关代码并将实施计划写入 .pi/plans/，完成后调用 ExitPlanMode 提交审批：\n");
 		}
 	};
 	const approvePlanAndExecute = async (mode: PermissionMode) => {
 		if (!snapshot) return;
 		setPlanMode(false);
+		setPlanEditorOpen(false);
+		if (planDraft.trim() && planDraft !== planState?.content) {
+			await api.writePlan(planDraft).catch(() => {});
+		}
 		await app.switchTo(() => api.saveSettings({ permission: mode, theme: snapshot.settings.theme }));
-		await app.send({ type: "prompt", message: "计划已批准。请严格按上述计划实施代码修改并运行相关测试验证。", images: [] });
+		const planRef = planState?.exists ? `（计划文件：${planState.relativePath}）` : "";
+		await app.send({ type: "prompt", message: `计划已批准${planRef}。请严格按上述计划实施代码修改并运行相关测试验证。`, images: [] });
 	};
 	const sendInitPrompt = () => {
 		app.setDraft("请分析当前项目结构、构建脚本、测试命令和代码规范，创建或更新根目录的 AGENTS.md 项目指南文件。");
 	};
+	const runBtw = async (question: string) => {
+		const q = question.trim();
+		if (!q) return;
+		setBtwState({ loading: true, question: q });
+		try {
+			const res = await api.btw(q);
+			setBtwState({ loading: false, question: q, answer: res.answer, model: res.model });
+		} catch (error) {
+			setBtwState({ loading: false, question: q, error: error instanceof Error ? error.message : String(error) });
+		}
+	};
 	const handleBuiltinSlash = (action: BuiltinSlashAction) => {
 		if (action === "compact") {
 			if (!blocked && history.messages.length) void app.command({ type: "compact" });
+		} else if (action === "context") {
+			setMemoryTab("context");
+		} else if (action === "hooks") {
+			setControlsTab("hooks");
+		} else if (action === "skills") {
+			setControlsTab("skills");
+		} else if (action === "btw") {
+			app.setDraft("/btw ");
 		} else if (action === "new") {
 			if (!blocked && snapshot?.active) switchTo(() => api.newConversation());
 		} else if (action === "permissions") {
@@ -289,6 +324,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				event.preventDefault();
 				setPaletteOpen((open) => !open);
 			}
+			if (lower === "f" && snapshot?.active) {
+				event.preventDefault();
+				setFindOpen((open) => !open);
+			}
 			if (lower === "n" && snapshot?.active && !blocked) {
 				event.preventDefault();
 				switchTo(() => api.newConversation());
@@ -297,6 +336,21 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		window.addEventListener("keydown", onKey);
 		return () => window.removeEventListener("keydown", onKey);
 	});
+	const activeConvId = snapshot?.active?.id;
+	const activePermMode = snapshot?.settings.permission;
+	useEffect(() => {
+		if (!activeConvId || !(planMode || activePermMode === "plan")) {
+			setPlanState(null);
+			return;
+		}
+		let mounted = true;
+		void api.readPlan(activeConvId).then((res) => {
+			if (!mounted) return;
+			setPlanState(res);
+			setPlanDraft(res.content);
+		}).catch(() => {});
+		return () => { mounted = false; };
+	}, [activeConvId, planMode, activePermMode, app.revision, running]);
 	if (!snapshot)
 		return (
 			<div className="cl-start">
@@ -327,25 +381,40 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		return [];
 	})();
 	const lastMessage = history.messages[history.messages.length - 1];
+	const inPlanMode = planMode || snapshot.settings.permission === "plan";
 	const showPlanApproval =
-		planMode &&
-		snapshot.settings.permission === "read" &&
+		inPlanMode &&
 		!running &&
 		!blocked &&
-		Boolean(lastMessage && lastMessage.role === "assistant");
+		Boolean(planState?.exists || (lastMessage && lastMessage.role === "assistant"));
+	const jumpFindMatch = (nextIdx: number) => {
+		const container = scroll.current;
+		const term = findQuery.trim().toLowerCase();
+		if (!container || !term) return;
+		const nodes = Array.from(container.querySelectorAll(".cl-msg")) as HTMLElement[];
+		const hits = nodes.filter((el) => (el.textContent ?? "").toLowerCase().includes(term));
+		if (!hits.length) return;
+		const clamped = ((nextIdx % hits.length) + hits.length) % hits.length;
+		setFindIndex(clamped);
+		hits[clamped].scrollIntoView({ behavior: "smooth", block: "center" });
+	};
 	const paletteActions: PaletteAction[] = [
 		{ id: "new", label: "新建会话", shortcut: "⌘N", keywords: "new session clear", disabled: blocked || !snapshot.active, run: () => switchTo(() => api.newConversation()) },
 		{ id: "search", label: "搜索历史会话", shortcut: "⌘K", keywords: "search find", run: () => { setQuery(""); setSearching(true); } },
+		{ id: "find", label: "会话内关键词搜索", shortcut: "⌘F", keywords: "find in transcript", disabled: !snapshot.active, run: () => setFindOpen(true) },
 		{ id: "open", label: "打开项目文件夹", keywords: "open project folder", disabled: blocked, run: () => void app.switchTo(() => api.openProject()) },
-		{ id: "plan", label: planMode ? "退出 Plan 计划模式" : "进入 Plan 计划模式", keywords: "plan mode readonly", disabled: blocked, run: () => void togglePlanMode() },
+		{ id: "plan", label: inPlanMode ? "退出 Plan 计划模式" : "进入 Plan 计划模式", keywords: "plan mode readonly", disabled: blocked, run: () => void togglePlanMode() },
 		{ id: "rewind", label: "检查点与代码回滚 (/rewind)", keywords: "git checkpoint restore", disabled: !snapshot.active, run: () => { setRewindQuery(undefined); setCheckpointsOpen(true); } },
 		{ id: "tasks", label: "后台任务、子 Agent 与 Worktree (/tasks)", keywords: "subagent external codex claude kimi", run: () => { setTaskInitialId(undefined); setTasksOpen(true); } },
 		{ id: "agents", label: "Agents 与子 Agent (/agents)", keywords: "agents subagent custom reviewer", run: () => setAgentsOpen(true) },
 		{ id: "mcp", label: "MCP 服务器管理 (/mcp)", keywords: "mcp servers oauth", run: () => setMcpOpen(true) },
-		{ id: "tools", label: "工具与 MCP 开关 (/mcp)", keywords: "tools mcp enable", run: () => setControlsTab("tools") },
+		{ id: "hooks", label: "生命周期 Hooks 管理 (/hooks)", keywords: "hooks pretooluse posttooluse", run: () => setControlsTab("hooks") },
+		{ id: "skills", label: "Skills 技能查看与创建 (/skills)", keywords: "skills commands prompt", run: () => setControlsTab("skills") },
+		{ id: "tools", label: "工具与 MCP 开关", keywords: "tools mcp enable", run: () => setControlsTab("tools") },
 		{ id: "perms", label: "细粒度权限规则 (/permissions)", keywords: "allow ask deny rules", run: () => setControlsTab("permissions") },
 		{ id: "sessions", label: "会话分支树与 CLI 历史导入 (/sessions)", keywords: "tree fork clone cli", disabled: !snapshot.active, run: () => setSessionsOpen(true) },
-		{ id: "memory", label: "项目记忆 AGENTS.md / CLAUDE.md (/memory)", keywords: "memory rules instructions", disabled: !snapshot.active, run: () => setMemoryTab("memory") },
+		{ id: "memory", label: "项目记忆与规则 (/memory)", keywords: "memory rules agents.md claude.md instructions", disabled: !snapshot.active, run: () => setMemoryTab("memory") },
+		{ id: "context", label: "上下文占用与压缩控制 (/context)", keywords: "context tokens autocompact", disabled: !snapshot.active, run: () => setMemoryTab("context") },
 		{ id: "status", label: "运行与上下文状态 (/status)", keywords: "status tokens cost model", run: () => setMemoryTab("status") },
 		{ id: "init", label: "/init 生成项目 AGENTS.md 指南", keywords: "init onboard agents.md", disabled: !snapshot.active, run: () => sendInitPrompt() },
 		{ id: "preview", label: previewUrl ? "关闭本地网页预览" : "打开本地网页预览 (/preview)", keywords: "web preview localhost", run: () => { setPane(null); setPreviewUrl((v) => (v ? null : "http://localhost:3000")); } },
@@ -570,7 +639,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					<div className="cl-auto-warning" role="status">
 						<ShieldAlert size={16} />
 						<span>
-							<strong>跳过确认模式</strong>：Pi 可在不询问的情况下执行命令；当前没有 OS 沙箱。
+							<strong>跳过确认模式</strong>：Pi 可在不询问的情况下执行命令；{snapshot.settings.sandbox ? "已开启 macOS Seatbelt 命令沙箱。" : "当前没有 OS 沙箱。"}
 						</span>
 						<button type="button" className="secondary-button" disabled={blocked} onClick={() => void savePermission("ask")}>
 							切回手动确认
@@ -588,6 +657,32 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				)}
 				<div className="cl-body">
 					<div className="cl-conversation">
+						{findOpen && (
+							<div className="cc-find-bar" role="search" aria-label="会话内查找">
+								<Search size={14} />
+								<input
+									autoFocus
+									aria-label="查找会话内容"
+									placeholder="输入关键词按回车定位…"
+									value={findQuery}
+									onChange={(e) => {
+										setFindQuery(e.target.value);
+										setFindIndex(0);
+									}}
+									onKeyDown={(e) => {
+										if (e.key === "Enter") {
+											e.preventDefault();
+											jumpFindMatch(findIndex + (e.shiftKey ? -1 : 1));
+										} else if (e.key === "Escape") {
+											setFindOpen(false);
+										}
+									}}
+								/>
+								<button type="button" className="cc-mini-btn" onClick={() => jumpFindMatch(findIndex - 1)}>上一个</button>
+								<button type="button" className="cc-mini-btn" onClick={() => jumpFindMatch(findIndex + 1)}>下一个</button>
+								<button type="button" className="cc-mini-btn" aria-label="关闭会话查找" onClick={() => setFindOpen(false)}>关闭</button>
+							</div>
+						)}
 						<div
 							className="cl-scroll"
 							ref={scroll}
@@ -688,33 +783,72 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								)}
 							</div>
 						)}
+						{btwState && (
+							<div className="cc-btw-card" role="region" aria-label="侧问结果">
+								<div className="cc-btw-head">
+									<strong>/btw {btwState.question}</strong>
+									<button type="button" className="cc-mini-btn" onClick={() => setBtwState(null)}>关闭</button>
+								</div>
+								{btwState.loading ? (
+									<p className="subtle-note">正在独立思考（不写入当前会话历史）…</p>
+								) : btwState.error ? (
+									<p className="live-error">{btwState.error}</p>
+								) : (
+									<div className="cc-btw-body">
+										<p>{btwState.answer}</p>
+										{btwState.model && <small className="subtle-note">模型：{btwState.model} · 未写入主会话</small>}
+									</div>
+								)}
+							</div>
+						)}
 						{showPlanApproval && (
 							<div className="cc-plan-bar" role="region" aria-label="计划审批">
-								<span>Plan 模式调研已完成，是否按计划开始实施？</span>
-								<div className="cc-plan-bar-actions">
-									<button
-										type="button"
-										className="primary-button"
-										title="项目内文件编辑自动允许；命令仍按规则询问"
-										onClick={() => void approvePlanAndExecute("acceptEdits")}
-									>
-										批准计划 · 接受编辑
-									</button>
-									<button type="button" className="secondary-button" onClick={() => void approvePlanAndExecute("ask")}>
-										批准计划 · 逐项确认
-									</button>
-									<button
-										type="button"
-										className="cc-mini-btn"
-										title="除规则外不再询问；命令以本机权限运行"
-										onClick={() => void approvePlanAndExecute("auto")}
-									>
-										跳过确认（危险）
-									</button>
-									<button type="button" className="cc-mini-btn" onClick={() => void togglePlanMode()}>
-										退出 Plan
-									</button>
+								<div className="cc-plan-bar-top">
+									<span>
+										Plan 模式调研已完成{planState?.exists ? `（已保存 ${planState.relativePath}）` : ""}，是否按计划开始实施？
+									</span>
+									<div className="cc-plan-bar-actions">
+										<button
+											type="button"
+											className="cc-mini-btn"
+											onClick={() => setPlanEditorOpen((v) => !v)}
+										>
+											{planEditorOpen ? "收起计划正文" : planState?.exists ? "查看/编辑计划" : "编写计划正文"}
+										</button>
+										<button
+											type="button"
+											className="primary-button"
+											title="项目内文件编辑自动允许；命令仍按规则询问"
+											onClick={() => void approvePlanAndExecute("acceptEdits")}
+										>
+											批准计划 · 接受编辑
+										</button>
+										<button type="button" className="secondary-button" onClick={() => void approvePlanAndExecute("ask")}>
+											批准计划 · 逐项确认
+										</button>
+										<button
+											type="button"
+											className="cc-mini-btn"
+											title="除规则外不再询问；命令以本机权限运行"
+											onClick={() => void approvePlanAndExecute("auto")}
+										>
+											跳过确认（危险）
+										</button>
+										<button type="button" className="cc-mini-btn" onClick={() => void togglePlanMode()}>
+											退出 Plan
+										</button>
+									</div>
 								</div>
+								{planEditorOpen && (
+									<textarea
+										className="cc-plan-editor"
+										rows={6}
+										aria-label="编辑计划内容"
+										placeholder="可在此审查或补充计划正文，点击批准时自动写入 .pi/plans/…"
+										value={planDraft}
+										onChange={(e) => setPlanDraft(e.target.value)}
+									/>
+								)}
 							</div>
 						)}
 						<LiveComposer
@@ -724,7 +858,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							setDraft={app.setDraft}
 							running={running}
 							changing={changing || bashBusy}
-							planMode={planMode}
+							planMode={inPlanMode}
 							onTogglePlanMode={() => void togglePlanMode()}
 							send={app.send}
 							stop={() => void app.command({ type: "abort" })}
@@ -732,6 +866,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							setPermission={(permission) => void savePermission(permission)}
 							openSettings={() => setSettings(true)}
 							onBuiltinSlash={handleBuiltinSlash}
+							onCompactInstructions={(customInstructions) => void app.command({ type: "compact", customInstructions })}
+							onBtw={(q) => void runBtw(q)}
 							fail={app.fail}
 						/>
 					</div>
@@ -741,7 +877,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							project={snapshot.active?.project}
 							ready={ready}
 							blocked={blocked}
-							readOnly={snapshot.settings.permission === "read"}
+							readOnly={snapshot.settings.permission === "read" || snapshot.settings.permission === "plan"}
 							bashBusy={bashBusy}
 							bashOutput={app.terminal}
 							onRunBash={(cmd) => app.bash(cmd)}
@@ -760,7 +896,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					close={() => setPane(null)}
 					revision={app.revision}
 					project={snapshot.active?.project}
-					readOnly={snapshot.settings.permission === "read"}
+					readOnly={snapshot.settings.permission === "read" || snapshot.settings.permission === "plan"}
 					onReferenceFile={(filePath) => {
 						const prefix = app.draft && !app.draft.endsWith(" ") && !app.draft.endsWith("\n") ? `${app.draft} ` : app.draft;
 						app.setDraft(`${prefix}@${filePath} `);
@@ -884,6 +1020,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					conversationId={snapshot.active?.id}
 					project={snapshot.active?.project}
 					initialTab={controlsTab}
+					onNotice={(msg) => app.setNotice(msg)}
 					close={() => setControlsTab(null)}
 					fail={app.fail}
 				/>
@@ -925,6 +1062,18 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					snapshot={snapshot}
 					gitBranch={gitSummary?.branch}
 					onInitPrompt={sendInitPrompt}
+					onCompact={async (customInstructions) => {
+						await app.command({ type: "compact", ...(customInstructions ? { customInstructions } : {}) });
+						await app.refresh();
+					}}
+					onToggleAutoCompaction={async (enabled) => {
+						await app.command({ type: "set_auto_compaction", enabled });
+						await app.refresh();
+					}}
+					onToggleAutoRetry={async (enabled) => {
+						await app.command({ type: "set_auto_retry", enabled });
+						await app.refresh();
+					}}
 					onNotice={(msg) => app.setNotice(msg)}
 					close={() => setMemoryTab(null)}
 					fail={app.fail}

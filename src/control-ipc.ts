@@ -3,6 +3,9 @@ import { validatePermissionRule } from "./permission-policy.ts";
 import type { ToolToggleInput } from "./control-types.ts";
 import type { AgentRemoveInput, AgentSaveInput } from "./agent-types.ts";
 import type { McpRemoveInput, McpSaveInput } from "./mcp-types.ts";
+import { hookEventNames } from "./hooks-service.ts";
+import type { HookEventName, HookRemoveInput, HookSaveInput, HookTestInput } from "./hook-types.ts";
+import type { SkillRemoveInput, SkillSaveInput } from "./skill-registry.ts";
 import { isAbsolute } from "node:path";
 
 type Handle = (channel: string, action: (...args: unknown[]) => Promise<unknown>) => void;
@@ -98,6 +101,71 @@ export function installControlHandlers(handle: Handle, service: DesktopService):
 			project: optionalPath(input.project),
 		};
 		return service.removeMcpServer(request);
+	});
+	handle("pi:permissions:import-claude", (id) => service.importClaudePermissions(optionalId(id)));
+	handle("pi:permissions:export-claude", (id) => service.exportClaudePermissions(optionalId(id)));
+	handle("pi:hooks:list", (project) => service.listHooks(optionalPath(project)));
+	handle("pi:hooks:save", (value) => {
+		const input = object(value);
+		if (!hookEventNames.includes(String(input.event) as HookEventName)) throw new Error("不支持的 Hook 事件。");
+		if (input.scope !== "user" && input.scope !== "project") throw new Error("Hook 作用域无效。");
+		if (input.timeout !== undefined && (!Number.isSafeInteger(input.timeout) || Number(input.timeout) < 500 || Number(input.timeout) > 30000))
+			throw new Error("Hook 超时须在 500–30000ms 之间。");
+		const request: HookSaveInput = {
+			id: input.id === undefined ? undefined : text(input.id, 200),
+			event: input.event as HookEventName,
+			matcher: input.matcher === undefined || input.matcher === "" ? undefined : text(input.matcher, 300),
+			command: text(input.command, 16384),
+			timeout: input.timeout as number | undefined,
+			scope: input.scope,
+			project: optionalPath(input.project),
+		};
+		return service.saveHook(request);
+	});
+	handle("pi:hooks:remove", (value) => {
+		const input = object(value);
+		if (input.scope !== "user" && input.scope !== "project") throw new Error("Hook 作用域无效。");
+		const request: HookRemoveInput = {
+			id: text(input.id, 200),
+			scope: input.scope,
+			project: optionalPath(input.project),
+		};
+		return service.removeHook(request);
+	});
+	handle("pi:hooks:test", (value) => {
+		const input = object(value);
+		if (!hookEventNames.includes(String(input.event) as HookEventName)) throw new Error("不支持的 Hook 事件。");
+		const request: HookTestInput = {
+			event: input.event as HookEventName,
+			toolName: input.toolName === undefined ? undefined : text(input.toolName, 300),
+			toolInput: input.toolInput === undefined ? undefined : object(input.toolInput),
+			prompt: input.prompt === undefined ? undefined : text(input.prompt, 16384),
+			project: optionalPath(input.project),
+		};
+		return service.testHook(request);
+	});
+	handle("pi:skills:list", (project) => service.listSkills(optionalPath(project)));
+	handle("pi:skills:save", (value) => {
+		const input = object(value);
+		if (input.scope !== "user" && input.scope !== "project") throw new Error("Skill 作用域无效。");
+		const request: SkillSaveInput = {
+			name: text(input.name, 64),
+			description: text(input.description, 500),
+			body: text(input.body, 128 * 1024),
+			scope: input.scope,
+			project: optionalPath(input.project),
+		};
+		return service.saveSkill(request);
+	});
+	handle("pi:skills:remove", (value) => {
+		const input = object(value);
+		if (input.scope !== "user" && input.scope !== "project") throw new Error("Skill 作用域无效。");
+		const request: SkillRemoveInput = {
+			name: text(input.name, 64),
+			scope: input.scope,
+			project: optionalPath(input.project),
+		};
+		return service.removeSkill(request);
 	});
 }
 function object(value: unknown): Record<string, unknown> {

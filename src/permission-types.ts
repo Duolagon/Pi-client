@@ -21,7 +21,7 @@ export interface PermissionRule {
 
 export interface RuntimePermissionPolicy {
 	version: 1;
-	mode: "ask" | "acceptEdits" | "auto" | "read";
+	mode: "ask" | "acceptEdits" | "auto" | "read" | "plan";
 	/** The host resolves global/project/conversation scopes before writing this list. */
 	rules: PermissionRule[];
 	disabledTools: string[];

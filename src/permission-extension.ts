@@ -1,8 +1,30 @@
+import { readFile, realpath, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import type { ExtensionAPI, ModelRegistry, ProviderModelConfig, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ConnectionMode, ConnectionProtocol, Provider } from "./shared.ts";
 import { connectionDefaults, connectionMode } from "./model-connections.ts";
 import { providerModels } from "./provider-presets.ts";
 import { evaluatePermission, loadRuntimePermissionPolicy } from "./permission-policy.ts";
+
+function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+async function callHost(path: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown> | undefined> {
+	const url = process.env.PI_DESKTOP_HOST_URL;
+	const token = process.env.PI_DESKTOP_HOST_TOKEN;
+	if (!url || !token || !/^[a-f0-9]{64}$/.test(token)) return undefined;
+	const response = await fetch(`${new URL(url).origin}${path}`, {
+		method: "POST",
+		headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+		body: JSON.stringify(body),
+		signal,
+		redirect: "error",
+	});
+	const result = (await response.json()) as { ok?: boolean; data?: Record<string, unknown>; error?: string };
+	if (!response.ok || result?.ok !== true) throw new Error(result?.error ?? `Desktop host error (${response.status})`);
+	return result.data ?? {};
+}
 
 interface Connection {
 	baseUrl?: string;
@@ -119,6 +141,164 @@ export default function permissions(pi: ExtensionAPI) {
 				}
 			},
 		});
+		pi.registerTool({
+			name: "AskUserQuestion",
+			label: "AskUserQuestion",
+			description: "Ask the user 1-4 structured multiple-choice or free-text questions when requirements or preferences need clarification.",
+			promptSnippet: "Ask the user structured clarifying questions",
+			parameters: {
+				type: "object",
+				additionalProperties: false,
+				required: ["questions"],
+				properties: {
+					questions: {
+						type: "array",
+						minItems: 1,
+						maxItems: 4,
+						items: {
+							type: "object",
+							additionalProperties: false,
+							required: ["question", "options"],
+							properties: {
+								header: { type: "string", minLength: 1, maxLength: 60 },
+								question: { type: "string", minLength: 1, maxLength: 1000 },
+								multiSelect: { type: "boolean" },
+								options: {
+									type: "array",
+									minItems: 1,
+									maxItems: 8,
+									items: {
+										type: "object",
+										additionalProperties: false,
+										required: ["label"],
+										properties: {
+											label: { type: "string", minLength: 1, maxLength: 120 },
+											description: { type: "string", maxLength: 400 },
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			} as ToolDefinition["parameters"],
+			exposure: "model-only",
+			defaultActive: true,
+			executionMode: "sequential",
+			async execute(_toolCallId, input, _signal, _onUpdate, ctx) {
+				const rec = input as { questions?: unknown[] };
+				const questions = Array.isArray(rec?.questions) ? rec.questions.slice(0, 4) : [];
+				if (!questions.length) throw new Error("At least one question is required.");
+				const answer = await ctx.ui.input("__PI_ASK_QUESTIONS__", JSON.stringify({ questions }));
+				if (answer === undefined) throw new Error("用户取消了提问。");
+				let parsed: unknown = answer;
+				try {
+					parsed = JSON.parse(answer);
+				} catch {
+					parsed = { raw: answer };
+				}
+				return {
+					content: [{ type: "text", text: typeof answer === "string" ? answer : JSON.stringify(parsed) }],
+					details: { questions, response: parsed },
+				};
+			},
+		});
+		pi.registerTool({
+			name: "ExitPlanMode",
+			label: "ExitPlanMode",
+			description: "Finalize and save the implementation plan (.pi/plans/) and signal readiness for user plan approval before exiting Plan mode.",
+			promptSnippet: "Save the plan and request user approval to begin implementation",
+			parameters: {
+				type: "object",
+				additionalProperties: false,
+				properties: {
+					title: { type: "string", maxLength: 200 },
+					plan: { type: "string", maxLength: 262144 },
+				},
+			} as ToolDefinition["parameters"],
+			exposure: "model-only",
+			defaultActive: true,
+			executionMode: "sequential",
+			async execute(toolCallId, input, signal) {
+				const rec = input as { title?: string; plan?: string };
+				const hostResult = await callHost("/plan-exit", {
+					toolCallId,
+					title: typeof rec?.title === "string" ? rec.title : undefined,
+					plan: typeof rec?.plan === "string" ? rec.plan : undefined,
+				}, signal);
+				const data = hostResult ?? { saved: false, status: "awaiting_user_approval" };
+				return {
+					content: [{ type: "text", text: JSON.stringify(data) }],
+					details: data,
+				};
+			},
+		});
+		pi.registerTool({
+			name: "NotebookEdit",
+			label: "NotebookEdit",
+			description: "Edit, insert, or delete a cell in a Jupyter Notebook (.ipynb) file.",
+			promptSnippet: "Modify cells in a Jupyter .ipynb notebook",
+			parameters: {
+				type: "object",
+				additionalProperties: false,
+				required: ["notebook_path", "new_source"],
+				properties: {
+					notebook_path: { type: "string", minLength: 1, maxLength: 4096 },
+					cell_id: { type: "string", maxLength: 120 },
+					cell_number: { type: "integer", minimum: 0, maximum: 10000 },
+					new_source: { type: "string", maxLength: 512 * 1024 },
+					cell_type: { type: "string", enum: ["code", "markdown"] },
+					edit_mode: { type: "string", enum: ["replace", "insert", "delete"] },
+				},
+			} as ToolDefinition["parameters"],
+			exposure: "model-only",
+			defaultActive: true,
+			executionMode: "sequential",
+			async execute(_toolCallId, input, _signal, _onUpdate, ctx) {
+				const rec = input as {
+					notebook_path: string;
+					cell_id?: string;
+					cell_number?: number;
+					new_source: string;
+					cell_type?: "code" | "markdown";
+					edit_mode?: "replace" | "insert" | "delete";
+				};
+				if (!rec.notebook_path.endsWith(".ipynb")) throw new Error("NotebookEdit 仅支持 .ipynb 文件。");
+				const target = await realpath(resolve(ctx.cwd, rec.notebook_path));
+				const raw = await readFile(target, "utf8");
+				const nb = JSON.parse(raw) as { cells?: Array<{ id?: string; cell_type: string; source: string[] | string; metadata?: Record<string, unknown>; outputs?: unknown[]; execution_count?: unknown }> };
+				if (!Array.isArray(nb.cells)) throw new Error("无效的 Notebook 格式（缺少 cells 数组）。");
+				const mode = rec.edit_mode ?? "replace";
+				const sourceLines = rec.new_source.split("\n").map((line, i, arr) => (i < arr.length - 1 ? `${line}\n` : line));
+				let idx = rec.cell_id ? nb.cells.findIndex((c) => c.id === rec.cell_id) : (rec.cell_number ?? 0);
+				if (mode === "insert") {
+					const insertAt = Math.max(0, Math.min(nb.cells.length, rec.cell_id ? idx + 1 : idx));
+					const cellType = rec.cell_type ?? "code";
+					nb.cells.splice(insertAt, 0, {
+						id: `cell-${Date.now().toString(36)}`,
+						cell_type: cellType,
+						metadata: {},
+						source: sourceLines,
+						...(cellType === "code" ? { outputs: [], execution_count: null } : {}),
+					});
+					idx = insertAt;
+				} else {
+					if (idx < 0 || idx >= nb.cells.length) throw new Error(`找不到指定的 Notebook 单元格（index=${idx}）。`);
+					if (mode === "delete") {
+						nb.cells.splice(idx, 1);
+					} else {
+						const cell = nb.cells[idx];
+						if (rec.cell_type) cell.cell_type = rec.cell_type;
+						cell.source = sourceLines;
+					}
+				}
+				await writeFile(target, `${JSON.stringify(nb, null, 1)}\n`, "utf8");
+				return {
+					content: [{ type: "text", text: `Updated notebook ${rec.notebook_path} (${mode} at cell ${idx})` }],
+					details: { notebook_path: rec.notebook_path, edit_mode: mode, cell_index: idx, total_cells: nb.cells.length },
+				};
+			},
+		});
 	}
 	function registerConnection(provider: Provider, connection: Connection, registry?: ModelRegistry) {
 		const definition = connectionDefaults[provider];
@@ -180,17 +360,59 @@ export default function permissions(pi: ExtensionAPI) {
 			const policy = await loadRuntimePermissionPolicy();
 			const decision = await evaluatePermission(policy, event);
 			if (decision.action === "deny") return { block: true, reason: decision.reason };
-			if (decision.action === "allow") return;
-			const allowed = await ctx.ui.confirm(
-				`允许执行 ${event.toolName}？`,
-				`${decision.reason}\n\n${JSON.stringify(event.input, null, 2)}`,
-			);
-			if (!allowed) return { block: true, reason: "用户未批准此操作。" };
-			// An approval dialog can stay open while the host revokes this tool or adds a deny rule.
-			const latest = await evaluatePermission(await loadRuntimePermissionPolicy(), event);
-			if (latest.action === "deny") return { block: true, reason: latest.reason };
+			let effectiveAction = decision.action;
+			let confirmReason = decision.reason;
+			if (!testingConnection) {
+				const hook = await callHost("/hook", {
+					phase: "pre",
+					toolName: event.toolName,
+					toolCallId: event.toolCallId,
+					toolInput: (event.input ?? {}) as Record<string, unknown>,
+				}).catch(() => undefined);
+				if (hook?.blocked || hook?.permissionDecision === "deny") {
+					return { block: true, reason: typeof hook.reason === "string" ? hook.reason : "PreToolUse Hook 阻止了此工具执行。" };
+				}
+				if (hook?.permissionDecision === "allow" && effectiveAction === "ask") effectiveAction = "allow";
+				else if (hook?.permissionDecision === "ask" && effectiveAction === "allow") {
+					effectiveAction = "ask";
+					confirmReason = typeof hook.reason === "string" ? hook.reason : "PreToolUse Hook 要求人工确认。";
+				}
+			}
+			if (effectiveAction === "ask") {
+				const allowed = await ctx.ui.confirm(
+					`允许执行 ${event.toolName}？`,
+					`${confirmReason}\n\n${JSON.stringify(event.input, null, 2)}`,
+				);
+				if (!allowed) return { block: true, reason: "用户未批准此操作。" };
+				// An approval dialog can stay open while the host revokes this tool or adds a deny rule.
+				const latest = await evaluatePermission(await loadRuntimePermissionPolicy(), event);
+				if (latest.action === "deny") return { block: true, reason: latest.reason };
+			}
+			const sandboxProfile = process.env.PI_DESKTOP_SANDBOX_PROFILE;
+			if (sandboxProfile && event.toolName === "bash" && typeof (event.input as { command?: unknown })?.command === "string") {
+				const bashInput = event.input as { command: string };
+				bashInput.command = `/usr/bin/sandbox-exec -f ${shellQuote(sandboxProfile)} /bin/sh -c ${shellQuote(bashInput.command)}`;
+			}
 		} catch (error) {
 			return { block: true, reason: `无法验证工具权限：${error instanceof Error ? error.message : String(error)}` };
+		}
+	});
+	pi.on("tool_result", async (event) => {
+		if (testingConnection) return;
+		const hook = await callHost("/hook", {
+			phase: "post",
+			toolName: event.toolName,
+			toolCallId: event.toolCallId,
+			toolInput: (event.input ?? {}) as Record<string, unknown>,
+			toolResponse: { isError: event.isError, content: event.content },
+		}).catch(() => undefined);
+		if (!hook) return;
+		if (hook.blocked) {
+			const reason = typeof hook.reason === "string" ? hook.reason : "PostToolUse Hook 报告检查失败。";
+			return { content: [...event.content, { type: "text" as const, text: `\n\n[Hook Blocked] ${reason}` }], isError: true };
+		}
+		if (typeof hook.additionalContext === "string" && hook.additionalContext.trim()) {
+			return { content: [...event.content, { type: "text" as const, text: `\n\n[Hook Context]\n${hook.additionalContext.trim()}` }] };
 		}
 	});
 }

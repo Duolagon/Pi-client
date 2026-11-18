@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, safeStorage, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, safeStorage, shell } from "electron";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { DesktopService } from "./backend.ts";
@@ -186,10 +186,14 @@ function installHandlers() {
 	handle("pi:settings", (input) => {
 		const settings = object(input);
 		if (
-			!["ask", "acceptEdits", "auto", "read"].includes(String(settings.permission)) ||
+			!["ask", "acceptEdits", "auto", "read", "plan"].includes(String(settings.permission)) ||
 			!["light", "dark", "system"].includes(String(settings.theme))
 		)
 			throw new Error("设置格式错误。");
+		if (settings.sandbox !== undefined && typeof settings.sandbox !== "boolean")
+			throw new Error("沙箱开关格式错误。");
+		if (settings.notifications !== undefined && typeof settings.notifications !== "boolean")
+			throw new Error("通知开关格式错误。");
 		if (settings.provider !== undefined) connection(settings);
 		if (settings.agentDir !== undefined) string(settings.agentDir, "Pi 配置目录", 16384);
 		return service.saveSettings(settings as Parameters<DesktopAPI["saveSettings"]>[0]);
@@ -229,11 +233,37 @@ void app.whenReady().then(() => {
 		environment.PATH = path;
 		return service.initialize();
 	});
-	service.subscribe((event) => {
-		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:event", event);
+	const notifyDesktop = (title: string, body: string) => {
+		if (process.env.PI_OFFLINE === "1" || !Notification.isSupported()) return;
+		if (window && !window.webContents.isDestroyed() && window.isFocused()) return;
+		void service.snapshot().then((snap) => {
+			if (snap.settings.notifications === false) return;
+			const note = new Notification({ title, body: body.slice(0, 160) });
+			note.on("click", () => {
+				if (window && !window.isDestroyed()) {
+					if (window.isMinimized()) window.restore();
+					window.focus();
+				}
+			});
+			note.show();
+		}).catch(() => {});
+	};
+	service.subscribe((packet) => {
+		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:event", packet);
+		if (packet.event.type === "extension_ui_request" && ["confirm", "select", "input", "editor"].includes(packet.event.method)) {
+			const reqTitle = "title" in packet.event ? packet.event.title : undefined;
+			notifyDesktop("Pi 需要你的确认", reqTitle === "__PI_ASK_QUESTIONS__" ? "模型发起了结构化提问，请查看并选择。" : (reqTitle ?? "工具执行等待批准"));
+		} else if (packet.event.type === "agent_settled") {
+			notifyDesktop("Pi 任务已结束", packet.event.aborted ? "当前回合已停止。" : "回复与工具执行已完成。");
+		}
 	});
 	service.subscribeTasks((event) => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:task:event", event);
+		if (event.type === "task_updated") {
+			if (event.task.status === "waiting_for_input") notifyDesktop("后台子任务需要确认", event.task.title);
+			else if (event.task.status === "completed") notifyDesktop("后台子任务已完成", event.task.title);
+			else if (event.task.status === "failed") notifyDesktop("后台子任务失败", event.task.error || event.task.title);
+		}
 	});
 	service.subscribeTerminals((event) => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:terminal:event", event);

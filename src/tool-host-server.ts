@@ -4,6 +4,14 @@ import { validateToolInvocation, type DesktopToolInvocation, type ToolHostContex
 
 export interface ToolHostServerOptions {
 	handle: (request: DesktopToolInvocation, context: ToolHostContext) => Promise<unknown>;
+	handleHook?: (
+		request: { phase: "pre" | "post"; toolName: string; toolCallId: string; toolInput: Record<string, unknown>; toolResponse?: unknown },
+		context: ToolHostContext,
+	) => Promise<unknown>;
+	handlePlanExit?: (
+		request: { title?: string; plan?: string; toolCallId: string },
+		context: ToolHostContext,
+	) => Promise<unknown>;
 }
 
 /** Session-bound loopback bridge. Tokens never travel through the renderer or model arguments. */
@@ -71,7 +79,8 @@ export class ToolHostServer {
 		if (this.closed) return reply(503, { ok: false, error: "Tool host is closed" });
 		if (request.headers.origin !== undefined || request.headers.host !== new URL(this.baseUrl!).host)
 			return reply(403, { ok: false, error: "Browser requests are not allowed" });
-		if (request.method !== "POST" || request.url !== "/invoke") return reply(404, { ok: false, error: "Not found" });
+		if (request.method !== "POST" || (request.url !== "/invoke" && request.url !== "/hook" && request.url !== "/plan-exit"))
+			return reply(404, { ok: false, error: "Not found" });
 		if (request.headers["content-type"]?.split(";")[0].trim() !== "application/json")
 			return reply(415, { ok: false, error: "Expected application/json" });
 		const supplied = request.headers.authorization?.match(/^Bearer ([a-f0-9]{64})$/)?.[1];
@@ -98,8 +107,45 @@ export class ToolHostServer {
 				chunks.push(Buffer.from(chunk));
 			}
 			if (controller.signal.aborted || this.owners.get(known) !== conversationId) return;
+			const parsedBody: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+			if (request.url === "/hook") {
+				const rec = parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody) ? (parsedBody as Record<string, unknown>) : null;
+				if (!rec || (rec.phase !== "pre" && rec.phase !== "post") || typeof rec.toolName !== "string" || !rec.toolName || rec.toolName.length > 300 || typeof rec.toolCallId !== "string" || !rec.toolCallId || rec.toolCallId.length > 300 || !rec.toolInput || typeof rec.toolInput !== "object" || Array.isArray(rec.toolInput))
+					return reply(400, { ok: false, error: "Invalid hook payload" });
+				const data = this.options.handleHook
+					? await this.options.handleHook(
+							{
+								phase: rec.phase,
+								toolName: rec.toolName,
+								toolCallId: rec.toolCallId,
+								toolInput: rec.toolInput as Record<string, unknown>,
+								toolResponse: rec.toolResponse,
+							},
+							{ conversationId, toolCallId: rec.toolCallId, signal: controller.signal },
+						)
+					: { blocked: false };
+				if (!controller.signal.aborted) reply(200, { ok: true, data });
+				return;
+			}
+			if (request.url === "/plan-exit") {
+				const rec = parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody) ? (parsedBody as Record<string, unknown>) : null;
+				if (!rec || typeof rec.toolCallId !== "string" || !rec.toolCallId || rec.toolCallId.length > 300 || (rec.title !== undefined && typeof rec.title !== "string") || (rec.plan !== undefined && typeof rec.plan !== "string"))
+					return reply(400, { ok: false, error: "Invalid plan exit payload" });
+				const data = this.options.handlePlanExit
+					? await this.options.handlePlanExit(
+							{
+								title: typeof rec.title === "string" ? rec.title.slice(0, 200) : undefined,
+								plan: typeof rec.plan === "string" ? rec.plan.slice(0, 512 * 1024) : undefined,
+								toolCallId: rec.toolCallId,
+							},
+							{ conversationId, toolCallId: rec.toolCallId, signal: controller.signal },
+						)
+					: { saved: false };
+				if (!controller.signal.aborted) reply(200, { ok: true, data });
+				return;
+			}
 			let invocation: DesktopToolInvocation;
-			try { invocation = validateToolInvocation(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
+			try { invocation = validateToolInvocation(parsedBody); }
 			catch (error) { return reply(400, { ok: false, error: error instanceof Error ? error.message : "Invalid request" }); }
 			const data = await this.options.handle(invocation, { conversationId, toolCallId: invocation.toolCallId, signal: controller.signal });
 			if (!controller.signal.aborted) reply(200, { ok: true, data });

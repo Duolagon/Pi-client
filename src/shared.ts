@@ -18,12 +18,18 @@ import type { DelegatedTaskResult } from "./delegation-types.ts";
 import type { DesktopExternalAgentsAPI } from "./external-types.ts";
 import type { DesktopAgentsAPI } from "./agent-types.ts";
 import type { DesktopMcpAPI } from "./mcp-types.ts";
+import type { DesktopHooksAPI } from "./hook-types.ts";
+import type { ContextBreakdown, ContextMemorySource } from "./context-inspector.ts";
+import type { SkillDefinitionEntry, SkillRemoveInput, SkillSaveInput } from "./skill-registry.ts";
 export type * from "./external-types.ts";
 export type * from "./agent-types.ts";
 export type * from "./mcp-types.ts";
+export type * from "./hook-types.ts";
 export type * from "./control-types.ts";
 export type * from "./permission-types.ts";
 export type * from "./tool-control-types.ts";
+export type { ContextBreakdown, ContextMemorySource } from "./context-inspector.ts";
+export type { SkillDefinitionEntry, SkillRemoveInput, SkillSaveInput, SkillScope } from "./skill-registry.ts";
 
 export type * from "./session-types.ts";
 export type * from "./session-history-types.ts";
@@ -80,7 +86,7 @@ export interface DesktopWorktreeAPI {
 	merge(id: string): Promise<WorktreeMergeResult>;
 }
 
-export type PermissionMode = "ask" | "acceptEdits" | "auto" | "read";
+export type PermissionMode = "ask" | "acceptEdits" | "auto" | "read" | "plan";
 export type ProjectTrustDecision = "trusted" | "untrusted";
 export interface ProjectTrustState {
 	project: string;
@@ -160,10 +166,39 @@ export interface Settings {
 	defaultModel?: { provider: string; id: string };
 	permission: PermissionMode;
 	theme: "light" | "dark" | "system";
+	sandbox?: boolean;
+	notifications?: boolean;
 	configuredProviders: Provider[];
 	connections: Partial<
 		Record<Provider, { baseUrl?: string; modelId?: string; api?: ConnectionProtocol; mode?: ConnectionMode }>
 	>;
+}
+export interface PlanFileState {
+	path: string;
+	relativePath: string;
+	content: string;
+	exists: boolean;
+}
+export interface SandboxStatus {
+	enabled: boolean;
+	supported: boolean;
+	reason?: string;
+}
+export interface BtwResult {
+	question: string;
+	answer: string;
+	model?: string;
+	latencyMs: number;
+}
+export interface ClaudePermissionsSyncResult {
+	path: string;
+	imported?: number;
+	exported?: number;
+}
+export interface DesktopSkillsAPI {
+	list(project?: string): Promise<SkillDefinitionEntry[]>;
+	save(input: SkillSaveInput): Promise<SkillDefinitionEntry[]>;
+	remove(input: SkillRemoveInput): Promise<SkillDefinitionEntry[]>;
 }
 export interface FileEntry {
 	name: string;
@@ -230,6 +265,8 @@ export interface DesktopAPI {
 	externalAgents: DesktopExternalAgentsAPI;
 	agents: DesktopAgentsAPI;
 	mcp: DesktopMcpAPI;
+	hooks: DesktopHooksAPI;
+	skills: DesktopSkillsAPI;
 	tools: DesktopToolsAPI;
 	permissions: DesktopPermissionsAPI;
 	sessions: DesktopSessionAPI;
@@ -256,10 +293,21 @@ export interface DesktopAPI {
 	gitCommit(message: string): Promise<GitCommitResult>;
 	readMemory(): Promise<MemoryFileEntry[]>;
 	writeMemory(file: "AGENTS.md" | "CLAUDE.md", content: string): Promise<MemoryFileEntry>;
+	contextReport(): Promise<ContextBreakdown>;
+	writeMemoryFile(relativePath: string, content: string): Promise<ContextMemorySource>;
+	deleteMemoryRule(relativePath: string): Promise<ContextBreakdown>;
+	readPlan(conversationId?: string): Promise<PlanFileState>;
+	writePlan(content: string, conversationId?: string): Promise<PlanFileState>;
+	btw(question: string): Promise<BtwResult>;
+	sandboxStatus(): Promise<SandboxStatus>;
+	importClaudePermissions(): Promise<ClaudePermissionsSyncResult>;
+	exportClaudePermissions(): Promise<ClaudePermissionsSyncResult>;
 	saveSettings(settings: {
 		agentDir?: string;
 		permission: PermissionMode;
 		theme: Settings["theme"];
+		sandbox?: boolean;
+		notifications?: boolean;
 		provider?: Provider;
 		mode?: ConnectionMode;
 		apiKey?: string;

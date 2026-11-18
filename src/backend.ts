@@ -72,6 +72,14 @@ import { AgentRegistry } from "./agent-definitions.ts";
 import type { AgentDefinition, AgentRemoveInput, AgentSaveInput } from "./agent-types.ts";
 import { McpRegistry } from "./mcp-registry.ts";
 import type { McpRemoveInput, McpSaveInput, McpServerInfo } from "./mcp-types.ts";
+import { HooksService } from "./hooks-service.ts";
+import type { HookEntry, HookRemoveInput, HookRunResult, HookSaveInput, HookTestInput } from "./hook-types.ts";
+import { SkillRegistry } from "./skill-registry.ts";
+import type { SkillDefinitionEntry, SkillRemoveInput, SkillSaveInput } from "./skill-registry.ts";
+import { buildContextReport, deleteProjectMemoryRule, writeProjectMemoryFile, type ContextBreakdown, type ContextMemorySource } from "./context-inspector.ts";
+import { buildSeatbeltProfile, probeSeatbeltSupport } from "./sandbox.ts";
+import { readClaudeProjectPermissions, writeClaudeProjectPermissions } from "./claude-settings-sync.ts";
+import type { BtwResult, ClaudePermissionsSyncResult, PlanFileState, SandboxStatus } from "./shared.ts";
 import { ExternalAgents } from "./external-agents.ts";
 import { CodexAdapter } from "./external-codex.ts";
 import { ClaudeAdapter } from "./external-claude.ts";
@@ -117,6 +125,7 @@ interface SessionRuntime {
 	navigation?: { directory: string; token: string; command: string };
 	controls?: { directory: string; token: string; command: string; hostToken: string; operation: Promise<void> };
 	policyFile?: string;
+	sandboxProfileFile?: string;
 	controlWrites?: Promise<void>;
 }
 export interface ServiceOptions {
@@ -174,6 +183,8 @@ export class DesktopService {
 	private delegation: ModelDelegation;
 	private agents: AgentRegistry;
 	private mcp: McpRegistry;
+	private hooks: HooksService;
+	private skills: SkillRegistry;
 	private controlListeners = new Set<(event: ControlEvent) => void>();
 	private worktreeOperationOwner?: string;
 	private external: ExternalAgents;
@@ -183,11 +194,39 @@ export class DesktopService {
 		this.toolSettings = new ToolSettingsStore(options.dataDir);
 		this.agents = new AgentRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
 		this.mcp = new McpRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
-		this.toolHost = new ToolHostServer({ handle: async (request, context) => {
-			const decision = await evaluatePermission(this.permissionPolicy(context.conversationId), { toolName: request.tool, input: request.input });
-			if (decision.action === "deny") throw new Error(decision.reason);
-			return this.modelTool(request, context);
-		} });
+		this.hooks = new HooksService({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
+		this.skills = new SkillRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
+		this.toolHost = new ToolHostServer({
+			handle: async (request, context) => {
+				const decision = await evaluatePermission(this.permissionPolicy(context.conversationId), { toolName: request.tool, input: request.input });
+				if (decision.action === "deny") throw new Error(decision.reason);
+				return this.modelTool(request, context);
+			},
+			handleHook: async (request, context) => {
+				const conv = this.conversation(context.conversationId);
+				return this.hooks.run(request.phase === "pre" ? "PreToolUse" : "PostToolUse", {
+					project: conv.project,
+					projectTrusted: this.isProjectTrusted(conv.project),
+					conversationId: context.conversationId,
+					toolName: request.toolName,
+					toolInput: request.toolInput,
+					toolResponse: request.toolResponse,
+					env: this.options.env,
+				});
+			},
+			handlePlanExit: async (request, context) => {
+				const conv = this.conversation(context.conversationId);
+				if (typeof request.plan === "string" && request.plan.trim()) {
+					const saved = await this.writePlan(
+						request.title ? `# ${request.title}\n\n${request.plan}` : request.plan,
+						context.conversationId,
+					);
+					return { saved: true, planFile: saved.relativePath, content: saved.content };
+				}
+				const current = await this.readPlan(context.conversationId);
+				return { saved: current.exists, planFile: current.relativePath, content: current.content };
+			},
+		});
 		this.delegation = new ModelDelegation({
 			getConversation: (id) => this.conversation(id),
 			getSelection: async (id) => {
@@ -207,6 +246,7 @@ export class DesktopService {
 				try { await exec("git", ["rev-parse", "--show-toplevel"], { cwd: project }); return true; } catch { return false; }
 			},
 			canRunShared: (_owner, readOnly) => readOnly,
+			isPlanMode: (id) => this.permissionPolicy(id).mode === "plan",
 			notify: async (owner, result) => {
 				const runtime = this.runtimes.get(owner);
 				if (!runtime?.controls || runtime.stopping || this.closed || ["cancelled", "interrupted"].includes(result.status)) return;
@@ -394,6 +434,169 @@ export class DesktopService {
 			await this.restartProject(project);
 			return this.mcp.list(project);
 		});
+	}
+
+	private isProjectTrusted(project: string): boolean {
+		return this.store.projectTrust?.[project] === "trusted";
+	}
+
+	private isReadRestricted(conversationId?: string): boolean {
+		const mode = conversationId ? this.permissionPolicy(conversationId).mode : this.store.settings.permission;
+		return mode === "read" || mode === "plan";
+	}
+
+	private assertWritableMode(actionLabel: string, conversationId?: string): void {
+		const mode = conversationId ? this.permissionPolicy(conversationId).mode : this.store.settings.permission;
+		if (mode === "read") throw new Error(`只读模式下不可${actionLabel}。`);
+		if (mode === "plan") throw new Error(`Plan 模式下不可${actionLabel}。`);
+	}
+
+	async listHooks(project?: string): Promise<HookEntry[]> {
+		await this.operation;
+		const resolved = project || this.active() ? await this.agentProject(project) : undefined;
+		return this.hooks.list(resolved, true);
+	}
+
+	saveHook(input: HookSaveInput): Promise<HookEntry[]> {
+		return this.serialize(async () => {
+			const project = input.scope === "project" || input.project ? await this.agentProject(input.project) : undefined;
+			return this.hooks.save({ ...input, project });
+		});
+	}
+
+	removeHook(input: HookRemoveInput): Promise<HookEntry[]> {
+		return this.serialize(async () => {
+			const project = input.scope === "project" || input.project ? await this.agentProject(input.project) : undefined;
+			return this.hooks.remove({ ...input, project });
+		});
+	}
+
+	async testHook(input: HookTestInput): Promise<HookRunResult> {
+		await this.operation;
+		const project = input.project || this.active() ? await this.agentProject(input.project) : undefined;
+		return this.hooks.run(input.event, {
+			project,
+			projectTrusted: project ? this.isProjectTrusted(project) : false,
+			conversationId: this.active()?.id,
+			toolName: input.toolName,
+			toolInput: input.toolInput,
+			prompt: input.prompt,
+			env: this.options.env,
+		});
+	}
+
+	async listSkills(project?: string): Promise<SkillDefinitionEntry[]> {
+		await this.operation;
+		const resolved = project || this.active() ? await this.agentProject(project) : undefined;
+		return this.skills.list(resolved, resolved ? true : false);
+	}
+
+	saveSkill(input: SkillSaveInput): Promise<SkillDefinitionEntry[]> {
+		return this.serialize(async () => {
+			const project = input.scope === "project" || input.project ? await this.agentProject(input.project) : undefined;
+			return this.skills.save({ ...input, project });
+		});
+	}
+
+	removeSkill(input: SkillRemoveInput): Promise<SkillDefinitionEntry[]> {
+		return this.serialize(async () => {
+			const project = input.scope === "project" || input.project ? await this.agentProject(input.project) : undefined;
+			return this.skills.remove({ ...input, project });
+		});
+	}
+
+	async contextReport(conversationId?: string): Promise<ContextBreakdown> {
+		await this.operation;
+		const conv = this.conversation(conversationId);
+		const runtime = this.runtimes.get(conv.id);
+		const tools = runtime?.controls && runtime.engineStatus === "ready"
+			? await this.controlRequest(runtime, "list").catch(() => [])
+			: [];
+		const snapshot = await this.buildSnapshot(conv.id);
+		return buildContextReport({
+			project: conv.project,
+			agentDir: this.store.settings.agentDir ?? this.defaultAgentDir(),
+			stats: snapshot.stats,
+			state: snapshot.state,
+			tools,
+			messages: snapshot.messages,
+		});
+	}
+
+	async writeMemoryFile(relativePath: string, content: string, conversationId?: string): Promise<ContextMemorySource> {
+		await this.operation;
+		this.assertWritableMode("修改项目记忆或规则文件", conversationId);
+		const conv = this.conversation(conversationId);
+		return writeProjectMemoryFile(conv.project, relativePath, content);
+	}
+
+	async deleteMemoryRule(relativePath: string, conversationId?: string): Promise<ContextBreakdown> {
+		await this.operation;
+		this.assertWritableMode("删除规则文件", conversationId);
+		const conv = this.conversation(conversationId);
+		await deleteProjectMemoryRule(conv.project, relativePath);
+		return this.contextReport(conv.id);
+	}
+
+	private planRelativePath(conversationId: string): string {
+		if (!/^[a-zA-Z0-9._-]+$/.test(conversationId)) throw new Error("会话标识无效。");
+		return join(".pi", "plans", `${conversationId}.md`).replaceAll("\\", "/");
+	}
+
+	async readPlan(conversationId?: string): Promise<PlanFileState> {
+		await this.operation;
+		const conv = this.conversation(conversationId);
+		const relativePath = this.planRelativePath(conv.id);
+		const fullPath = resolve(conv.project, relativePath);
+		if (!inside(conv.project, fullPath)) throw new Error("计划文件路径超出项目目录。");
+		try {
+			const real = await realpath(fullPath);
+			if (!inside(conv.project, real)) throw new Error("计划文件路径超出项目目录。");
+			const content = await readFile(real, "utf8");
+			return { path: real, relativePath, content, exists: true };
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				return { path: fullPath, relativePath, content: "", exists: false };
+			}
+			throw error;
+		}
+	}
+
+	async writePlan(content: string, conversationId?: string): Promise<PlanFileState> {
+		await this.operation;
+		const conv = this.conversation(conversationId);
+		if (this.permissionPolicy(conv.id).mode === "read") throw new Error("只读模式下不可写入计划文件。");
+		const relativePath = this.planRelativePath(conv.id);
+		const fullPath = resolve(conv.project, relativePath);
+		if (!inside(conv.project, fullPath)) throw new Error("计划文件路径超出项目目录。");
+		await mkdir(dirname(fullPath), { recursive: true });
+		await writeFile(fullPath, content, "utf8");
+		return { path: fullPath, relativePath, content, exists: true };
+	}
+
+	async sandboxStatus(): Promise<SandboxStatus> {
+		const probe = await probeSeatbeltSupport();
+		return { enabled: Boolean(this.store.settings.sandbox), supported: probe.supported, reason: probe.reason };
+	}
+
+	importClaudePermissions(conversationId?: string): Promise<ClaudePermissionsSyncResult> {
+		return this.serialize(async () => {
+			const conv = this.conversation(conversationId);
+			const project = await realpath(conv.project);
+			const parsed = await readClaudeProjectPermissions(project);
+			for (const rule of parsed) await this.toolSettings.upsert(rule);
+			await this.refreshControls("permissions_changed");
+			return { path: join(project, ".claude", "settings.json"), imported: parsed.length };
+		});
+	}
+
+	async exportClaudePermissions(conversationId?: string): Promise<ClaudePermissionsSyncResult> {
+		await this.operation;
+		const conv = this.conversation(conversationId);
+		const project = await realpath(conv.project);
+		const rules = this.toolSettings.rules();
+		const res = await writeClaudeProjectPermissions(project, rules);
+		return { path: res.path, exported: res.count };
 	}
 
 	private assertProjectRestartable(project: string): void {
@@ -796,7 +999,14 @@ export class DesktopService {
 			runtime.bashBusy = true;
 			try {
 				await this.startCheckpoint(runtime, command.command);
-				return await agent.request<BashResult>(command);
+				const sandboxCmd =
+					runtime.sandboxProfileFile && (await probeSeatbeltSupport()).supported
+						? {
+								...command,
+								command: `/usr/bin/sandbox-exec -f '${runtime.sandboxProfileFile.replaceAll("'", "'\\''")}' /bin/sh -c '${command.command.replaceAll("'", "'\\''")}'`,
+							}
+						: command;
+				return await agent.request<BashResult>(sandboxCmd);
 			} finally {
 				runtime.bashBusy = false;
 				runtime.settling = this.finishRuntime(runtime, false);
@@ -820,6 +1030,18 @@ export class DesktopService {
 				if (runtime.state) runtime.state.isStreaming = true;
 			}
 			try {
+				const hook = await this.hooks.run("UserPromptSubmit", {
+					project: active.project,
+					projectTrusted: this.isProjectTrusted(active.project),
+					conversationId: active.id,
+					prompt: command.message,
+					env: this.options.env,
+				});
+				if (hook.blocked) throw new Error(hook.reason ?? "UserPromptSubmit Hook 阻止了发送。");
+				const promptToSend =
+					hook.additionalContext && !command.message.includes(hook.additionalContext)
+						? { ...command, message: `${command.message}\n\n[Hook Context]\n${hook.additionalContext}` }
+						: command;
 				if (!alreadyRunning) await this.startCheckpoint(runtime, command.message);
 				if (this.closed || (launch !== undefined && this.launches.get(active.id) !== launch))
 					throw new Error("任务已取消。");
@@ -831,7 +1053,7 @@ export class DesktopService {
 				await this.persist();
 				if (this.closed || (launch !== undefined && this.launches.get(active.id) !== launch))
 					throw new Error("任务已取消。");
-				const result = await agent.request<{ disposition: string }>(command);
+				const result = await agent.request<{ disposition: string }>(promptToSend);
 				if (result.disposition === "handled") {
 					if (!alreadyRunning) {
 						runtime.busy = false;
@@ -998,7 +1220,7 @@ export class DesktopService {
 	}
 
 	async gitStage(paths?: string[], conversationId?: string): Promise<Workspace> {
-		if (this.store.settings.permission === "read") throw new Error("只读模式下不可修改 Git 暂存区。");
+		this.assertWritableMode("修改 Git 暂存区", conversationId);
 		const cwd = this.conversation(conversationId).project;
 		const rels = paths?.length ? this.gitPaths(cwd, paths) : [];
 		const args = rels.length ? ["add", "--", ...rels] : ["add", "-A"];
@@ -1007,7 +1229,7 @@ export class DesktopService {
 	}
 
 	async gitUnstage(paths?: string[], conversationId?: string): Promise<Workspace> {
-		if (this.store.settings.permission === "read") throw new Error("只读模式下不可修改 Git 暂存区。");
+		this.assertWritableMode("修改 Git 暂存区", conversationId);
 		const cwd = this.conversation(conversationId).project;
 		const rels = paths?.length ? this.gitPaths(cwd, paths) : [];
 		try {
@@ -1033,7 +1255,7 @@ export class DesktopService {
 	}
 
 	async gitDiscard(paths: string[], conversationId?: string): Promise<Workspace> {
-		if (this.store.settings.permission === "read") throw new Error("只读模式下不可还原工作区文件。");
+		this.assertWritableMode("还原工作区文件", conversationId);
 		if (!paths.length) throw new Error("请指定要还原的文件路径。");
 		const cwd = this.conversation(conversationId).project;
 		this.assertProjectIdle(cwd);
@@ -1053,7 +1275,7 @@ export class DesktopService {
 	}
 
 	async gitCommit(message: string, conversationId?: string): Promise<GitCommitResult> {
-		if (this.store.settings.permission === "read") throw new Error("只读模式下不可执行 Git 提交。");
+		this.assertWritableMode("执行 Git 提交", conversationId);
 		const trimmed = message.trim();
 		if (!trimmed) throw new Error("请输入提交说明。");
 		const cwd = this.conversation(conversationId).project;
@@ -1095,7 +1317,7 @@ export class DesktopService {
 	}
 
 	async writeMemory(file: "AGENTS.md" | "CLAUDE.md", content: string, conversationId?: string): Promise<MemoryFileEntry> {
-		if (this.store.settings.permission === "read") throw new Error("只读模式下不可修改项目记忆文件。");
+		this.assertWritableMode("修改项目记忆文件", conversationId);
 		if (file !== "AGENTS.md" && file !== "CLAUDE.md") throw new Error("仅支持 AGENTS.md 或 CLAUDE.md。");
 		const cwd = this.conversation(conversationId).project;
 		const target = resolve(cwd, file);
@@ -1112,6 +1334,8 @@ export class DesktopService {
 	saveSettings(settings: {
 		permission: PermissionMode;
 		theme: Settings["theme"];
+		sandbox?: boolean;
+		notifications?: boolean;
 		provider?: Provider;
 		apiKey?: string;
 		baseUrl?: string;
@@ -1125,6 +1349,8 @@ export class DesktopService {
 			const next: StoredState = structuredClone(this.store);
 			next.settings.permission = settings.permission;
 			next.settings.theme = settings.theme;
+			if (settings.sandbox !== undefined) next.settings.sandbox = settings.sandbox;
+			if (settings.notifications !== undefined) next.settings.notifications = settings.notifications;
 			if (settings.agentDir !== undefined) {
 				const value = settings.agentDir.trim();
 				if (value) {
@@ -1173,13 +1399,14 @@ export class DesktopService {
 			}
 			const needsRestart =
 				next.settings.permission !== this.store.settings.permission ||
+				Boolean(next.settings.sandbox) !== Boolean(this.store.settings.sandbox) ||
 				next.settings.agentDir !== this.store.settings.agentDir ||
 				Boolean(settings.provider);
 			this.store = next;
 			await this.persist();
 			if (needsRestart) {
 				for (const runtime of [...this.runtimes.values()]) await this.stopRuntime(runtime);
-				if (next.settings.permission === "read") {
+				if (next.settings.permission === "read" || next.settings.permission === "plan") {
 					for (const terminal of this.terminals.list()) await this.terminals.close(terminal.id);
 				}
 				const active = this.active();
@@ -1316,6 +1543,99 @@ export class DesktopService {
 		return result.path;
 	}
 
+	async askBtw(question: string, conversationId?: string): Promise<BtwResult> {
+		await this.operation;
+		const q = question.trim();
+		if (!q || q.length > 32768 || q.includes("\0")) throw new Error("请输入有效的侧问问题（/btw）。");
+		const conv = this.conversation(conversationId);
+		const runtime = this.runtimes.get(conv.id);
+		const activeModel = runtime?.state?.model ?? this.store.settings.defaultModel;
+		if (!activeModel?.provider || !activeModel?.id) throw new Error("当前会话未连接模型，无法发起 /btw 侧问。");
+		const snapshot = await this.buildSnapshot(conv.id);
+		const summaryTurns = snapshot.messages
+			.filter((m) => m.role === "user" || m.role === "assistant")
+			.slice(-8)
+			.map((m) => {
+				const raw = typeof m.content === "string"
+					? m.content
+					: m.content.filter((b) => b.type === "text").map((b) => b.text).join(" ");
+				return `${m.role === "user" ? "User" : "Assistant"}: ${raw.slice(0, 800)}`;
+			})
+			.join("\n");
+		const prompt = summaryTurns
+			? `You are answering an ephemeral side question (/btw) that must NOT assume edits or tool calls. Here is the recent conversation excerpt for context:\n\n${summaryTurns}\n\n---\nSide question:\n${q}\n\nAnswer concisely and accurately in the same language.`
+			: q;
+		const temporary = await mkdtemp(join(this.options.dataDir, "btw-"));
+		let agent: AgentProcess | undefined;
+		let timer: NodeJS.Timeout | undefined;
+		const started = Date.now();
+		try {
+			const env: NodeJS.ProcessEnv = {
+				...process.env,
+				...this.options.env,
+				PI_SKIP_VERSION_CHECK: "1",
+				PI_DESKTOP_CONNECTION_TEST: "1",
+			};
+			if (this.store.settings.agentDir) env.PI_CODING_AGENT_DIR = this.store.settings.agentDir;
+			const connections: Record<string, { baseUrl?: string; modelId?: string; envKey?: string; api?: ConnectionProtocol; mode?: ConnectionMode; presetBaseUrl?: string }> = {};
+			for (const provider of providers) {
+				const conn = this.store.settings.connections[provider];
+				const encrypted = this.store.keys[provider];
+				const envKey = `PI_DESKTOP_KEY_${provider.toUpperCase()}`;
+				if (encrypted && this.options.decrypt) env[envKey] = this.options.decrypt(encrypted);
+				if (conn) connections[provider] = { ...conn, envKey: encrypted ? envKey : undefined, presetBaseUrl: this.options.providerBaseUrls?.[provider] };
+			}
+			env.PI_DESKTOP_CONNECTIONS = JSON.stringify(connections);
+			const runtimeDir = this.options.runtimeDir ?? dirname(dirname(dirname(this.options.entry!)));
+			let resultMessage: Extract<Message, { role: "assistant" }> | undefined;
+			let settle!: () => void;
+			let fail!: (error: Error) => void;
+			const completion = new Promise<void>((resolve, reject) => {
+				settle = resolve;
+				fail = reject;
+			});
+			agent = new AgentProcess({
+				executable: this.options.executable,
+				entry: this.options.entry ?? join(runtimeDir, "dist/bundle/rpc-entry.js"),
+				cwd: conv.project,
+				args: [
+					"--no-session",
+					"--no-tools",
+					"--no-skills",
+					"--no-prompt-templates",
+					"--no-context-files",
+					"--no-approve",
+					"--extension",
+					this.options.permissionExtension ?? join(runtimeDir, "permission-extension.mjs"),
+					"--provider",
+					activeModel.provider,
+					"--model",
+					activeModel.id,
+				],
+				env,
+				onEvent: (event) => {
+					if (event.type === "message_end" && event.message.role === "assistant") resultMessage = event.message;
+					if (event.type === "agent_settled") settle();
+					if (event.type === "desktop_error") fail(new Error(event.message));
+				},
+			});
+			timer = setTimeout(() => fail(new Error("/btw 请求超时（45 秒）。")), 45000);
+			await Promise.all([agent.request({ type: "prompt", message: prompt }), completion]);
+			if (!resultMessage || resultMessage.stopReason === "error" || resultMessage.stopReason === "aborted")
+				throw new Error(resultMessage?.errorMessage ?? "侧问未返回有效回复。");
+			const answer = resultMessage.content
+				.filter((b) => b.type === "text")
+				.map((b) => b.text)
+				.join("\n")
+				.trim();
+			return { question: q, answer, model: activeModel.id, latencyMs: Date.now() - started };
+		} finally {
+			clearTimeout(timer);
+			await agent?.stop();
+			await rm(temporary, { recursive: true, force: true });
+		}
+	}
+
 	subscribeTasks(listener: (event: TaskEvent) => void): () => void {
 		this.taskListeners.add(listener);
 		return () => this.taskListeners.delete(listener);
@@ -1418,11 +1738,13 @@ export class DesktopService {
 		].filter((mode): mode is RuntimePermissionPolicy["mode"] => Boolean(mode));
 		const mode = modes.includes("read")
 			? "read"
-			: modes.includes("ask")
-				? "ask"
-				: modes.includes("acceptEdits")
-					? "acceptEdits"
-					: "auto";
+			: modes.includes("plan")
+				? "plan"
+				: modes.includes("ask")
+					? "ask"
+					: modes.includes("acceptEdits")
+						? "acceptEdits"
+						: "auto";
 		return { version: 1, mode, rules, disabledTools: [...disabledTools], project: conversation.project };
 	}
 
@@ -1602,7 +1924,7 @@ export class DesktopService {
 		return this.serialize(async () => {
 			if (this.closed) throw new Error("桌面服务已关闭。");
 			const conversation = this.conversation(input.conversationId);
-			if (this.permissionPolicy(conversation.id).mode === "read") throw new Error("只读模式禁止创建交互终端。");
+			if (this.isReadRestricted(conversation.id)) throw new Error("只读或 Plan 模式禁止创建交互终端。");
 			return this.terminals.create({ ...input, conversationId: conversation.id, project: conversation.project });
 		});
 	}
@@ -1614,7 +1936,7 @@ export class DesktopService {
 
 	async writeTerminal(id: string, data: string): Promise<void> {
 		const terminal = this.terminals.list().find((item) => item.id === id);
-		if (this.closed || this.store.settings.permission === "read" || (terminal && this.permissionPolicy(terminal.conversationId).mode === "read")) throw new Error("当前不可向终端输入。");
+		if (this.closed || this.isReadRestricted() || (terminal && this.isReadRestricted(terminal.conversationId))) throw new Error("当前不可向终端输入。");
 		await this.terminals.write(id, data);
 	}
 
@@ -1659,7 +1981,7 @@ export class DesktopService {
 
 	async restoreCheckpoint(id: string, conversationId?: string, paths?: string[]): Promise<GitRestoreResult> {
 		return this.serialize(async () => {
-			if (this.store.settings.permission === "read") throw new Error("只读模式禁止恢复文件。");
+			if (this.isReadRestricted(conversationId)) throw new Error("只读或 Plan 模式禁止恢复文件。");
 			const conversation = this.conversation(conversationId);
 			this.assertProjectIdle(conversation.project);
 			if (
@@ -1679,7 +2001,7 @@ export class DesktopService {
 
 	createWorktree(input: WorktreeCreateInput): Promise<WorktreeInfo> {
 		return this.serialize(async () => {
-			if (this.store.settings.permission === "read") throw new Error("只读模式禁止创建 Worktree。");
+			if (this.isReadRestricted(input.conversationId)) throw new Error("只读或 Plan 模式禁止创建 Worktree。");
 			if (input.conversationId) this.conversation(input.conversationId);
 			return this.worktrees.create(input);
 		});
@@ -1687,7 +2009,7 @@ export class DesktopService {
 
 	removeWorktree(id: string): Promise<WorktreeRemoveResult> {
 		return this.serialize(async () => {
-			if (this.store.settings.permission === "read") throw new Error("只读模式禁止删除 Worktree。");
+			if (this.isReadRestricted()) throw new Error("只读或 Plan 模式禁止删除 Worktree。");
 			const item = (await this.worktrees.list()).find((tree) => tree.id === id);
 			if (!item) throw new Error("Worktree 不存在。");
 			if (item.conversationId) {
@@ -1703,7 +2025,7 @@ export class DesktopService {
 
 	mergeWorktree(id: string): Promise<WorktreeMergeResult> {
 		return this.serialize(() => {
-			if (this.store.settings.permission === "read") throw new Error("只读模式禁止合并 Worktree。");
+			if (this.isReadRestricted()) throw new Error("只读或 Plan 模式禁止合并 Worktree。");
 			return this.worktrees.merge(id);
 		});
 	}
@@ -1883,6 +2205,15 @@ export class DesktopService {
 			if (task && ["running", "waiting_for_input"].includes(task.status))
 				this.updateTask(task, error ? "failed" : aborted ? "cancelled" : "completed", error);
 			await this.persist();
+			if (!runtime.stopping && !this.closed) {
+				const conv = this.conversation(runtime.conversationId);
+				void this.hooks.run("Stop", {
+					project: conv.project,
+					projectTrusted: this.isProjectTrusted(conv.project),
+					conversationId: conv.id,
+					env: this.options.env,
+				}).catch(() => {});
+			}
 		} catch (failure) {
 			const message = `无法完成 Git 恢复点：${failure instanceof Error ? failure.message : String(failure)}`;
 			const task = this.store.tasks.find((item) => item.conversationId === runtime.conversationId);
@@ -1923,6 +2254,7 @@ export class DesktopService {
 			await rm(runtime.controls.directory, { recursive: true, force: true });
 		}
 		if (runtime.policyFile) await rm(runtime.policyFile, { force: true });
+		if (runtime.sandboxProfileFile) await rm(runtime.sandboxProfileFile, { force: true });
 		if (this.runtimes.get(runtime.conversationId) === runtime) this.runtimes.delete(runtime.conversationId);
 	}
 	private async scheduleTasks(): Promise<void> {
@@ -2094,6 +2426,11 @@ export class DesktopService {
 			env.PI_DESKTOP_CONNECTIONS = JSON.stringify(connections);
 			runtime.policyFile = join(this.options.dataDir, `policy-${conversation.id}-${randomBytes(8).toString("hex")}.json`);
 			env.PI_DESKTOP_POLICY_FILE = runtime.policyFile;
+			if (this.store.settings.sandbox && (await probeSeatbeltSupport()).supported) {
+				runtime.sandboxProfileFile = join(this.options.dataDir, `sandbox-${conversation.id}-${randomBytes(8).toString("hex")}.sb`);
+				await writeFile(runtime.sandboxProfileFile, buildSeatbeltProfile(conversation.project, [this.options.dataDir]), { mode: 0o600 });
+				env.PI_DESKTOP_SANDBOX_PROFILE = runtime.sandboxProfileFile;
+			}
 			const delegated = this.store.tasks.find((task) => task.conversationId === conversation.id && task.parentConversationId);
 			// Set these explicitly so an inherited shell environment cannot change a session's role.
 			env.PI_DESKTOP_CHILD = delegated ? "1" : "0";
@@ -2155,12 +2492,15 @@ export class DesktopService {
 				args.push("--provider", model.provider, "--model", model.id);
 			}
 			const task = this.store.tasks.find((item) => item.conversationId === conversation.id);
+			const policyMode = this.permissionPolicy(conversation.id).mode;
 			const allowedTools = task?.allowedTools?.filter((name) => piBuiltinTools.has(name));
 			if (allowedTools?.length) {
 				args.push("--tools", allowedTools.join(","));
-				if (this.permissionPolicy(conversation.id).mode === "read") args.push("--exclude-tools", "mcp__*");
-			} else if (this.permissionPolicy(conversation.id).mode === "read") {
+				if (policyMode === "read" || policyMode === "plan") args.push("--exclude-tools", "mcp__*");
+			} else if (policyMode === "read") {
 				args.push("--tools", "read,grep,find,ls", "--exclude-tools", "mcp__*");
+			} else if (policyMode === "plan") {
+				args.push("--tools", "read,grep,find,ls,write,edit", "--exclude-tools", "mcp__*");
 			}
 			const agent = new AgentProcess({
 				executable: this.options.executable,
@@ -2185,6 +2525,12 @@ export class DesktopService {
 				reasoning,
 			}));
 			runtime.engineStatus = "ready";
+			void this.hooks.run("SessionStart", {
+				project: conversation.project,
+				projectTrusted: this.isProjectTrusted(conversation.project),
+				conversationId: conversation.id,
+				env: this.options.env,
+			}).catch(() => {});
 			if (conversation.sessionLeafId !== undefined) {
 				const cursor = await agent.request<SessionTreeResult>({ type: "get_tree" });
 				if (cursor.leafId !== conversation.sessionLeafId) {
@@ -2467,7 +2813,7 @@ function validateStore(input: unknown): StoredState {
 	)
 		throw new Error("会话配置格式错误。");
 	if (
-		!["ask", "acceptEdits", "read", "auto"].includes(value.settings.permission) ||
+		!["ask", "acceptEdits", "read", "auto", "plan"].includes(value.settings.permission) ||
 		!["light", "dark", "system"].includes(value.settings.theme)
 	)
 		throw new Error("设置格式错误。");
@@ -2494,6 +2840,8 @@ function validateStore(input: unknown): StoredState {
 		settings: {
 			permission: value.settings.permission,
 			theme: value.settings.theme,
+			sandbox: typeof value.settings.sandbox === "boolean" ? value.settings.sandbox : undefined,
+			notifications: typeof value.settings.notifications === "boolean" ? value.settings.notifications : undefined,
 			defaultModel: value.settings.defaultModel,
 			connections: value.settings.connections ?? {},
 			agentDir: value.settings.agentDir,

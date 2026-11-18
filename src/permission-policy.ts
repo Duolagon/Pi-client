@@ -12,9 +12,9 @@ import type {
 } from "./permission-types.ts";
 
 const readingTools = new Set(["read", "grep", "find", "ls"]);
-const editTools = new Set(["edit", "write"]);
-const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite"]);
-const pathTools = new Set([...readingTools, "edit", "write"]);
+const editTools = new Set(["edit", "write", "NotebookEdit"]);
+const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite", "AskUserQuestion", "ExitPlanMode"]);
+const pathTools = new Set([...readingTools, "edit", "write", "NotebookEdit"]);
 const wrappers = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", ".", "env", "sudo", "doas", "exec", "command", "xargs"]);
 
 function object(value: unknown, label: string): Record<string, unknown> {
@@ -86,7 +86,7 @@ export function validatePermissionRule(value: unknown): PermissionRule {
 export function validateRuntimePolicy(value: unknown): RuntimePermissionPolicy {
 	const record = object(value, "运行时权限配置");
 	keys(record, ["version", "mode", "rules", "disabledTools", "project"], "运行时权限配置");
-	if (record.version !== 1 || !["ask", "acceptEdits", "auto", "read"].includes(record.mode as string))
+	if (record.version !== 1 || !["ask", "acceptEdits", "auto", "read", "plan"].includes(record.mode as string))
 		throw new Error("运行时权限版本或模式无效。");
 	if (!Array.isArray(record.rules) || record.rules.length > 2000) throw new Error("权限规则列表无效。");
 	if (!Array.isArray(record.disabledTools) || record.disabledTools.length > 10000) throw new Error("停用工具列表无效。");
@@ -306,12 +306,37 @@ export async function evaluatePermission(
 		? (call.input as Record<string, unknown>)
 		: {};
 	let targets: string[] = [];
-	if (typeof input.path === "string") targets = [pathTools.has(call.toolName)
-		? await nativeToolTarget(input.path, project, call.toolName === "read")
-		: await canonicalPermissionPath(input.path, project)];
+	const rawPath =
+		typeof input.path === "string"
+			? input.path
+			: call.toolName === "NotebookEdit" && typeof input.notebook_path === "string"
+				? input.notebook_path
+				: undefined;
+	if (typeof rawPath === "string") targets = [pathTools.has(call.toolName)
+		? await nativeToolTarget(rawPath, project, call.toolName === "read")
+		: await canonicalPermissionPath(rawPath, project)];
 	else if (pathTools.has(call.toolName)) {
-		if (["read", "edit", "write"].includes(call.toolName)) return { action: "deny", reason: "工具缺少有效的文件路径。" };
+		if (["read", "edit", "write", "NotebookEdit"].includes(call.toolName)) return { action: "deny", reason: "工具缺少有效的文件路径。" };
 		targets = [project];
+	}
+	let writingPlanFile = false;
+	if (policy.mode === "plan") {
+		const planDirs = await Promise.all([
+			canonicalPermissionPath(".pi/plans", project),
+			canonicalPermissionPath(".claude/plans", project),
+		]);
+		const inPlanDir = (target: string) => planDirs.some((dir) => contained(dir, target) && target !== dir);
+		writingPlanFile = (call.toolName === "write" || call.toolName === "edit") && targets.length > 0 && targets.every(inPlanDir);
+		const isSafePlanAgent = call.toolName === "Agent" && input.subagent_type !== "general-purpose";
+		const allowedInPlan =
+			readingTools.has(call.toolName) ||
+			harmlessDesktopTools.has(call.toolName) ||
+			call.toolName === "WebFetch" ||
+			writingPlanFile ||
+			isSafePlanAgent;
+		if (!allowedInPlan) {
+			return { action: "deny", reason: "Plan 模式下此工具不可执行，仅允许只读调研或编写计划文件（.pi/plans/）。", ...(targets.length ? { targets } : {}) };
+		}
 	}
 	const shell = call.toolName === "bash" && typeof input.command === "string" ? parseShell(input.command) : undefined;
 	const matches: { rule: PermissionRule; conservative: boolean }[] = [];
@@ -344,6 +369,11 @@ export async function evaluatePermission(
 		};
 	}
 	const result = (action: PermissionAction, reason: string): PermissionDecision => ({ action, reason, ...(targets.length ? { targets } : {}) });
+	if (policy.mode === "plan") {
+		if (writingPlanFile) return result("allow", "Plan 模式：允许编辑计划文件。");
+		if (call.toolName === "Agent" && (input.subagent_type === "Explore" || input.subagent_type === "Plan"))
+			return result("allow", "Plan 模式：允许只读探索/规划子 Agent。");
+	}
 	if (policy.mode === "auto") return result("allow", "自动执行模式。");
 	if (policy.mode === "acceptEdits" && editTools.has(call.toolName) && targets.length && targets.every((target) => contained(project, target)))
 		return result("allow", "接受编辑模式：项目内文件编辑自动允许。");

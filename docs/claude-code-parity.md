@@ -5,14 +5,15 @@
 > 结论口径：只比较“能力面”和“交互面”，不比较底层模型谁更聪明；服务依赖型能力单独标注。
 > 2026-11-17 修复：已补工作区信任 UI 与 `--approve`/`--no-approve` 启动参数；`auto` 已改名为“跳过确认（危险）”并加常驻警告。第 3.4、4.1、4.2、4.8 节相关条目已部分关闭，其余仍是差距。
 > 2026-11-18 第二阶段：新增 `acceptEdits`、自定义 Agent（`.claude/agents`、`.pi/agents`、工具白名单、模型/思考强度）与 MCP 服务器管理（用户/项目 `mcp.json`、stdio/HTTP、启停）。第 3.4、3.6、4.4、4.5、4.8 节的部分条目已关闭。
+> 2026-11-18 第三阶段：新增 Claude 兼容声明式 Hooks 引擎与 `/hooks` 管理（`PreToolUse` / `PostToolUse` / `UserPromptSubmit` / `Stop` / `SessionStart` / `Notification`）、引擎级 `plan` 权限模式与 `ExitPlanMode`（`.pi/plans/<id>.md` + 放行 `WebFetch` 与 `Explore/Plan` 只读子 Agent）、`.claude/rules/*.md` 与 `@import` 分层记忆、`/context` 占用可视化与 `autoCompaction`/`autoRetry`/`/compact [指令]`、`AskUserQuestion` 结构化提问、`NotebookEdit`、`/btw` 侧问、`⌘F` 会话检索、`/skills` 创建管理、`.claude/settings.json` 规则导入/导出、桌面通知，以及设置中可选的 macOS `sandbox-exec`（Seatbelt）Bash 命令沙箱。
 
 ## 0. 一分钟结论
 
 | 层面 | 判断 | 说明 |
 | --- | --- | --- |
-| 视觉与消息流 | **约 80%** | `>` 提示块、工具树、`⎿` 摘要、内联 Diff、Thought、Todo、Plan 审批条都已具备，观感接近原生客户端 |
-| 日常本地编码 | **约 55%** | 读写、命令、权限规则、检查点、Git、PTY、Worktree、自定义 Agent 与 MCP 管理可用；OS 沙箱、Hooks、插件、记忆/上下文、后台会话仍是硬伤 |
-| 平台与生态 | **约 20%** | 无 IDE/LSP、Chrome、语音、云会话、Remote Control、插件市场、企业策略 |
+| 视觉与消息流 | **约 95%** | `>` 提示块、工具树、`⎿` 摘要、内联 Diff、Thought、Todo、结构化提问卡片、可编辑 Plan 审批条都已具备 |
+| 日常本地编码 | **约 85%** | 读写、命令、Notebook、Hooks、权限规则导入导出、检查点、Git 分栏/暂存/提交、PTY、Worktree、自定义 Agent、MCP、`/context`、`/memory`/rules、引擎级 `plan` 与 macOS Bash 沙箱均已就绪 |
+| 平台与生态 | **约 25%** | 仍不含需 Anthropic 云账号/外部扩展生态的功能（IDE/LSP 插件、官方插件市场、Chrome 浏览器操控、语音、云会话/Remote Control、企业托管策略、正式代码签名/自动更新） |
 | 综合（15 个能力面简单平均） | **约 48%** | 详见第 2 节；这是排序用的主观评分，不是厂商基准 |
 
 **最需要补的五件事**：OS 沙箱与安全边界、Hooks/插件扩展体系、记忆与上下文可视化、后台会话与系统通知、真正的 Plan 模式与项目规则共享。

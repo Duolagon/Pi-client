@@ -152,6 +152,8 @@ export class ModelDelegation {
 			const owner = await this.callbacks.getConversation(context.conversationId);
 			const definition = await this.resolveAgent(owner.project, input.subagent_type);
 			const readOnly = definition?.readOnly ?? input.subagent_type !== "general-purpose";
+			if ((await this.callbacks.isPlanMode?.(owner.id)) && !readOnly)
+				throw new Error("Plan 模式下仅允许委派 Explore / Plan 等只读子 Agent。");
 			const selection = await this.callbacks.getSelection(owner.id);
 			const isolation = input.isolation ?? (readOnly ? "shared" : (await this.callbacks.isGit(owner.project)) ? "worktree" : "shared");
 			if (input.worktree_id) await this.ownedWorktree(owner.id, input.worktree_id);

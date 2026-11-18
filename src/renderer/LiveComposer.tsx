@@ -12,6 +12,7 @@ const DEFAULT_DESKTOP_KEYBINDINGS = { submit: "Enter" };
 const PERMISSION_LABEL: Record<PermissionMode, string> = {
 	ask: "手动确认",
 	acceptEdits: "接受编辑",
+	plan: "计划模式",
 	auto: "跳过确认（危险）",
 	read: "只读模式",
 };
@@ -37,6 +38,10 @@ export type BuiltinSlashAction =
 	| "new"
 	| "permissions"
 	| "mcp"
+	| "hooks"
+	| "skills"
+	| "context"
+	| "btw"
 	| "rewind"
 	| "tasks"
 	| "agents"
@@ -49,16 +54,20 @@ export type BuiltinSlashAction =
 	| "preview";
 
 const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[] = [
-	{ name: "compact", description: "压缩当前会话上下文" },
+	{ name: "compact", description: "压缩上下文（支持 /compact <聚焦指令>）" },
+	{ name: "context", description: "查看上下文占用构成与自动压缩设置" },
+	{ name: "btw", description: "不污染主会话的侧边快问（/btw <问题>）" },
 	{ name: "new", description: "新建会话" },
-	{ name: "plan", description: "进入/退出只读计划模式（调研方案并待审批后执行）" },
+	{ name: "plan", description: "进入/退出引擎级计划模式（只读调研+输出方案）" },
 	{ name: "rewind", description: "打开 Git 检查点与代码回滚" },
-	{ name: "permissions", description: "管理细粒度权限规则" },
+	{ name: "permissions", description: "管理细粒度权限规则与团队导入导出" },
 	{ name: "mcp", description: "查看工具清单与 MCP 服务" },
+	{ name: "hooks", description: "管理 Claude 兼容生命周期 Hooks" },
+	{ name: "skills", description: "查看与新建 Skills 指令技能" },
 	{ name: "tasks", description: "查看后台任务、子 Agent 与 Worktree" },
 	{ name: "agents", description: "查看或创建自定义子 Agent" },
 	{ name: "sessions", description: "查看会话分支树与导入 CLI 历史" },
-	{ name: "memory", description: "查看或编辑项目 AGENTS.md / CLAUDE.md" },
+	{ name: "memory", description: "编辑项目记忆与 .claude/rules 规则" },
 	{ name: "status", description: "查看当前模型、上下文与工具挂载状态" },
 	{ name: "init", description: "AI 分析仓库并生成 AGENTS.md 项目指南" },
 	{ name: "preview", description: "打开本地应用网页预览面板" },
@@ -79,6 +88,8 @@ export function LiveComposer({
 	setPermission,
 	openSettings,
 	onBuiltinSlash,
+	onCompactInstructions,
+	onBtw,
 	fail,
 }: {
 	snapshot: Snapshot;
@@ -94,6 +105,8 @@ export function LiveComposer({
 	setPermission: (value: PermissionMode) => void;
 	openSettings: () => void;
 	onBuiltinSlash: (action: BuiltinSlashAction) => void;
+	onCompactInstructions?: (instructions: string) => void;
+	onBtw?: (question: string) => void;
 	fail: (error: unknown) => void;
 }) {
 	const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -187,10 +200,22 @@ export function LiveComposer({
 	const submit = async () => {
 		const trimmed = draft.trim();
 		if (trimmed.startsWith("/") && !attachments.length) {
-			const cmdName = trimmed.slice(1).split(/\s+/)[0].toLowerCase();
+			const match = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(trimmed);
+			const cmdName = match?.[1]?.toLowerCase() ?? "";
+			const argText = match?.[2]?.trim() ?? "";
 			if (cmdName === "clear") {
 				setDraft("");
 				onBuiltinSlash("new");
+				return;
+			}
+			if (cmdName === "compact" && argText && onCompactInstructions) {
+				setDraft("");
+				onCompactInstructions(argText);
+				return;
+			}
+			if (cmdName === "btw" && argText && onBtw) {
+				setDraft("");
+				onBtw(argText);
 				return;
 			}
 			const builtin = BUILTIN_SLASH_COMMANDS.find((c) => c.name === cmdName);
@@ -236,7 +261,7 @@ export function LiveComposer({
 	const activeSlashIndex = slashOptions.length ? Math.min(slashIndex, slashOptions.length - 1) : 0;
 	const selectSlash = (name: string) => {
 		const builtin = BUILTIN_SLASH_COMMANDS.find((c) => c.name === name);
-		if (builtin && name !== "plan") {
+		if (builtin && name !== "plan" && name !== "btw") {
 			setDraft("");
 			setSlashDismissed(false);
 			setSlashIndex(0);
@@ -398,7 +423,7 @@ export function LiveComposer({
 					onKeyDown={(event) => {
 						if (event.key === "Tab" && event.shiftKey && !changing && !running) {
 							event.preventDefault();
-							const order: PermissionMode[] = ["ask", "acceptEdits", "auto", "read"];
+							const order: PermissionMode[] = ["ask", "acceptEdits", "plan", "auto", "read"];
 							const next = order[(order.indexOf(snapshot.settings.permission) + 1) % order.length];
 							setPermission(next);
 							return;

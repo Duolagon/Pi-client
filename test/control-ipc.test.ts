@@ -64,8 +64,11 @@ test("control IPC lists real Pi tools, applies scoped overrides, and exposes fin
 	t.after(data.cleanup);
 	assert.deepEqual([...data.handlers.keys()].sort(), [
 		"pi:agents:list", "pi:agents:remove", "pi:agents:save",
+		"pi:hooks:list", "pi:hooks:remove", "pi:hooks:save", "pi:hooks:test",
 		"pi:mcp:list", "pi:mcp:remove", "pi:mcp:save",
-		"pi:permissions:check", "pi:permissions:list", "pi:permissions:remove", "pi:permissions:upsert",
+		"pi:permissions:check", "pi:permissions:export-claude", "pi:permissions:import-claude",
+		"pi:permissions:list", "pi:permissions:remove", "pi:permissions:upsert",
+		"pi:skills:list", "pi:skills:remove", "pi:skills:save",
 		"pi:task:result", "pi:tools:list", "pi:tools:set-enabled",
 	]);
 	let tools = await data.invoke<DesktopToolInfo[]>("pi:tools:list", data.id);

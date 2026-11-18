@@ -79,13 +79,17 @@ DeepSeek 默认使用 `deepseek-flash`，并提供 `deepseek-v4-pro`；模型与
 - Git 暂存、放弃修改与提交，以及 Unified / Split（分栏）Diff 视图切换。
 - 原生交互式 PTY 终端：界面支持单次命令与交互 PTY 双页签，支持多终端创建、标准输入、Ctrl-C、输出回放与子进程清理。
 - 会话分支树与 Pi CLI 历史导入（`/sessions`）：浏览会话分支树、节点跳转/分叉、克隆当前分支，以及发现并显式导入 Pi CLI 历史副本。
-- Claude Code 对等增强：Plan 计划模式与计划审批栏、`TodoWrite` 任务进度清单、`WebFetch` 网页抓取（带内网隔离）、`/memory` 与 `/status`（编辑 `AGENTS.md`/`CLAUDE.md`、`/init` 引导与 Token/费用/工具统计）、`/preview` 本地 Web 应用预览面板、消息悬停操作（复制 Markdown / 分叉 / 回滚）与 `⌘P` 全局命令面板。
+- Claude Code 对等增强（Phase 1–3）：
+  - **引擎级 Plan 模式 & 结构化交互**：独立 `plan` 权限模式（只读调研、放行 `WebFetch` 与 `Explore/Plan` 只读子 Agent、允许写入 `.pi/plans/<id>.md` 并阻断源码写入与写命令），配合 `ExitPlanMode`、计划正文预览/编辑审批栏与 `AskUserQuestion` 多选/表单提问卡片；另内置 `TodoWrite` 任务进度清单、`WebFetch`（带内网隔离）与 `NotebookEdit`（`.ipynb` 单元格编辑）。
+  - **Claude 兼容 Hooks 引擎（`/hooks`）**：支持 `~/.claude/settings.json`、`~/.pi/agent/hooks.json` 以及受信任项目内的 `.claude/settings.json` / `.pi/hooks.json`，涵盖 `PreToolUse`、`PostToolUse`、`UserPromptSubmit`、`Stop`、`SessionStart`、`Notification`，支持正则 matcher、exit code `2` / JSON 决策拦截与测试触发。
+  - **上下文分析、分层记忆与压缩控制（`/memory` / `/context` / `/status`）**：支持编辑根目录 `AGENTS.md` / `AGENTS.override.md` / `CLAUDE.md` / `CLAUDE.local.md` 与 `.claude/rules/*.md`（含 `paths:` 与 `@import` 解析）、`/init` 引导、分段上下文占用可视化、缓存命中率、`autoCompaction` / `autoRetry` 开关以及 `/compact [指令]`。
+  - **权限规则共享、Skills、侧问与效率工具**：支持将项目规则双向导入/导出 `.claude/settings.json`；`/skills` 支持查看与新建 `.pi/skills` / `.claude/skills`；支持 `/btw <问题>` 不污染主会话的独立侧问、`/preview` 本地网页预览（仅 `localhost`）、`⌘F` 会话内检索、`⌘P` 全局命令面板、窗口失焦桌面通知，以及设置中可选的 macOS `sandbox-exec`（Seatbelt）Bash 命令沙箱开关。
 
 新增后端能力通过 preload/IPC 提供给负责界面的开发者。完整接入契约、示例与限制见 [后端接口文档](docs/backend-api.md)。
 
 工具控制及 Claude Code 风格的子任务卡片接入见 [工具与委派文档](docs/tools-and-delegation.md)。外部执行器使用方式、能力限制和前端事件契约见 [本机多 Agent 接入](docs/local-external-agents.md)；SSH 后续实现。
 
-权限确认作用于 Pi 工具调用，不等同于操作系统沙箱。只读模式限制工具并阻止客户端直接命令执行；其他模式下，命令工具使用启动用户的系统权限。
+权限确认作用于 Pi 工具调用，默认不等同于操作系统沙箱。在 macOS 设置中启用实验性 Seatbelt 沙箱开关后，Bash 命令的文件写操作会被限制在当前项目与临时目录；未启用或交互式 PTY 终端仍以启动用户的系统权限运行。
 
 ## 数据和限制
 

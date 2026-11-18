@@ -19,9 +19,13 @@ export function PermissionDialog({
 	fail: (error: unknown) => void;
 }) {
 	const [value, setValue] = useState("");
+	const [questionAnswers, setQuestionAnswers] = useState<Record<string, string[]>>({});
+	const [questionCustom, setQuestionCustom] = useState<Record<string, string>>({});
 	const [pending, setPending] = useState(false);
 	useEffect(() => {
 		setValue(request.method === "editor" ? (request.prefill ?? "") : "");
+		setQuestionAnswers({});
+		setQuestionCustom({});
 		setPending(false);
 	}, [request.id]);
 	const answer = async (response: Response) => {
@@ -44,7 +48,24 @@ export function PermissionDialog({
 	const cancel = () => {
 		if (!pending) void answer({ type: "extension_ui_response", id: request.id, cancelled: true });
 	};
-	const title = "title" in request ? request.title : "Pi 需要你的输入";
+	const isAskQuestions = request.method === "input" && request.title === "__PI_ASK_QUESTIONS__";
+	const parsedQuestions = useMemo(() => {
+		if (!isAskQuestions || !("placeholder" in request) || !request.placeholder) return null;
+		try {
+			const data = JSON.parse(request.placeholder) as {
+				questions?: Array<{
+					header?: string;
+					question: string;
+					multiSelect?: boolean;
+					options: Array<{ label: string; description?: string }>;
+				}>;
+			};
+			return Array.isArray(data?.questions) ? data.questions : null;
+		} catch {
+			return null;
+		}
+	}, [isAskQuestions, request]);
+	const title = isAskQuestions ? "请回答以下确认问题" : "title" in request ? request.title : "Pi 需要你的输入";
 	const toolMatch = /^允许执行\s+([^\s？?]+)[？?]?$/.exec(title);
 	const inferredTool = toolMatch?.[1];
 
@@ -179,7 +200,77 @@ export function PermissionDialog({
 						</button>
 					</div>
 				)}
-				{(request.method === "input" || request.method === "editor") && (
+				{isAskQuestions && parsedQuestions ? (
+					<form
+						className="cc-ask-form"
+						onSubmit={(event) => {
+							event.preventDefault();
+							const formatted: Record<string, string | string[]> = {};
+							parsedQuestions.forEach((q, idx) => {
+								const key = q.header || `Q${idx + 1}`;
+								const selected = questionAnswers[String(idx)] ?? [];
+								const custom = (questionCustom[String(idx)] ?? "").trim();
+								const combined = custom ? [...selected, custom] : selected;
+								formatted[key] = q.multiSelect ? combined : (combined[0] ?? "");
+							});
+							void answer({ type: "extension_ui_response", id: request.id, value: JSON.stringify({ answers: formatted }) });
+						}}
+					>
+						{parsedQuestions.map((q, idx) => {
+							const k = String(idx);
+							const selected = questionAnswers[k] ?? [];
+							const toggleOption = (label: string) => {
+								setQuestionAnswers((prev) => {
+									const cur = prev[k] ?? [];
+									if (q.multiSelect) {
+										return { ...prev, [k]: cur.includes(label) ? cur.filter((x) => x !== label) : [...cur, label] };
+									}
+									return { ...prev, [k]: [label] };
+								});
+							};
+							return (
+								<div key={idx} className="cc-ask-card">
+									<div className="cc-ask-head">
+										{q.header && <span className="cc-source-tag">{q.header}</span>}
+										<strong>{q.question}</strong>
+									</div>
+									<div className="cc-ask-options">
+										{q.options.map((opt) => {
+											const checked = selected.includes(opt.label);
+											return (
+												<button
+													type="button"
+													key={opt.label}
+													className={`cc-ask-opt ${checked ? "active" : ""}`}
+													onClick={() => toggleOption(opt.label)}
+													disabled={pending}
+												>
+													<strong>{opt.label}</strong>
+													{opt.description && <span>{opt.description}</span>}
+												</button>
+											);
+										})}
+									</div>
+									<input
+										aria-label={`补充说明 ${idx + 1}`}
+										placeholder="或填写其他补充说明（可选）…"
+										value={questionCustom[k] ?? ""}
+										onChange={(e) => setQuestionCustom((prev) => ({ ...prev, [k]: e.target.value }))}
+										disabled={pending}
+									/>
+								</div>
+							);
+						})}
+						<div className="dialog-actions">
+							<button disabled={pending} type="button" className="secondary-button" onClick={cancel}>
+								取消
+							</button>
+							<button disabled={pending} className="primary-button">
+								提交回答
+							</button>
+						</div>
+					</form>
+				) : (request.method === "input" || request.method === "editor") && (
 					<form
 						onSubmit={(event) => {
 							event.preventDefault();

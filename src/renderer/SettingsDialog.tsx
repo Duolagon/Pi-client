@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type {
 	ConnectionInput,
 	ConnectionMode,
@@ -8,6 +8,7 @@ import type {
 	PermissionMode,
 	Provider,
 	ProviderPreset,
+	SandboxStatus,
 	Settings,
 	Snapshot,
 } from "../shared.ts";
@@ -58,6 +59,9 @@ export function SettingsDialog({
 	const initial = connectionValues(settings, initialPreset);
 	const [permission, setPermission] = useState<PermissionMode>(settings.permission);
 	const [theme, setTheme] = useState<Settings["theme"]>(settings.theme);
+	const [sandbox, setSandbox] = useState<boolean>(Boolean(settings.sandbox));
+	const [notifications, setNotifications] = useState<boolean>(settings.notifications !== false);
+	const [sandboxInfo, setSandboxInfo] = useState<SandboxStatus | null>(null);
 	const [provider, setProvider] = useState<Provider>(initialProvider);
 	const [mode, setMode] = useState<ConnectionMode>(initial.mode);
 	const [agentDir, setAgentDir] = useState(settings.agentDir ?? "");
@@ -71,6 +75,11 @@ export function SettingsDialog({
 	const [testing, setTesting] = useState(false);
 	const [error, setError] = useState("");
 	const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
+	useEffect(() => {
+		let mounted = true;
+		void window.pi.sandboxStatus().then((status) => { if (mounted) setSandboxInfo(status); }).catch(() => {});
+		return () => { mounted = false; };
+	}, []);
 	const preset = presets.find((item) => item.provider === provider)!;
 	const original = connectionValues(settings, preset);
 	const model = preset.models.find((item) => item.id === modelId);
@@ -78,7 +87,11 @@ export function SettingsDialog({
 	const storedKey = settings.configuredProviders.includes(provider);
 	const hasKey = Boolean(apiKey.trim()) || storedKey;
 	const generalSettingsChanged =
-		permission !== settings.permission || theme !== settings.theme || agentDir.trim() !== (settings.agentDir ?? "");
+		permission !== settings.permission ||
+		theme !== settings.theme ||
+		sandbox !== Boolean(settings.sandbox) ||
+		notifications !== (settings.notifications !== false) ||
+		agentDir.trim() !== (settings.agentDir ?? "");
 	const connectionChanged =
 		Boolean(apiKey.trim()) ||
 		mode !== original.mode ||
@@ -130,7 +143,7 @@ export function SettingsDialog({
 		}
 		setSaving(true);
 		try {
-			const update: Parameters<DesktopAPI["saveSettings"]>[0] = { permission, theme };
+			const update: Parameters<DesktopAPI["saveSettings"]>[0] = { permission, theme, sandbox, notifications };
 			if (agentDir.trim() !== (settings.agentDir ?? "")) update.agentDir = agentDir.trim();
 			if (connectionChanged) Object.assign(update, connectionInput);
 			const next = await window.pi.saveSettings(update);
@@ -369,6 +382,7 @@ export function SettingsDialog({
 							>
 								<option value="ask">手动确认：写文件和运行工具前询问</option>
 								<option value="acceptEdits">接受编辑：项目内文件编辑自动允许，命令仍按规则询问</option>
+								<option value="plan">计划模式：只读调研、子 Agent 与写入 .pi/plans/，批准后实施</option>
 								<option value="auto">跳过确认（危险）：除规则外不再询问，命令以本机权限运行</option>
 								<option value="read">只读：仅允许读取与搜索</option>
 							</select>
@@ -384,6 +398,29 @@ export function SettingsDialog({
 								<option value="dark">深色</option>
 								<option value="system">跟随系统</option>
 							</select>
+						</label>
+						<label className="live-setting-toggle">
+							<input
+								type="checkbox"
+								aria-label="开启 macOS 命令沙箱"
+								checked={sandbox}
+								disabled={pending || busy || sandboxInfo?.supported === false}
+								onChange={(event) => setSandbox(event.target.checked)}
+							/>
+							macOS Seatbelt 命令沙箱（将 Bash 写操作隔离至当前项目与临时目录）
+						</label>
+						{sandboxInfo && !sandboxInfo.supported && (
+							<p className="subtle-note">当前运行环境不支持嵌套 Seatbelt 沙箱：{sandboxInfo.reason}</p>
+						)}
+						<label className="live-setting-toggle">
+							<input
+								type="checkbox"
+								aria-label="任务桌面通知"
+								checked={notifications}
+								disabled={pending || busy}
+								onChange={(event) => setNotifications(event.target.checked)}
+							/>
+							窗口未聚焦时发送任务完成/待审批系统通知
 						</label>
 					</div>
 				</details>
