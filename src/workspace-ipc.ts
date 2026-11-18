@@ -44,6 +44,12 @@ export function installWorkspaceHandlers(
 			shell: optionalText(input.shell, "Shell 路径"),
 		});
 	});
+	handle("pi:terminal:packages", (conversationId, action, source) => {
+		if (action !== "list" && action !== "install" && action !== "update" && action !== "remove") throw new Error("Pi 扩展操作无效。");
+		return service.startPiPackages(id(conversationId), action, optionalText(source, "扩展包名称", 256));
+	});
+	handle("pi:terminal:ssh", (conversationId, host, startPi) => service.startSsh(id(conversationId), string(host, "SSH 主机", 300), startPi === true));
+	handle("pi:terminal:mcp-oauth", (conversationId, name) => service.startMcpOAuth(id(conversationId), string(name, "MCP 服务器", 64)));
 	handle("pi:terminal:list", async (conversationId) => service.listTerminals(optionalId(conversationId)));
 	handle("pi:terminal:write", (terminalId, data) => {
 		if (typeof data !== "string" || Buffer.byteLength(data, "utf8") > 1024 * 1024)
@@ -119,6 +125,13 @@ export function installWorkspaceHandlers(
 	handle("pi:workspace:write-memory", (file, content) => {
 		if (file !== "AGENTS.md" && file !== "CLAUDE.md") throw new Error("记忆文件名无效。");
 		return service.writeMemory(file, string(content, "记忆内容", 1024 * 1024));
+	});
+	handle("pi:code:inspect", (conversationId, path, at) => {
+		const location = at === undefined ? undefined : object(at);
+		return service.inspectCode(id(conversationId), string(path, "文件路径", 4096), location ? {
+			line: integer(location.line, "行号", 1, 1000000),
+			column: integer(location.column, "列号", 1, 1000000),
+		} : undefined);
 	});
 	handle("pi:workspace:context-report", () => service.contextReport());
 	handle("pi:workspace:write-memory-file", (relativePath, content) =>

@@ -1,4 +1,5 @@
-import { lstat, mkdir, realpath } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { lstat, mkdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
 
 function inside(root: string, path: string): boolean {
@@ -7,7 +8,7 @@ function inside(root: string, path: string): boolean {
 }
 
 function segment(value: string): string {
-	if (!/^[A-Za-z0-9._-]+$/.test(value) || value === "." || value === "..")
+	if (!value || /[\0/\\:]/.test(value) || value === "." || value === "..")
 		throw new Error("配置路径段无效。");
 	return value;
 }
@@ -69,4 +70,15 @@ export async function managedFile(
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 	return target;
+}
+
+/** Replace a validated file using a fresh, exclusively created sibling. */
+export async function writeManagedFile(target: string, content: string): Promise<void> {
+	const temporary = `${target}.${randomUUID()}.tmp`;
+	try {
+		await writeFile(temporary, content, { flag: "wx", mode: 0o600 });
+		await rename(temporary, target);
+	} finally {
+		await rm(temporary, { force: true });
+	}
 }

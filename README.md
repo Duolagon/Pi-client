@@ -42,7 +42,7 @@ npm run package
 npm run dist:mac
 ```
 
-打包时 electron-builder 会自行下载配置指定的 Electron 运行时，不要求先执行开发启动用的下载步骤。macOS Apple Silicon 的应用目录输出为 `release/desktop/mac-arm64/Pi Desktop.app`；应用内置 Electron 的 Node 运行时与 Pi RPC bundle，最终用户不需要安装 Node、编译器或 Pi。打包配置见 `desktop-builder.json`，当前本地构建未签名。
+打包时 electron-builder 会自行下载配置指定的 Electron 运行时，不要求先执行开发启动用的下载步骤。macOS Apple Silicon 的应用目录输出为 `release/desktop/mac-arm64/Pi Desktop.app`；应用内置 Electron 的 Node 运行时与 Pi RPC bundle，最终用户不需要安装 Node、编译器或 Pi。打包配置见 `desktop-builder.json`。日常构建使用未签名的开发包，发行包可运行 `npm run dist:mac:signed`。签名发行需要 Developer ID Application 证书和 Apple 公证凭据，凭据通过环境变量提供。Windows 构建跳过 POSIX PTY，Windows 客户端使用单次命令面板。 [electron-builder 签名文档](https://www.electron.build/v26/docs/features/code-signing/)
 
 ## 模型配置
 
@@ -70,7 +70,7 @@ DeepSeek 默认使用 `deepseek-flash`，并提供 `deepseek-v4-pro`；模型与
 - 实际项目文件查看、Git 分支状态及语法着色的修改差异审核，支持一键插入 `@文件引用`。
 - 文本和图片附件、可检索 Skills 浮层、`@` 文件与 `/` 命令补全、会话 HTML 导出与上下文压缩。
 - 工具清单、工具与细粒度权限管理弹窗：支持全局／项目／会话作用域启停、恢复继承以及 `allow / ask / deny` 规则增删。
-- MCP 服务器管理（`/mcp`）：读写用户 `~/.pi/agent/mcp.json` 与项目 `.pi/mcp.json`，支持 stdio/HTTP 增删、启停和描述；保存后重启当前项目会话，OAuth 登录仍使用 `pi mcp login <server>`。
+- MCP 服务器管理（`/mcp`）：读写用户 `~/.pi/agent/mcp.json` 与项目 `.pi/mcp.json`，支持 stdio/HTTP 增删、启停和描述；保存后重启当前项目会话，已启用的 HTTP 服务器可从管理面板打开 OAuth 登录终端，凭据由 Pi 保存。
 - 项目信任：打开含 `.pi/settings.json`、`.pi/mcp.json`、`.pi/agents`、`.claude/agents`、`.pi/extensions`、`.pi/skills`、`.pi/prompts`、`.pi/SYSTEM.md` 或祖先 `.agents/skills` 的项目时显示信任横幅与资源清单；未信任时不加载这些项目配置，信任后重启会话生效，顶栏可随时更改。`跳过确认（危险）` 模式有常驻风险提示。
 - 模型主动 `Agent` 委派、前台等待／后台结果回传、只读 Explore／Plan 与 Worktree 编码子任务；后台任务与 Worktree 弹窗支持查看详情、子任务审批、停止、快进合并与安全清理。
 - 自定义 Agent（`/agents`）：读取 `.claude/agents` 与 `.pi/agents`（项目级需项目信任），支持名称、描述、提示词、工具白名单、模型和思考强度；`Agent` 工具可按名称委派，只读定义自动共享、可写定义默认 Worktree。
@@ -87,9 +87,16 @@ DeepSeek 默认使用 `deepseek-flash`，并提供 `deepseek-v4-pro`；模型与
 
 新增后端能力通过 preload/IPC 提供给负责界面的开发者。完整接入契约、示例与限制见 [后端接口文档](docs/backend-api.md)。
 
-工具控制及 Claude Code 风格的子任务卡片接入见 [工具与委派文档](docs/tools-and-delegation.md)。外部执行器使用方式、能力限制和前端事件契约见 [本机多 Agent 接入](docs/local-external-agents.md)；SSH 后续实现。
+工具控制及 Claude Code 风格的子任务卡片接入见 [工具与委派文档](docs/tools-and-delegation.md)。外部执行器使用方式、能力限制和前端事件契约见 [本机多 Agent 接入](docs/local-external-agents.md)。
 
-权限确认作用于 Pi 工具调用，默认不等同于操作系统沙箱。在 macOS 设置中启用实验性 Seatbelt 沙箱开关后，Bash 命令的文件写操作会被限制在当前项目与临时目录；未启用或交互式 PTY 终端仍以启动用户的系统权限运行。
+权限确认作用于 Pi 工具调用，默认不等同于操作系统沙箱。在 macOS 设置中启用 Seatbelt 后，Bash 命令仅可写当前项目和临时目录，并可关闭网络访问。交互终端、MCP、Hooks 和模型连接各自运行。
+
+### 日常工作流
+
+1. 在前台会话运行时，可从侧栏切到其他会话。待确认的工具可选「稍后处理」，切回原会话恢复审批、流式内容和当前窗口的独立草稿。并行写入使用不同项目或 Worktree。关闭桌面应用会结束本地进程，重新启动后可以读取已保存历史。
+2. 在「代码修改」点击 Diff 行号，将带文件路径和行号的评审反馈加入会话草稿。「PR 与 CI」使用已登录的 `gh` 读取 PR、每 30 秒刷新检查状态，并可从已推送分支创建草稿 PR。「本地网页预览」的「验证页面」使用隔离的 Chromium 读取同源页面，报告 HTTP 状态、标题和浏览器错误。
+3. 信任项目后，文件面板的「代码分析」可检查诊断和文档符号，并按文件位置跳到项目内定义。JS／TS、Python、Go、Rust 分别需要在 PATH 配置 `typescript-language-server`、`pyright-langserver`、`gopls`、`rust-analyzer`。项目规则支持 `.claude/rules`、`.pi/rules` 和 `paths` 匹配，支持展开项目内 `@文件` 和 Markdown 导入。通过 `/memory` 编辑的「本机项目记忆」保存在应用数据中，在受信任的同项目会话间复用。
+4. 在设置中开启 macOS 命令沙箱，可附加网络隔离。在 MCP 面板点击「OAuth 登录」。终端的「Pi 扩展」可列出、安装、更新或移除用户级 npm 扩展包，「SSH」可用系统 OpenSSH 配置打开远端 Shell 或 Pi。远端接入使用独立终端，审批与会话记录留在远端。
 
 ## 数据和限制
 
@@ -97,7 +104,7 @@ DeepSeek 默认使用 `deepseek-flash`，并提供 `deepseek-v4-pro`；模型与
 
 项目信任决定保存在应用数据目录 `desktop.json` 的 `projectTrust` 字段。未信任项目只加载用户级 Pi 配置与 `AGENTS.md` / `CLAUDE.md`；信任后才会加载项目 `.pi` 受保护资源，并重启该项目会话。该机制不等于 OS 沙箱。
 
-终端面板同时提供原单次命令模式与真实交互式 PTY 页签（`window.pi.terminals`）；网页预览出于安全原因仅允许加载 `localhost` / `127.0.0.1` 本地地址。跨机 SSH 委派、正式代码签名和自动更新尚未实现。自定义连接匹配 Pi 已知的服务商和模型 ID 时，沿用其能力与计费元数据；未知模型使用通用上下文、输出上限和占位价格。
+终端面板同时提供原单次命令模式与真实交互式 PTY 页签（`window.pi.terminals`）；网页预览出于安全原因仅允许加载 `localhost` / `127.0.0.1` 本地地址。SSH 支持在桌面终端连接远端或启动远端已安装的 Pi。云端托管、手机接管、将 SSH 会话纳入本地 Agent 委派与审批，以及自动更新仍待实现。自定义连接匹配 Pi 已知的服务商和模型 ID 时，沿用其能力与计费元数据；未知模型使用通用上下文、输出上限和占位价格。
 
 `PI_DESKTOP_DATA_DIR` 和 `PI_DESKTOP_WORKSPACE` 可指定独立的数据和初始项目目录，供开发及隔离验证使用。普通启动会等待用户选择项目，不会把 Finder 的当前目录当成项目。
 

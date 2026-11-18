@@ -21,6 +21,11 @@ import type { DesktopMcpAPI } from "./mcp-types.ts";
 import type { DesktopHooksAPI } from "./hook-types.ts";
 import type { ContextBreakdown, ContextMemorySource } from "./context-inspector.ts";
 import type { SkillDefinitionEntry, SkillRemoveInput, SkillSaveInput } from "./skill-registry.ts";
+import type { DraftPullRequest } from "./review-service.ts";
+import type { CodeIntelligence, CodePosition } from "./language-service.ts";
+import type { PreviewCheck } from "./preview-check.ts";
+export type { CodeIntelligence, CodePosition } from "./language-service.ts";
+export type { PreviewCheck } from "./preview-check.ts";
 export type * from "./external-types.ts";
 export type * from "./agent-types.ts";
 export type * from "./mcp-types.ts";
@@ -54,7 +59,11 @@ export interface DesktopGitAPI {
 	diff(input: CheckpointTarget & { path?: string }): Promise<GitCheckpointDiff>;
 	restore(input: CheckpointTarget & { paths?: string[] }): Promise<GitRestoreResult>;
 }
+export type PiPackageAction = "list" | "install" | "update" | "remove";
 export interface DesktopTerminalAPI {
+	packages(conversationId: string, action: PiPackageAction, source?: string): Promise<TerminalInfo>;
+	ssh(conversationId: string, host: string, startPi: boolean): Promise<TerminalInfo>;
+	mcpOAuth(conversationId: string, name: string): Promise<TerminalInfo>;
 	create(
 		input?: Omit<TerminalCreateInput, "project" | "conversationId"> & { conversationId?: string },
 	): Promise<TerminalInfo>;
@@ -167,6 +176,7 @@ export interface Settings {
 	permission: PermissionMode;
 	theme: "light" | "dark" | "system";
 	sandbox?: boolean;
+	sandboxOffline?: boolean;
 	notifications?: boolean;
 	configuredProviders: Provider[];
 	connections: Partial<
@@ -227,7 +237,24 @@ export interface MemoryFileEntry {
 	content: string;
 	exists: boolean;
 }
+export type SessionActivity = "running" | "approval";
+
+export interface PullRequestStatus {
+	number: number;
+	title: string;
+	url: string;
+	state: string;
+	isDraft: boolean;
+	headRefName: string;
+	baseRefName: string;
+	reviewDecision?: string;
+	checks: {name: string; status: string}[];
+}
+
 export interface Snapshot {
+	activity?: Record<string, SessionActivity>;
+	activitySequence?: number;
+	bashBusy?: boolean;
 	/** Sequence of the last host event included in this snapshot. */
 	eventSequence?: number;
 	/** Current output omitted from Pi's finalized get_messages transcript. */
@@ -281,11 +308,13 @@ export interface DesktopAPI {
 	newConversation(): Promise<Snapshot>;
 	selectConversation(id: string): Promise<Snapshot>;
 	renameConversation(id: string, title: string): Promise<Snapshot>;
-	command(command: Command): Promise<unknown>;
-	respond(response: RpcExtensionUIResponse): Promise<void>;
+	command(command: Command, conversationId?: string): Promise<unknown>;
+	respond(response: RpcExtensionUIResponse, conversationId?: string): Promise<void>;
 	files(path: string): Promise<FileEntry[]>;
 	readFile(path: string): Promise<{ path: string; content: string }>;
 	workspace(): Promise<Workspace>;
+	createDraftPullRequest(conversationId: string, draft: DraftPullRequest): Promise<{ url: string; number: number }>;
+	pullRequest(conversationId: string, number?: number): Promise<PullRequestStatus | null>;
 	diff(path: string): Promise<string>;
 	gitStage(paths?: string[]): Promise<Workspace>;
 	gitUnstage(paths?: string[]): Promise<Workspace>;
@@ -299,6 +328,8 @@ export interface DesktopAPI {
 	readPlan(conversationId?: string): Promise<PlanFileState>;
 	writePlan(content: string, conversationId?: string): Promise<PlanFileState>;
 	btw(question: string): Promise<BtwResult>;
+	checkPreview(url: string, mobile: boolean): Promise<PreviewCheck>;
+	inspectCode(conversationId: string, path: string, at?: CodePosition): Promise<CodeIntelligence>;
 	sandboxStatus(): Promise<SandboxStatus>;
 	importClaudePermissions(): Promise<ClaudePermissionsSyncResult>;
 	exportClaudePermissions(): Promise<ClaudePermissionsSyncResult>;
@@ -307,6 +338,7 @@ export interface DesktopAPI {
 		permission: PermissionMode;
 		theme: Settings["theme"];
 		sandbox?: boolean;
+		sandboxOffline?: boolean;
 		notifications?: boolean;
 		provider?: Provider;
 		mode?: ConnectionMode;

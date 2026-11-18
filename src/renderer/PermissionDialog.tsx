@@ -10,12 +10,14 @@ export function PermissionDialog({
 	conversationId,
 	project,
 	respond,
+	defer,
 	fail,
 }: {
 	request: RpcExtensionUIRequest;
 	conversationId?: string;
 	project?: string;
 	respond: (response: Response) => Promise<void>;
+	defer?: () => void;
 	fail: (error: unknown) => void;
 }) {
 	const [value, setValue] = useState("");
@@ -117,6 +119,9 @@ export function PermissionDialog({
 
 	return (
 		<Modal title={title} close={cancel}>
+			{defer && !("timeout" in request && request.timeout) && (
+				<button type="button" className="cc-mini-btn cc-defer-approval" disabled={pending} onClick={defer}>稍后处理</button>
+			)}
 			<div className="simple-dialog permission-dialog">
 				<div className="live-permission-note">
 					<ShieldCheck size={17} />

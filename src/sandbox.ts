@@ -29,7 +29,7 @@ function escapeSeatbeltString(value: string): string {
  * Build a Seatbelt profile restricting file writes to the workspace and temp directories.
  * Reads stay unrestricted so language toolchains and system headers work cleanly.
  */
-export function buildSeatbeltProfile(project: string, extraWritablePaths: string[] = []): string {
+export function buildSeatbeltProfile(project: string, extraWritablePaths: string[] = [], offline = false): string {
 	const roots = [project, "/tmp", "/private/tmp", "/var/folders", "/private/var/folders", ...extraWritablePaths]
 		.filter(Boolean)
 		.map((item) => `(subpath "${escapeSeatbeltString(item)}")`)
@@ -38,6 +38,7 @@ export function buildSeatbeltProfile(project: string, extraWritablePaths: string
 		"(version 1)",
 		"(allow default)",
 		"(deny file-write*)",
+		...(offline ? ["(deny network*)"] : []),
 		`(allow file-write*`,
 		`    (literal "/dev/null")`,
 		`    (literal "/dev/tty")`,

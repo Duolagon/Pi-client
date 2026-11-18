@@ -19,6 +19,9 @@ export const projectTrustResources = [
 	".pi/themes",
 	".claude/settings.json",
 	".claude/settings.local.json",
+	".claude/rules",
+	".pi/rules",
+	"CLAUDE.local.md",
 ] as const;
 
 async function exists(path: string): Promise<boolean> {

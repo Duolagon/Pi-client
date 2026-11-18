@@ -1,4 +1,6 @@
-import { readFile, readdir, realpath, stat, writeFile, mkdir, rm } from "node:fs/promises";
+import { privateMemoryLabel, rulePaths, scopedRule } from "./project-memory.ts";
+import { managedFile, writeManagedFile } from "./managed-path.ts";
+import { readFile, realpath, stat, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { DesktopToolInfo } from "./tool-control-types.ts";
@@ -8,7 +10,7 @@ export interface ContextMemorySource {
 	id: string;
 	relativePath: string;
 	path: string;
-	scope: "user" | "project" | "local" | "rule";
+	scope: "user" | "project" | "local" | "rule" | "desktop";
 	exists: boolean;
 	editable: boolean;
 	bytes: number;
@@ -48,15 +50,6 @@ function inside(root: string, target: string): boolean {
 
 function estimateTokens(text: string): number {
 	return text ? Math.ceil(Buffer.byteLength(text, "utf8") / 3.5) : 0;
-}
-
-function extractPathsFrontmatter(content: string): string | undefined {
-	const norm = content.replace(/\r\n/g, "\n");
-	if (!norm.startsWith("---\n")) return undefined;
-	const end = norm.indexOf("\n---", 4);
-	if (end < 0) return undefined;
-	const match = /^paths:\s*(.+)$/m.exec(norm.slice(4, end));
-	return match?.[1]?.trim();
 }
 
 async function resolveImports(content: string, baseDir: string, project: string): Promise<{ target: string; exists: boolean }[]> {
@@ -109,7 +102,7 @@ async function readSource(
 			bytes: Buffer.byteLength(content, "utf8"),
 			estimatedTokens: estimateTokens(content),
 			content: content.slice(0, 256 * 1024),
-			pathsPattern: scope === "rule" ? extractPathsFrontmatter(content) : undefined,
+			pathsPattern: scope === "rule" ? scopedRule(content).patterns.join(", ") || undefined : undefined,
 			imports: await resolveImports(content, dirname(real), project),
 		};
 	} catch {
@@ -118,19 +111,9 @@ async function readSource(
 }
 
 async function collectRules(project: string, dirRel: string): Promise<ContextMemorySource[]> {
-	const dir = join(project, dirRel);
-	try {
-		const items = await readdir(dir, { withFileTypes: true });
-		const out: ContextMemorySource[] = [];
-		for (const item of items.sort((a, b) => a.name.localeCompare(b.name))) {
-			if (!item.isFile() || !item.name.endsWith(".md")) continue;
-			const rel = `${dirRel}/${item.name}`;
-			out.push(await readSource(rel, rel, join(dir, item.name), "rule", true, project, project));
-		}
-		return out;
-	} catch {
-		return [];
-	}
+	return Promise.all((await rulePaths(project, dirRel)).map((rel) =>
+		readSource(rel, rel, join(project, rel), "rule", true, project, project),
+	));
 }
 
 export function validateWritableMemoryRelativePath(rel: string): string {
@@ -138,9 +121,8 @@ export function validateWritableMemoryRelativePath(rel: string): string {
 	const allowedRoots = new Set(["AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md"]);
 	if (allowedRoots.has(trimmed)) return trimmed;
 	if (
-		(/^\.claude\/rules\/[A-Za-z0-9._-]{1,120}\.md$/.test(trimmed) ||
-			/^\.pi\/rules\/[A-Za-z0-9._-]{1,120}\.md$/.test(trimmed)) &&
-		!trimmed.includes("..")
+		/^\.(?:claude|pi)\/rules\/(?:[A-Za-z0-9._-]{1,120}\/){0,8}[A-Za-z0-9._-]{1,120}\.md$/.test(trimmed) &&
+		!trimmed.split("/").some((segment) => segment === "." || segment === "..")
 	) {
 		return trimmed;
 	}
@@ -150,10 +132,9 @@ export function validateWritableMemoryRelativePath(rel: string): string {
 export async function writeProjectMemoryFile(project: string, relativePath: string, content: string): Promise<ContextMemorySource> {
 	const root = await realpath(project).catch(() => project);
 	const valid = validateWritableMemoryRelativePath(relativePath);
-	const target = resolve(root, valid);
-	if (!inside(root, target)) throw new Error("记忆文件路径超出项目目录。");
-	await mkdir(dirname(target), { recursive: true });
-	await writeFile(target, content, "utf8");
+	const parts = valid.split("/");
+	const target = (await managedFile(root, parts.slice(0, -1), parts.at(-1)!, true))!;
+	await writeManagedFile(target, content);
 	return readSource(valid, valid, target, valid.includes("/rules/") ? "rule" : valid === "CLAUDE.local.md" ? "local" : "project", true, root, root);
 }
 
@@ -161,13 +142,14 @@ export async function deleteProjectMemoryRule(project: string, relativePath: str
 	const root = await realpath(project).catch(() => project);
 	const valid = validateWritableMemoryRelativePath(relativePath);
 	if (!valid.includes("/rules/")) throw new Error("仅支持删除规则文件。");
-	const target = resolve(root, valid);
-	if (!inside(root, target)) throw new Error("规则文件路径超出项目目录。");
-	await rm(target, { force: true });
+	const parts = valid.split("/");
+	const target = await managedFile(root, parts.slice(0, -1), parts.at(-1)!, false);
+	if (target) await rm(target, { force: true });
 }
 
 export async function buildContextReport(params: {
 	project: string;
+	privateMemory?: string;
 	agentDir: string;
 	stats?: SessionStats;
 	state?: RpcSessionState;
@@ -179,6 +161,7 @@ export async function buildContextReport(params: {
 	const agentDir = await realpath(params.agentDir).catch(() => params.agentDir);
 	const claudeDir = await realpath(join(homedir(), ".claude")).catch(() => join(homedir(), ".claude"));
 	const sources: ContextMemorySource[] = [
+		...(params.privateMemory ? [await readSource(privateMemoryLabel, privateMemoryLabel, params.privateMemory, "desktop", true, dirname(params.privateMemory), project)] : []),
 		await readSource("user-pi-agents", "~/.pi/agent/AGENTS.md", join(agentDir, "AGENTS.md"), "user", false, agentDir, project),
 		await readSource("user-claude", "~/.claude/CLAUDE.md", join(claudeDir, "CLAUDE.md"), "user", false, claudeDir, project),
 		await readSource("AGENTS.md", "AGENTS.md", join(project, "AGENTS.md"), "project", true, project, project),

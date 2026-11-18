@@ -1,3 +1,4 @@
+import type { PreviewCheck } from "../shared.ts";
 import { useState } from "react";
 import { ExternalLink, Globe, Monitor, RefreshCw, Smartphone, X } from "lucide-react";
 import { IconButton } from "../prototype/ui.tsx";
@@ -5,7 +6,7 @@ import { IconButton } from "../prototype/ui.tsx";
 function normalizeLocalUrl(raw: string): string | null {
 	try {
 		const url = new URL(raw.trim().startsWith("http") ? raw.trim() : `http://${raw.trim()}`);
-		if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+		if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password) return null;
 		const host = url.hostname.toLowerCase();
 		if (host !== "localhost" && host !== "127.0.0.1" && host !== "::1" && host !== "[::1]") return null;
 		return url.toString();
@@ -17,15 +18,32 @@ function normalizeLocalUrl(raw: string): string | null {
 export function PreviewPanel({
 	initialUrl = "http://localhost:3000",
 	close,
+	onReport,
 }: {
 	initialUrl?: string;
 	close: () => void;
+	onReport?: (report: string) => void;
 }) {
 	const [inputUrl, setInputUrl] = useState(initialUrl);
 	const [activeUrl, setActiveUrl] = useState(() => normalizeLocalUrl(initialUrl) ?? "http://localhost:3000");
 	const [reloadKey, setReloadKey] = useState(0);
 	const [mobile, setMobile] = useState(false);
 	const [error, setError] = useState("");
+	const [checking, setChecking] = useState(false);
+	const [result, setResult] = useState<PreviewCheck | null>(null);
+
+	const verify = async () => {
+		setChecking(true);
+		setError("");
+		setResult(null);
+		try {
+			setResult(await window.pi.checkPreview(activeUrl, mobile));
+		} catch (error) {
+			setError(error instanceof Error ? error.message : String(error));
+		} finally {
+			setChecking(false);
+		}
+	};
 
 	const navigate = (e: React.FormEvent) => {
 		e.preventDefault();
@@ -62,10 +80,18 @@ export function PreviewPanel({
 					onChange={(e) => setInputUrl(e.target.value)}
 					placeholder="http://localhost:3000"
 				/>
-				<button type="submit" className="cc-mini-btn">
+				<button type="submit" className="cc-mini-btn" disabled={checking}>
 					访问
 				</button>
+				<button type="button" className="cc-mini-btn" disabled={checking} onClick={() => void verify()}>{checking ? "验证中…" : "验证页面"}</button>
 			</form>
+			{result && <section className="cc-preview-result">
+				<strong>HTTP {result.status || "未知"} · {result.elapsedMs} ms</strong>
+				{result.title && <p>{result.title}</p>}
+				<p>{result.errors.length ? `${result.errors.length} 条浏览器错误` : "未捕获浏览器错误"}</p>
+				{result.errors.length > 0 && <ul>{result.errors.map((error, index) => <li key={index}>{error}</li>)}</ul>}
+				{onReport && <button type="button" className="cc-mini-btn" onClick={() => onReport(`浏览器验证 ${result.url} · HTTP ${result.status} · ${result.elapsedMs} ms\n${result.errors.join("\n")}`)}>加入会话草稿</button>}
+			</section>}
 			{error && <div className="live-error" role="alert">{error}</div>}
 			<div className="cc-preview-stage">
 				<iframe
@@ -73,7 +99,7 @@ export function PreviewPanel({
 					title="本地应用网页预览"
 					src={activeUrl}
 					className={mobile ? "mobile" : ""}
-					sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+					sandbox="allow-scripts allow-same-origin allow-forms"
 				/>
 			</div>
 		</aside>

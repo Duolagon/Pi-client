@@ -12,7 +12,7 @@
 | `pi.permissions` | `list / upsert / remove / check / onEvent` | 细粒度规则、授权预览与热更新 |
 | `pi.externalAgents` | `executors / configure / start / list / snapshot / send / result / cancel / respond / replay / onEvent` | 本机 Codex／Claude／Kimi 协作与独立审批流 |
 | `pi.git` | `begin / finish / list / diff / restore` | 工作树检查点与安全恢复 |
-| `pi.terminals` | `create / list / write / resize / close / replay / onEvent` | 真正 PTY 与输出回放 |
+| `pi.terminals` | `create / list / write / resize / close / replay / onEvent / ssh / mcpOAuth / packages` | PTY 与输出回放、SSH、MCP OAuth 和 Pi CLI 扩展管理 |
 | `pi.tasks` | `start / list / snapshot / result / cancel / command / respond / files / readFile / workspace / diff / onEvent` | 后台任务、模型委派结果与指定会话操作 |
 | `pi.worktrees` | `create / list / remove / merge` | 托管 Worktree 生命周期 |
 | `pi.sessions` | `fork / clone / entries / tree / forkMessages / navigate / history / importHistory` | 会话分支、树导航和 CLI 历史导入 |
@@ -21,7 +21,7 @@
 | `pi.mcp` | `list / save / remove` | MCP 服务器增删与启停 |
 | `pi.onEvent` | 原接口保留 | 所有会话的 Pi 流式事件，按 `conversationId` 路由 |
 
-原有前台接口继续工作。后端切换项目或会话会保留正在运行的旧会话；前端不得再假设“只有当前会话会产生事件”。当前正式界面仍在运行时禁用项目／会话切换，后台任务、独立 PTY 和会话树等入口待接入。修改全局模型连接、权限等设置前，需要停止全部运行中或排队中的任务。
+原有前台接口继续工作。后端切换项目或会话会保留正在运行的旧会话；前端不得再假设“只有当前会话会产生事件”。前台切换时传入目标会话的 ID 调用 `pi.command(command, id)` 和 `pi.respond(response, id)`，并用 `Snapshot.activity` 显示其他会话的运行与审批状态。不同会话的写任务需要不同项目目录或 Worktree。修改全局模型连接、权限等设置前，需要停止全部运行中或排队中的任务。
 
 流式恢复使用 `Snapshot.liveTranscript / eventSequence` 和 `DesktopEvent.sequence`。`messages` 是 Pi 已结束的消息，`liveTranscript` 补充当前生成中的 assistant 与未完成工具进度；页面重载时应一起恢复。事件序号在本次桌面宿主进程内递增，前端只重放同一 `conversationId`、且晚于快照序号的事件，避免漏接或重复追加。正式界面通过共享的 `src/transcript.ts` 和有界事件窗口处理这一过程；完整会话历史仍由 Pi 持久化。
 
@@ -188,6 +188,14 @@ await window.pi.tasks.cancel(task.id);
 
 取消是停止请求，正在结束的任务可能还在完成工具清理与检查点封存。恢复文件前，应等会话不再执行；后端会再次检查。应用重启后未完成任务标记为 `interrupted`，不会自动重复发送提示或消耗模型额度。前端重新调用 `tasks.list()` 恢复列表。
 
+## 评审、浏览器验证和代码分析
+
+`pi.pullRequest(conversationId, number?)` 使用 `gh` 读取 PR 和 CI 状态。 `pi.createDraftPullRequest(conversationId, { branch, title, body, base? })` 在用户提交表单后从已推送的当前分支创建草稿 PR。
+
+`pi.checkPreview(url, mobile)` 在隔离的 Chromium 会话中访问回环地址并返回 HTTP 状态、标题、耗时和浏览器错误。验证窗口允许同源的 GET、HEAD 和 OPTIONS 请求。
+
+`pi.inspectCode(conversationId, path, { line, column }?)` 在已信任项目启动适配的本地语言服务器。返回的行列从 1 开始，定义只能跳转到项目内文件。 `pi.writeMemoryFile("本机项目记忆", content)` 写入应用数据区，正文上限 24 KiB。项目规则和本机项目记忆会进入受信任项目的模型上下文。
+
 ## Git 检查点
 
 每次新的 Pi 提示和直接 RPC `bash` 命令都会自动创建、封存检查点；同一轮运行中的引导／follow-up 共用该轮检查点。非 Git 目录不自动创建检查点。PTY 的任意交互输入没有可靠的命令边界，应使用手动检查点：
@@ -299,4 +307,4 @@ Pi 引擎来自精确锁定的 `@earendil-works/pi-coding-agent@1.5.2` 与 `@ear
 
 新增 `window.pi.tools`、`window.pi.permissions` 和 `window.pi.tasks.result`；真实模型工具 Agent、TaskOutput/Stop/List 及 Worktree 工具已接入。完整参数、权限规则、热更新语义、父子事件路由和前端卡片约定见 [tools-and-delegation.md](tools-and-delegation.md)。前端页面没有随本次后端接入修改。
 
-本机外部执行器另见 [local-external-agents.md](local-external-agents.md)。外部 Agent 的审批和事件使用独立命名空间，不能用 Pi tasks.respond/snapshot 代替；主模型使用 Agent 的 executor 和 AgentSend 持续协作。SSH 尚未接入。
+本机外部执行器另见 [local-external-agents.md](local-external-agents.md)。外部 Agent 的审批和事件使用独立命名空间，不能用 Pi tasks.respond/snapshot 代替；主模型使用 Agent 的 executor 和 AgentSend 持续协作。`pi.terminals.ssh(conversationId, host, startPi)` 启动 SSH 终端，使用系统 OpenSSH 配置和远端安装的 Pi。SSH 终端拥有独立的回放与生命周期。

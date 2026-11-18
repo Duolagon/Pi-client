@@ -347,3 +347,18 @@ test(
 		}
 	},
 );
+
+test("program terminals deliver exact arguments without invoking a shell", async () => {
+	const { service } = setup();
+	try {
+		const terminal = await service.create({ conversationId: "program", project: directory }, {
+			program: "/usr/bin/printf", args: ["argv=%s\\n", "a; b c"], label: "Fixture",
+		});
+		assert.equal(terminal.label, "Fixture");
+		await waitForOutput(service, terminal.id, /argv=a; b c/);
+		await waitForExit(service, terminal.id);
+		assert.equal(service.replay(terminal.id).terminal.exitCode, 0);
+	} finally {
+		await service.dispose();
+	}
+});

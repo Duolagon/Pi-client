@@ -1,11 +1,11 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { managedFile } from "./managed-path.ts";
+import { readFile } from "node:fs/promises";
+import { managedFile, writeManagedFile } from "./managed-path.ts";
 import type { McpRemoveInput, McpSaveInput, McpScope, McpServerInfo, McpTransport } from "./mcp-types.ts";
 
 type JsonObject = Record<string, unknown>;
 interface McpConfig {
 	data: JsonObject;
+	rejected?: JsonObject;
 	servers: Record<string, JsonObject>;
 }
 
@@ -46,29 +46,30 @@ async function readConfig(file: string): Promise<McpConfig> {
 	try {
 		parsed = JSON.parse(await readFile(file, "utf8"));
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { data: {}, servers: {} };
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { data: {}, servers: Object.create(null) };
 		throw new Error(`无法读取 MCP 配置 ${file}：${error instanceof Error ? error.message : String(error)}`);
 	}
 	const data = object(parsed, "MCP 配置");
 	const servers = data.mcpServers === undefined ? {} : object(data.mcpServers, "mcpServers");
-	const result: Record<string, JsonObject> = {};
+	const result: Record<string, JsonObject> = Object.create(null);
+	const rejected: JsonObject = Object.create(null);
 	for (const [name, value] of Object.entries(servers)) {
-		if (!namePattern.test(name)) continue;
+		if (!namePattern.test(name)) {
+			rejected[name] = value;
+			continue;
+		}
 		try {
 			result[name] = object(value, `MCP 服务器 ${name}`);
 		} catch {
-			// One malformed entry must not hide the rest; Pi reports it separately.
+			rejected[name] = value;
 		}
 	}
-	return { data, servers: result };
+	return { data, servers: result, rejected };
 }
 
-async function writeConfig(file: string, data: JsonObject, servers: Record<string, JsonObject>): Promise<void> {
-	await mkdir(dirname(file), { recursive: true, mode: 0o700 });
-	const output = { ...data, mcpServers: servers };
-	const temporary = `${file}.tmp`;
-	await writeFile(temporary, JSON.stringify(output, null, 2) + "\n", { mode: 0o600 });
-	await rename(temporary, file);
+async function writeConfig(file: string, config: McpConfig): Promise<void> {
+	const output = { ...config.data, mcpServers: { ...config.rejected, ...config.servers } };
+	await writeManagedFile(file, JSON.stringify(output, null, 2) + "\n");
 }
 
 /** Manage the Pi-compatible mcp.json files without rewriting unrelated entries. */
@@ -145,7 +146,7 @@ export class McpRegistry {
 			if (description === undefined) delete existing.description;
 			else existing.description = description;
 			config.servers[name] = existing;
-			await writeConfig(file, config.data, config.servers);
+			await writeConfig(file, config);
 			return this.list(project);
 		}
 		if (input.transport !== "stdio" && input.transport !== "http") throw new Error("MCP 传输方式无效。");
@@ -176,7 +177,7 @@ export class McpRegistry {
 			delete entry.type;
 		}
 		config.servers[name] = entry;
-		await writeConfig(file, config.data, config.servers);
+		await writeConfig(file, config);
 		return this.list(project);
 	}
 
@@ -189,7 +190,7 @@ export class McpRegistry {
 		const config = await readConfig(file);
 		if (!config.servers[name]) throw new Error("MCP 服务器不存在于此作用域。");
 		delete config.servers[name];
-		await writeConfig(file, config.data, config.servers);
+		await writeConfig(file, config);
 		return this.list(project);
 	}
 }

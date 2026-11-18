@@ -33,7 +33,13 @@ export default function uiProvider(pi) {
 				return slow.provider.streamSimple(model, context, streamOptions);
 			}
 			let response;
-			if (prompt.includes("实现问候函数")) {
+			if (prompt.includes("模型上下文验证")) {
+				const system = [context.systemPrompt, ...context.messages.filter((message) => message.role === "system")
+					.flatMap((message) => [message.content, ...Object.values(message.sections ?? {})])].join("\n");
+				response = fauxAssistantMessage(["PI_PRIVATE_MEMORY_FIXTURE", "PI_RULE_FIXTURE", "PI_REFERENCE_FIXTURE"].every((marker) => system.includes(marker))
+					? "收到项目记忆、规则和文件引用。"
+					: "项目上下文缺失。");
+			} else if (prompt.includes("实现问候函数")) {
 				const steps = [
 					fauxAssistantMessage([
 						fauxThinking("先读取现有函数，再补全实现，最后运行项目测试。"),

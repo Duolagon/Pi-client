@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Command, DesktopAPI, DesktopEvent, Snapshot, RpcExtensionUIRequest, BashResult } from "../shared.ts";
+import type { Command, DesktopAPI, DesktopEvent, Snapshot, RpcExtensionUIRequest, BashResult, SessionActivity } from "../shared.ts";
 import { applyEvent, transcript, type Transcript } from "./messages.ts";
 
 export function useDesktop(api: DesktopAPI) {
@@ -8,14 +8,23 @@ export function useDesktop(api: DesktopAPI) {
 	const [running, setRunning] = useState(false);
 	const [changing, setChanging] = useState(false);
 	const [bashBusy, setBashBusy] = useState(false);
-	const [terminal, setTerminal] = useState("");
+	const [terminalOutput, setTerminalOutput] = useState<Record<string, string>>({});
+	const appendTerminal = (id: string, delta: string) => setTerminalOutput((output) => ({ ...output, [id]: ((output[id] ?? "") + delta).slice(-200000) }));
 	const [error, setError] = useState("");
 	const [notice, setNotice] = useState("");
-	const [draft, setDraft] = useState("");
+	const [draft, putDraft] = useState("");
+	const [activity, setActivity] = useState<Record<string, SessionActivity>>({});
+	const drafts = useRef(new Map<string, string>());
+	const setDraft = (value: string) => {
+		const id = activeId.current;
+		if (id) drafts.current.set(id, value);
+		putDraft(value);
+	};
 	const [requests, setRequests] = useState<RpcExtensionUIRequest[]>([]);
 	const [revision, setRevision] = useState(0);
 	const activeId = useRef<string | undefined>(undefined);
 	const generation = useRef(0);
+	const selecting = useRef(false);
 	const appliedSequence = useRef(0);
 	const buffered = useRef<{ packet: DesktopEvent; bytes: number }[]>([]);
 	const bufferedBytes = useRef(0);
@@ -37,12 +46,14 @@ export function useDesktop(api: DesktopAPI) {
 		activeId.current = next.active?.id;
 		appliedSequence.current = sequence;
 		setSnapshot(next);
+		setActivity(next.activity ?? {});
+		setBashBusy(Boolean(next.bashBusy));
 		setHistory(transcript(next.messages, next.liveTranscript));
 		setRunning(Boolean(next.state?.isStreaming || next.state?.isCompacting));
 		setRequests(next.pendingUI.filter((request) => ["confirm", "select", "input", "editor"].includes(request.method)));
 		if (changed) {
-			setTerminal("");
-			setDraft("");
+			putDraft(id ? drafts.current.get(id) ?? "" : "");
+			setNotice("");
 		}
 		if (id && next.eventSequence !== undefined) {
 			for (const { packet } of buffered.current) {
@@ -51,9 +62,18 @@ export function useDesktop(api: DesktopAPI) {
 			}
 			droppedThrough.current.delete(id);
 		}
+		// A snapshot only carries a replay cursor for its active session. While selecting,
+		// retain events from other sessions that arrived after the snapshot was formed.
+		if (id && next.eventSequence !== undefined) {
+			for (const { packet } of buffered.current) {
+				if (packet.conversationId !== id && packet.sequence !== undefined && packet.sequence > (next.activitySequence ?? Infinity))
+					listener.current(packet, true);
+			}
+		}
 		setRevision((value) => value + 1);
 	}, []);
 	const refresh = useCallback(async () => {
+		if (selecting.current) return;
 		const token = ++generation.current;
 		try {
 			const next = await api.snapshot();
@@ -80,6 +100,18 @@ export function useDesktop(api: DesktopAPI) {
 					droppedThrough.current.delete(droppedThrough.current.keys().next().value!);
 			}
 		}
+		const interactive = event.type === "extension_ui_request" && ["confirm", "select", "input", "editor"].includes(event.method);
+		const ended = event.type === "agent_settled" || event.type === "desktop_error" ||
+			(event.type === "compaction_end" && !event.willRetry);
+		if (interactive || ended || event.type === "agent_start" || event.type === "compaction_start") {
+			setActivity((previous) => {
+				const next = { ...previous };
+				if (ended) delete next[conversationId];
+				else next[conversationId] = interactive ? "approval" : "running";
+				return next;
+			});
+		}
+		if (!replay && event.type === "bash_execution_update") appendTerminal(conversationId, event.delta);
 		if (conversationId !== activeId.current) return;
 		if (sequence !== undefined) {
 			if (sequence <= appliedSequence.current) return;
@@ -115,7 +147,6 @@ export function useDesktop(api: DesktopAPI) {
 				void refresh();
 			}
 		}
-		if (event.type === "bash_execution_update") setTerminal((value) => (value + event.delta).slice(-1000000));
 		if (event.type === "auto_retry_start")
 			setNotice(`正在重试 ${event.attempt}/${event.maxAttempts}：${event.errorMessage}`);
 		if (event.type === "auto_retry_end") {
@@ -169,73 +200,89 @@ export function useDesktop(api: DesktopAPI) {
 		return () => media.removeEventListener("change", applyTheme);
 	}, [snapshot?.settings.theme]);
 	const switchTo = async (operation: () => Promise<Snapshot | null>) => {
+		if (selecting.current) return;
+		selecting.current = true;
 		setChanging(true);
 		setError("");
-		++generation.current;
+		const token = ++generation.current;
 		try {
 			const next = await operation();
-			if (next) apply(next);
+			if (next && token === generation.current) apply(next);
 		} catch (cause) {
 			fail(cause);
 		} finally {
+			selecting.current = false;
 			setChanging(false);
+			if (droppedThrough.current.size && activeId.current && droppedThrough.current.has(activeId.current)) void refresh();
 		}
 	};
 	const command = async (value: Command) => {
 		setError("");
 		try {
-			await api.command(value);
+			await api.command(value, activeId.current);
 			await refresh();
 		} catch (cause) {
 			fail(cause);
 		}
 	};
 	const send = async (value: Extract<Command, { type: "prompt" }>) => {
+		const id = activeId.current;
 		const previous = running;
 		const submittedDraft = draft;
 		setError("");
 		setNotice("");
 		setRunning(true);
 		try {
-			const result = (await api.command({ ...value, streamingBehavior: previous ? "steer" : undefined })) as {
+			const result = (await api.command({ ...value, streamingBehavior: previous ? "steer" : undefined }, id)) as {
 				disposition: "started" | "handled" | "queued";
 			};
-			setDraft((current) => (current === submittedDraft ? "" : current));
-			if (result.disposition === "handled") {
+			if (id && drafts.current.get(id) === submittedDraft) {
+				drafts.current.delete(id);
+				if (activeId.current === id) putDraft("");
+			}
+			if (activeId.current === id && result.disposition === "handled") {
 				setRunning(previous);
 				await refresh();
 			}
 		} catch (cause) {
-			fail(cause);
-			setRunning(previous);
+			if (activeId.current === id) {
+				fail(cause);
+				setRunning(previous);
+			}
 			throw cause;
 		}
 	};
 	const respond: DesktopAPI["respond"] = async (response) => {
-		await api.respond(response);
+		const id = activeId.current;
+		await api.respond(response, id);
+		if (activeId.current !== id) return;
 		setRequests((items) => items.filter((item) => item.id !== response.id));
+		await refresh();
 	};
 	const bash = async (value: string) => {
+		const id = activeId.current;
+		if (!id) return;
 		setBashBusy(true);
 		setError("");
-		setTerminal((text) => `${text}\n$ ${value}\n`);
+		appendTerminal(id, `\n$ ${value}\n`);
 		try {
-			const result = (await api.command({ type: "bash", command: value })) as BashResult;
-			setTerminal((text) => `${text}\n[退出码 ${result.exitCode ?? "—"}${result.cancelled ? "，已取消" : ""}]\n`);
-			await refresh();
+			const result = (await api.command({ type: "bash", command: value }, id)) as BashResult;
+			appendTerminal(id, `\n[退出码 ${result.exitCode ?? "—"}${result.cancelled ? "，已取消" : ""}]\n`);
+			if (activeId.current === id) await refresh();
 		} catch (cause) {
-			fail(cause);
+			if (activeId.current === id) fail(cause);
 		} finally {
-			setBashBusy(false);
+			if (activeId.current === id) setBashBusy(false);
 		}
 	};
 	return {
 		snapshot,
+		activity,
 		history,
 		running,
 		changing,
 		bashBusy,
-		terminal,
+		terminal: snapshot?.active?.id ? terminalOutput[snapshot.active.id] ?? "" : "",
 		error,
 		notice,
 		draft,

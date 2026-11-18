@@ -25,14 +25,17 @@
 		"check": "tsc --noEmit",
 		"test:backend": "node --test test/*.test.ts",
 		"verify:client": "node scripts/verify-client.mjs",
-		"package": "node scripts/build.mjs && electron-builder --config desktop-builder.json --dir",
-		"dist:mac": "node scripts/build.mjs && electron-builder --config desktop-builder.json --mac zip"
+		"package": "node scripts/build.mjs && electron-builder --config desktop-builder.json --config.mac.identity=null --dir",
+		"dist:mac": "node scripts/build.mjs && electron-builder --config desktop-builder.json --config.mac.identity=null --mac zip --publish never",
+		"dist:mac:signed": "node scripts/build.mjs && electron-builder --config desktop-builder.json --config.forceCodeSigning=true --config.mac.notarize=true --mac zip --publish never"
 	},
 	"dependencies": {
 		"@anthropic-ai/claude-agent-sdk": "0.3.325",
 		"@earendil-works/pi-agent-core": "1.5.2",
 		"@earendil-works/pi-ai": "1.5.2",
 		"@earendil-works/pi-coding-agent": "1.5.2",
+		"@xterm/addon-fit": "0.11.0",
+		"@xterm/xterm": "6.0.0",
 		"lucide-react": "1.72.0",
 		"react": "19.3.0",
 		"react-dom": "19.3.0",

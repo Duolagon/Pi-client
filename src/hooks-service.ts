@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { isAbsolute, join } from "node:path";
+import { managedFile, writeManagedFile } from "./managed-path.ts";
+import { piToClaudeToolNames } from "./claude-settings-sync.ts";
 import type {
 	HookEntry,
 	HookEventName,
@@ -78,7 +80,7 @@ function parseClaudeSettingsHooks(
 					if (handler.type !== undefined && handler.type !== "command") continue;
 					if (typeof handler.command !== "string" || !handler.command.trim()) continue;
 					const timeout = typeof handler.timeout === "number" && Number.isFinite(handler.timeout)
-						? Math.min(Math.max(500, Math.floor(handler.timeout)), 30000)
+						? Math.min(Math.max(500, Math.floor(handler.timeout * (editable ? 1 : 1000))), 30000)
 						: undefined;
 					const id = typeof handler.id === "string" && handler.id.trim()
 						? handler.id.trim()
@@ -87,7 +89,7 @@ function parseClaudeSettingsHooks(
 				}
 			} else if (typeof rec.command === "string" && rec.command.trim()) {
 				const timeout = typeof rec.timeout === "number" && Number.isFinite(rec.timeout)
-					? Math.min(Math.max(500, Math.floor(rec.timeout)), 30000)
+					? Math.min(Math.max(500, Math.floor(rec.timeout * (editable ? 1 : 1000))), 30000)
 					: undefined;
 				const id = typeof rec.id === "string" && rec.id.trim()
 					? rec.id.trim()
@@ -122,10 +124,10 @@ export class HooksService {
 		this.agentDir = options.agentDir;
 	}
 
-	private editableFile(scope: HookScope, project?: string): string {
-		if (scope === "user") return join(this.agentDir(), "hooks.json");
+	private async editableFile(scope: HookScope, project: string | undefined, create: boolean) {
+		if (scope === "user") return managedFile(this.agentDir(), [], "hooks.json", create);
 		if (!project || !isAbsolute(project)) throw new Error("项目作用域 Hook 需要绝对项目路径。");
-		return join(project, ".pi", "hooks.json");
+		return managedFile(project, [".pi"], "hooks.json", create);
 	}
 
 	async list(project?: string, projectTrusted = true): Promise<HookEntry[]> {
@@ -158,7 +160,7 @@ export class HooksService {
 		const command = text(input.command, "Hook 命令", 16384);
 		const matcher = input.matcher?.trim() ? input.matcher.trim().slice(0, 300) : undefined;
 		const timeout = input.timeout !== undefined ? Math.min(Math.max(500, Math.floor(input.timeout)), 30000) : undefined;
-		const file = this.editableFile(input.scope, input.project);
+		const file = (await this.editableFile(input.scope, input.project, true))!;
 		const raw = (await readJsonFile(file)) as PiHooksFile | undefined;
 		const hooks: NonNullable<PiHooksFile["hooks"]> = { ...(raw?.hooks ?? {}) };
 		const existing = Array.isArray(hooks[input.event]) ? [...hooks[input.event]!] : [];
@@ -167,16 +169,15 @@ export class HooksService {
 		const filtered = existing.filter((item) => item?.id !== id);
 		if (filtered.length >= 100) throw new Error("单个事件的 Hook 数量已达上限。");
 		hooks[input.event] = [...filtered, nextEntry];
-		await mkdir(dirname(file), { recursive: true });
-		await writeFile(`${file}.tmp`, JSON.stringify({ version: 1, hooks }, null, 2), "utf8");
-		await rename(`${file}.tmp`, file);
+		await writeManagedFile(file, JSON.stringify({ version: 1, hooks }, null, 2) + "\n");
 		return this.list(input.project, true);
 	}
 
 	async remove(input: HookRemoveInput): Promise<HookEntry[]> {
 		const id = text(input.id, "Hook ID", 200);
 		if (input.scope !== "user" && input.scope !== "project") throw new Error("Hook 作用域无效。");
-		const file = this.editableFile(input.scope, input.project);
+		const file = await this.editableFile(input.scope, input.project, false);
+		if (!file) return this.list(input.project, true);
 		const raw = (await readJsonFile(file)) as PiHooksFile | undefined;
 		if (!raw?.hooks) return this.list(input.project, true);
 		const hooks: NonNullable<PiHooksFile["hooks"]> = { ...raw.hooks };
@@ -189,9 +190,7 @@ export class HooksService {
 				return derived !== id && item.id !== id;
 			});
 		}
-		await mkdir(dirname(file), { recursive: true });
-		await writeFile(`${file}.tmp`, JSON.stringify({ version: 1, hooks }, null, 2), "utf8");
-		await rename(`${file}.tmp`, file);
+		await writeManagedFile(file, JSON.stringify({ version: 1, hooks }, null, 2) + "\n");
 		return this.list(input.project, true);
 	}
 
@@ -213,7 +212,8 @@ export class HooksService {
 		const matching = all.filter(
 			(entry) =>
 				entry.event === event &&
-				matcherMatches(entry.matcher, context.toolName ?? context.message ?? event),
+				(matcherMatches(entry.matcher, context.toolName ?? context.message ?? event) ||
+					(Boolean(context.toolName) && !entry.editable && matcherMatches(entry.matcher, piToClaudeToolNames[context.toolName!]))),
 		);
 		if (!matching.length) return { blocked: false, executedCount: 0 };
 
@@ -221,7 +221,7 @@ export class HooksService {
 		const messages: string[] = [];
 		let permissionDecision: "allow" | "deny" | "ask" | undefined;
 		const cwd = context.project && isAbsolute(context.project) ? context.project : process.cwd();
-		const stdinPayload = JSON.stringify({
+		const input = {
 			hook_event_name: event,
 			session_id: context.conversationId,
 			cwd,
@@ -230,12 +230,12 @@ export class HooksService {
 			tool_response: context.toolResponse,
 			prompt: context.prompt,
 			message: context.message,
-		});
+		};
 
 		for (const entry of matching) {
 			const outcome = await execHookCommand(entry.command, {
 				cwd,
-				stdin: stdinPayload,
+				stdin: JSON.stringify(entry.editable || !context.toolName ? input : { ...input, tool_name: piToClaudeToolNames[context.toolName] ?? context.toolName }),
 				timeout: entry.timeout ?? 10000,
 				env: {
 					...process.env,
@@ -315,6 +315,7 @@ function execHookCommand(
 			cwd: options.cwd,
 			env: options.env,
 			stdio: ["pipe", "pipe", "pipe"],
+			detached: process.platform !== "win32",
 		});
 		let stdout = "";
 		let stderr = "";
@@ -326,7 +327,10 @@ function execHookCommand(
 			resolve({ code, stdout, stderr });
 		};
 		const timer = setTimeout(() => {
-			child.kill("SIGKILL");
+			try {
+				if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+				else child.kill("SIGKILL");
+			} catch { /* The command may already have exited. */ }
 			finish(1);
 		}, options.timeout);
 		child.stdout.on("data", (chunk: Buffer) => {
@@ -337,6 +341,7 @@ function execHookCommand(
 		});
 		child.on("error", () => finish(1));
 		child.on("close", (code) => finish(code));
+		child.stdin.on("error", () => {});
 		child.stdin.end(options.stdin);
 	});
 }

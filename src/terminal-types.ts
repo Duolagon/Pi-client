@@ -11,6 +11,7 @@ export interface TerminalInfo {
 	conversationId: string;
 	project: string;
 	shell: string;
+	label?: string;
 	cols: number;
 	rows: number;
 	pid?: number;

@@ -61,6 +61,7 @@ export function SettingsDialog({
 	const [theme, setTheme] = useState<Settings["theme"]>(settings.theme);
 	const [sandbox, setSandbox] = useState<boolean>(Boolean(settings.sandbox));
 	const [notifications, setNotifications] = useState<boolean>(settings.notifications !== false);
+	const [sandboxOffline, setSandboxOffline] = useState(Boolean(settings.sandboxOffline));
 	const [sandboxInfo, setSandboxInfo] = useState<SandboxStatus | null>(null);
 	const [provider, setProvider] = useState<Provider>(initialProvider);
 	const [mode, setMode] = useState<ConnectionMode>(initial.mode);
@@ -90,6 +91,7 @@ export function SettingsDialog({
 		permission !== settings.permission ||
 		theme !== settings.theme ||
 		sandbox !== Boolean(settings.sandbox) ||
+		(sandbox && sandboxOffline) !== Boolean(settings.sandboxOffline) ||
 		notifications !== (settings.notifications !== false) ||
 		agentDir.trim() !== (settings.agentDir ?? "");
 	const connectionChanged =
@@ -143,7 +145,7 @@ export function SettingsDialog({
 		}
 		setSaving(true);
 		try {
-			const update: Parameters<DesktopAPI["saveSettings"]>[0] = { permission, theme, sandbox, notifications };
+			const update: Parameters<DesktopAPI["saveSettings"]>[0] = { permission, theme, sandbox, sandboxOffline: sandbox && sandboxOffline, notifications };
 			if (agentDir.trim() !== (settings.agentDir ?? "")) update.agentDir = agentDir.trim();
 			if (connectionChanged) Object.assign(update, connectionInput);
 			const next = await window.pi.saveSettings(update);
@@ -404,11 +406,15 @@ export function SettingsDialog({
 								type="checkbox"
 								aria-label="开启 macOS 命令沙箱"
 								checked={sandbox}
-								disabled={pending || busy || sandboxInfo?.supported === false}
+								disabled={pending || busy || (!sandbox && sandboxInfo?.supported === false)}
 								onChange={(event) => setSandbox(event.target.checked)}
 							/>
 							macOS Seatbelt 命令沙箱（将 Bash 写操作隔离至当前项目与临时目录）
 						</label>
+						{sandbox && <label className="field-label">
+							<span><input type="checkbox" checked={sandboxOffline} disabled={pending || busy} onChange={(event) => setSandboxOffline(event.target.checked)} /> 禁止 Bash 命令访问网络</span>
+							<small>适用于模型的 Bash 和单次命令。交互终端、MCP、Hooks 和模型连接使用各自的权限。</small>
+						</label>}
 						{sandboxInfo && !sandboxInfo.supported && (
 							<p className="subtle-note">当前运行环境不支持嵌套 Seatbelt 沙箱：{sandboxInfo.reason}</p>
 						)}

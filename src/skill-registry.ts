@@ -1,4 +1,5 @@
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { managedDirectory, managedFile, writeManagedFile } from "./managed-path.ts";
+import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
 
@@ -161,16 +162,8 @@ export class SkillRegistry {
 		if (typeof input.body !== "string" || !input.body.trim() || input.body.length > 128 * 1024)
 			throw new Error("Skill 指令正文不能为空。");
 		if (input.scope !== "user" && input.scope !== "project") throw new Error("Skill 作用域无效。");
-		const baseDir =
-			input.scope === "user"
-				? join(this.agentDir(), "skills")
-				: (() => {
-						if (!input.project || !isAbsolute(input.project)) throw new Error("项目 Skill 需要绝对项目路径。");
-						return join(input.project, ".pi", "skills");
-					})();
-		const skillDir = join(baseDir, name);
-		const file = join(skillDir, "SKILL.md");
-		await mkdir(skillDir, { recursive: true });
+		const { base, segments } = this.location(input.scope, input.project, name);
+		const file = (await managedFile(base, segments, "SKILL.md", true))!;
 		const frontmatter = [
 			"---",
 			`name: ${name}`,
@@ -180,22 +173,22 @@ export class SkillRegistry {
 			input.body.trim(),
 			"",
 		].join("\n");
-		await writeFile(`${file}.tmp`, frontmatter, "utf8");
-		await rename(`${file}.tmp`, file);
+		await writeManagedFile(file, frontmatter);
 		return this.list(input.project, true);
 	}
 
 	async remove(input: SkillRemoveInput): Promise<SkillDefinitionEntry[]> {
 		const name = validateName(input.name);
 		if (input.scope !== "user" && input.scope !== "project") throw new Error("Skill 作用域无效。");
-		const baseDir =
-			input.scope === "user"
-				? join(this.agentDir(), "skills")
-				: (() => {
-						if (!input.project || !isAbsolute(input.project)) throw new Error("项目 Skill 需要绝对项目路径。");
-						return join(input.project, ".pi", "skills");
-					})();
-		await rm(join(baseDir, name), { recursive: true, force: true });
+		const { base, segments } = this.location(input.scope, input.project, name);
+		const directory = await managedDirectory(base, segments, false);
+		if (directory) await rm(directory, { recursive: true, force: true });
 		return this.list(input.project, true);
+	}
+
+	private location(scope: SkillScope, project: string | undefined, name: string) {
+		if (scope === "user") return { base: this.agentDir(), segments: ["skills", name] };
+		if (!project || !isAbsolute(project)) throw new Error("项目 Skill 需要绝对项目路径。");
+		return { base: project, segments: [".pi", "skills", name] };
 	}
 }

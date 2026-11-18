@@ -106,10 +106,12 @@ export function UnifiedDiffView({
 	diff,
 	mode = "unified",
 	className = "",
+	onReview,
 }: {
 	diff: string;
 	mode?: "unified" | "split";
 	className?: string;
+	onReview?: (side: "old" | "new", line: number) => void;
 }) {
 	const parsed = useMemo(() => parseUnifiedDiff(diff), [diff]);
 	const splitRows = useMemo(() => {
@@ -136,6 +138,11 @@ export function UnifiedDiffView({
 		return rows;
 	}, [parsed, mode]);
 
+	const number = (side: "old" | "new", line?: number) =>
+		onReview && line !== undefined
+			? <button type="button" className="cc-diff-num cc-review-line" aria-label={`评审${side === "old" ? "原" : "新"}行 ${line}`} onClick={() => onReview(side, line)}>{line}</button>
+			: <span className="cc-diff-num">{line ?? ""}</span>;
+
 	if (!diff.trim()) {
 		return <div className={`cc-diff empty ${className}`}>此文件没有可显示的文本差异。</div>;
 	}
@@ -150,12 +157,12 @@ export function UnifiedDiffView({
 					) : (
 						<div key={idx} className="cc-diff-split-row">
 							<div className={`cc-diff-split-cell ${row.left ? `cc-diff-${row.left.type}` : "cc-diff-pad"}`}>
-								<span className="cc-diff-num">{row.left?.oldNum ?? ""}</span>
+								{number("old", row.left?.oldNum)}
 								<span className="cc-diff-sign">{row.left?.type === "del" ? "-" : " "}</span>
 								<span className="cc-diff-code">{row.left ? highlightCode(row.left.text || " ") : ""}</span>
 							</div>
 							<div className={`cc-diff-split-cell ${row.right ? `cc-diff-${row.right.type}` : "cc-diff-pad"}`}>
-								<span className="cc-diff-num">{row.right?.newNum ?? ""}</span>
+								{number("new", row.right?.newNum)}
 								<span className="cc-diff-sign">{row.right?.type === "add" ? "+" : " "}</span>
 								<span className="cc-diff-code">{row.right ? highlightCode(row.right.text || " ") : ""}</span>
 							</div>
@@ -169,8 +176,8 @@ export function UnifiedDiffView({
 		<div className={`cc-diff ${className}`}>
 			{parsed.map((line, idx) => (
 				<div key={idx} className={`cc-diff-line cc-diff-${line.type}`}>
-					<span className="cc-diff-num">{line.oldNum ?? ""}</span>
-					<span className="cc-diff-num">{line.newNum ?? ""}</span>
+					{number("old", line.oldNum)}
+					{number("new", line.newNum)}
 					<span className="cc-diff-sign">
 						{line.type === "add" ? "+" : line.type === "del" ? "-" : line.type === "ctx" ? " " : ""}
 					</span>
@@ -200,12 +207,12 @@ export function InlineEditDiff({ oldText, newText }: { oldText: string; newText:
 	);
 }
 
-export function CodeLines({ content, startLine = 1 }: { content: string; startLine?: number }) {
+export function CodeLines({ content, startLine = 1, activeLine }: { content: string; startLine?: number; activeLine?: number }) {
 	const lines = useMemo(() => content.split("\n"), [content]);
 	return (
 		<div className="cc-code-lines">
 			{lines.map((line, idx) => (
-				<div key={idx} className="cc-code-line">
+				<div key={idx} id={`workspace-line-${startLine + idx}`} className={`cc-code-line${activeLine === startLine + idx ? " active" : ""}`}>
 					<span className="cc-code-num">{startLine + idx}</span>
 					<span className="cc-code-text">{highlightCode(line || " ")}</span>
 				</div>

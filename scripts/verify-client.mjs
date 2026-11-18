@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { access, cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -90,6 +91,7 @@ for (const key of Object.keys(env))
 let application;
 let page;
 const checks = [];
+let previewServer;
 try {
 	application = await electron.launch({ executablePath: executable, args: [], env, timeout: 30000 });
 	page = await application.firstWindow();
@@ -413,7 +415,13 @@ try {
 	await page.locator(".live-diff").filter({ hasText: "你好" }).waitFor();
 	await page.locator('button[title="切换统一/分栏对比"]').click();
 	await page.locator(".cc-diff-split").waitFor();
+	await page.getByRole("button", { name: /^评审新行 / }).first().click();
+	await page.getByRole("textbox", { name: "逐行评审反馈", exact: true }).fill("Check greeting punctuation.");
+	await page.getByRole("button", { name: "加入会话草稿", exact: true }).click();
+	assert.match(await input.inputValue(), /src\/greeting.mjs[\s\S]*Check greeting punctuation\./);
+	await input.fill("");
 	await page.getByRole("button", { name: "关闭工作区面板", exact: true }).click();
+	checks.push("split Diff line feedback enters the active draft");
 
 	await page.getByRole("button", { name: "项目记忆与状态", exact: true }).click();
 	await page.getByRole("dialog", { name: "项目记忆与会话状态", exact: true }).waitFor();
@@ -435,9 +443,36 @@ try {
 	await page.getByRole("textbox", { name: "预览地址", exact: true }).fill("https://example.com");
 	await page.getByRole("button", { name: "访问", exact: true }).click();
 	await page.getByRole("alert").filter({ hasText: /localhost/ }).waitFor();
-	await page.getByRole("textbox", { name: "预览地址", exact: true }).fill("http://127.0.0.1:4173");
+	previewServer = createServer(async (request, response) => {
+		if (request.url === "/mcp") {
+			try {
+				const chunks = [];
+				for await (const chunk of request) chunks.push(chunk);
+				const query = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+				if (query.id === undefined) { response.writeHead(202).end(); return; }
+				const result = query.method === "initialize" ? {
+					protocolVersion: query.params.protocolVersion, serverInfo: { name: "local-fixture", version: "1" }, capabilities: { tools: {} },
+				} : { tools: [] };
+				response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: query.id, result }));
+			} catch {
+				response.writeHead(400).end();
+			}
+			return;
+		}
+		response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+		response.end("<title>Pi Local Preview</title><h1>Preview fixture</h1><script>console.error('fixture console')</script>");
+	});
+	await new Promise((resolve) => previewServer.listen(0, "127.0.0.1", resolve));
+	const previewUrl = `http://127.0.0.1:${previewServer.address().port}/`;
+	await page.getByRole("textbox", { name: "预览地址", exact: true }).fill(previewUrl);
 	await page.getByRole("button", { name: "访问", exact: true }).click();
-	assert.equal(await page.locator("aside.cc-preview-panel iframe").getAttribute("src"), "http://127.0.0.1:4173/");
+	assert.equal(await page.locator("aside.cc-preview-panel iframe").getAttribute("src"), previewUrl);
+	await page.frameLocator("aside.cc-preview-panel iframe").getByRole("heading", { name: "Preview fixture" }).waitFor();
+	await page.getByRole("button", { name: "验证页面", exact: true }).click();
+	await page.getByText("Pi Local Preview", { exact: true }).waitFor();
+	await page.getByText("fixture console", { exact: true }).waitFor();
+	assert.match(await page.locator(".cc-preview-result").innerText(), /HTTP 200/);
+	checks.push("local Chromium preview and console validation");
 	await page.getByRole("button", { name: "关闭预览面板", exact: true }).click();
 
 	await page.getByRole("button", { name: "命令面板", exact: true }).click();
@@ -536,7 +571,7 @@ try {
 	await page.getByRole("textbox", { name: "名称", exact: true }).fill("e2e-mcp");
 	await page.getByRole("combobox", { name: "作用域", exact: true }).selectOption("user");
 	await page.getByRole("combobox", { name: "传输方式", exact: true }).selectOption("http");
-	await page.getByRole("textbox", { name: "URL", exact: true }).fill("https://example.com/mcp");
+	await page.getByRole("textbox", { name: "URL", exact: true }).fill(new URL("/mcp", previewUrl).href);
 	await page.getByRole("button", { name: "保存并重载", exact: true }).click();
 	await page.getByText("e2e-mcp", { exact: true }).waitFor();
 	assert.match(await readFile(join(agentDir, "mcp.json"), "utf8"), /e2e-mcp/);
@@ -544,6 +579,63 @@ try {
 
 	checks.push("acceptEdits, custom Agents and MCP save");
 	checks.push("Git stage/unstage, split diff, memory/status, localhost preview, command palette and Plan mode");
+
+	const originalSession = (await snapshot()).active;
+	const secondProject = join(root, "parallel-project");
+	await mkdir(secondProject);
+	const secondSession = (await page.evaluate((dir) => window.pi.selectProject(dir), secondProject)).active;
+	await page.getByRole("button", { name: "刷新会话", exact: true }).click();
+	await until(async () => (await page.locator(".cl-conv.selected").innerText()).includes("parallel-project"), "the other project");
+	await page.locator(".cl-conv").filter({ hasText: originalSession.title }).first().click();
+	await ready();
+	await page.getByRole("button", { name: "新建会话", exact: true }).first().click();
+	await ready();
+	const approvalSession = (await snapshot()).active;
+	await submit("审批拒绝验证");
+	await page.getByRole("button", { name: "稍后处理", exact: true }).click();
+	await input.fill("只属于第一条会话的草稿");
+	await page.locator(".cl-conv").filter({ hasText: "parallel-project" }).click();
+	await ready();
+	assert.notEqual(secondSession.id, approvalSession.id);
+	assert.equal(await input.inputValue(), "");
+	assert.equal((await snapshot()).activity[approvalSession.id], "approval");
+	await submit("停止生成验证");
+	await page.waitForFunction(() => document.querySelector(".cl-transcript")?.textContent.includes("流式恢复验证："));
+	await input.fill("第二条会话草稿");
+	await page.locator(".cl-conv").filter({ hasText: "审批拒绝验证 · 待确认" }).first().click();
+	await page.getByRole("dialog", { name: "允许执行 write？", exact: true }).waitFor();
+	assert.equal(await input.inputValue(), "只属于第一条会话的草稿");
+	assert.equal((await snapshot()).active.id, approvalSession.id);
+	assert.equal((await snapshot()).activity[secondSession.id], "running");
+	await page.getByRole("button", { name: "拒绝", exact: true }).click();
+	await idle();
+	await page.locator(".cl-conv").filter({ hasText: "停止生成验证 · 运行中" }).click();
+	await page.getByRole("button", { name: "停止任务", exact: true }).click();
+	await idle();
+	assert.equal(await input.inputValue(), "第二条会话草稿");
+	checks.push("parallel foreground sessions restore independent drafts, live output and approvals");
+
+	await page.evaluate(async (dir) => {
+		await window.pi.setProjectTrust({ project: dir, decision: "trusted" });
+		await window.pi.writeMemoryFile("本机项目记忆", "PI_PRIVATE_MEMORY_FIXTURE");
+		await window.pi.writeMemoryFile(".claude/rules/fixture.md", "PI_RULE_FIXTURE");
+	}, (await snapshot()).active.project);
+	await writeFile(join(secondProject, "ref.md"), "PI_REFERENCE_FIXTURE");
+	await submit("模型上下文验证 @ref.md");
+	await page.getByText("收到项目记忆、规则和文件引用。", { exact: true }).waitFor();
+	await idle();
+	checks.push("approved scoped rules, private memory and references reach the real model request");
+
+	await page.getByRole("button", { name: "终端", exact: true }).click();
+	await page.getByRole("button", { name: "Pi 扩展", exact: true }).click();
+	await page.getByRole("button", { name: "列出用户扩展包", exact: true }).click();
+	await page.getByLabel("交互终端画面", { exact: true }).waitFor();
+	await until(async () => await page.evaluate(async (id) => {
+		const installed = (await window.pi.terminals.list(id)).find((item) => item.label === "Pi 扩展");
+		return installed?.status === "exited" && installed.exitCode === 0;
+	}, secondSession.id), "the bundled Pi package CLI");
+	checks.push("bundled Pi CLI and interactive terminal");
+
 
 	assert.deepEqual(pageErrors, []);
 	if (capture)
@@ -558,5 +650,7 @@ try {
 	throw error;
 } finally {
 	await application?.close();
+	previewServer?.closeAllConnections();
+	await new Promise((resolve) => previewServer ? previewServer.close(resolve) : resolve());
 	await rm(root, { recursive: true, force: true });
 }

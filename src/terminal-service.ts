@@ -61,7 +61,8 @@ export class TerminalService {
 			throw new Error("Terminal output buffer must be at least 1024 bytes.");
 	}
 
-	async create(input: TerminalCreateInput): Promise<TerminalInfo> {
+	async create(input: TerminalCreateInput, launch?: { program: string; args: string[]; label: string; env?: NodeJS.ProcessEnv }): Promise<TerminalInfo> {
+		if (process.platform === "win32") throw new Error("Windows 当前支持单次命令，交互终端需要 POSIX PTY。");
 		if (this.disposed) throw new Error("终端服务已关闭。");
 		const project = await realpath(input.project);
 		if (!(await stat(project)).isDirectory()) throw new Error("终端项目路径必须是文件夹。");
@@ -70,6 +71,7 @@ export class TerminalService {
 		validateSize(cols, rows);
 		const environment = { ...process.env, ...this.options.env };
 		const shell =
+			launch?.program ??
 			input.shell ??
 			this.options.shell ??
 			environment.SHELL ??
@@ -92,7 +94,8 @@ export class TerminalService {
 			(this.options.maxTerminals ?? 16)
 		)
 			throw new Error("已达到同时运行的终端数量上限。");
-		const child = spawn(this.options.helperPath, [shell, String(cols), String(rows)], {
+		Object.assign(environment, launch?.env);
+		const child = spawn(this.options.helperPath, [shell, String(cols), String(rows), ...(launch?.args ?? [])], {
 			cwd: project,
 			env: environment,
 			stdio: ["pipe", "pipe", "pipe"],
@@ -108,6 +111,7 @@ export class TerminalService {
 				conversationId: input.conversationId,
 				project,
 				shell,
+				label: launch?.label,
 				cols,
 				rows,
 				status: "starting",

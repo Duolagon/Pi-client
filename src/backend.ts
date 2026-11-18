@@ -1,3 +1,5 @@
+import { createDraftPullRequest, readPullRequest, type DraftPullRequest } from "./review-service.ts";
+import { managedFile, writeManagedFile } from "./managed-path.ts";
 import { execFile } from "node:child_process";
 import { randomBytes, randomUUID, createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, writeFile, rename, realpath, stat, readdir, rm } from "node:fs/promises";
@@ -59,6 +61,8 @@ import type {
 } from "./shared.ts";
 import { connectionMode, validateEndpoint } from "./model-connections.ts";
 import { providerModels, providerPresets } from "./provider-presets.ts";
+import { memoryLimit, memoryName, privateMemoryLabel } from "./project-memory.ts";
+import { codeIntelligence, type CodePosition } from "./language-service.ts";
 import { detectProjectTrustResources } from "./project-trust.ts";
 import { ToolSettingsStore } from "./tool-settings.ts";
 import { evaluatePermission, validatePermissionRule, validateRuntimePolicy } from "./permission-policy.ts";
@@ -371,7 +375,7 @@ export class DesktopService {
 			const project = await realpath(input.project);
 			if (!this.store.projects.some((item) => item.path === project)) throw new Error("项目未打开。");
 			const runtimes = [...this.runtimes.values()].filter(
-				(runtime) => this.conversation(runtime.conversationId).project === project,
+				(runtime) => this.trustProjectFor(this.conversation(runtime.conversationId).project) === project,
 			);
 			for (const runtime of runtimes) {
 				if (runtime.busy || runtime.bashBusy || runtime.pendingUI.size)
@@ -385,7 +389,7 @@ export class DesktopService {
 				// only takes effect after the affected runtimes are recreated.
 				for (const runtime of runtimes) await this.stopRuntime(runtime);
 				const active = this.active();
-				if (active?.project === project && (await this.projectAvailable(active))) await this.ensureRuntime(active);
+				if (active && this.trustProjectFor(active.project) === project && (await this.projectAvailable(active))) await this.ensureRuntime(active);
 			}
 			return this.buildSnapshot();
 		});
@@ -449,7 +453,7 @@ export class DesktopService {
 	}
 
 	private isProjectTrusted(project: string): boolean {
-		return this.store.projectTrust?.[project] === "trusted";
+		return this.store.projectTrust?.[this.trustProjectFor(project)] === "trusted";
 	}
 
 	private isReadRestricted(conversationId?: string): boolean {
@@ -527,6 +531,7 @@ export class DesktopService {
 		const snapshot = await this.buildSnapshot(conv.id);
 		return buildContextReport({
 			project: conv.project,
+			privateMemory: this.privateMemoryPath(this.trustProjectFor(conv.project)),
 			agentDir: this.store.settings.agentDir ?? this.defaultAgentDir(),
 			stats: snapshot.stats,
 			state: snapshot.state,
@@ -535,10 +540,21 @@ export class DesktopService {
 		});
 	}
 
+	private privateMemoryPath(project: string): string {
+		return join(this.options.dataDir, "project-memory", memoryName(project));
+	}
+
 	async writeMemoryFile(relativePath: string, content: string, conversationId?: string): Promise<ContextMemorySource> {
 		await this.operation;
 		this.assertWritableMode("修改项目记忆或规则文件", conversationId);
 		const conv = this.conversation(conversationId);
+		if (relativePath === privateMemoryLabel) {
+			if (Buffer.byteLength(content) > memoryLimit) throw new Error("本机项目记忆最多 24 KiB。");
+			const project = this.trustProjectFor(conv.project);
+			const file = (await managedFile(this.options.dataDir, ["project-memory"], memoryName(project), true))!;
+			await writeManagedFile(file, content);
+			return (await this.contextReport(conv.id)).sources.find((source) => source.id === privateMemoryLabel)!;
+		}
 		return writeProjectMemoryFile(conv.project, relativePath, content);
 	}
 
@@ -579,10 +595,8 @@ export class DesktopService {
 		const conv = this.conversation(conversationId);
 		if (this.permissionPolicy(conv.id).mode === "read") throw new Error("只读模式下不可写入计划文件。");
 		const relativePath = this.planRelativePath(conv.id);
-		const fullPath = resolve(conv.project, relativePath);
-		if (!inside(conv.project, fullPath)) throw new Error("计划文件路径超出项目目录。");
-		await mkdir(dirname(fullPath), { recursive: true });
-		await writeFile(fullPath, content, "utf8");
+		const fullPath = (await managedFile(conv.project, [".pi", "plans"], `${conv.id}.md`, true))!;
+		await writeManagedFile(fullPath, content);
 		return { path: fullPath, relativePath, content, exists: true };
 	}
 
@@ -1125,6 +1139,21 @@ export class DesktopService {
 		if (task && !runtime!.pendingUI.size && task.status === "waiting_for_input") this.updateTask(task, "running");
 	}
 
+	async createDraftPullRequest(conversationId: string, draft: DraftPullRequest) {
+		await this.operation;
+		const conv = this.conversation(conversationId);
+		this.assertWritableMode("创建 GitHub PR", conv.id);
+		this.assertPathAvailable(conv.project, conv.id);
+		const runtime = this.runtimes.get(conv.id);
+		if (runtime?.busy || runtime?.bashBusy || runtime?.settling) throw new Error("请先等待当前项目操作完成。");
+		return createDraftPullRequest(conv.project, draft, this.options.env);
+	}
+
+	async pullRequest(conversationId: string, number?: number) {
+		await this.operation;
+		return readPullRequest(this.conversation(conversationId).project, this.options.env, number);
+	}
+
 	async files(path: string, conversationId?: string): Promise<FileEntry[]> {
 		const folder = await this.scopedPath(path, conversationId);
 		const entries = await readdir(folder, { withFileTypes: true });
@@ -1138,6 +1167,14 @@ export class DesktopService {
 				directory: entry.isDirectory(),
 			}))
 			.sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name));
+	}
+
+	async inspectCode(conversationId: string, path: string, at?: CodePosition) {
+		await this.operation;
+		const { project } = this.conversation(conversationId);
+		if (this.store.projectTrust?.[this.trustProjectFor(project)] !== "trusted")
+			throw new Error("请先在项目菜单中信任此项目，再启动语言服务器。");
+		return codeIntelligence(project, path, this.options.env, at);
 	}
 
 	async readFile(path: string, conversationId?: string): Promise<{ path: string; content: string }> {
@@ -1332,22 +1369,15 @@ export class DesktopService {
 	async writeMemory(file: "AGENTS.md" | "CLAUDE.md", content: string, conversationId?: string): Promise<MemoryFileEntry> {
 		this.assertWritableMode("修改项目记忆文件", conversationId);
 		if (file !== "AGENTS.md" && file !== "CLAUDE.md") throw new Error("仅支持 AGENTS.md 或 CLAUDE.md。");
-		const cwd = this.conversation(conversationId).project;
-		const target = resolve(cwd, file);
-		try {
-			const real = await realpath(target);
-			if (!inside(cwd, real)) throw new Error("记忆文件路径超出项目目录。");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		}
-		await writeFile(target, content, "utf8");
-		return { file, path: target, content, exists: true };
+		const source = await this.writeMemoryFile(file, content, conversationId);
+		return { file, path: source.path, content, exists: true };
 	}
 
 	saveSettings(settings: {
 		permission: PermissionMode;
 		theme: Settings["theme"];
 		sandbox?: boolean;
+		sandboxOffline?: boolean;
 		notifications?: boolean;
 		provider?: Provider;
 		apiKey?: string;
@@ -1363,6 +1393,10 @@ export class DesktopService {
 			next.settings.permission = settings.permission;
 			next.settings.theme = settings.theme;
 			if (settings.sandbox !== undefined) next.settings.sandbox = settings.sandbox;
+			if (settings.sandboxOffline !== undefined) next.settings.sandboxOffline = settings.sandboxOffline;
+			if (!next.settings.sandbox) next.settings.sandboxOffline = false;
+			if (next.settings.sandbox && !(await probeSeatbeltSupport()).supported)
+				throw new Error("此系统无法启动命令沙箱，请在设置中关闭沙箱后重试。");
 			if (settings.notifications !== undefined) next.settings.notifications = settings.notifications;
 			if (settings.agentDir !== undefined) {
 				const value = settings.agentDir.trim();
@@ -1413,6 +1447,7 @@ export class DesktopService {
 			const needsRestart =
 				next.settings.permission !== this.store.settings.permission ||
 				Boolean(next.settings.sandbox) !== Boolean(this.store.settings.sandbox) ||
+				Boolean(next.settings.sandboxOffline) !== Boolean(this.store.settings.sandboxOffline) ||
 				next.settings.agentDir !== this.store.settings.agentDir ||
 				Boolean(settings.provider);
 			this.store = next;
@@ -1942,6 +1977,54 @@ export class DesktopService {
 		});
 	}
 
+	startSsh(conversationId: string, host: string, startPi: boolean): Promise<TerminalInfo> {
+		return this.serialize(async () => {
+			if (!/^(?:[a-zA-Z0-9_][a-zA-Z0-9_.-]*@)?[a-zA-Z0-9][a-zA-Z0-9_.-]{0,252}$/.test(host))
+				throw new Error("SSH 地址应为主机名、配置别名或 user@host。");
+			const conversation = this.conversation(conversationId);
+			this.assertWritableMode("启动 SSH 终端", conversation.id);
+			const args = ["-a", "-x", "-o", "ClearAllForwardings=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none", "-t", "--", host];
+			if (startPi) args.push("pi");
+			return this.terminals.create({ conversationId, project: conversation.project }, { program: "/usr/bin/ssh", args, label: startPi ? `Pi · ${host}` : `SSH · ${host}` });
+		});
+	}
+
+	private openPiCli(conversationId: string, cwd: string, args: string[], label: string): Promise<TerminalInfo> {
+		const runtimeDir = this.options.runtimeDir ?? dirname(dirname(dirname(this.options.entry!)));
+		return this.terminals.create({ conversationId, project: cwd }, {
+			program: this.options.executable,
+			args: [join(runtimeDir, "dist/bundle/cli.js"), ...args],
+			label,
+			env: { PI_CODING_AGENT_DIR: this.store.settings.agentDir ?? this.defaultAgentDir(), ELECTRON_RUN_AS_NODE: "1" },
+		});
+	}
+
+	startPiPackages(conversationId: string, action: "list" | "install" | "update" | "remove", source?: string): Promise<TerminalInfo> {
+		return this.serialize(async () => {
+			const conv = this.conversation(conversationId);
+			this.assertWritableMode("启动 Pi 扩展管理终端", conv.id);
+			if (action === "list") return this.openPiCli(conv.id, this.options.dataDir, ["list"], "Pi 扩展");
+			if (!source || !/^npm:(?:@[a-z0-9_.-]+\/)?[a-z0-9][a-z0-9_.-]*(?:@[a-zA-Z0-9][a-zA-Z0-9.-]*)?$/.test(source))
+				throw new Error("填写 npm: 包名，可附加明确的版本或标签。");
+			return this.openPiCli(conv.id, this.options.dataDir, [action, source], `Pi 扩展 · ${action}`);
+		});
+	}
+
+	startMcpOAuth(conversationId: string, name: string): Promise<TerminalInfo> {
+		return this.serialize(async () => {
+			if (!/^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,63}$/.test(name)) throw new Error("MCP 服务器名称无效。");
+			const conversation = this.conversation(conversationId);
+			this.assertWritableMode("启动 MCP 授权", conversation.id);
+			const server = (await this.mcp.list(conversation.project)).find((item) => item.name === name);
+			if (server?.transport !== "http" || !server.enabled) throw new Error("请选择已启用的 HTTP MCP 服务器。");
+			const projectScoped = server.scope === "project" && !server.overridden;
+			if (server.scope === "project" && this.store.projectTrust?.[this.trustProjectFor(conversation.project)] !== "trusted")
+				throw new Error("请先信任此项目，再登录项目 MCP。");
+			const cwd = projectScoped ? conversation.project : this.options.dataDir;
+			return this.openPiCli(conversationId, cwd, ["mcp", "login", name, ...(projectScoped ? ["-l"] : [])], `MCP · ${name}`);
+		});
+	}
+
 	listTerminals(conversationId?: string): TerminalInfo[] {
 		if (conversationId) this.conversation(conversationId);
 		return this.terminals.list(conversationId);
@@ -2439,9 +2522,11 @@ export class DesktopService {
 			env.PI_DESKTOP_CONNECTIONS = JSON.stringify(connections);
 			runtime.policyFile = join(this.options.dataDir, `policy-${conversation.id}-${randomBytes(8).toString("hex")}.json`);
 			env.PI_DESKTOP_POLICY_FILE = runtime.policyFile;
-			if (this.store.settings.sandbox && (await probeSeatbeltSupport()).supported) {
+			delete env.PI_DESKTOP_SANDBOX_PROFILE;
+			if (this.store.settings.sandbox) {
+				if (!(await probeSeatbeltSupport()).supported) throw new Error("无法启动命令沙箱。请在支持的环境中运行，或在设置中关闭沙箱。");
 				runtime.sandboxProfileFile = join(this.options.dataDir, `sandbox-${conversation.id}-${randomBytes(8).toString("hex")}.sb`);
-				await writeFile(runtime.sandboxProfileFile, buildSeatbeltProfile(conversation.project, [this.options.dataDir]), { mode: 0o600 });
+				await writeFile(runtime.sandboxProfileFile, buildSeatbeltProfile(conversation.project, [], this.store.settings.sandboxOffline), { mode: 0o600 });
 				env.PI_DESKTOP_SANDBOX_PROFILE = runtime.sandboxProfileFile;
 			}
 			const delegated = this.store.tasks.find((task) => task.conversationId === conversation.id && task.parentConversationId);
@@ -2488,8 +2573,10 @@ export class DesktopService {
 			// Pi reads protected project resources once at startup. Pass an explicit
 			// decision so RPC mode never silently falls back to its "ask" default.
 			const trustResources = await detectProjectTrustResources(conversation.project);
-			const trustProject = await this.trustProjectFor(conversation.project);
+			const trustProject = this.trustProjectFor(conversation.project);
 			const trustDecision = this.store.projectTrust?.[trustProject];
+			env.PI_DESKTOP_MEMORY_ROOT = trustDecision === "trusted" ? conversation.project : "";
+			env.PI_DESKTOP_MEMORY_FILE = trustDecision === "trusted" ? this.privateMemoryPath(trustProject) : "";
 			const args = [
 				"--session-dir",
 				sessionDir,
@@ -2722,6 +2809,12 @@ export class DesktopService {
 		const trust = conversation ? await this.projectTrustState(conversation.project) : undefined;
 		return {
 			eventSequence,
+			activitySequence: this.eventSequence,
+			activity: Object.fromEntries([...this.runtimes.values()].flatMap<[string, "approval" | "running"]>((item) =>
+				item.pendingUI.size ? [[item.conversationId, "approval" as const]]
+					: item.busy || item.bashBusy || item.state?.isCompacting ? [[item.conversationId, "running" as const]] : [],
+			)),
+			bashBusy: runtime?.bashBusy ?? false,
 			liveTranscript,
 			projects: this.store.projects,
 			conversations: this.store.conversations,
@@ -2746,15 +2839,18 @@ export class DesktopService {
 		};
 	}
 
-	private async trustProjectFor(project: string): Promise<string> {
+	private trustProjectFor(project: string): string {
 		if (this.store.projects.some((item) => item.path === project)) return project;
 		const task = this.store.tasks.find((item) => item.workingDirectory === project);
 		return task?.project ?? project;
 	}
 
 	private async projectTrustState(project: string): Promise<ProjectTrustState> {
-		const trustProject = await this.trustProjectFor(project);
-		const resources = await detectProjectTrustResources(project);
+		const trustProject = this.trustProjectFor(project);
+		const resources: string[] = await detectProjectTrustResources(project);
+		const memory = await managedFile(this.options.dataDir, ["project-memory"], memoryName(trustProject), false)
+			.then((file) => file ? stat(file).then(() => true, () => false) : false, () => false);
+		if (memory) resources.push(privateMemoryLabel);
 		return {
 			project: trustProject,
 			resources,
@@ -2864,6 +2960,7 @@ function validateStore(input: unknown): StoredState {
 			permission: value.settings.permission,
 			theme: value.settings.theme,
 			sandbox: typeof value.settings.sandbox === "boolean" ? value.settings.sandbox : undefined,
+			sandboxOffline: value.settings.sandbox === true && value.settings.sandboxOffline === true,
 			notifications: typeof value.settings.notifications === "boolean" ? value.settings.notifications : undefined,
 			defaultModel: value.settings.defaultModel,
 			connections: value.settings.connections ?? {},

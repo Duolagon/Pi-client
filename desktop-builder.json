@@ -24,7 +24,7 @@
 		}
 	],
 	"npmRebuild": false,
-	"mac": { "identity": null, "category": "public.app-category.developer-tools", "target": ["zip"] },
+	"mac": { "category": "public.app-category.developer-tools", "target": ["zip"] },
 	"win": { "target": ["nsis"] },
 	"linux": { "target": ["AppImage"], "category": "Development" }
 }

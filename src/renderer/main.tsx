@@ -103,6 +103,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [query, setQuery] = useState("");
 	const [pane, setPane] = useState<"changes" | "files" | null>(null);
 	const [terminalOpen, setTerminalOpen] = useState(false);
+	const [deferredApproval, setDeferredApproval] = useState<string>();
+	const [focusedTerminal, setFocusedTerminal] = useState<{ conversationId: string; terminalId: string }>();
 	const [controlsTab, setControlsTab] = useState<ControlsTab | null>(null);
 	const [checkpointsOpen, setCheckpointsOpen] = useState(false);
 	const [rewindQuery, setRewindQuery] = useState<string | undefined>(undefined);
@@ -133,6 +135,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const stickToEnd = useRef(true);
 	useEffect(() => {
 		stickToEnd.current = true;
+		setDeferredApproval(undefined);
 	}, [snapshot?.active?.id]);
 	useEffect(() => {
 		setTrustOpen(false);
@@ -274,7 +277,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		} else if (action === "btw") {
 			app.setDraft("/btw ");
 		} else if (action === "new") {
-			if (!blocked && snapshot?.active) switchTo(() => api.newConversation());
+			if (!changing && snapshot?.active) switchTo(() => api.newConversation());
 		} else if (action === "permissions") {
 			setControlsTab("permissions");
 		} else if (action === "mcp") {
@@ -328,7 +331,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				event.preventDefault();
 				setFindOpen((open) => !open);
 			}
-			if (lower === "n" && snapshot?.active && !blocked) {
+			if (lower === "n" && snapshot?.active && !changing) {
 				event.preventDefault();
 				switchTo(() => api.newConversation());
 			}
@@ -399,10 +402,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		hits[clamped].scrollIntoView({ behavior: "smooth", block: "center" });
 	};
 	const paletteActions: PaletteAction[] = [
-		{ id: "new", label: "新建会话", shortcut: "⌘N", keywords: "new session clear", disabled: blocked || !snapshot.active, run: () => switchTo(() => api.newConversation()) },
+		{ id: "new", label: "新建会话", shortcut: "⌘N", keywords: "new session clear", disabled: changing || !snapshot.active, run: () => switchTo(() => api.newConversation()) },
 		{ id: "search", label: "搜索历史会话", shortcut: "⌘K", keywords: "search find", run: () => { setQuery(""); setSearching(true); } },
 		{ id: "find", label: "会话内关键词搜索", shortcut: "⌘F", keywords: "find in transcript", disabled: !snapshot.active, run: () => setFindOpen(true) },
-		{ id: "open", label: "打开项目文件夹", keywords: "open project folder", disabled: blocked, run: () => void app.switchTo(() => api.openProject()) },
+		{ id: "open", label: "打开项目文件夹", keywords: "open project folder", disabled: changing, run: () => void app.switchTo(() => api.openProject()) },
 		{ id: "plan", label: inPlanMode ? "退出 Plan 计划模式" : "进入 Plan 计划模式", keywords: "plan mode readonly", disabled: blocked, run: () => void togglePlanMode() },
 		{ id: "rewind", label: "检查点与代码回滚 (/rewind)", keywords: "git checkpoint restore", disabled: !snapshot.active, run: () => { setRewindQuery(undefined); setCheckpointsOpen(true); } },
 		{ id: "tasks", label: "后台任务、子 Agent 与 Worktree (/tasks)", keywords: "subagent external codex claude kimi", run: () => { setTaskInitialId(undefined); setTasksOpen(true); } },
@@ -435,7 +438,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				<IconButton
 					icon={SquarePen}
 					label="新建会话"
-					disabled={blocked || !snapshot.active}
+					disabled={changing || !snapshot.active}
 					onClick={() => switchTo(() => api.newConversation())}
 				/>
 				<IconButton
@@ -446,7 +449,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						setSearching(true);
 					}}
 				/>
-				<IconButton icon={FolderOpen} label="打开项目" disabled={blocked} onClick={() => void app.switchTo(() => api.openProject())} />
+				<IconButton icon={FolderOpen} label="打开项目" disabled={changing} onClick={() => void app.switchTo(() => api.openProject())} />
 				<span className="cl-rail-spacer" />
 				<IconButton icon={Settings} label="设置" active={settings} onClick={() => setSettings(true)} />
 			</nav>
@@ -456,7 +459,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						<span className="cl-side-title">会话</span>
 					</div>
 					<div className="cl-side-actions">
-						<button className="cl-side-action" disabled={blocked || !snapshot.active} onClick={() => switchTo(() => api.newConversation())}>
+						<button className="cl-side-action" disabled={changing || !snapshot.active} onClick={() => switchTo(() => api.newConversation())}>
 							<Plus size={16} />
 							<span>新建会话</span>
 							<kbd>⌘N</kbd>
@@ -472,7 +475,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							<span>搜索会话</span>
 							<kbd>⌘K</kbd>
 						</button>
-						<button className="cl-side-action" disabled={blocked} onClick={() => void app.switchTo(() => api.openProject())}>
+						<button className="cl-side-action" disabled={changing} onClick={() => void app.switchTo(() => api.openProject())}>
 							<FolderOpen size={16} />
 							<span>打开项目</span>
 						</button>
@@ -485,11 +488,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									<button
 										className={`cl-conv ${session.id === snapshot.active?.id ? "selected" : ""}`}
 										key={session.id}
-										disabled={blocked}
+										disabled={changing}
 										onClick={() => switchTo(() => api.selectConversation(session.id))}
 										aria-current={session.id === snapshot.active?.id ? "page" : undefined}
 									>
-										<span className="cl-conv-title">{session.title}</span>
+										<span className="cl-conv-title">{session.title}{app.activity[session.id] === "approval" ? " · 待确认" : app.activity[session.id] === "running" ? " · 运行中" : ""}</span>
 										<span className="cl-conv-sub">
 											{projectName(snapshot, session.project)} · {formatTime(session.updatedAt)}
 										</span>
@@ -526,7 +529,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						)}
 					</div>
 					<div className="cl-top-tools">
-						{snapshot.trust?.required && (
+						{snapshot.trust && (
 							<IconButton
 								icon={ShieldCheck}
 								label={
@@ -873,6 +876,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					</div>
 					{terminalOpen && (
 						<TerminalPanel
+							key={snapshot.active?.id}
+							focusId={focusedTerminal?.conversationId === snapshot.active?.id ? focusedTerminal?.terminalId : undefined}
 							conversationId={snapshot.active?.id}
 							project={snapshot.active?.project}
 							ready={ready}
@@ -890,8 +895,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			</main>
 			{pane && (
 				<WorkspacePanel
-					key={`${snapshot.active?.project}-${pane}`}
+					key={`${snapshot.active?.id}-${pane}`}
 					pane={pane}
+					conversationId={snapshot.active?.id}
+					onReviewNote={(note) => app.setDraft([app.draft, note].filter(Boolean).join("\n\n"))}
 					setPane={setPane}
 					close={() => setPane(null)}
 					revision={app.revision}
@@ -899,7 +906,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					readOnly={snapshot.settings.permission === "read" || snapshot.settings.permission === "plan"}
 					onReferenceFile={(filePath) => {
 						const prefix = app.draft && !app.draft.endsWith(" ") && !app.draft.endsWith("\n") ? `${app.draft} ` : app.draft;
-						app.setDraft(`${prefix}@${filePath} `);
+						app.setDraft(`${prefix}@${/\s/.test(filePath) ? JSON.stringify(filePath) : filePath} `);
 					}}
 					onWorkspaceMutated={() => void app.refresh()}
 					onNotice={(msg) => app.setNotice(msg)}
@@ -908,10 +915,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			{!pane && previewUrl && (
 				<PreviewPanel
 					initialUrl={previewUrl}
+					onReport={(report) => app.setDraft([app.draft, report].filter(Boolean).join("\n\n"))}
 					close={() => setPreviewUrl(null)}
 				/>
 			)}
-			{trustOpen && snapshot.trust?.required && (
+			{trustOpen && snapshot.trust && (
 				<ProjectTrustDialog
 					trust={snapshot.trust}
 					busy={trustBusy || blocked}
@@ -929,6 +937,13 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			)}
 			{mcpOpen && (
 				<McpDialog
+					onOAuth={snapshot.active && snapshot.settings.permission !== "read" && snapshot.settings.permission !== "plan" ? async (name) => {
+						const id = snapshot.active!.id;
+						const terminal = await api.terminals.mcpOAuth(id, name);
+						setFocusedTerminal({ conversationId: id, terminalId: terminal.id });
+						setMcpOpen(false);
+						setTerminalOpen(true);
+					} : undefined}
 					project={snapshot.active?.project}
 					close={() => setMcpOpen(false)}
 					onNotice={(message) => app.setNotice(message)}
@@ -963,7 +978,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							.filter((session) => `${session.title} ${session.project}`.toLowerCase().includes(query.toLowerCase()))
 							.map((session) => (
 								<button
-									disabled={blocked}
+									disabled={changing}
 									key={session.id}
 									onClick={() => switchTo(() => api.selectConversation(session.id))}
 								>
@@ -1005,13 +1020,17 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					</form>
 				</Modal>
 			)}
-			{app.requests[0] && (
+			{app.requests[0]?.id === deferredApproval && deferredApproval && (
+				<button type="button" className="secondary-button cc-return-approval" onClick={() => setDeferredApproval(undefined)}>继续处理审批</button>
+			)}
+			{app.requests[0] && app.requests[0].id !== deferredApproval && (
 				<PermissionDialog
 					key={app.requests[0].id}
 					request={app.requests[0]}
 					conversationId={snapshot.active?.id}
 					project={snapshot.active?.project}
 					respond={app.respond}
+					defer={() => setDeferredApproval(app.requests[0]?.id)}
 					fail={app.fail}
 				/>
 			)}

@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { managedFile, writeManagedFile } from "./managed-path.ts";
 import { validatePermissionRule } from "./permission-policy.ts";
 import type { PermissionAction, PermissionRule } from "./permission-types.ts";
 
-const toolMap: Record<string, string> = {
+export const claudeToolNames: Record<string, string> = {
 	Bash: "bash",
 	Edit: "edit",
 	Write: "write",
@@ -17,7 +17,7 @@ const toolMap: Record<string, string> = {
 	Agent: "Agent",
 };
 
-const reverseToolMap: Record<string, string> = {
+export const piToClaudeToolNames: Record<string, string> = {
 	bash: "Bash",
 	edit: "Edit",
 	write: "Write",
@@ -44,7 +44,7 @@ export function parseClaudePermissionSpec(
 	const match = /^([A-Za-z0-9_.:?*-]+)(?:\((.*)\))?$/.exec(trimmed);
 	if (!match) return undefined;
 	const rawTool = match[1];
-	const tool = toolMap[rawTool] ?? rawTool;
+	const tool = claudeToolNames[rawTool] ?? rawTool;
 	const arg = match[2]?.trim();
 	const base: PermissionRule = {
 		id: ruleId(project, action, trimmed),
@@ -89,7 +89,7 @@ export function parseClaudePermissionSpec(
 }
 
 export function formatClaudePermissionSpec(rule: PermissionRule): string | undefined {
-	const name = reverseToolMap[rule.tool] ?? rule.tool;
+	const name = piToClaudeToolNames[rule.tool] ?? rule.tool;
 	if (rule.command) {
 		if (rule.command.type === "exact") return `${name}(${rule.command.value})`;
 		return `${name}(${rule.command.argv.join(" ")}:*)`;
@@ -100,7 +100,9 @@ export function formatClaudePermissionSpec(rule: PermissionRule): string | undef
 
 export async function readClaudeProjectPermissions(project: string): Promise<PermissionRule[]> {
 	const rules: PermissionRule[] = [];
-	for (const file of [join(project, ".claude", "settings.json"), join(project, ".claude", "settings.local.json")]) {
+	for (const name of ["settings.json", "settings.local.json"]) {
+		const file = await managedFile(project, [".claude"], name, false);
+		if (!file) continue;
 		try {
 			const raw = JSON.parse(await readFile(file, "utf8")) as {
 				permissions?: { allow?: unknown; ask?: unknown; deny?: unknown };
@@ -112,7 +114,7 @@ export async function readClaudeProjectPermissions(project: string): Promise<Per
 				for (const item of list) {
 					if (typeof item !== "string") continue;
 					const parsed = parseClaudePermissionSpec(item, action, project);
-					if (parsed) rules.push(parsed);
+					if (parsed) rules.push(name === "settings.local.json" ? { ...parsed, id: `private-${parsed.id}` } : parsed);
 				}
 			}
 		} catch {
@@ -126,23 +128,32 @@ export async function writeClaudeProjectPermissions(
 	project: string,
 	rules: PermissionRule[],
 ): Promise<{ path: string; count: number }> {
-	const target = join(project, ".claude", "settings.json");
+	const target = (await managedFile(project, [".claude"], "settings.json", true))!;
 	let doc: Record<string, unknown> = {};
 	try {
 		const parsed: unknown = JSON.parse(await readFile(target, "utf8"));
-		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) doc = parsed as Record<string, unknown>;
-	} catch {
-		// Create new settings.json cleanly.
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Claude 设置必须是 JSON 对象。");
+		doc = parsed as Record<string, unknown>;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
-	const permissions: { allow: string[]; ask: string[]; deny: string[] } = { allow: [], ask: [], deny: [] };
+	const existing = doc.permissions ?? {};
+	if (typeof existing !== "object" || Array.isArray(existing)) throw new Error("Claude permissions 必须是对象。");
+	const permissions = { ...existing } as Record<string, unknown>;
+	// Older imports used the shared ID even when the original rule was private.
+	const privateIds = new Set((await readClaudeProjectPermissions(project)).map((rule) => rule.id)
+		.filter((id) => id.startsWith("private-")).map((id) => id.slice("private-".length)));
+	let count = 0;
 	for (const rule of rules) {
-		if (rule.scope !== "project" || rule.project !== project) continue;
+		if (rule.scope !== "project" || rule.project !== project || rule.id.startsWith("private-") || privateIds.has(rule.id)) continue;
 		const spec = formatClaudePermissionSpec(rule);
-		if (spec && !permissions[rule.action].includes(spec)) permissions[rule.action].push(spec);
+		if (!spec) continue;
+		const list = permissions[rule.action];
+		if (list !== undefined && !Array.isArray(list)) throw new Error(`Claude permissions.${rule.action} 必须是数组。`);
+		if (list?.includes(spec)) continue;
+		permissions[rule.action] = [...(list ?? []), spec];
+		count++;
 	}
-	doc.permissions = permissions;
-	await mkdir(dirname(target), { recursive: true });
-	await writeFile(`${target}.tmp`, JSON.stringify(doc, null, 2), "utf8");
-	await rename(`${target}.tmp`, target);
-	return { path: target, count: permissions.allow.length + permissions.ask.length + permissions.deny.length };
+	if (count > 0) await writeManagedFile(target, JSON.stringify({ ...doc, permissions }, null, 2) + "\n");
+	return { path: target, count };
 }

@@ -14,7 +14,8 @@ const require = createRequire(resolve(agent, "package.json"));
 const backendOnly = process.argv.includes("--backend-only");
 if (!backendOnly) await rm(resolve(app, "dist"), { recursive: true, force: true });
 await mkdir(resolve(app, "dist"), { recursive: true });
-await buildPtyHelper(resolve(app, "dist/native/pty-host"));
+if (process.platform === "win32") await mkdir(resolve(app, "dist/native"), { recursive: true });
+else await buildPtyHelper(resolve(app, "dist/native/pty-host"));
 const common = { absWorkingDir: app, bundle: true, sourcemap: true, logLevel: "info", tsconfig: "tsconfig.json" };
 await Promise.all([
 	build({

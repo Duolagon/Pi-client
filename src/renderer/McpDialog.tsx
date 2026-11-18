@@ -13,12 +13,14 @@ export function McpDialog({
 	fail,
 	onNotice,
 	onChanged,
+	onOAuth,
 }: {
 	project?: string;
 	close: () => void;
 	fail: (error: unknown) => void;
 	onNotice: (message: string) => void;
 	onChanged: () => void;
+	onOAuth?: (name: string) => Promise<void>;
 }) {
 	const [servers, setServers] = useState<McpServerInfo[]>([]);
 	const [selected, setSelected] = useState<McpServerInfo | null>(null);
@@ -199,6 +201,19 @@ export function McpDialog({
 							<strong>{selected ? "编辑 MCP 服务器" : "新建 MCP 服务器"}</strong>
 							{selected?.source && <small>{selected.source}</small>}
 						</div>
+						{selected?.transport === "http" && selected.enabled && onOAuth && (
+							<button type="button" className="cc-mini-btn" disabled={busy} onClick={async () => {
+								setBusy(true);
+								setError("");
+								try {
+									await onOAuth(selected.name);
+								} catch (error) {
+									setError(error instanceof Error ? error.message : String(error));
+								} finally {
+									setBusy(false);
+								}
+							}}>OAuth 登录</button>
+						)}
 						{selected && (
 							<button type="button" className="cc-mini-btn" disabled={busy} onClick={() => void remove()}>
 								<Trash2 size={13} /> 删除

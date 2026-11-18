@@ -59,7 +59,7 @@ static int fail(const char *message) {
 }
 
 int main(int argc, char **argv) {
-	if (argc != 4 || argv[1][0] != '/') return fail("Invalid PTY helper arguments");
+	if (argc < 4 || argv[1][0] != '/') return fail("Invalid PTY helper arguments");
 	int cols = positive_size(argv[2]), rows = positive_size(argv[3]);
 	if (!cols || !rows) return fail("Invalid terminal dimensions");
 	struct winsize size;
@@ -76,7 +76,12 @@ int main(int argc, char **argv) {
 		/* forkpty creates a session and controlling terminal before exec. */
 		close(exec_status[0]);
 		signal(SIGPIPE, SIG_DFL);
-		execl(argv[1], argv[1], "-l", "-i", (char *)NULL);
+		if (argc == 4) {
+			execl(argv[1], argv[1], "-l", "-i", (char *)NULL);
+		} else {
+			argv[3] = argv[1];
+			execv(argv[1], &argv[3]);
+		}
 		int error = errno;
 		write_all(exec_status[1], (const unsigned char *)&error, sizeof(error));
 		_exit(127);

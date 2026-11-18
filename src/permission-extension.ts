@@ -1,3 +1,7 @@
+import { projectMemoryContext } from "./project-memory.ts";
+import { get as getHttp } from "node:http";
+import { get as getHttps } from "node:https";
+import { Readable } from "node:stream";
 import { lookup } from "node:dns/promises";
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import { isIP } from "node:net";
@@ -82,13 +86,14 @@ function blockedAddress(address: string): boolean {
 	return isIP(address) === 4 ? blockedIpv4(address) : isIP(address) === 6 ? blockedIpv6(address) : true;
 }
 
-async function assertPublicHost(hostname: string): Promise<void> {
+async function publicAddresses(hostname: string): Promise<{ address: string; family: number }[]> {
 	const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
 	if (host === "localhost" || host.endsWith(".local"))
 		throw new Error("Refusing to fetch private or loopback network addresses.");
-	if (isIP(host)) {
+	const family = isIP(host);
+	if (family) {
 		if (blockedAddress(host)) throw new Error("Refusing to fetch private or loopback network addresses.");
-		return;
+		return [{ address: host, family }];
 	}
 	let addresses: Array<{ address: string; family: number }>;
 	try {
@@ -98,6 +103,47 @@ async function assertPublicHost(hostname: string): Promise<void> {
 	}
 	if (!addresses.length || addresses.some(({ address }) => blockedAddress(address)))
 		throw new Error("Refusing to fetch private or loopback network addresses.");
+	return addresses;
+}
+
+async function fetchPinned(url: URL, signal: AbortSignal): Promise<Response> {
+	if (url.username || url.password) throw new Error("WebFetch URLs cannot contain credentials.");
+	signal.throwIfAborted();
+	// Node's TLS still sees the original URL hostname. Only address resolution is pinned.
+	const addresses = await publicAddresses(url.hostname);
+	signal.throwIfAborted();
+	const get = url.protocol === "https:" ? getHttps : getHttp;
+	const first = addresses[0]!;
+	return new Promise((resolve, reject) => {
+		const request = get(url, {
+			agent: false,
+			signal,
+			lookup: (_host, options, callback) => {
+				if (options.all) callback(null, addresses);
+				else callback(null, first.address, first.family);
+			},
+			headers: { "user-agent": "Pi-Desktop", "accept-encoding": "identity" },
+		}, (incoming) => {
+			try {
+				const headers = new Headers();
+				for (const [name, value] of Object.entries(incoming.headers)) {
+					if (typeof value === "string") headers.set(name, value);
+					else if (Array.isArray(value)) for (const item of value) headers.append(name, item);
+				}
+				const status = incoming.statusCode ?? 502;
+				if (status < 200) throw new Error(`Unsupported HTTP status ${status}`);
+				const empty = status === 204 || status === 205 || status === 304;
+				if (empty) incoming.resume();
+				resolve(new Response(empty ? null : Readable.toWeb(incoming) as ReadableStream<Uint8Array>, {
+					status, statusText: incoming.statusMessage, headers,
+				}));
+			} catch (error) {
+				incoming.destroy();
+				reject(error);
+			}
+		});
+		request.once("error", reject);
+	});
 }
 
 async function readLimited(response: Response): Promise<{ text: string; truncated: boolean }> {
@@ -130,12 +176,7 @@ async function readLimited(response: Response): Promise<{ text: string; truncate
 async function fetchPublic(url: URL, signal: AbortSignal): Promise<{ response: Response; url: URL }> {
 	let current = url;
 	for (let redirects = 0; redirects <= maxRedirects; redirects++) {
-		await assertPublicHost(current.hostname);
-		const response = await fetch(current.toString(), {
-			signal,
-			redirect: "manual",
-			headers: { "user-agent": "Pi-Desktop/0.1" },
-		});
+		const response = await fetchPinned(current, signal);
 		if ([301, 302, 303, 307, 308].includes(response.status)) {
 			const location = response.headers.get("location");
 			await response.body?.cancel().catch(() => {});
@@ -222,7 +263,10 @@ export default function permissions(pi: ExtensionAPI) {
 				signal?.addEventListener("abort", onAbort, { once: true });
 				try {
 					const { response, url } = await fetchPublic(parsed, controller.signal);
-					if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+					if (!response.ok) {
+						await response.body?.cancel().catch(() => {});
+						throw new Error(`HTTP ${response.status} ${response.statusText}`);
+					}
 					const body = await readLimited(response);
 					const contentType = response.headers.get("content-type") ?? "";
 					const readable = contentType.includes("html")
@@ -447,6 +491,30 @@ export default function permissions(pi: ExtensionAPI) {
 	}
 	for (const [provider, connection] of Object.entries(connections))
 		registerConnection(provider as Provider, connection);
+	const memoryRoot = process.env.PI_DESKTOP_MEMORY_ROOT;
+	const memoryToolPaths = new Set<string>();
+	if (memoryRoot) {
+		let prompt = "";
+		let system = "";
+		let context: string | undefined;
+		let analyzedPaths = -1;
+		pi.on("before_agent_start", (event) => {
+			prompt = event.messageType === "user" ? event.prompt : "";
+			system = event.systemPrompt;
+			memoryToolPaths.clear();
+			analyzedPaths = -1;
+		});
+		pi.on("context_with_system", async (event) => {
+			if (analyzedPaths !== memoryToolPaths.size) {
+				context = await projectMemoryContext(memoryRoot, prompt, process.env.PI_DESKTOP_MEMORY_FILE, [...memoryToolPaths], system);
+				analyzedPaths = memoryToolPaths.size;
+			}
+			const first = event.messages[0];
+			if (context && first?.role === "system") {
+				return { messages: [{ ...first, sections: { ...first.sections, desktopProjectMemory: context } }, ...event.messages.slice(1)] };
+			}
+		});
+	}
 	pi.on("session_start", async (_event, ctx) => {
 		// The registry is bound after initial loading and can include user-defined model capabilities.
 		for (const [provider, connection] of Object.entries(connections)) {
@@ -501,6 +569,8 @@ export default function permissions(pi: ExtensionAPI) {
 		}
 	});
 	pi.on("tool_result", async (event) => {
+		if (memoryRoot && !event.isError && ["read", "write", "edit"].includes(event.toolName) && typeof event.input.path === "string" && memoryToolPaths.size < 64)
+			memoryToolPaths.add(event.input.path);
 		if (testingConnection) return;
 		const hook = await callHost("/hook", {
 			phase: "post",

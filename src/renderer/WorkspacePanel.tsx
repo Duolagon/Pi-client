@@ -1,8 +1,9 @@
+import { PullRequestPanel } from "./PullRequestPanel.tsx";
 import { useEffect, useState } from "react";
 import { ArrowLeft, Check, Columns2, FileCode2, Folder, Minus, Plus, RefreshCw, RotateCcw, X } from "lucide-react";
 import { IconButton } from "../prototype/ui.tsx";
 import { CodeLines, UnifiedDiffView } from "./DiffView.tsx";
-import type { Change, FileEntry, Workspace } from "../shared.ts";
+import type { Change, CodeIntelligence, CodePosition, FileEntry, Workspace } from "../shared.ts";
 
 export function WorkspacePanel({
 	pane,
@@ -10,6 +11,8 @@ export function WorkspacePanel({
 	close,
 	revision,
 	project,
+	conversationId,
+	onReviewNote,
 	readOnly = false,
 	onReferenceFile,
 	onWorkspaceMutated,
@@ -20,6 +23,8 @@ export function WorkspacePanel({
 	close: () => void;
 	revision: number;
 	project?: string;
+	conversationId?: string;
+	onReviewNote?: (note: string) => void;
 	readOnly?: boolean;
 	onReferenceFile?: (path: string) => void;
 	onWorkspaceMutated?: () => void;
@@ -34,7 +39,31 @@ export function WorkspacePanel({
 	const [mutating, setMutating] = useState(false);
 	const [error, setError] = useState("");
 	const [loading, setLoading] = useState(false);
+	const [review, setReview] = useState<{side: "old" | "new"; line: number} | null>(null);
+	const [note, setNote] = useState("");
 	const [refresh, setRefresh] = useState(0);
+	const [intelligence, setIntelligence] = useState<CodeIntelligence | null>(null);
+	const [analyzing, setAnalyzing] = useState(false);
+	const [activeLine, setActiveLine] = useState<number>();
+	const [line, setLine] = useState("1");
+	const [column, setColumn] = useState("1");
+
+	useEffect(() => {
+		if (activeLine) document.getElementById(`workspace-line-${activeLine}`)?.scrollIntoView({ block: "center" });
+	}, [activeLine, content]);
+
+	const inspect = async (at?: CodePosition) => {
+		if (!conversationId || !content) return;
+		setAnalyzing(true);
+		setError("");
+		try {
+			setIntelligence(await window.pi.inspectCode(conversationId, content.path, at));
+		} catch (error) {
+			setError(error instanceof Error ? error.message : String(error));
+		} finally {
+			setAnalyzing(false);
+		}
+	};
 
 	useEffect(() => {
 		setDirectory("");
@@ -66,7 +95,13 @@ export function WorkspacePanel({
 		};
 	}, [directory, pane, revision, refresh, project]);
 
-	const open = async (path: string) => {
+	const open = async (path: string, jump?: number) => {
+		setIntelligence(null);
+		setActiveLine(jump);
+		setLine(String(jump ?? 1));
+		setColumn("1");
+		setReview(null);
+		setNote("");
 		setError("");
 		setLoading(true);
 		try {
@@ -160,6 +195,7 @@ export function WorkspacePanel({
 								<Columns2 size={12} /> {diffMode === "split" ? "分栏" : "统一"}
 							</button>
 						)}
+						{pane === "files" && conversationId && <button type="button" className="cc-mini-btn" disabled={analyzing} onClick={() => void inspect()}>{analyzing ? "分析中…" : "代码分析"}</button>}
 						{onReferenceFile && (
 							<button type="button" className="cc-mini-btn" onClick={() => onReferenceFile(content.path)} title="插入 @文件引用 到输入框">
 								@引用
@@ -168,12 +204,43 @@ export function WorkspacePanel({
 					</div>
 					{pane === "changes" ? (
 						<div className="live-file-content live-diff">
-							<UnifiedDiffView diff={content.content} mode={diffMode} />
+							<UnifiedDiffView diff={content.content} mode={diffMode} onReview={onReviewNote && ((side, line) => setReview({ side, line }))} />
+							{review && <form className="cc-review-note" onSubmit={(event) => {
+								event.preventDefault();
+								if (!note.trim()) return;
+								onReviewNote?.(`评审反馈 ${content.path}（${review.side === "old" ? "原文件" : "新文件"}第 ${review.line} 行）\n${note.trim()}`);
+								setReview(null);
+								setNote("");
+							}}>
+								<label>第 {review.line} 行的反馈
+									<textarea aria-label="逐行评审反馈" value={note} onChange={(event) => setNote(event.target.value)} autoFocus />
+								</label>
+								<button className="cc-mini-btn" type="submit" disabled={!note.trim()}>加入会话草稿</button>
+								<button className="cc-mini-btn" type="button" onClick={() => setReview(null)}>取消</button>
+							</form>}
 						</div>
 					) : (
-						<div className="live-file-content">
-							{content.content ? <CodeLines content={content.content} /> : <p className="subtle-note">空文件</p>}
-						</div>
+						<>
+							{intelligence && <section className="cc-code-inspector">
+								<form onSubmit={(event) => { event.preventDefault(); void inspect({ line: Number(line), column: Number(column) }); }}>
+									<input type="number" required min="1" aria-label="定义查询行号" value={line} onChange={(event) => setLine(event.target.value)} />
+									<input type="number" required min="1" aria-label="定义查询列号" value={column} onChange={(event) => setColumn(event.target.value)} />
+									<button className="cc-mini-btn" disabled={analyzing}>查找定义</button>
+								</form>
+								{intelligence.definitions.map((item, index) => <button type="button" key={index} onClick={() => void open(item.path, item.line)}>{item.path}:{item.line}:{item.column}</button>)}
+								<details open={intelligence.diagnostics.length > 0}>
+									<summary>诊断 {intelligence.diagnostics.length}</summary>
+									{intelligence.diagnostics.map((item, index) => <button type="button" key={index} onClick={() => setActiveLine(item.line)}>{item.line}:{item.column} {item.message}</button>)}
+								</details>
+								<details>
+									<summary>符号 {intelligence.symbols.length}</summary>
+									{intelligence.symbols.map((item, index) => <button type="button" key={index} onClick={() => setActiveLine(item.line)}>{item.name} · {item.line}:{item.column}</button>)}
+								</details>
+							</section>}
+							<div className="live-file-content">
+								{content.content ? <CodeLines content={content.content} activeLine={activeLine} /> : <p className="subtle-note">空文件</p>}
+							</div>
+						</>
 					)}
 				</>
 			) : pane === "files" ? (
@@ -200,6 +267,7 @@ export function WorkspacePanel({
 				</>
 			) : (
 				<>
+					{workspace?.isGit && <PullRequestPanel conversationId={conversationId} branch={workspace.branch} readOnly={readOnly} />}
 					<div className="changes-overview cc-git-overview">
 						<p>{workspace?.isGit ? `分支：${workspace.branch}` : "当前目录不是 Git 仓库"}</p>
 						{workspace?.isGit && workspace.changes.length > 0 && !readOnly && (

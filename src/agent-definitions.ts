@@ -1,7 +1,7 @@
-import { lstat, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, sep } from "node:path";
-import { managedDirectory } from "./managed-path.ts";
+import { managedDirectory, writeManagedFile } from "./managed-path.ts";
 import type { AgentDefinition, AgentRemoveInput, AgentSaveInput, AgentScope } from "./agent-types.ts";
 import type { ThinkingLevel } from "./shared.ts";
 
@@ -221,7 +221,6 @@ export class AgentRegistry {
 		);
 		if (!directory) throw new Error("无法创建 Agent 目录。");
 		const target = join(directory, `${name}.md`);
-		const temporary = `${target}.tmp`;
 		let extra: Record<string, string> = {};
 		try {
 			const info = await lstat(target);
@@ -232,8 +231,7 @@ export class AgentRegistry {
 		}
 		const known = new Set(["name", "description", "tools", "model", "thinkingLevel"]);
 		extra = Object.fromEntries(Object.entries(extra).filter(([key]) => !known.has(key)));
-		await writeFile(temporary, serializeAgent({ ...input, name, description, prompt, tools, model }, extra), { mode: 0o600 });
-		await rename(temporary, target);
+		await writeManagedFile(target, serializeAgent({ ...input, name, description, prompt, tools, model }, extra));
 		return this.list(project);
 	}
 

@@ -30,7 +30,7 @@ export function ProjectTrustDialog({
 					</div>
 				</div>
 				<p>
-					该项目包含以下 Pi 配置。Pi 只在明确信任后加载它们；其中的扩展、Skills 与 MCP 服务器可以执行代码或改变模型行为。
+					信任项目后可以启动语言服务器并加载项目规则、记忆和扩展配置。项目扩展和 MCP 服务器可以执行代码。
 				</p>
 				<ul className="cc-trust-list">
 					{trust.resources.map((resource) => (

@@ -7,6 +7,7 @@ import { installSessionHandlers } from "./session-ipc.ts";
 import { installControlHandlers } from "./control-ipc.ts";
 import { installExternalHandlers } from "./external-ipc.ts";
 import type { Command, ConnectionInput, DesktopAPI } from "./shared.ts";
+import { checkPreview } from "./preview-check.ts";
 import { captureToolPath } from "./tool-path.ts";
 import type { RpcExtensionUIResponse } from "@earendil-works/pi-coding-agent";
 
@@ -149,6 +150,7 @@ function installHandlers() {
 			await ready;
 			return action(...args);
 		});
+	handle("pi:preview:check", (url, mobile) => checkPreview(string(url, "预览地址", 4096), mobile === true));
 	handle("pi:snapshot", () => service.snapshot());
 	handle("pi:open-project", async () => {
 		const result = await dialog.showOpenDialog(window!, { title: "打开项目文件夹", properties: ["openDirectory"] });
@@ -167,8 +169,8 @@ function installHandlers() {
 	handle("pi:rename", (id, title) =>
 		service.renameConversation(string(id, "会话 ID", 200), string(title, "会话名称", 160)),
 	);
-	handle("pi:command", (input) => service.command(command(input)));
-	handle("pi:respond", async (input) => {
+	handle("pi:command", (input, id) => service.command(command(input), id === undefined ? undefined : string(id, "会话 ID", 200)));
+	handle("pi:respond", async (input, id) => {
 		const record = object(input);
 		string(record.id, "确认 ID", 300);
 		if (
@@ -177,11 +179,25 @@ function installHandlers() {
 		)
 			throw new Error("确认响应格式错误。");
 		if (typeof record.value === "string") string(record.value, "确认内容", 1024 * 1024);
-		return service.respond(record as RpcExtensionUIResponse);
+		return service.respond(record as RpcExtensionUIResponse, id === undefined ? undefined : string(id, "会话 ID", 200));
 	});
 	handle("pi:files", (path) => service.files(string(path, "文件路径")));
 	handle("pi:read-file", (path) => service.readFile(string(path, "文件路径")));
 	handle("pi:workspace", () => service.workspace());
+	handle("pi:workspace:create-draft-pr", (id, input) => {
+		const draft = object(input);
+		return service.createDraftPullRequest(string(id, "会话 ID", 200), {
+			branch: string(draft.branch, "源分支", 255),
+			title: string(draft.title, "PR 标题", 256),
+			body: string(draft.body, "PR 说明", 32768),
+			base: draft.base === undefined ? undefined : string(draft.base, "目标分支", 255),
+		});
+	});
+	handle("pi:pull-request", (id, number) => {
+		if (number !== undefined && (typeof number !== "number" || !Number.isSafeInteger(number) || number < 1))
+			throw new Error("PR 编号无效。");
+		return service.pullRequest(string(id, "会话 ID", 200), number);
+	});
 	handle("pi:diff", (path) => service.diff(string(path, "文件路径")));
 	handle("pi:settings", (input) => {
 		const settings = object(input);
@@ -190,6 +206,7 @@ function installHandlers() {
 			!["light", "dark", "system"].includes(String(settings.theme))
 		)
 			throw new Error("设置格式错误。");
+		if (settings.sandboxOffline !== undefined && typeof settings.sandboxOffline !== "boolean") throw new Error("沙箱网络设置格式错误。");
 		if (settings.sandbox !== undefined && typeof settings.sandbox !== "boolean")
 			throw new Error("沙箱开关格式错误。");
 		if (settings.notifications !== undefined && typeof settings.notifications !== "boolean")
