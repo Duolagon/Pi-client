@@ -2425,7 +2425,11 @@ body {
 /* Memory editor, Status grid, Preview panel, Command palette */
 .cc-memory-switch {
 	display: flex;
+	flex-wrap: wrap;
 	gap: 6px;
+}
+.cc-memory-switch + .secondary-button {
+	flex-shrink: 0;
 }
 .cc-memory-editor {
 	width: 100%;

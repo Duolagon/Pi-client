@@ -1077,6 +1077,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			)}
 			{memoryTab && (
 				<MemoryStatusDialog
+					key={snapshot.active?.id}
 					initialTab={memoryTab}
 					snapshot={snapshot}
 					gitBranch={gitSummary?.branch}

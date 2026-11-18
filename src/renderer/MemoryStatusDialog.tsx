@@ -32,6 +32,7 @@ export function MemoryStatusDialog({
 	const [activePath, setActivePath] = useState<string>("AGENTS.md");
 	const [draft, setDraft] = useState("");
 	const [newRuleName, setNewRuleName] = useState("");
+	const [loading, setLoading] = useState(true);
 	const [saving, setSaving] = useState(false);
 	const [compactInstructions, setCompactInstructions] = useState("");
 	const [tools, setTools] = useState<DesktopToolInfo[]>([]);
@@ -78,7 +79,7 @@ export function MemoryStatusDialog({
 	};
 
 	useEffect(() => {
-		void refreshReport().catch(fail);
+		void refreshReport().catch(fail).finally(() => setLoading(false));
 	}, [snapshot.active?.id]);
 
 	const activeSource = sources.find((s) => s.relativePath === activePath);
@@ -90,6 +91,7 @@ export function MemoryStatusDialog({
 	};
 
 	const saveMemory = async () => {
+		if (!activeSource?.editable || loading || saving) return;
 		setSaving(true);
 		try {
 			const updated = await window.pi.writeMemoryFile(activePath, draft);
@@ -151,6 +153,7 @@ export function MemoryStatusDialog({
 			? (stats.contextUsage as { percent?: number; tokens?: number; contextWindow?: number })
 			: undefined;
 	const restricted = snapshot.settings.permission === "read" || snapshot.settings.permission === "plan";
+	const canEdit = !loading && !saving && !restricted && Boolean(activeSource?.editable);
 	const mcpCount = tools.filter((t) => t.source === "mcp").length;
 	const activeToolsCount = tools.filter((t) => t.enabled && t.modelVisible).length;
 
@@ -184,6 +187,7 @@ export function MemoryStatusDialog({
 										key={entry.id}
 										className={`cc-mini-btn ${activePath === entry.relativePath ? "active" : ""}`}
 										onClick={() => switchSource(entry.relativePath)}
+										disabled={saving}
 										title={entry.path}
 									>
 										{entry.relativePath} {entry.exists ? `(${entry.estimatedTokens}t)` : "(新建)"}
@@ -208,12 +212,12 @@ export function MemoryStatusDialog({
 								placeholder="新增规则名 (保存到 .claude/rules/<name>.md)…"
 								value={newRuleName}
 								onChange={(e) => setNewRuleName(e.target.value)}
-								disabled={!snapshot.active || restricted}
+								disabled={loading || saving || !snapshot.active || restricted}
 							/>
 							<button
 								type="button"
 								className="cc-mini-btn"
-								disabled={saving || !newRuleName.trim() || !snapshot.active || restricted}
+								disabled={loading || saving || !newRuleName.trim() || !snapshot.active || restricted}
 								onClick={() => void createRule()}
 							>
 								<Plus size={12} /> 新建规则
@@ -237,13 +241,14 @@ export function MemoryStatusDialog({
 						{activeSource?.pathsPattern && (
 							<p className="subtle-note">作用域 paths 匹配：{activeSource.pathsPattern}</p>
 						)}
+						{loading && <p className="subtle-note" role="status">正在加载项目记忆…</p>}
 						<textarea
 							className="cc-memory-editor"
 							aria-label={`编辑 ${activePath}`}
 							placeholder={`在此编写 ${activePath} 项目规范、构建命令与架构约定…`}
 							value={draft}
 							onChange={(e) => setDraft(e.target.value)}
-							disabled={!snapshot.active || restricted || activeSource?.editable === false}
+							disabled={!canEdit}
 						/>
 						<div className="dialog-actions">
 							<button type="button" className="secondary-button" onClick={close}>
@@ -252,7 +257,7 @@ export function MemoryStatusDialog({
 							<button
 								type="button"
 								className="primary-button"
-								disabled={saving || !snapshot.active || restricted || activeSource?.editable === false}
+								disabled={!canEdit}
 								onClick={() => void saveMemory()}
 							>
 								<Save size={13} />{" "}
