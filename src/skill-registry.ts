@@ -16,6 +16,8 @@ export interface SkillDefinitionEntry {
 	filePath: string;
 	editable: boolean;
 	estimatedTokens: number;
+	/** Frontmatter `disable-model-invocation: true`; forbids preloading into subagents. */
+	disableModelInvocation?: boolean;
 }
 
 export interface SkillSaveInput {
@@ -69,6 +71,7 @@ async function scanSkillDirectory(
 				const { data, body } = parseFrontmatter(content);
 				const name = (data.name || item.name).trim();
 				const description = (data.description || body.split("\n").find((l) => l.trim()) || name).trim().slice(0, 500);
+				const disableModelInvocation = String(data["disable-model-invocation"] ?? "").trim().toLowerCase() === "true";
 				results.push({
 					id: `${scope}:${root}:${name}`,
 					name,
@@ -80,6 +83,7 @@ async function scanSkillDirectory(
 					filePath: skillFile,
 					editable,
 					estimatedTokens: estimateTokens(content),
+					...(disableModelInvocation ? { disableModelInvocation: true } : {}),
 				});
 			} catch {
 				// Skip unreadable skill subdirectories.

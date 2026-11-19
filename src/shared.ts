@@ -10,7 +10,7 @@ import type {
 import type { GitCheckpoint, GitCheckpointDiff, GitRestoreResult } from "./git-types.ts";
 import type { TerminalCreateInput, TerminalEvent, TerminalInfo, TerminalReplay } from "./terminal-types.ts";
 import type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRemoveResult } from "./worktree-types.ts";
-import type { DesktopTask, TaskEvent, TaskSendInput, TaskSendResult, TaskStartInput } from "./task-types.ts";
+import type { ChildApprovalRequest, DesktopTask, TaskEvent, TaskPendingApproval, TaskProgress, TaskProgressActivity, TaskSendInput, TaskSendResult, TaskStartInput } from "./task-types.ts";
 import type { DesktopSessionAPI } from "./session-types.ts";
 import type { LiveTranscript } from "./transcript.ts";
 import type { DesktopToolsAPI, DesktopPermissionsAPI } from "./control-types.ts";
@@ -42,7 +42,7 @@ export type * from "./session-history-types.ts";
 export type { GitCheckpoint, GitCheckpointDiff, GitRestoreResult } from "./git-types.ts";
 export type { TerminalCreateInput, TerminalEvent, TerminalInfo, TerminalReplay } from "./terminal-types.ts";
 export type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRemoveResult } from "./worktree-types.ts";
-export type { DesktopTask, TaskEvent, TaskSendInput, TaskSendResult, TaskStartInput, TaskStatus } from "./task-types.ts";
+export type { ChildApprovalRequest, DesktopTask, TaskEvent, TaskPendingApproval, TaskProgress, TaskProgressActivity, TaskSendInput, TaskSendResult, TaskStartInput, TaskStatus } from "./task-types.ts";
 
 export interface CheckpointInput {
 	conversationId?: string;
@@ -79,6 +79,8 @@ export interface DesktopTaskAPI {
 	list(): Promise<DesktopTask[]>;
 	snapshot(id: string): Promise<Snapshot>;
 	cancel(id: string): Promise<DesktopTask>;
+	/** Move an active foreground sub-agent to the background (Ctrl+B); result arrives via outbox. */
+	background(id: string): Promise<DesktopTask>;
 	/** Stop every background sub-agent (Pi and external) that this conversation delegated. */
 	stopAll(conversationId: string): Promise<{ stopped: number }>;
 	/** Deliver held background results to this conversation now and start a run for them. */
@@ -176,6 +178,8 @@ export interface Conversation {
 	sourceSessionId?: string;
 	/** Selected native tree cursor, including an explicitly empty root. */
 	sessionLeafId?: string | null;
+	/** Host-derived marker for delegated child sessions; folded under their parent in the sidebar. */
+	kind?: "subagent";
 	updatedAt: number;
 }
 export interface Project {
@@ -194,9 +198,17 @@ export interface Settings {
 	subagentDefaultBackground?: boolean;
 	/**
 	 * How long a foreground Agent call waits before the child is handed to background
-	 * delivery, in milliseconds; 0 waits without limit. Absent means 300000.
+	 * delivery, in milliseconds; 0 waits without limit (default).
 	 */
 	foregroundSubagentTimeoutMs?: number;
+	/** Allow `Agent(subagent_type: "fork")` / `fork: true`; absent means true. */
+	forkSubagent?: boolean;
+	/** Isolate writable worktree subagent Bash inside the worktree via Seatbelt on macOS; absent means true. */
+	confineSubagentBash?: boolean;
+	/** Maximum subagent nesting depth (1–3); absent means 1. */
+	maxSubagentDepth?: number;
+	/** Maximum concurrent active subagents per parent conversation (1–20); absent means 8. */
+	maxConcurrentSubagents?: number;
 	configuredProviders: Provider[];
 	connections: Partial<
 		Record<Provider, { baseUrl?: string; modelId?: string; api?: ConnectionProtocol; mode?: ConnectionMode }>
@@ -299,6 +311,8 @@ export interface Snapshot {
 	trust?: ProjectTrustState;
 	/** Background sub-agent results this conversation holds without delivery ("待交付"). */
 	pendingTaskNotifications?: number;
+	/** Open interactive approvals of all descendant tasks of the active conversation. */
+	childApprovals?: ChildApprovalRequest[];
 }
 export type DesktopEvent = {
 	conversationId: string;
@@ -365,6 +379,10 @@ export interface DesktopAPI {
 		notifications?: boolean;
 		subagentDefaultBackground?: boolean;
 		foregroundSubagentTimeoutMs?: number;
+		forkSubagent?: boolean;
+		confineSubagentBash?: boolean;
+		maxSubagentDepth?: number;
+		maxConcurrentSubagents?: number;
 		provider?: Provider;
 		mode?: ConnectionMode;
 		apiKey?: string;

@@ -409,3 +409,41 @@ test("a resumed task's pending message and SendMessage call ids are validated on
 		assert.equal(validateTask(child("c1", "/project", { pendingMessage }), ids).pendingMessage, undefined);
 	assert.equal(validateTask(child("c1", "/project", { turnCalls: "call-1" }), ids).turnCalls, undefined);
 });
+
+test("validates isFork, omitClaudeMd, mcpServers and P6 settings on load", async () => {
+	const ids = new Set(["parent", "c1"]);
+	const valid = validateTask(child("c1", "/project", { isFork: true, omitClaudeMd: true, mcpServers: ["github", "db"] }), ids);
+	assert.equal(valid.isFork, true);
+	assert.equal(valid.omitClaudeMd, true);
+	assert.deepEqual(valid.mcpServers, ["github", "db"]);
+
+	assert.throws(() => validateTask(baseTask("c1", "/project", { isFork: true }), ids), /parentConversationId/);
+	assert.throws(() => validateTask(child("c1", "/project", { mcpServers: ["bad server"] }), ids), /mcpServers/);
+	assert.throws(() => validateTask(child("c1", "/project", { mcpServers: Array.from({ length: 17 }, (_, i) => `s${i}`) }), ids), /mcpServers/);
+
+	const root = await mkdtemp(join(tmpdir(), "pi-store-p6-"));
+	const project = join(root, "project");
+	const dataDir = join(root, "data");
+	await mkdir(project);
+	await mkdir(dataDir);
+	await writeFile(
+		join(dataDir, "desktop.json"),
+		JSON.stringify({
+			projects: [{ path: project, name: "project" }],
+			conversations: [{ id: "root", title: "Root", project, updatedAt: 1 }],
+			activeId: "root",
+			settings: { permission: "ask", theme: "light", forkSubagent: false, confineSubagentBash: false, connections: {} },
+			keys: {},
+			tasks: [],
+		}),
+	);
+	const desktop = service(dataDir, root);
+	try {
+		const snap = await desktop.initialize();
+		assert.equal(snap.settings.forkSubagent, false);
+		assert.equal(snap.settings.confineSubagentBash, false);
+	} finally {
+		await desktop.close();
+		await rm(root, { recursive: true, force: true });
+	}
+});

@@ -22,6 +22,12 @@ export interface AgentDefinition {
 	memory?: AgentMemoryScope;
 	isolation?: "worktree" | "shared";
 	background?: boolean;
+	/** MCP servers referenced by name; inline configurations are not supported. */
+	mcpServers?: string[];
+	/** Do not load CLAUDE.md/AGENTS.md memory files into this child. */
+	omitClaudeMd?: boolean;
+	/** Claude frontmatter `color`; display only, never sent to the model. */
+	color?: string;
 	hooks?: HookEntry[];
 	readOnly: boolean;
 	scope: AgentScope;
@@ -30,6 +36,8 @@ export interface AgentDefinition {
 	removable?: boolean;
 	/** Unknown frontmatter fields preserved across edits. */
 	extra?: Record<string, string>;
+	/** Non-fatal parse error (e.g. readOnly + memory conflict) surfaced if the agent is invoked. */
+	definitionError?: string;
 }
 
 export interface AgentSaveInput {
@@ -47,6 +55,9 @@ export interface AgentSaveInput {
 	memory?: AgentMemoryScope;
 	isolation?: "worktree" | "shared";
 	background?: boolean;
+	mcpServers?: string[];
+	omitClaudeMd?: boolean;
+	color?: string;
 	scope: "project" | "user";
 	project?: string;
 }

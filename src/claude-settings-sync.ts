@@ -108,6 +108,9 @@ export function parseClaudePermissionRules(spec: string, action: PermissionActio
 		} else if (rawTool === "WebFetch") {
 			if (!arg.startsWith("domain:")) return [];
 			extra = { domain: arg.slice("domain:".length).trim() };
+		} else if (tools[0] === "Agent") {
+			if (!/^[A-Za-z0-9_.*?*-]+$/.test(arg)) return [];
+			extra = { agentType: arg };
 		} else if (claudeToolFamilies[rawTool] || ["read", "grep", "find", "ls", "edit", "write", "NotebookEdit"].includes(tools[0])) {
 			const path = claudePath(arg);
 			if (!path) return [];
@@ -134,12 +137,14 @@ export function parseClaudePermissionSpec(
 }
 
 export function formatClaudePermissionSpec(rule: PermissionRule): string | undefined {
+	if (/^Agent\([^()]+\)$/.test(rule.tool)) return rule.tool;
 	const name = piToClaudeToolNames[rule.tool] ?? rule.tool;
 	if (rule.command) {
 		if (rule.command.type === "exact") return `${name}(${rule.command.value})`;
 		return `${name}(${rule.command.argv.join(" ")}:*)`;
 	}
 	if (rule.domain) return `${name}(domain:${rule.domain})`;
+	if (rule.agentType) return `${name}(${rule.agentType})`;
 	if (rule.path) {
 		const path = rule.path;
 		const spec = path.startsWith("/") ? `/${path}` : path.startsWith("~") ? path : path.startsWith("**/") && !path.slice(3).includes("/") ? path.slice(3) : `/${path}`;
@@ -203,7 +208,7 @@ export async function writeClaudeProjectPermissions(
 	const fromFiles = await readClaudeProjectPermissions(project);
 	const importedIds = new Set(fromFiles.flatMap((rule) => [rule.id, rule.id.replace(/^private-/, "")]));
 	const signature = (rule: PermissionRule) =>
-		JSON.stringify([rule.action, rule.tool, rule.path ?? null, rule.command ?? null, rule.domain ?? null]);
+		JSON.stringify([rule.action, rule.tool, rule.path ?? null, rule.command ?? null, rule.domain ?? null, rule.agentType ?? null]);
 	const present = new Set(fromFiles.map(signature));
 	let count = 0;
 	for (const rule of rules) {

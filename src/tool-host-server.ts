@@ -1,6 +1,19 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { MAX_CONCURRENT_TOOL_CALLS_PER_TOKEN, MAX_PROGRESS_LINE_BYTES } from "./delegation-limits.ts";
 import { validateToolInvocation, type DesktopToolInvocation, type ToolHostContext } from "./tool-control-types.ts";
+
+const NDJSON_HEADERS = {
+	"content-type": "application/x-ndjson; charset=utf-8",
+	"cache-control": "no-store",
+	"x-content-type-options": "nosniff",
+};
+function acceptsNdjson(header: string | undefined): boolean {
+	if (!header) return false;
+	return header
+		.split(",")
+		.some((part) => part.split(";")[0].trim().toLowerCase() === "application/x-ndjson");
+}
 
 export interface HookBridgeRequest {
 	/** `max_turns` lets a child mark its own limit stop before it aborts its run. */
@@ -99,13 +112,21 @@ export class ToolHostServer {
 		const known = supplied && [...this.owners.keys()].find((token) => timingSafeEqual(Buffer.from(token), Buffer.from(supplied)));
 		const conversationId = known && this.owners.get(known);
 		if (!known || !conversationId) return reply(401, { ok: false, error: "Unauthorized tool session" });
-		const controller = new AbortController();
 		const calls = this.inflight.get(known) ?? new Set<AbortController>();
+		if (calls.size >= MAX_CONCURRENT_TOOL_CALLS_PER_TOKEN) {
+			return reply(429, { ok: false, error: "Too many concurrent tool calls" });
+		}
+		const controller = new AbortController();
 		calls.add(controller);
 		this.inflight.set(known, calls);
+		const onRevoked = () => {
+			if (!response.writableEnded && !response.destroyed) response.destroy();
+		};
+		controller.signal.addEventListener("abort", onRevoked, { once: true });
 		const disconnected = () => { if (!response.writableEnded) controller.abort(new Error("Tool caller disconnected")); };
 		request.once("aborted", disconnected);
 		response.once("close", disconnected);
+		let streamed = false;
 		try {
 			const chunks: Buffer[] = [];
 			let bytes = 0;
@@ -171,14 +192,51 @@ export class ToolHostServer {
 			let invocation: DesktopToolInvocation;
 			try { invocation = validateToolInvocation(parsedBody); }
 			catch (error) { return reply(400, { ok: false, error: error instanceof Error ? error.message : "Invalid request" }); }
+			const streamable = (invocation.tool === "Agent" || invocation.tool === "SendMessage") && acceptsNdjson(request.headers.accept);
+			const writeNdjsonLine = (payload: unknown, maxBytes?: number): boolean => {
+				if (controller.signal.aborted || response.destroyed || response.writableEnded || this.owners.get(known) !== conversationId) return false;
+				const line = JSON.stringify(payload);
+				if (maxBytes !== undefined && Buffer.byteLength(line, "utf8") > maxBytes) return false;
+				if (!streamed) {
+					response.writeHead(200, NDJSON_HEADERS);
+					streamed = true;
+				}
+				response.write(`${line}\n`);
+				return true;
+			};
+			const onProgress = streamable
+				? (progress: unknown) => {
+					writeNdjsonLine({ type: "progress", progress }, MAX_PROGRESS_LINE_BYTES);
+				}
+				: undefined;
 			const data = await this.options.handle(invocation, {
 				conversationId, toolCallId: invocation.toolCallId, signal: controller.signal,
 				...(invocation.batch ? { batch: invocation.batch } : {}),
+				...(onProgress ? { onProgress } : {}),
 			});
-			if (!controller.signal.aborted) reply(200, { ok: true, data });
+			if (controller.signal.aborted || this.owners.get(known) !== conversationId) return;
+			if (streamable) {
+				if (!response.destroyed && !response.writableEnded) {
+					if (!streamed) {
+						response.writeHead(200, NDJSON_HEADERS);
+						streamed = true;
+					}
+					response.end(`${JSON.stringify({ type: "result", ok: true, data })}\n`);
+				}
+				return;
+			}
+			reply(200, { ok: true, data });
 		} catch (error) {
-			if (!controller.signal.aborted) reply(400, { ok: false, error: error instanceof Error ? error.message : "Tool request failed" });
+			if (!controller.signal.aborted) {
+				const message = error instanceof Error ? error.message : "Tool request failed";
+				if (streamed && !response.destroyed && !response.writableEnded) {
+					response.end(`${JSON.stringify({ type: "result", ok: false, error: message })}\n`);
+				} else {
+					reply(400, { ok: false, error: message });
+				}
+			}
 		} finally {
+			controller.signal.removeEventListener("abort", onRevoked);
 			request.off("aborted", disconnected);
 			response.off("close", disconnected);
 			calls.delete(controller);

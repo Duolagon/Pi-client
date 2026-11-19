@@ -53,7 +53,9 @@ const service = new DesktopService({
 const tasks = new Map<string, DesktopTask>();
 const listeners = new Set<() => void>();
 let maxRunning = 0;
-service.subscribeTasks(({ task }) => {
+service.subscribeTasks((event) => {
+	if (event.type !== "task_updated") return;
+	const { task } = event;
 	tasks.set(task.id, task);
 	maxRunning = Math.max(
 		maxRunning,

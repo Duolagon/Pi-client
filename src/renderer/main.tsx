@@ -39,11 +39,16 @@ import type {
 	PlanFileState,
 	ProjectTrustDecision,
 	Snapshot,
+	TaskProgress,
 } from "../shared.ts";
 import { IconButton, Modal, PiMark } from "../prototype/ui.tsx";
 import { useDesktop } from "./useDesktop.ts";
 import { TranscriptView, type TodoItem } from "./TranscriptView.tsx";
 import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
+import { SubagentPanel, type SubagentPanelHandle } from "./SubagentPanel.tsx";
+import { SubagentTranscriptView } from "./SubagentTranscriptView.tsx";
+import { SubagentApprovals } from "./SubagentApprovals.tsx";
+import { collectDescendantApprovals, groupSidebarConversations, isActiveTaskStatus } from "./subagent-panel-state.ts";
 import { PermissionDialog } from "./PermissionDialog.tsx";
 import { SettingsDialog } from "./SettingsDialog.tsx";
 import { WorkspacePanel } from "./WorkspacePanel.tsx";
@@ -61,37 +66,12 @@ import { McpDialog } from "./McpDialog.tsx";
 import "../prototype/style.css";
 import "./style.css";
 
-const DAY = 24 * 60 * 60 * 1000;
-function dayStart(value: number): number {
-	const date = new Date(value);
-	return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
-}
-function dayLabel(timestamp: number, now: number): string {
-	const diff = Math.floor((dayStart(now) - dayStart(timestamp)) / DAY);
-	if (diff <= 0) return "今天";
-	if (diff === 1) return "昨天";
-	if (diff < 7) return "近 7 天";
-	if (diff < 30) return "近 30 天";
-	return "更早";
-}
 function formatTime(timestamp: number): string {
 	return new Date(timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 function projectName(snapshot: Snapshot, path: string): string {
 	const found = snapshot.projects.find((item) => item.path === path);
 	return found?.name ?? path.split("/").filter(Boolean).pop() ?? path;
-}
-function grouped(snapshot: Snapshot): { label: string; items: Conversation[] }[] {
-	const now = Date.now();
-	const order = ["今天", "昨天", "近 7 天", "近 30 天", "更早"];
-	const buckets = new Map<string, Conversation[]>();
-	for (const session of [...snapshot.conversations].sort((a, b) => b.updatedAt - a.updatedAt)) {
-		const label = dayLabel(session.updatedAt, now);
-		const list = buckets.get(label) ?? [];
-		list.push(session);
-		buckets.set(label, list);
-	}
-	return order.filter((label) => buckets.has(label)).map((label) => ({ label, items: buckets.get(label)! }));
 }
 
 function Desktop({ api }: { api: DesktopAPI }) {
@@ -128,6 +108,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [mcpOpen, setMcpOpen] = useState(false);
 	const [todoExpanded, setTodoExpanded] = useState(false);
 	const [tasksMap, setTasksMap] = useState<Record<string, DesktopTask>>({});
+	const [taskProgressMap, setTaskProgressMap] = useState<Record<string, TaskProgress>>({});
+	const [focusedSubagentTaskId, setFocusedSubagentTaskId] = useState<string | null>(null);
+	const [expandedParents, setExpandedParents] = useState<Record<string, boolean>>({});
+	const subagentPanelRef = useRef<SubagentPanelHandle>(null);
+	const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
 	/** Held background results per parent conversation ("N 条子 Agent 结果待交付"). */
 	const [heldResults, setHeldResults] = useState<Record<string, number>>({});
 	const [delivering, setDelivering] = useState(false);
@@ -141,6 +126,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	useEffect(() => {
 		stickToEnd.current = true;
 		setDeferredApproval(undefined);
+		setFocusedSubagentTaskId(null);
 	}, [snapshot?.active?.id]);
 	useEffect(() => {
 		setTrustOpen(false);
@@ -167,12 +153,24 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				setHeldResults((prev) => ({ ...prev, [event.conversationId]: event.pending }));
 				return;
 			}
+			if (event.type === "task_progress") {
+				setTaskProgressMap((prev) => ({ ...prev, [event.taskId]: event.progress }));
+				return;
+			}
 			if (event.type === "task_updated") {
 				setTasksMap((prev) => {
 					const current = prev[event.task.id];
 					if (current && current.revision >= event.task.revision) return prev;
 					return { ...prev, [event.task.id]: event.task };
 				});
+				if (!isActiveTaskStatus(event.task.status)) {
+					setTaskProgressMap((prev) => {
+						if (!(event.task.id in prev)) return prev;
+						const next = { ...prev };
+						delete next[event.task.id];
+						return next;
+					});
+				}
 			}
 		});
 		const unsubExt = api.externalAgents.onEvent((packet) => {
@@ -234,6 +232,55 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		} catch (error) {
 			app.fail(error);
 		}
+	};
+	const backgroundSubagent = async (taskId: string) => {
+		try {
+			await api.tasks.background(taskId);
+			app.setNotice("已将子 Agent 转到后台运行，完成后结果自动回传。");
+		} catch (error) {
+			app.fail(error);
+		}
+	};
+	const backgroundForegroundSubagents = async () => {
+		const activeId = snapshot?.active?.id;
+		if (!activeId) return false;
+		const targets = Object.values(tasksMap).filter(
+			(t) =>
+				t.parentConversationId === activeId &&
+				!t.runInBackground &&
+				isActiveTaskStatus(t.status) &&
+				Boolean(t.readOnly || t.worktreeId),
+		);
+		if (!targets.length) return false;
+		try {
+			for (const target of targets) await api.tasks.background(target.id);
+			app.setNotice(
+				targets.length === 1
+					? "已将前台子 Agent 转到后台运行，完成后结果自动回传。"
+					: `已将 ${targets.length} 个前台子 Agent 转到后台运行。`,
+			);
+			return true;
+		} catch (error) {
+			app.fail(error);
+			return true;
+		}
+	};
+	const stopSubagent = async (taskId: string, kind: "pi" | "external") => {
+		try {
+			if (kind === "external") await api.externalAgents.cancel(taskId);
+			else await api.tasks.cancel(taskId);
+			app.setNotice("已停止子 Agent。");
+		} catch (error) {
+			app.fail(error);
+		}
+	};
+	const openSubagent = (taskId: string) => {
+		if (tasksMap[taskId]) {
+			setFocusedSubagentTaskId(taskId);
+			return;
+		}
+		setTaskInitialId(taskId);
+		setTasksOpen(true);
 	};
 	const blocked = running || changing || bashBusy;
 	const project = snapshot?.projects.find((item) => item.path === snapshot.active?.project);
@@ -372,6 +419,24 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				}
 				return;
 			}
+			if (event.ctrlKey && !event.metaKey && !event.shiftKey && lower === "b") {
+				const activeId = snapshot?.active?.id;
+				const hasForeground = Boolean(
+					activeId &&
+						Object.values(tasksMap).some(
+							(t) =>
+								t.parentConversationId === activeId &&
+								!t.runInBackground &&
+								isActiveTaskStatus(t.status) &&
+								Boolean(t.readOnly || t.worktreeId),
+						),
+				);
+				if (hasForeground) {
+					event.preventDefault();
+					void backgroundForegroundSubagents();
+					return;
+				}
+			}
 			if (lower === "k") {
 				event.preventDefault();
 				setQuery("");
@@ -422,7 +487,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			</div>
 		);
 	const ready = snapshot.engineStatus === "ready";
-	const groups = grouped(snapshot);
+	const sidebarGroups = groupSidebarConversations(snapshot.conversations);
+	const groups = sidebarGroups.groups;
+	const focusedSubagentTask = focusedSubagentTaskId ? tasksMap[focusedSubagentTaskId] : undefined;
+	const liveChildApprovals = collectDescendantApprovals(Object.values(tasksMap), snapshot.active?.id);
+	const childApprovals = liveChildApprovals.length > 0 ? liveChildApprovals : (snapshot.childApprovals ?? []);
 	const latestTodos: TodoItem[] = (() => {
 		for (let i = history.messages.length - 1; i >= 0; i--) {
 			const msg = history.messages[i];
@@ -538,20 +607,71 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						{groups.map((group) => (
 							<section className="cl-group" key={group.label}>
 								<div className="cl-group-label">{group.label}</div>
-								{group.items.map((session) => (
-									<button
-										className={`cl-conv ${session.id === snapshot.active?.id ? "selected" : ""}`}
-										key={session.id}
-										disabled={changing}
-										onClick={() => switchTo(() => api.selectConversation(session.id))}
-										aria-current={session.id === snapshot.active?.id ? "page" : undefined}
-									>
-										<span className="cl-conv-title">{session.title}{app.activity[session.id] === "approval" ? " · 待确认" : app.activity[session.id] === "running" ? " · 运行中" : ""}</span>
-										<span className="cl-conv-sub">
-											{projectName(snapshot, session.project)} · {formatTime(session.updatedAt)}
-										</span>
-									</button>
-								))}
+								{group.items.map((session) => {
+									const children = sidebarGroups.childrenByParent.get(session.id) ?? [];
+									const childActive = children.some((c) => c.id === snapshot.active?.id);
+									const childWaiting = children.filter((c) => app.activity[c.id] === "approval").length;
+									const expanded = Boolean(expandedParents[session.id]) || childActive;
+									return (
+										<div key={session.id} className="cl-conv-wrap">
+											<div className={`cl-conv-row ${session.id === snapshot.active?.id ? "selected" : ""}`}>
+												<button
+													className={`cl-conv ${session.id === snapshot.active?.id ? "selected" : ""}`}
+													disabled={changing}
+													onClick={() => switchTo(() => api.selectConversation(session.id))}
+													aria-current={session.id === snapshot.active?.id ? "page" : undefined}
+												>
+													<span className="cl-conv-title">
+														{session.title}
+														{app.activity[session.id] === "approval"
+															? " · 待确认"
+															: childWaiting > 0
+																? ` · !${childWaiting} 子 Agent 待确认`
+																: app.activity[session.id] === "running"
+																	? " · 运行中"
+																	: ""}
+													</span>
+													<span className="cl-conv-sub">
+														{projectName(snapshot, session.project)} · {formatTime(session.updatedAt)}
+													</span>
+												</button>
+												{children.length > 0 && (
+													<button
+														type="button"
+														className="cl-conv-fold"
+														title={expanded ? "收起子 Agent 会话" : `展开 ${children.length} 个子 Agent 会话`}
+														aria-expanded={expanded}
+														onClick={(event) => {
+															event.stopPropagation();
+															setExpandedParents((prev) => ({ ...prev, [session.id]: !expanded }));
+														}}
+													>
+														(+{children.length})
+													</button>
+												)}
+											</div>
+											{expanded && children.length > 0 && (
+												<div className="cl-conv-children">
+													{children.map((child) => (
+														<button
+															key={child.id}
+															className={`cl-conv cl-conv-child ${child.id === snapshot.active?.id ? "selected" : ""}`}
+															disabled={changing}
+															onClick={() => switchTo(() => api.selectConversation(child.id))}
+															aria-current={child.id === snapshot.active?.id ? "page" : undefined}
+														>
+															<span className="cl-conv-title">
+																{child.title}
+																{app.activity[child.id] === "approval" ? " · 待确认" : app.activity[child.id] === "running" ? " · 运行中" : ""}
+															</span>
+															<span className="cl-conv-sub">子 Agent · {formatTime(child.updatedAt)}</span>
+														</button>
+													))}
+												</div>
+											)}
+										</div>
+									);
+								})}
 							</section>
 						))}
 						{!snapshot.conversations.length && <p className="cl-side-empty">还没有会话。打开项目，开始第一次编码任务。</p>}
@@ -714,103 +834,122 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				)}
 				<div className="cl-body">
 					<div className="cl-conversation">
-						{findOpen && (
-							<div className="cc-find-bar" role="search" aria-label="会话内查找">
-								<Search size={14} />
-								<input
-									autoFocus
-									aria-label="查找会话内容"
-									placeholder="输入关键词按回车定位…"
-									value={findQuery}
-									onChange={(e) => {
-										setFindQuery(e.target.value);
-										setFindIndex(0);
-									}}
-									onKeyDown={(e) => {
-										if (e.key === "Enter") {
-											e.preventDefault();
-											jumpFindMatch(findIndex + (e.shiftKey ? -1 : 1));
-										} else if (e.key === "Escape") {
-											setFindOpen(false);
-										}
-									}}
-								/>
-								<button type="button" className="cc-mini-btn" onClick={() => jumpFindMatch(findIndex - 1)}>上一个</button>
-								<button type="button" className="cc-mini-btn" onClick={() => jumpFindMatch(findIndex + 1)}>下一个</button>
-								<button type="button" className="cc-mini-btn" aria-label="关闭会话查找" onClick={() => setFindOpen(false)}>关闭</button>
-							</div>
-						)}
-						<div
-							className="cl-scroll"
-							ref={scroll}
-							onScroll={(event) => {
-								const element = event.currentTarget;
-								stickToEnd.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
-							}}
-						>
-							{history.messages.length ? (
-								<TranscriptView
-									transcript={history}
-									tasks={Object.values(tasksMap)}
-									externalTasks={Object.values(externalTasksMap)}
-									onOpenTask={(id) => {
-										setTaskInitialId(id);
-										setTasksOpen(true);
-									}}
-									onRewindPrompt={(promptText) => {
-										setRewindQuery(promptText);
-										setCheckpointsOpen(true);
-									}}
-									onForkPrompt={(promptText) => {
-										void api.sessions
-											.forkMessages(snapshot.active?.id)
-											.then(async ({ messages }) => {
-												const match = messages.find((m) => m.text.trim() === promptText.trim() || promptText.includes(m.text.slice(0, 40)));
-												if (match) {
-													await api.sessions.fork({ conversationId: snapshot.active?.id, entryId: match.entryId, activate: true });
-													await app.refresh();
-												} else {
-													setSessionsOpen(true);
+						{focusedSubagentTask ? (
+							<SubagentTranscriptView
+								api={api}
+								task={focusedSubagentTask}
+								progress={taskProgressMap[focusedSubagentTask.id]}
+								onBack={() => setFocusedSubagentTaskId(null)}
+								onMainCompact={(customInstructions) => {
+									setFocusedSubagentTaskId(null);
+									void app.command({ type: "compact", ...(customInstructions ? { customInstructions } : {}) });
+								}}
+								onMainClear={() => {
+									setFocusedSubagentTaskId(null);
+									if (!changing && snapshot.active) switchTo(() => api.newConversation());
+								}}
+								onNotice={(msg) => app.setNotice(msg)}
+								fail={app.fail}
+							/>
+						) : (
+							<>
+								{findOpen && (
+									<div className="cc-find-bar" role="search" aria-label="会话内查找">
+										<Search size={14} />
+										<input
+											autoFocus
+											aria-label="查找会话内容"
+											placeholder="输入关键词按回车定位…"
+											value={findQuery}
+											onChange={(e) => {
+												setFindQuery(e.target.value);
+												setFindIndex(0);
+											}}
+											onKeyDown={(e) => {
+												if (e.key === "Enter") {
+													e.preventDefault();
+													jumpFindMatch(findIndex + (e.shiftKey ? -1 : 1));
+												} else if (e.key === "Escape") {
+													setFindOpen(false);
 												}
-											})
-											.catch(app.fail);
-									}}
-									onOpenPreview={(url) => {
-										setPane(null);
-										setPreviewUrl(url);
-									}}
-								/>
-							) : (
-								<div className="cl-empty">
-									<PiMark />
-									<h1>{snapshot.active ? "开始一个真实编码任务" : "选择项目文件夹"}</h1>
-									<p>
-										{snapshot.active
-											? "Pi 会读取项目文件、修改代码并执行工具。"
-											: "打开你要工作的目录，Pi 会在该目录中运行。"}
-									</p>
-									{!snapshot.active && (
-										<button className="primary-button" onClick={() => void app.switchTo(() => api.openProject())}>
-											打开项目
-										</button>
-									)}
-									{snapshot.active && <p className="cl-empty-path">{snapshot.active.project}</p>}
-									<div className="cc-empty-hints">
-										<span><kbd>⌘N</kbd> 新建会话</span>
-										<span><kbd>⌘K</kbd> 搜索会话</span>
-										<span><kbd>/</kbd> 斜杠命令</span>
-										<span><kbd>Shift+Enter</kbd> 换行</span>
+											}}
+										/>
+										<button type="button" className="cc-mini-btn" onClick={() => jumpFindMatch(findIndex - 1)}>上一个</button>
+										<button type="button" className="cc-mini-btn" onClick={() => jumpFindMatch(findIndex + 1)}>下一个</button>
+										<button type="button" className="cc-mini-btn" aria-label="关闭会话查找" onClick={() => setFindOpen(false)}>关闭</button>
 									</div>
+								)}
+								<div
+									className="cl-scroll"
+									ref={scroll}
+									onScroll={(event) => {
+										const element = event.currentTarget;
+										stickToEnd.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+									}}
+								>
+									{history.messages.length ? (
+										<TranscriptView
+											transcript={history}
+											tasks={Object.values(tasksMap)}
+											externalTasks={Object.values(externalTasksMap)}
+											taskProgressMap={taskProgressMap}
+											onOpenTask={openSubagent}
+											onBackgroundTask={(id) => void backgroundSubagent(id)}
+											onStopTask={(id, kind) => void stopSubagent(id, kind)}
+											onRewindPrompt={(promptText) => {
+												setRewindQuery(promptText);
+												setCheckpointsOpen(true);
+											}}
+											onForkPrompt={(promptText) => {
+												void api.sessions
+													.forkMessages(snapshot.active?.id)
+													.then(async ({ messages }) => {
+														const match = messages.find((m) => m.text.trim() === promptText.trim() || promptText.includes(m.text.slice(0, 40)));
+														if (match) {
+															await api.sessions.fork({ conversationId: snapshot.active?.id, entryId: match.entryId, activate: true });
+															await app.refresh();
+														} else {
+															setSessionsOpen(true);
+														}
+													})
+													.catch(app.fail);
+											}}
+											onOpenPreview={(url) => {
+												setPane(null);
+												setPreviewUrl(url);
+											}}
+										/>
+									) : (
+										<div className="cl-empty">
+											<PiMark />
+											<h1>{snapshot.active ? "开始一个真实编码任务" : "选择项目文件夹"}</h1>
+											<p>
+												{snapshot.active
+													? "Pi 会读取项目文件、修改代码并执行工具。"
+													: "打开你要工作的目录，Pi 会在该目录中运行。"}
+											</p>
+											{!snapshot.active && (
+												<button className="primary-button" onClick={() => void app.switchTo(() => api.openProject())}>
+													打开项目
+												</button>
+											)}
+											{snapshot.active && <p className="cl-empty-path">{snapshot.active.project}</p>}
+											<div className="cc-empty-hints">
+												<span><kbd>⌘N</kbd> 新建会话</span>
+												<span><kbd>⌘K</kbd> 搜索会话</span>
+												<span><kbd>/</kbd> 斜杠命令</span>
+												<span><kbd>Shift+Enter</kbd> 换行</span>
+											</div>
+										</div>
+									)}
+									{running && (
+										<div className="cl-working" role="status">
+											<span className="cl-spinner" />
+											Pi 正在工作
+											{snapshot.state?.pendingMessageCount ? ` · ${snapshot.state.pendingMessageCount} 条指令待处理` : ""}
+										</div>
+									)}
 								</div>
-							)}
-							{running && (
-								<div className="cl-working" role="status">
-									<span className="cl-spinner" />
-									Pi 正在工作
-									{snapshot.state?.pendingMessageCount ? ` · ${snapshot.state.pendingMessageCount} 条指令待处理` : ""}
-								</div>
-							)}
-						</div>
 						{latestTodos.length > 0 && (
 							<div className="cc-pinned-todos">
 								<button type="button" className="cc-pinned-todos-head" onClick={() => setTodoExpanded((v) => !v)}>
@@ -920,6 +1059,27 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								</div>
 							</div>
 						)}
+						<SubagentPanel
+							ref={subagentPanelRef}
+							parentConversationId={snapshot.active?.id}
+							tasks={Object.values(tasksMap)}
+							externalTasks={Object.values(externalTasksMap)}
+							progressMap={taskProgressMap}
+							onOpenTask={(row) => {
+								if (row.kind === "pi") setFocusedSubagentTaskId(row.id);
+								else {
+									setTaskInitialId(row.id);
+									setTasksOpen(true);
+								}
+							}}
+							onStopTask={(row) => void stopSubagent(row.id, row.kind)}
+							onBackgroundTask={(id) => void backgroundSubagent(id)}
+							onOpenTasksDrawer={() => {
+								setTaskInitialId(undefined);
+								setTasksOpen(true);
+							}}
+							onReturnToComposer={() => composerInputRef.current?.focus()}
+						/>
 						<LiveComposer
 							key={snapshot.active?.id ?? "no-conversation"}
 							snapshot={snapshot}
@@ -937,8 +1097,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							onBuiltinSlash={handleBuiltinSlash}
 							onCompactInstructions={(customInstructions) => void app.command({ type: "compact", customInstructions })}
 							onBtw={(q) => void runBtw(q)}
+							onFocusSubagentPanel={() => subagentPanelRef.current?.focusFirst() ?? false}
+							inputRef={composerInputRef}
 							fail={app.fail}
 						/>
+							</>
+						)}
 					</div>
 					{terminalOpen && (
 						<TerminalPanel
@@ -1100,6 +1264,29 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					fail={app.fail}
 				/>
 			)}
+			{(!app.requests[0] || app.requests[0].id === deferredApproval) && snapshot.active && childApprovals.length > 0 && (
+				<SubagentApprovals
+					approvals={childApprovals}
+					rootConversationId={snapshot.active.id}
+					project={snapshot.active.project}
+					onRespond={async (taskId, response) => {
+						await api.tasks.respond(taskId, response);
+						setTasksMap((prev) => {
+							const target = prev[taskId];
+							if (!target?.pendingApprovals) return prev;
+							const remaining = target.pendingApprovals.filter((r) => r.id !== response.id);
+							return {
+								...prev,
+								[taskId]: {
+									...target,
+									...(remaining.length ? { pendingApprovals: remaining } : { pendingApprovals: undefined }),
+								},
+							};
+						});
+					}}
+					fail={app.fail}
+				/>
+			)}
 			{controlsTab && (
 				<ControlsDialog
 					conversationId={snapshot.active?.id}
@@ -1136,6 +1323,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				<SessionsDialog
 					conversationId={snapshot.active?.id}
 					project={snapshot.active?.project}
+					orphanedSubagents={sidebarGroups.orphanedSubagents}
+					allSubagents={sidebarGroups.allSubagents}
+					onSelectConversation={(id) => switchTo(() => api.selectConversation(id))}
 					onSnapshot={() => void app.refresh()}
 					onEditorText={(text) => app.setDraft(text)}
 					close={() => setSessionsOpen(false)}

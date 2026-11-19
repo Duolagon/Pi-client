@@ -191,6 +191,9 @@ test("task IPC routes approvals, commands, file access, diffs, and automatic che
 		await assert.rejects(data.invoke("pi:conversation:viewing", "missing-conversation", true), /会话不存在/);
 		assert.equal(await data.invoke("pi:conversation:viewing", task.conversationId, true), undefined);
 		assert.equal(await data.invoke("pi:conversation:viewing", task.conversationId, false), undefined);
+		await assert.rejects(data.invoke("pi:task:background", "../escape"), /标识符/);
+		await assert.rejects(data.invoke("pi:task:background", "missing-task"), /后台任务不存在/);
+		assert.equal((await data.invoke<DesktopTask>("pi:task:background", task.id)).id, task.id);
 	} finally {
 		await data.service.close();
 		await data.fixture.cleanup();

@@ -92,5 +92,32 @@ test("new parent conversation denies and tool revocations reach an already-runni
 		await assert.rejects(access(join(child.workingDirectory, "forbidden-shell.txt")));
 		assert.ok(snapshot.messages.some((message) => message.role === "assistant" && content(message).includes("policy_pause:ok,read:ok,write:ok,write:error,bash:error")));
 		assert.equal((await data.service.checkPermission({ conversationId: child.conversationId, toolName: "write", input: { path: "denied.txt" } })).action, "deny");
+		// A delegatedOnly allow rule on the parent never overrides the parent's deny ceiling or disabled tools.
+		await data.service.upsertPermission({
+			id: "tree-allow-all-writes",
+			scope: "conversation",
+			conversationId: data.parentId,
+			delegatedOnly: true,
+			action: "allow",
+			tool: "write",
+		});
+		await data.service.upsertPermission({
+			id: "tree-allow-bash",
+			scope: "conversation",
+			conversationId: data.parentId,
+			delegatedOnly: true,
+			action: "allow",
+			tool: "bash",
+		});
+		assert.equal(
+			(await data.service.checkPermission({ conversationId: child.conversationId, toolName: "write", input: { path: "denied.txt" } })).action,
+			"deny",
+			"parent deny rule still overrides delegatedOnly allow rule",
+		);
+		assert.equal(
+			(await data.service.checkPermission({ conversationId: child.conversationId, toolName: "bash", input: { command: "echo hi" } })).action,
+			"deny",
+			"parent disabled tool ceiling still overrides delegatedOnly allow rule",
+		);
 	} finally { await data.service.close(); await data.fixture.cleanup(); }
 });

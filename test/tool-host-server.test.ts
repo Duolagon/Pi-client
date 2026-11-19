@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { request as httpRequest } from "node:http";
 import { test } from "node:test";
 import { ToolHostServer } from "../src/tool-host-server.ts";
+import { postLoopbackNdjson } from "../src/loopback-request.ts";
 import { validateDesktopToolInput } from "../src/tool-control-types.ts";
 
 test("loopback tool host authenticates and binds calls to the registered conversation", async () => {
@@ -90,4 +91,90 @@ test("revoking a session aborts pending host operations", async () => {
 		host.revoke(token);
 		await stopped;
 	} finally { controller.abort(); await response; await host.close(); }
+});
+
+test("NDJSON streaming emits progress lines before the final result and preserves JSON when accept is absent", async () => {
+	const host = new ToolHostServer({
+		handle: async (request, context) => {
+			if (request.tool === "Agent") {
+				context.onProgress?.({ taskId: "t1", status: "running", toolUses: 1, lastToolName: "read" });
+				context.onProgress?.({ taskId: "t1", status: "running", toolUses: 2, lastToolName: "bash" });
+			}
+			return { task_id: "t1", status: "completed" };
+		},
+	});
+	const url = await host.start();
+	const { token } = host.register("parent");
+	try {
+		const progress: unknown[] = [];
+		const streamed = await postLoopbackNdjson(
+			url,
+			"/invoke",
+			token,
+			{ tool: "Agent", toolCallId: "call-1", input: { description: "work", prompt: "do it" } },
+			(item) => progress.push(item),
+		);
+		assert.equal(streamed.status, 200);
+		assert.deepEqual(progress, [
+			{ taskId: "t1", status: "running", toolUses: 1, lastToolName: "read" },
+			{ taskId: "t1", status: "running", toolUses: 2, lastToolName: "bash" },
+		]);
+		assert.deepEqual(streamed.body, { ok: true, data: { task_id: "t1", status: "completed" } });
+
+		// Without accept: application/x-ndjson, responses stay a single JSON object.
+		const plain = await fetch(`${url}/invoke`, {
+			method: "POST",
+			headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+			body: JSON.stringify({ tool: "Agent", toolCallId: "call-2", input: { description: "work", prompt: "do it" } }),
+		});
+		assert.equal(plain.status, 200);
+		assert.match(plain.headers.get("content-type") ?? "", /^application\/json/);
+		assert.deepEqual(await plain.json(), { ok: true, data: { task_id: "t1", status: "completed" } });
+
+		// Unauthenticated requests never receive any NDJSON progress lines.
+		const unauth = await fetch(`${url}/invoke`, {
+			method: "POST",
+			headers: { "content-type": "application/json", accept: "application/x-ndjson" },
+			body: JSON.stringify({ tool: "Agent", toolCallId: "call-3", input: { description: "work", prompt: "do it" } }),
+		});
+		assert.equal(unauth.status, 401);
+		const unauthText = await unauth.text();
+		assert.ok(!unauthText.includes('"progress"'));
+		assert.equal(JSON.parse(unauthText).ok, false);
+	} finally {
+		await host.close();
+	}
+});
+
+test("revoking a token interrupts an active NDJSON stream", async () => {
+	let sentFirst!: () => void;
+	const firstReady = new Promise<void>((resolve) => { sentFirst = resolve; });
+	const host = new ToolHostServer({
+		handle: async (_request, context) => {
+			context.onProgress?.({ taskId: "t1", status: "running", toolUses: 1 });
+			sentFirst();
+			await new Promise<void>((resolve) => {
+				context.signal.addEventListener("abort", () => resolve(), { once: true });
+			});
+			return { task_id: "t1", status: "cancelled" };
+		},
+	});
+	const url = await host.start();
+	const { token } = host.register("parent");
+	const received: unknown[] = [];
+	const pending = postLoopbackNdjson(
+		url,
+		"/invoke",
+		token,
+		{ tool: "Agent", toolCallId: "call-stream", input: { description: "stream", prompt: "run" } },
+		(item) => received.push(item),
+	);
+	try {
+		await firstReady;
+		host.revoke(token);
+		await assert.rejects(pending);
+		assert.ok(received.length <= 1);
+	} finally {
+		await host.close();
+	}
 });

@@ -219,8 +219,9 @@ export default function permissions(pi: ExtensionAPI) {
 	// This JSON is supplied by the desktop host, separate from the user's Pi files.
 	const connections = JSON.parse(process.env.PI_DESKTOP_CONNECTIONS ?? "{}") as Partial<Record<Provider, Connection>>;
 	const testingConnection = process.env.PI_DESKTOP_CONNECTION_TEST === "1";
+	const forkChild = process.env.PI_DESKTOP_FORK_CHILD === "1";
 	const isChild = process.env.PI_DESKTOP_CHILD === "1" || process.env.PI_DESKTOP_READ_ONLY_CHILD === "1";
-	if (!testingConnection && !isChild && process.env.PI_DESKTOP_HOST_URL) {
+	if (!testingConnection && (!isChild || forkChild) && process.env.PI_DESKTOP_HOST_URL) {
 		pi.registerTool({
 			name: "TodoWrite",
 			label: "TodoWrite",
@@ -648,6 +649,9 @@ export default function permissions(pi: ExtensionAPI) {
 	});
 	pi.on("tool_call", async (event, ctx) => {
 		try {
+			if (forkChild && (event.toolName === "Agent" || event.toolName === "SendMessage" || event.toolName === "AgentSend")) {
+				return { block: true, reason: "Forked agents cannot fork or spawn agents" };
+			}
 			if (maxTurns > 0 && turnCount > maxTurns) {
 				return { block: true, reason: `已达到子 Agent 最大轮次上限 (${maxTurns})，停止执行工具。`, terminate: true };
 			}

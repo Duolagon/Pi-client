@@ -1,6 +1,13 @@
+import { watch, type FSWatcher } from "node:fs";
 import { lstat, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import {
+	AGENT_COLOR_PATTERN,
+	AGENT_DEFINITION_RELOAD_DEBOUNCE_MS,
+	MAX_AGENT_MCP_SERVERS,
+	MAX_AGENT_SKILLS,
+} from "./delegation-limits.ts";
 import { parseHooksMap } from "./hooks-service.ts";
 import { managedDirectory, writeManagedFile } from "./managed-path.ts";
 import type {
@@ -18,6 +25,8 @@ const thinkingLevels = new Set<ThinkingLevel>(["off", "minimal", "low", "medium"
 const modelAliases = new Set<AgentModelAlias>(["sonnet", "opus", "haiku", "fable", "inherit"]);
 const permissionModes = new Set<AgentPermissionMode>(["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "read"]);
 const memoryScopes = new Set<AgentMemoryScope>(["user", "project", "local"]);
+/** Tools a `memory` definition always gets; a read-only agent may not declare memory. */
+const memoryTools = ["read", "write", "edit"] as const;
 const readOnlyTools = new Set(["read", "grep", "find", "ls", "WebFetch", "TodoWrite", "AskUserQuestion", "ExitPlanMode", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "AgentExecutors"]);
 const denylistReadOnlyRequirements = ["edit", "write", "bash"] as const;
 const toolAliases: Record<string, string> = {
@@ -55,6 +64,9 @@ const knownFrontmatterKeys = new Set([
 	"memory",
 	"isolation",
 	"background",
+	"mcpServers",
+	"omitClaudeMd",
+	"color",
 	"hooks",
 ]);
 
@@ -331,6 +343,60 @@ function isAgentReadOnly(
 	return false;
 }
 
+/** A `color` is a UI token only: a 6-digit hex color or a short CSS-like keyword. */
+function normalizeColor(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim().toLowerCase();
+	return AGENT_COLOR_PATTERN.test(trimmed) ? trimmed : undefined;
+}
+
+/**
+ * `memory` grants read/write/edit to maintain persistent agent memory, unless read-only.
+ * Explicit `permissionMode: read` or a strictly read-only `tools` allowlist conflicts
+ * with `memory` and errors instead of silently widening permissions.
+ */
+function memoryToolConflict(
+	permissionMode: AgentPermissionMode | undefined,
+	rawTools: string[] | undefined,
+): string | undefined {
+	if (permissionMode === "read") return "只读 Agent 不能声明 memory（需要 read/write/edit 权限）。";
+	if (rawTools !== undefined && rawTools.every((tool) => readOnlyTools.has(tool)))
+		return "只读 Agent 不能声明 memory（需要 read/write/edit 权限）。";
+	return undefined;
+}
+
+/** Preloaded skills: deduplicated, validated names, capped at MAX_AGENT_SKILLS. */
+function normalizeSkills(value: unknown): string[] | undefined {
+	const skills = stringListValue(value)?.filter((item) => /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(item));
+	if (!skills?.length) return undefined;
+	if (skills.length > MAX_AGENT_SKILLS) throw new Error(`Agent 预加载的 Skill 不能超过 ${MAX_AGENT_SKILLS} 个。`);
+	return skills;
+}
+
+const mcpServerNamePattern = /^[A-Za-z0-9_.-]{1,64}$/;
+
+/** `mcpServers` supports referencing configured servers by name; inline objects are rejected. */
+function normalizeMcpServers(value: unknown): string[] | undefined {
+	if (value === undefined || value === "") return undefined;
+	const items = Array.isArray(value)
+		? value
+		: typeof value === "string"
+			? value.split(",").map((item) => unquote(item)).filter(Boolean)
+			: [value];
+	const names: string[] = [];
+	for (const item of items) {
+		if (typeof item !== "string") {
+			throw new Error("内联 mcpServers 配置暂不支持，请按名称引用已配置的 MCP 服务器。");
+		}
+		const trimmed = item.trim();
+		if (!trimmed) continue;
+		if (!mcpServerNamePattern.test(trimmed)) throw new Error(`MCP 服务器名称无效：${trimmed.slice(0, 64)}`);
+		if (!names.includes(trimmed)) names.push(trimmed);
+	}
+	if (names.length > MAX_AGENT_MCP_SERVERS) throw new Error(`Agent 引用的 MCP 服务器不能超过 ${MAX_AGENT_MCP_SERVERS} 个。`);
+	return names.length ? names : undefined;
+}
+
 function parseAgent(content: string, file: string, scope: Exclude<AgentScope, "builtin">, removable: boolean): AgentDefinition | undefined {
 	const { parsed, body } = splitFrontmatter(content);
 	const name = (typeof parsed.name === "string" && parsed.name.trim() ? parsed.name.trim() : basename(file, ".md")).trim();
@@ -352,6 +418,17 @@ function parseAgent(content: string, file: string, scope: Exclude<AgentScope, "b
 		typeof parsed.permissionMode === "string" && permissionModes.has(parsed.permissionMode.trim() as AgentPermissionMode)
 			? (parsed.permissionMode.trim() as AgentPermissionMode)
 			: undefined;
+	const memory =
+		typeof parsed.memory === "string" && memoryScopes.has(parsed.memory.trim() as AgentMemoryScope)
+			? (parsed.memory.trim() as AgentMemoryScope)
+			: undefined;
+	const readOnly = isAgentReadOnly(tools, disallowedTools, permissionMode);
+	let definitionError = memory ? memoryToolConflict(permissionMode, rawTools) : undefined;
+	const effectiveTools =
+		memory && !readOnly && !definitionError && tools !== undefined
+			? [...new Set([...tools, ...memoryTools.filter((tool) => !disallowedTools?.includes(tool))])]
+			: tools;
+
 	const rawMaxTurns =
 		typeof parsed.maxTurns === "number"
 			? parsed.maxTurns
@@ -362,11 +439,18 @@ function parseAgent(content: string, file: string, scope: Exclude<AgentScope, "b
 		rawMaxTurns !== undefined && Number.isSafeInteger(rawMaxTurns) && rawMaxTurns >= 1 && rawMaxTurns <= 200
 			? rawMaxTurns
 			: undefined;
-	const skills = stringListValue(parsed.skills)?.filter((s) => /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(s));
-	const memory =
-		typeof parsed.memory === "string" && memoryScopes.has(parsed.memory.trim() as AgentMemoryScope)
-			? (parsed.memory.trim() as AgentMemoryScope)
-			: undefined;
+	let skills: string[] | undefined;
+	try {
+		skills = normalizeSkills(parsed.skills);
+	} catch (error) {
+		definitionError ??= error instanceof Error ? error.message : String(error);
+	}
+	let mcpServers: string[] | undefined;
+	try {
+		mcpServers = normalizeMcpServers(parsed.mcpServers);
+	} catch (error) {
+		definitionError ??= error instanceof Error ? error.message : String(error);
+	}
 	const isolation =
 		parsed.isolation === "worktree" || parsed.isolation === "shared" ? parsed.isolation : undefined;
 	const background =
@@ -388,7 +472,7 @@ function parseAgent(content: string, file: string, scope: Exclude<AgentScope, "b
 		name,
 		description,
 		prompt: body.slice(0, 64 * 1024),
-		tools,
+		tools: effectiveTools,
 		...(disallowedTools?.length ? { disallowedTools } : {}),
 		model,
 		...(modelAlias ? { modelAlias } : {}),
@@ -399,12 +483,16 @@ function parseAgent(content: string, file: string, scope: Exclude<AgentScope, "b
 		...(memory ? { memory } : {}),
 		...(isolation ? { isolation } : {}),
 		...(background ? { background: true } : {}),
+		...(mcpServers?.length ? { mcpServers } : {}),
+		...(parsed.omitClaudeMd === true || String(parsed.omitClaudeMd).toLowerCase() === "true" ? { omitClaudeMd: true } : {}),
+		...(normalizeColor(parsed.color) ? { color: normalizeColor(parsed.color) } : {}),
 		...(hooks?.length ? { hooks } : {}),
-		readOnly: isAgentReadOnly(tools, disallowedTools, permissionMode),
+		readOnly,
 		scope,
 		source: file,
 		removable,
 		...(Object.keys(extra).length ? { extra } : {}),
+		...(definitionError ? { definitionError } : {}),
 	};
 }
 
@@ -424,6 +512,9 @@ function serializeAgent(
 	if (input.memory) lines.push(`memory: ${input.memory}`);
 	if (input.isolation) lines.push(`isolation: ${input.isolation}`);
 	if (input.background) lines.push(`background: true`);
+	if (input.mcpServers?.length) lines.push(`mcpServers: [${input.mcpServers.join(", ")}]`);
+	if (input.omitClaudeMd) lines.push(`omitClaudeMd: true`);
+	if (input.color) lines.push(`color: ${JSON.stringify(input.color)}`);
 	for (const [key, value] of Object.entries(extra)) {
 		if (/^[A-Za-z0-9_-]+$/.test(key)) lines.push(`${key}: ${JSON.stringify(value)}`);
 	}
@@ -434,6 +525,21 @@ function serializeAgent(
 	return lines.join("\n");
 }
 
+/** Ancestor directories from Git repository root down to `project` (or `[project]` outside Git). */
+async function projectAncestors(project: string): Promise<string[]> {
+	const chain: string[] = [];
+	let current = project;
+	for (let depth = 0; depth < 24; depth++) {
+		chain.push(current);
+		const hasGit = await lstat(join(current, ".git")).then(() => true, () => false);
+		if (hasGit) return chain.reverse();
+		const parent = dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+	return [project];
+}
+
 /** Read and write project/user agent definitions without following paths outside the managed folders. */
 export class AgentRegistry {
 	private agentDir: () => string;
@@ -442,18 +548,80 @@ export class AgentRegistry {
 		this.agentDir = options.agentDir;
 	}
 
-	private directories(project: string): AgentDirectory[] {
+	private async directories(project: string): Promise<AgentDirectory[]> {
+		const ancestors = await projectAncestors(project);
+		// Lowest priority first; later directories overwrite earlier definitions with the same name:
+		// agentDir/agents < ~/.claude/agents < project .pi/agents < project .claude/agents (closest to cwd wins).
 		return [
-			{ scope: "user", base: join(homedir(), ".claude"), segments: ["agents"], removable: false },
 			{ scope: "user", base: this.agentDir(), segments: ["agents"], removable: true },
-			{ scope: "project", base: project, segments: [".claude", "agents"], removable: false },
-			{ scope: "project", base: project, segments: [".pi", "agents"], removable: true },
+			{ scope: "user", base: join(homedir(), ".claude"), segments: ["agents"], removable: false },
+			...ancestors.map((base) => ({ scope: "project" as const, base, segments: [".pi", "agents"], removable: base === project })),
+			...ancestors.map((base) => ({ scope: "project" as const, base, segments: [".claude", "agents"], removable: false })),
 		];
+	}
+
+	/**
+	 * Watch agent definition directories for `project` and invoke `onChange` (debounced by 1s)
+	 * whenever a definition file is added, modified or removed.
+	 */
+	watchProject(project: string, trusted: boolean, onChange: () => void): () => void {
+		let closed = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const watchers: FSWatcher[] = [];
+		const trigger = () => {
+			if (closed) return;
+			if (timer) clearTimeout(timer);
+			timer = setTimeout(() => {
+				timer = undefined;
+				if (!closed) onChange();
+			}, AGENT_DEFINITION_RELOAD_DEBOUNCE_MS);
+		};
+		const attach = (dir: string, filterNames?: Set<string>) => {
+			try {
+				const watcher = watch(dir, { persistent: false }, (_event, filename) => {
+					if (closed) return;
+					const name = typeof filename === "string" ? filename : undefined;
+					if (filterNames && name && !filterNames.has(name)) return;
+					if (!filterNames && name && !name.endsWith(".md")) return;
+					trigger();
+				});
+				watcher.on("error", () => {});
+				watchers.push(watcher);
+			} catch {
+				// Directory may not exist yet or platform watcher limit reached.
+			}
+		};
+		void (async () => {
+			const dirs = await this.directories(project).catch(() => [] as AgentDirectory[]);
+			if (closed) return;
+			const watched = new Set<string>();
+			for (const d of dirs) {
+				if (!trusted && d.scope === "project") continue;
+				const agentsDir = await managedDirectory(d.base, d.segments, false).catch(() => undefined);
+				if (agentsDir && !watched.has(agentsDir)) {
+					watched.add(agentsDir);
+					attach(agentsDir);
+				} else if (!agentsDir && d.segments.length >= 2) {
+					const parent = await managedDirectory(d.base, d.segments.slice(0, -1), false).catch(() => undefined);
+					if (parent && !watched.has(parent)) {
+						watched.add(parent);
+						attach(parent, new Set([d.segments.at(-1)!]));
+					}
+				}
+			}
+		})();
+		return () => {
+			closed = true;
+			if (timer) clearTimeout(timer);
+			for (const watcher of watchers) {
+				try { watcher.close(); } catch {}
+			}
+		};
 	}
 
 	async list(project: string, trusted = true): Promise<AgentDefinition[]> {
 		const merged = new Map<string, AgentDefinition>(builtins.map((agent) => [agent.name, agent]));
-		for (const descriptor of this.directories(project)) {
+		for (const descriptor of await this.directories(project)) {
 			if (!trusted && descriptor.scope === "project") continue;
 			const root = await managedDirectory(descriptor.base, descriptor.segments, false);
 			if (!root) continue;
@@ -501,9 +669,14 @@ export class AgentRegistry {
 		if (permissionMode && !permissionModes.has(permissionMode)) throw new Error("Agent 权限模式无效。");
 		if (input.maxTurns !== undefined && (!Number.isSafeInteger(input.maxTurns) || input.maxTurns < 1 || input.maxTurns > 200))
 			throw new Error("Agent 最大轮次需在 1–200 之间。");
-		const skills = input.skills?.map((s) => s.trim()).filter((s) => /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(s));
+		const skills = input.skills ? normalizeSkills(input.skills) : undefined;
 		const memory = input.memory;
 		if (memory && !memoryScopes.has(memory)) throw new Error("Agent 记忆作用域无效。");
+		if (memory && (permissionMode === "read" || isAgentReadOnly(tools, disallowedTools, permissionMode)))
+			throw new Error("只读 Agent 不能声明 memory（需要 read/write/edit 权限）。");
+		const mcpServers = input.mcpServers ? normalizeMcpServers(input.mcpServers) : undefined;
+		const color = input.color === undefined ? undefined : normalizeColor(input.color);
+		if (input.color !== undefined && !color) throw new Error("Agent color 需为十六进制颜色（如 #3b82f6）或英文颜色名称。");
 		const isolation = input.isolation;
 		if (isolation && isolation !== "worktree" && isolation !== "shared") throw new Error("Agent 隔离模式无效。");
 		const rawModel = input.model === undefined ? undefined : text(input.model, "Agent 模型", 300);
@@ -544,6 +717,8 @@ export class AgentRegistry {
 					disallowedTools,
 					model: rawModel,
 					skills: skills?.length ? skills : undefined,
+					mcpServers,
+					color,
 				},
 				extra,
 				preservedBlocks,

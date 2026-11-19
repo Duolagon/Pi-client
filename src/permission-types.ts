@@ -10,6 +10,12 @@ export interface PermissionRule {
 	scope: PermissionScope;
 	project?: string;
 	conversationId?: string;
+	/**
+	 * When true on a `conversation`-scoped rule, the rule applies only to delegated
+	 * descendants of `conversationId` (the delegation tree) and does not relax the root
+	 * conversation itself.
+	 */
+	delegatedOnly?: boolean;
 	action: PermissionAction;
 	/** Tool-name glob: * and ?; mcp__server__* can select one MCP server. */
 	tool: string;
@@ -19,6 +25,8 @@ export interface PermissionRule {
 	command?: PermissionCommandSelector;
 	/** URL host for WebFetch-style tools: `example.com` or `*.example.com`. */
 	domain?: string;
+	/** Agent type glob for Agent tool: `general-purpose`, `code-reviewer`, or `*`. */
+	agentType?: string;
 }
 
 export interface RuntimePermissionPolicy {
@@ -29,6 +37,8 @@ export interface RuntimePermissionPolicy {
 	/** The host resolves global/project/conversation scopes before writing this list. */
 	rules: PermissionRule[];
 	disabledTools: string[];
+	/** When set, restricts `mcp__<server>__*` tool calls to these MCP server names. */
+	allowedMcpServers?: string[];
 	project: string;
 }
 

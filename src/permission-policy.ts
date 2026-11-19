@@ -2,6 +2,7 @@ import { access, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { MAX_AGENT_MCP_SERVERS } from "./delegation-limits.ts";
 import type {
 	PermissionAction,
 	PermissionCommandSelector,
@@ -68,13 +69,22 @@ function keys(record: Record<string, unknown>, allowed: string[], label: string)
 /** Validate stored or IPC-supplied rules instead of trusting TypeScript at a data boundary. */
 export function validatePermissionRule(value: unknown): PermissionRule {
 	const record = object(value, "权限规则");
-	keys(record, ["id", "scope", "project", "conversationId", "action", "tool", "path", "command", "domain"], "权限规则");
+	keys(record, ["id", "scope", "project", "conversationId", "delegatedOnly", "action", "tool", "path", "command", "domain", "agentType"], "权限规则");
 	const id = text(record.id, "规则标识", 200);
 	if (!/^[a-zA-Z0-9._-]+$/.test(id)) throw new Error("规则标识无效。");
 	if (!["global", "project", "conversation"].includes(record.scope as string)) throw new Error("权限作用域无效。");
 	if (!["allow", "ask", "deny"].includes(record.action as string)) throw new Error("权限动作无效。");
+	if (record.delegatedOnly !== undefined && typeof record.delegatedOnly !== "boolean")
+		throw new Error("委派树权限标志无效。");
+	if (record.delegatedOnly === true && record.scope !== "conversation")
+		throw new Error("委派树权限规则必须为会话作用域。");
 	const tool = text(record.tool, "工具选择器", 300);
-	if (!/^[a-zA-Z0-9_.:?*-]+$/.test(tool)) throw new Error("工具选择器无效。");
+	const inlineAgent = /^Agent\(([^()]+)\)$/.exec(tool);
+	if (inlineAgent) {
+		if (!/^[a-zA-Z0-9_.*?*-]+$/.test(inlineAgent[1])) throw new Error("工具选择器无效。");
+	} else if (!/^[a-zA-Z0-9_.:?*-]+$/.test(tool)) {
+		throw new Error("工具选择器无效。");
+	}
 	const project = record.project === undefined ? undefined : text(record.project, "项目目录");
 	if (project !== undefined && !isAbsolute(project)) throw new Error("权限项目目录必须为绝对路径。");
 	const conversationId = record.conversationId === undefined ? undefined : text(record.conversationId, "会话标识", 200);
@@ -111,6 +121,15 @@ export function validatePermissionRule(value: unknown): PermissionRule {
 			throw new Error("域名选择器无效。");
 		if (path !== undefined || command !== undefined) throw new Error("域名规则不能同时指定路径或命令。");
 	}
+	let agentType: string | undefined;
+	if (record.agentType !== undefined) {
+		agentType = text(record.agentType, "代理类型", 100);
+		if (!/^[a-zA-Z0-9_.*?*-]+$/.test(agentType)) throw new Error("代理类型选择器无效。");
+		if (inlineAgent || path !== undefined || command !== undefined || domain !== undefined)
+			throw new Error("代理类型规则不能同时指定路径、命令、域名或内联 Agent(...)。");
+	}
+	if (inlineAgent && (path !== undefined || command !== undefined || domain !== undefined))
+		throw new Error("Agent(...) 规则不能同时指定路径、命令或域名。");
 	return {
 		id,
 		scope: record.scope as PermissionRule["scope"],
@@ -118,9 +137,11 @@ export function validatePermissionRule(value: unknown): PermissionRule {
 		tool,
 		...(project !== undefined ? { project } : {}),
 		...(conversationId !== undefined ? { conversationId } : {}),
+		...(record.delegatedOnly === true ? { delegatedOnly: true } : {}),
 		...(path !== undefined ? { path } : {}),
 		...(command !== undefined ? { command } : {}),
 		...(domain !== undefined ? { domain } : {}),
+		...(agentType !== undefined ? { agentType } : {}),
 	};
 }
 
@@ -144,9 +165,14 @@ function domainMatches(rule: PermissionRule, host: string | undefined): boolean 
 	return host === domain || (rule.action !== "allow" && host.endsWith(`.${domain}`));
 }
 
+function agentTypeMatches(rule: PermissionRule, pattern: string, type: string | undefined): boolean {
+	if (type === undefined) return rule.action !== "allow";
+	return segmentMatches(pattern, type);
+}
+
 export function validateRuntimePolicy(value: unknown): RuntimePermissionPolicy {
 	const record = object(value, "运行时权限配置");
-	keys(record, ["version", "mode", "dontAsk", "rules", "disabledTools", "project"], "运行时权限配置");
+	keys(record, ["version", "mode", "dontAsk", "rules", "disabledTools", "allowedMcpServers", "project"], "运行时权限配置");
 	if (record.version !== 1 || !["ask", "acceptEdits", "auto", "read", "plan"].includes(record.mode as string))
 		throw new Error("运行时权限版本或模式无效。");
 	if (record.dontAsk !== undefined && typeof record.dontAsk !== "boolean")
@@ -160,6 +186,16 @@ export function validateRuntimePolicy(value: unknown): RuntimePermissionPolicy {
 		if (!/^[a-zA-Z0-9_.:-]+$/.test(name)) throw new Error("停用工具名称无效。");
 		return name;
 	});
+	let allowedMcpServers: string[] | undefined;
+	if (record.allowedMcpServers !== undefined) {
+		if (!Array.isArray(record.allowedMcpServers) || record.allowedMcpServers.length > MAX_AGENT_MCP_SERVERS)
+			throw new Error("允许的 MCP 服务器列表无效。");
+		allowedMcpServers = record.allowedMcpServers.map((item) => {
+			const name = text(item, "MCP 服务器名称", 64);
+			if (!/^[A-Za-z0-9_.-]{1,64}$/.test(name)) throw new Error("MCP 服务器名称无效。");
+			return name;
+		});
+	}
 	const project = text(record.project, "运行时项目目录");
 	if (!isAbsolute(project)) throw new Error("运行时项目目录必须为绝对路径。");
 	return {
@@ -168,6 +204,7 @@ export function validateRuntimePolicy(value: unknown): RuntimePermissionPolicy {
 		...(record.dontAsk === true ? { dontAsk: true } : {}),
 		rules,
 		disabledTools,
+		...(allowedMcpServers !== undefined ? { allowedMcpServers } : {}),
 		project,
 	};
 }
@@ -412,11 +449,26 @@ export async function evaluatePermission(
 ): Promise<PermissionDecision> {
 	const project = await canonicalPermissionPath(policy.project, policy.project);
 	if (policy.disabledTools.includes(call.toolName)) return { action: "deny", reason: "该工具已停用。" };
-	if (policy.mode === "read" && !readingTools.has(call.toolName) && !harmlessDesktopTools.has(call.toolName))
-		return { action: "deny", reason: "当前为只读模式，此工具不可执行。" };
+	if (policy.allowedMcpServers !== undefined && call.toolName.startsWith("mcp__")) {
+		const rest = call.toolName.slice(5);
+		const sepIndex = rest.indexOf("__");
+		const server = sepIndex >= 0 ? rest.slice(0, sepIndex) : rest;
+		if (!policy.allowedMcpServers.includes(server)) {
+			return { action: "deny", reason: `此子 Agent 未授权使用 MCP 服务器 ${server}。` };
+		}
+	}
 	const input = call.input && typeof call.input === "object" && !Array.isArray(call.input)
 		? (call.input as Record<string, unknown>)
 		: {};
+	const readModeSafeDelegation =
+		(call.toolName === "SendMessage" || call.toolName === "AgentSend") ||
+		(call.toolName === "Agent" &&
+			input.fork !== true &&
+			typeof input.subagent_type === "string" &&
+			input.subagent_type !== "general-purpose" &&
+			input.subagent_type !== "fork");
+	if (policy.mode === "read" && !readingTools.has(call.toolName) && !harmlessDesktopTools.has(call.toolName) && !readModeSafeDelegation)
+		return { action: "deny", reason: "当前为只读模式，此工具不可执行。" };
 	let targets: string[] = [];
 	const rawPath =
 		typeof input.path === "string"
@@ -453,10 +505,23 @@ export async function evaluatePermission(
 		}
 	}
 	const shell = call.toolName === "bash" && typeof input.command === "string" ? parseShell(input.command) : undefined;
+	const agentType = call.toolName === "Agent"
+		? input.fork === true
+			? "fork"
+			: typeof input.subagent_type === "string"
+				? input.subagent_type
+				: input.subagent_type === undefined
+					? "general-purpose"
+					: undefined
+		: undefined;
 	const matches: { rule: PermissionRule; conservative: boolean }[] = [];
 	for (const rule of policy.rules) {
-		if (!segmentMatches(rule.tool, call.toolName)) continue;
+		const inlineAgent = /^Agent\(([^()]+)\)$/.exec(rule.tool);
+		const ruleToolPattern = inlineAgent ? "Agent" : rule.tool;
+		const ruleAgentPattern = rule.agentType ?? inlineAgent?.[1];
+		if (!segmentMatches(ruleToolPattern, call.toolName)) continue;
 		if (rule.domain !== undefined && !domainMatches(rule, requestHost(input))) continue;
+		if (ruleAgentPattern !== undefined && !agentTypeMatches(rule, ruleAgentPattern, agentType)) continue;
 		if (rule.path !== undefined) {
 			if (!targets.length) continue;
 			const pathResults = await Promise.all(targets.map((target) => pathMatches(rule.path!, target, project)));
@@ -498,6 +563,8 @@ export async function evaluatePermission(
 			return { action: "deny", reason: `dontAsk 模式自动拒绝未预授权的操作：${reason}`, ...(targets.length ? { targets } : {}) };
 		return { action, reason, ...(targets.length ? { targets } : {}) };
 	};
+	if (policy.mode === "read" && call.toolName === "Agent" && (input.subagent_type === "Explore" || input.subagent_type === "Plan"))
+		return result("allow", "只读模式：允许只读探索/规划子 Agent。");
 	if (policy.mode === "plan") {
 		if (writingPlanFile) return result("allow", "Plan 模式：允许编辑计划文件。");
 		if (call.toolName === "Agent" && (input.subagent_type === "Explore" || input.subagent_type === "Plan"))

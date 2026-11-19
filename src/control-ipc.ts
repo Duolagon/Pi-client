@@ -70,6 +70,10 @@ export function installControlHandlers(handle: Handle, service: DesktopService):
 			throw new Error("Agent 隔离模式无效。");
 		if (input.background !== undefined && typeof input.background !== "boolean")
 			throw new Error("Agent 后台标志无效。");
+		const mcpServers = input.mcpServers === undefined ? undefined : stringArray(input.mcpServers, 16, 64);
+		if (input.omitClaudeMd !== undefined && typeof input.omitClaudeMd !== "boolean")
+			throw new Error("Agent omitClaudeMd 标志无效。");
+		const color = input.color === undefined ? undefined : text(input.color, 32);
 		const request: AgentSaveInput = {
 			name: text(input.name, 64),
 			description: text(input.description, 500),
@@ -84,6 +88,9 @@ export function installControlHandlers(handle: Handle, service: DesktopService):
 			memory: memory as AgentSaveInput["memory"],
 			isolation: isolation as AgentSaveInput["isolation"],
 			background: input.background as boolean | undefined,
+			mcpServers,
+			omitClaudeMd: input.omitClaudeMd as boolean | undefined,
+			color,
 			scope: input.scope,
 			project: optionalPath(input.project),
 		};

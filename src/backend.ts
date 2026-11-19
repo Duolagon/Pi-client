@@ -32,20 +32,30 @@ import type {
 import type { GitCheckpoint, GitCheckpointDiff, GitRestoreResult } from "./git-types.ts";
 import type { TerminalCreateInput, TerminalEvent, TerminalInfo, TerminalReplay } from "./terminal-types.ts";
 import type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRemoveResult } from "./worktree-types.ts";
-import type { DesktopTask, TaskEvent, TaskSendInput, TaskSendResult, TaskStartInput, TaskStopReason } from "./task-types.ts";
+import type { ChildApprovalRequest, DesktopTask, TaskEvent, TaskPendingApproval, TaskProgress, TaskProgressActivity, TaskSendInput, TaskSendResult, TaskStartInput, TaskStopReason } from "./task-types.ts";
 import { sanitizeStoredTasks } from "./task-validation.ts";
 import {
 	CHILD_RUNTIME_IDLE_MS,
 	CHILD_RUNTIME_REAP_INTERVAL_MS,
 	DEFAULT_FOREGROUND_SUBAGENT_TIMEOUT_MS,
+	DEFAULT_MAX_BORROWED_SLOTS,
+	DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+	DEFAULT_MAX_SUBAGENT_DEPTH,
 	MAX_AGENT_OUTPUT,
+	MAX_AGENT_SKILLS,
+	MAX_CONCURRENT_SUBAGENTS_LIMIT,
+	MAX_DELEGATION_DEPTH,
+	MAX_HOOK_ADDITIONAL_CONTEXT,
 	MAX_IDLE_CHILD_RUNTIMES,
+	MAX_RECENT_TASK_ACTIVITIES,
 	MAX_SEND_MESSAGE,
 	MAX_TURN_CALLS,
 	PARENT_MESSAGE_PREFIX,
 	MAX_AGENT_SYSTEM_PROMPT,
 	MAX_AGENT_TURNS,
 	MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS,
+	TASK_PROGRESS_PERSIST_MS,
+	TASK_PROGRESS_THROTTLE_MS,
 	exceedsLength,
 	MAX_MODEL_ID,
 	MAX_MODEL_PROVIDER,
@@ -132,16 +142,21 @@ export function piToolAllowlist(tools: string[] | undefined): string[] | undefin
 export function piToolArgs(
 	task: Pick<DesktopTask, "allowedTools" | "disallowedTools"> | undefined,
 	policyMode: RuntimePermissionPolicy["mode"],
+	options?: { canDelegate?: boolean },
 ): string[] {
 	const disallowed = new Set(task?.disallowedTools ?? []);
 	const definedTools = piToolAllowlist(task?.allowedTools)?.filter((name) => !disallowed.has(name));
+	const delegationTools = options?.canDelegate
+		? ["Agent", "SendMessage", "AgentSend", "TaskOutput", "TaskStop", "TaskList", "WorktreeList"].filter((name) => !disallowed.has(name))
+		: [];
 	if (definedTools !== undefined) {
 		// An explicit empty allowlist must deny all built-in tools instead of
 		// falling back to Pi's unrestricted default.
-		return ["--tools", definedTools.join(","), ...(policyMode === "read" || policyMode === "plan" ? ["--exclude-tools", "mcp__*"] : [])];
+		const list = definedTools.length > 0 ? [...definedTools, ...delegationTools] : definedTools;
+		return ["--tools", list.join(","), ...(policyMode === "read" || policyMode === "plan" ? ["--exclude-tools", "mcp__*"] : [])];
 	}
-	if (policyMode === "read") return ["--tools", "read,grep,find,ls", "--exclude-tools", "mcp__*"];
-	if (policyMode === "plan") return ["--tools", "read,grep,find,ls,write,edit", "--exclude-tools", "mcp__*"];
+	if (policyMode === "read") return ["--tools", ["read", "grep", "find", "ls", ...delegationTools].join(","), "--exclude-tools", "mcp__*"];
+	if (policyMode === "plan") return ["--tools", ["read", "grep", "find", "ls", "write", "edit", ...delegationTools].join(","), "--exclude-tools", "mcp__*"];
 	return [];
 }
 function finiteCount(value: unknown): number {
@@ -183,6 +198,8 @@ interface SessionRuntime {
 	busy: boolean;
 	bashBusy: boolean;
 	pendingUI: Map<string, RpcExtensionUIRequest>;
+	/** Recently answered UI request ids in this runtime, so duplicate replies are idempotent. */
+	answeredUI: Set<string>;
 	checkpointId?: string;
 	settling?: Promise<void>;
 	loading?: Promise<void>;
@@ -194,6 +211,7 @@ interface SessionRuntime {
 	controls?: { directory: string; token: string; command: string; hostToken: string; operation: Promise<void> };
 	policyFile?: string;
 	sandboxProfileFile?: string;
+	metaWritten?: boolean;
 	controlWrites?: Promise<void>;
 	/**
 	 * Background results this Pi process holds as `nextTurn` messages. They count as
@@ -204,6 +222,20 @@ interface SessionRuntime {
 	queueConsumers?: Set<() => void>;
 	/** Last event or user attention; an idle finished child is reaped after CHILD_RUNTIME_IDLE_MS. */
 	lastActivity: number;
+	/** Running task progress accumulator, throttled to task_progress events. */
+	progress?: {
+		taskId: string;
+		turn: number;
+		toolUses: number;
+		lastToolName?: string;
+		tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+		cost: number;
+		startedAt: number;
+		recentActivities: TaskProgressActivity[];
+		emitTimer?: ReturnType<typeof setTimeout>;
+		lastEmitAt: number;
+		lastPersistAt: number;
+	};
 }
 /** One undelivered background result, rebuilt from the task record on every flush. */
 interface OutboxItem {
@@ -241,6 +273,8 @@ export interface ServiceOptions {
 	externalAdapters?: Record<ExternalProvider, ExternalAdapter>;
 	claudeHelperPath?: string;
 	maxConcurrentTasks?: number;
+	/** Hard cap on extra concurrent processes allowed for slot borrowing across foreground ancestor chains. */
+	maxBorrowedSlots?: number;
 	/** Idle time before a finished child's process is stopped; it restarts on demand. */
 	childRuntimeIdleMs?: number;
 	/** Reaper period; 0 disables the timer (tests call reapIdleChildRuntimes directly). */
@@ -271,6 +305,8 @@ export class DesktopService {
 	private closed = false;
 	private listeners = new Set<(event: DesktopEvent) => void>();
 	private taskListeners = new Set<(event: TaskEvent) => void>();
+	private progressListeners = new Map<string, Set<(progress: TaskProgress) => void>>();
+	private userBackgroundedTasks = new Set<string>();
 	private scheduling = false;
 	private launches = new Map<string, number>();
 	private commands = new Set<Promise<unknown>>();
@@ -281,6 +317,7 @@ export class DesktopService {
 	private toolHost: ToolHostServer;
 	private delegation: ModelDelegation;
 	private agents: AgentRegistry;
+	private agentWatcher?: { key: string; stop: () => void };
 	private mcp: McpRegistry;
 	private hooks: HooksService;
 	private skills: SkillRegistry;
@@ -394,12 +431,17 @@ export class DesktopService {
 				const runtime = await this.ensureRuntime(this.conversation(id));
 				return { model: runtime.state?.model ? { provider: runtime.state.model.provider, id: runtime.state.model.id } : undefined, thinkingLevel: runtime.state?.thinkingLevel };
 			},
-			resolveAgent: (project, name) => this.agents.resolve(project, name, this.projectTrusted(project)),
+			resolveAgent: (project, name) => this.agents.resolve(this.trustProjectFor(project), name, this.projectTrusted(this.trustProjectFor(project))),
 			resolveModelAlias: (parentId, alias, strict) => this.resolveAgentModelAlias(parentId, alias, strict),
-			listAgentNames: async (project) => (await this.agents.list(project, this.projectTrusted(project))).map((agent) => agent.name),
+			listAgentNames: async (project) => (await this.agents.list(this.trustProjectFor(project), this.projectTrusted(this.trustProjectFor(project)))).map((agent) => agent.name),
 			defaultBackground: () => this.store.settings.subagentDefaultBackground !== false,
 			foregroundTimeoutMs: () => this.store.settings.foregroundSubagentTimeoutMs ?? DEFAULT_FOREGROUND_SUBAGENT_TIMEOUT_MS,
-			prepareAgentContext: (project, definition) => this.prepareCustomAgentContext(project, definition),
+			forkSubagentEnabled: () => this.store.settings.forkSubagent !== false,
+			confineSubagentBash: () => this.store.settings.confineSubagentBash !== false,
+			seatbeltSupport: () => probeSeatbeltSupport(),
+			maxSubagentDepth: () => this.store.settings.maxSubagentDepth ?? DEFAULT_MAX_SUBAGENT_DEPTH,
+			maxConcurrentSubagents: () => this.store.settings.maxConcurrentSubagents ?? DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+			prepareAgentContext: (project, definition) => this.prepareCustomAgentContext(this.trustProjectFor(project), definition),
 			listTasks: () => this.listTasks(),
 			startTask: (input, metadata) => this.startTask(input, metadata),
 			cancelTask: (id, reason) => this.cancelTask(id, reason),
@@ -427,6 +469,8 @@ export class DesktopService {
 				predicate, signal, timeout,
 			),
 			detachTask: (id) => this.detachTask(id),
+			subscribeTaskProgress: (id, listener) => this.subscribeTaskProgress(id, listener),
+			isUserBackgrounded: (id) => this.userBackgroundedTasks.has(id),
 			flushNotifications: (owner) => this.flushNotifications(owner, "auto"),
 		});
 		this.git = new GitSnapshots(join(options.dataDir, "checkpoints"));
@@ -460,7 +504,7 @@ export class DesktopService {
 			policy: (id) => this.permissionPolicy(id),
 			delegated: (id) => this.store.tasks.some((task) => task.conversationId === id && task.parentConversationId),
 			createWorktree: (input) => this.createWorktree(input), listWorktrees: () => this.listWorktrees(),
-			capacity: () => (options.maxConcurrentTasks ?? 4) - this.store.tasks.filter((task) => ["running", "waiting_for_input"].includes(task.status)).length,
+			capacity: () => (options.maxConcurrentTasks ?? 4) - this.store.tasks.filter((task) => ["running", "waiting_for_input"].includes(task.status) && !this.isSlotBorrower(task)).length,
 			canStart: (task) => {
 				if (task.readOnly) return true;
 				try { this.assertPathAvailable(task.workingDirectory, undefined, task.id); return true; } catch { return false; }
@@ -572,10 +616,27 @@ export class DesktopService {
 				// only takes effect after the affected runtimes are recreated.
 				for (const runtime of runtimes) await this.stopRuntime(runtime);
 				const active = this.active();
-				if (active && this.trustProjectFor(active.project) === project && (await this.projectAvailable(active))) await this.ensureRuntime(active);
+				if (active && this.trustProjectFor(active.project) === project) {
+					this.ensureAgentWatcher(active.project);
+					if (await this.projectAvailable(active)) await this.ensureRuntime(active);
+				}
 			}
 			return this.buildSnapshot();
 		});
+	}
+
+	private ensureAgentWatcher(project: string): void {
+		if (this.closed) return;
+		const trusted = this.isProjectTrusted(project);
+		const key = `${project}\0${trusted ? "1" : "0"}`;
+		if (this.agentWatcher?.key === key) return;
+		this.agentWatcher?.stop();
+		this.agentWatcher = {
+			key,
+			stop: this.agents.watchProject(project, trusted, () => {
+				void this.refreshControls("agents_changed").catch(() => {});
+			}),
+		};
 	}
 
 	async listAgents(project?: string): Promise<AgentDefinition[]> {
@@ -763,6 +824,13 @@ export class DesktopService {
 			const extraHooks = meta.extraHooks?.map((entry) =>
 				entry.event === "Stop" ? { ...entry, event: "SubagentStop" as const } : entry,
 			);
+			const conv = this.store.conversations.find((item) => item.id === conversationId);
+			const sessionDir = join(this.options.dataDir, "sessions");
+			const transcriptPath =
+				conv?.sessionFile ??
+				this.runtimes.get(conversationId)?.state?.sessionFile ??
+				(await findSessionFileById(sessionDir, conversationId).catch(() => undefined)) ??
+				join(sessionDir, conversationId);
 			return this.hooks.run("SubagentStop", {
 				project,
 				projectTrusted: this.isProjectTrusted(project),
@@ -770,6 +838,7 @@ export class DesktopService {
 				permissionMode: this.permissionPolicy(conversationId).mode,
 				agentId: meta.agentId,
 				agentType: meta.agentType,
+				transcriptPath,
 				stopHookActive,
 				lastAssistantMessage,
 				extraHooks,
@@ -817,12 +886,19 @@ export class DesktopService {
 		const sections: string[] = [];
 		const trusted = this.isProjectTrusted(project);
 		if (definition.skills?.length) {
+			if (definition.skills.length > MAX_AGENT_SKILLS) {
+				throw new Error(`Agent ${definition.name} 引用的 Skills 超过上限 (${MAX_AGENT_SKILLS})。`);
+			}
 			const available = await this.skills.list(project, trusted);
 			let skillBytes = 0;
 			const matched: string[] = [];
 			for (const reqName of definition.skills) {
 				const found = available.find((s) => s.name.toLowerCase() === reqName.toLowerCase());
-				if (!found || !found.body.trim()) continue;
+				if (!found) continue;
+				if (found.disableModelInvocation) {
+					throw new Error(`Skill /${found.name} 禁止模型自动调用（disable-model-invocation），不能预加载到子 Agent。`);
+				}
+				if (!found.body.trim()) continue;
 				const block = `## Skill /${found.name}\n${found.body.trim()}`;
 				const bytes = Buffer.byteLength(block, "utf8");
 				if (skillBytes + bytes > 48 * 1024) break;
@@ -862,6 +938,7 @@ export class DesktopService {
 		disallowedTools: string[] | undefined,
 		requestedMode: AgentPermissionMode | undefined,
 		readOnly: boolean,
+		allowedMcpServers?: string[],
 	): RuntimePermissionPolicy {
 		const disabled = new Set(parentPolicy.disabledTools);
 		for (const tool of disallowedTools ?? []) disabled.add(tool);
@@ -881,11 +958,16 @@ export class DesktopService {
 		} else if (requestedMode === "bypassPermissions" && parentPolicy.mode === "auto") {
 			mode = "auto";
 		}
+		const mergedMcp =
+			parentPolicy.allowedMcpServers !== undefined && allowedMcpServers !== undefined
+				? parentPolicy.allowedMcpServers.filter((name) => allowedMcpServers.includes(name))
+				: (allowedMcpServers ?? parentPolicy.allowedMcpServers);
 		return {
 			...parentPolicy,
 			mode,
 			...(dontAsk ? { dontAsk: true } : {}),
 			disabledTools: [...disabled],
+			...(mergedMcp !== undefined ? { allowedMcpServers: mergedMcp } : {}),
 		};
 	}
 
@@ -1573,15 +1655,32 @@ export class DesktopService {
 	}
 
 	async respond(response: RpcExtensionUIResponse, conversationId?: string): Promise<void> {
-		const runtime = conversationId
-			? this.runtimes.get(conversationId)
-			: [...this.runtimes.values()].find((item) => item.pendingUI.has(response.id));
-		const request = runtime?.pendingUI.get(response.id);
-		if (!request) throw new Error("此确认请求已失效。");
-		await this.requireAgent(runtime!).respond(response);
-		runtime!.pendingUI.delete(response.id);
-		const task = this.store.tasks.find((item) => item.conversationId === runtime!.conversationId);
-		if (task && !runtime!.pendingUI.size && task.status === "waiting_for_input") this.updateTask(task, "running");
+		const targetConvId = conversationId
+			? (this.store.tasks.find((item) => item.id === conversationId)?.conversationId ?? conversationId)
+			: undefined;
+		let runtime: SessionRuntime | undefined;
+		if (targetConvId) {
+			runtime = this.runtimes.get(targetConvId);
+			if (runtime?.answeredUI.has(response.id)) return;
+			if (!runtime?.pendingUI.has(response.id)) throw new Error("此确认请求不属于当前会话或已失效。");
+		} else {
+			if ([...this.runtimes.values()].some((item) => item.answeredUI.has(response.id))) return;
+			runtime = [...this.runtimes.values()].find((item) => item.pendingUI.has(response.id));
+			if (!runtime) throw new Error("此确认请求已失效。");
+		}
+		runtime.pendingUI.delete(response.id);
+		runtime.answeredUI.add(response.id);
+		while (runtime.answeredUI.size > 128) runtime.answeredUI.delete(runtime.answeredUI.values().next().value!);
+		const task = this.store.tasks.find((item) => item.conversationId === runtime.conversationId);
+		this.syncTaskPendingApprovals(runtime, task);
+		await this.requireAgent(runtime).respond(response);
+		if (task && !runtime.pendingUI.size && task.status === "waiting_for_input") {
+			this.updateTask(task, "running");
+			this.scheduleProgressEmit(runtime, task, true);
+		} else if (task) {
+			task.revision = (task.revision ?? 0) + 1;
+			for (const listener of this.taskListeners) listener({ type: "task_updated", task: structuredClone(task) });
+		}
 	}
 
 	async createDraftPullRequest(conversationId: string, draft: DraftPullRequest) {
@@ -1826,6 +1925,10 @@ export class DesktopService {
 		notifications?: boolean;
 		subagentDefaultBackground?: boolean;
 		foregroundSubagentTimeoutMs?: number;
+		forkSubagent?: boolean;
+		confineSubagentBash?: boolean;
+		maxSubagentDepth?: number;
+		maxConcurrentSubagents?: number;
 		provider?: Provider;
 		apiKey?: string;
 		baseUrl?: string;
@@ -1854,6 +1957,26 @@ export class DesktopService {
 				if (!Number.isSafeInteger(value) || value < 0 || value > MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS)
 					throw new Error("前台子 Agent 等待时长无效。");
 				next.settings.foregroundSubagentTimeoutMs = value;
+			}
+			if (settings.forkSubagent !== undefined) {
+				if (typeof settings.forkSubagent !== "boolean") throw new Error("子 Agent fork 开关设置无效。");
+				next.settings.forkSubagent = settings.forkSubagent;
+			}
+			if (settings.confineSubagentBash !== undefined) {
+				if (typeof settings.confineSubagentBash !== "boolean") throw new Error("子 Agent 沙箱隔离设置无效。");
+				next.settings.confineSubagentBash = settings.confineSubagentBash;
+			}
+			if (settings.maxSubagentDepth !== undefined) {
+				const value = settings.maxSubagentDepth;
+				if (!Number.isSafeInteger(value) || value < 1 || value > MAX_DELEGATION_DEPTH)
+					throw new Error("子 Agent 最大嵌套深度无效。");
+				next.settings.maxSubagentDepth = value;
+			}
+			if (settings.maxConcurrentSubagents !== undefined) {
+				const value = settings.maxConcurrentSubagents;
+				if (!Number.isSafeInteger(value) || value < 1 || value > MAX_CONCURRENT_SUBAGENTS_LIMIT)
+					throw new Error("最大并发子 Agent 数量无效。");
+				next.settings.maxConcurrentSubagents = value;
 			}
 			if (settings.agentDir !== undefined) {
 				const value = settings.agentDir.trim();
@@ -2209,19 +2332,51 @@ export class DesktopService {
 		return this.delegation.result(task.parentConversationId, { task_id: id, ...options });
 	}
 
+	private canDelegateFurther(conversationId: string): boolean {
+		const task = this.store.tasks.find((item) => item.conversationId === conversationId);
+		if (!task) return true;
+		if (task.quarantined || task.isFork) return false;
+		const depth = task.delegationDepth ?? 1;
+		const maxDepth = this.store.settings.maxSubagentDepth ?? DEFAULT_MAX_SUBAGENT_DEPTH;
+		return Boolean(task.parentConversationId) && depth < maxDepth;
+	}
+
 	private permissionPolicy(conversationId: string): RuntimePermissionPolicy {
 		const conversation = this.conversation(conversationId);
 		const task = this.store.tasks.find((item) => item.conversationId === conversationId);
+		const isDelegatedChild = Boolean(task?.parentConversationId);
 		const own = this.toolSettings.effective(conversation.project, conversationId);
+		// A root conversation's `delegatedOnly` rules apply only to its delegated descendants,
+		// never relaxing the root conversation itself.
+		const ownRules = isDelegatedChild ? own.rules : own.rules.filter((rule) => !rule.delegatedOnly);
 		const inherited = this.store.taskPolicies?.[conversationId];
 		const parent = task?.parentConversationId ? this.permissionPolicy(task.parentConversationId) : undefined;
-		const translate = (policy: RuntimePermissionPolicy | undefined): PermissionRule[] => (policy?.rules ?? []).map((rule) => {
-			if (!rule.path || !policy || !isAbsolute(rule.path) || !inside(policy.project, rule.path)) return rule;
-			return { ...rule, path: join(conversation.project, relative(policy.project, rule.path)) };
-		});
-		// A child keeps its spawn ceiling and also receives later parent revocations.
+		const translateFrom = (sourceProject: string | undefined, rules: PermissionRule[] | undefined): PermissionRule[] =>
+			(rules ?? []).map((rule) => {
+				if (!rule.path || !sourceProject || !isAbsolute(rule.path) || !inside(sourceProject, rule.path)) return rule;
+				return { ...rule, path: join(conversation.project, relative(sourceProject, rule.path)) };
+			});
+		const translate = (policy: RuntimePermissionPolicy | undefined): PermissionRule[] =>
+			translateFrom(policy?.project, policy?.rules);
+		const delegatedTreeRules: PermissionRule[] = [];
+		if (isDelegatedChild) {
+			let cursor = task?.parentConversationId;
+			const visited = new Set<string>([conversationId]);
+			while (cursor && !visited.has(cursor)) {
+				visited.add(cursor);
+				const ancestorConv = this.store.conversations.find((item) => item.id === cursor);
+				if (ancestorConv) {
+					const treeOnly = this.toolSettings
+						.effective(ancestorConv.project, ancestorConv.id)
+						.rules.filter((rule) => rule.delegatedOnly === true);
+					delegatedTreeRules.push(...translateFrom(ancestorConv.project, treeOnly));
+				}
+				cursor = this.store.tasks.find((item) => item.conversationId === cursor)?.parentConversationId;
+			}
+		}
+		// A child keeps its spawn ceiling and also receives later parent revocations and delegation-tree rules.
 		const unique = new Map<string, PermissionRule>();
-		for (const rule of [...translate(inherited), ...translate(parent), ...own.rules]) {
+		for (const rule of [...translate(inherited), ...translate(parent), ...delegatedTreeRules, ...ownRules]) {
 			const signature = JSON.stringify(rule);
 			if (!unique.has(signature)) unique.set(signature, rule);
 		}
@@ -2234,7 +2389,10 @@ export class DesktopService {
 		const disabledTools = new Set(Object.entries(this.toolOverrides(conversationId)).filter(([, enabled]) => !enabled).map(([name]) => name));
 		for (const name of inherited?.disabledTools ?? []) disabledTools.add(name);
 		for (const name of parent?.disabledTools ?? []) disabledTools.add(name);
-		if (task?.parentConversationId || task?.quarantined) for (const name of delegatingToolNames) disabledTools.add(name);
+		if (!this.canDelegateFurther(conversationId)) for (const name of delegatingToolNames) disabledTools.add(name);
+		if (isDelegatedChild || task?.quarantined) {
+			for (const name of ["WorktreeCreate", "WorktreeMerge", "WorktreeRemove"]) disabledTools.add(name);
+		}
 		const dontAsk = Boolean(inherited?.dontAsk || parent?.dontAsk);
 		const parentCeiling = parent?.mode ?? this.store.settings.permission;
 		let mode: RuntimePermissionPolicy["mode"];
@@ -2252,12 +2410,19 @@ export class DesktopService {
 			);
 			mode = modes.includes("ask") ? "ask" : modes.includes("acceptEdits") ? "acceptEdits" : "auto";
 		}
+		const serverLists = [inherited?.allowedMcpServers, parent?.allowedMcpServers, task?.mcpServers].filter(
+			(list): list is string[] => list !== undefined,
+		);
+		const allowedMcpServers = serverLists.length
+			? serverLists.reduce((acc, list) => acc.filter((name) => list.includes(name)))
+			: undefined;
 		return {
 			version: 1,
 			mode,
 			...(dontAsk ? { dontAsk: true } : {}),
 			rules,
 			disabledTools: [...disabledTools],
+			...(allowedMcpServers !== undefined ? { allowedMcpServers } : {}),
 			project: conversation.project,
 		};
 	}
@@ -2266,13 +2431,24 @@ export class DesktopService {
 		const conversation = this.conversation(conversationId);
 		const task = this.store.tasks.find((item) => item.conversationId === conversationId);
 		const own = this.toolSettings.effective(conversation.project, conversationId).overrides;
-		if (task?.quarantined && !task.parentConversationId) return { ...own, Agent: false, SendMessage: false, AgentSend: false };
+		if (task?.quarantined && !task.parentConversationId) {
+			return { ...own, Agent: false, SendMessage: false, AgentSend: false, WorktreeCreate: false, WorktreeMerge: false, WorktreeRemove: false };
+		}
 		if (!task?.parentConversationId) return own;
 		const parent = this.conversation(task.parentConversationId);
 		const inherited = this.toolSettings.effective(parent.project, parent.id).overrides;
-		const combined: Record<string, boolean> = { ...inherited, ...own, Agent: false, SendMessage: false, AgentSend: false };
+		const canDelegate = this.canDelegateFurther(conversationId);
+		const combined: Record<string, boolean> = {
+			...inherited,
+			...own,
+			...(!canDelegate && !task.isFork ? { Agent: false, SendMessage: false, AgentSend: false } : {}),
+			...(!task.isFork ? { WorktreeCreate: false, WorktreeMerge: false, WorktreeRemove: false } : {}),
+		};
 		for (const [name, enabled] of Object.entries(inherited)) if (!enabled) combined[name] = false;
-		for (const name of this.store.taskPolicies?.[conversationId]?.disabledTools ?? []) combined[name] = false;
+		for (const name of this.store.taskPolicies?.[conversationId]?.disabledTools ?? []) {
+			if (task.isFork && delegatingToolNames.includes(name as typeof delegatingToolNames[number])) continue;
+			combined[name] = false;
+		}
 		return combined;
 	}
 
@@ -2294,7 +2470,8 @@ export class DesktopService {
 	private async writeAgentListing(runtime: SessionRuntime): Promise<void> {
 		if (!runtime.controls) return;
 		const conversation = this.conversation(runtime.conversationId);
-		const delegating = !this.store.tasks.some((task) => task.conversationId === conversation.id && (task.parentConversationId || task.quarantined));
+		const task = this.store.tasks.find((item) => item.conversationId === conversation.id);
+		const delegating = this.canDelegateFurther(conversation.id) || Boolean(task?.isFork);
 		const project = this.trustProjectFor(conversation.project);
 		const definitions = delegating ? await this.agents.list(project, this.projectTrusted(project)) : [];
 		await this.atomicJson(join(runtime.controls.directory, "agents.json"), buildAgentListing(definitions));
@@ -2405,22 +2582,29 @@ export class DesktopService {
 			if (existing && input.baseRef !== undefined) throw new Error("已有 Worktree 不能重新指定 Git 基准。");
 			const project = await realpath(input.project ?? existing?.repository ?? this.requireActive().project);
 			if (!(await stat(project)).isDirectory()) throw new Error("项目目录不存在。");
-			const trusted = this.isProjectTrusted(project);
+			const rootProject = delegation ? this.trustProjectFor(project) : project;
+			const trusted = this.isProjectTrusted(rootProject);
 			const agentDef = delegation?.subagentType
-				? await this.agents.resolve(project, delegation.subagentType, trusted).catch(() => undefined)
+				? await this.agents.resolve(rootProject, delegation.subagentType, trusted).catch(() => undefined)
 				: undefined;
+			let hookAdditionalContext: string | undefined;
+			const agentId = delegation ? randomUUID() : undefined;
 			if (delegation) {
 				const startHook = await this.hooks.run("SubagentStart", {
-					project,
+					project: rootProject,
 					projectTrusted: trusted,
 					conversationId: delegation.parentConversationId,
 					permissionMode: this.permissionPolicy(delegation.parentConversationId).mode,
+					agentId,
 					agentType: delegation.subagentType,
 					prompt: input.message,
 					extraHooks: agentDef?.hooks,
 					env: this.options.env,
 				});
 				if (startHook.blocked) throw new Error(startHook.reason ?? "SubagentStart Hook 阻止启动子 Agent。");
+				if (startHook.additionalContext?.trim()) {
+					hookAdditionalContext = truncateText(startHook.additionalContext.trim(), MAX_HOOK_ADDITIONAL_CONTEXT);
+				}
 			}
 			const isolated = input.isolation !== "shared";
 			if (isolated && !existing && this.store.settings.permission === "read")
@@ -2435,9 +2619,12 @@ export class DesktopService {
 				if (worktree && !existing) await this.worktrees.remove(worktree.id).catch(() => {});
 				throw error;
 			}
-			if (!this.store.projects.some((item) => item.path === project))
-				this.store.projects.push({ path: project, name: basename(project) });
-			const conversation = this.createConversation(directory);
+			if (!delegation && !this.store.projects.some((item) => item.path === rootProject))
+				this.store.projects.push({ path: rootProject, name: basename(rootProject) });
+			const conversation: Conversation = agentId
+				? { id: agentId, title: "新会话", project: directory, updatedAt: Date.now() }
+				: this.createConversation(directory);
+			if (agentId) this.store.conversations.unshift(conversation);
 			conversation.title = input.title?.trim().slice(0, 160) || input.message.trim().split("\n")[0].slice(0, 60);
 			if (input.forkParentConversationId) {
 				// A requested fork must inherit the parent's history or fail visibly. Silently
@@ -2471,13 +2658,17 @@ export class DesktopService {
 			if (worktree) await this.worktrees.bindConversation(worktree.id, conversation.id);
 			// The definition body becomes part of the child's system prompt through a private
 			// file; the task message (its first user message) carries only the task itself.
+			const combinedPrompt = [
+				input.systemPrompt?.trim(),
+				hookAdditionalContext ? `<!-- SubagentStart Hook Additional Context -->\n${hookAdditionalContext}` : undefined,
+			].filter(Boolean).join("\n\n---\n\n");
 			let systemPromptFile: string | undefined;
-			if (delegation && input.systemPrompt?.trim()) {
+			if (delegation && combinedPrompt) {
 				const directory = join(this.options.dataDir, "agent-prompts");
 				await mkdir(directory, { recursive: true, mode: 0o700 });
 				systemPromptFile = join(directory, `${conversation.id}.md`);
 				try {
-					await this.atomicFile(systemPromptFile, input.systemPrompt);
+					await this.atomicFile(systemPromptFile, combinedPrompt);
 				} catch (error) {
 					this.store.conversations = this.store.conversations.filter((item) => item.id !== conversation.id);
 					if (worktree && !existing) await this.worktrees.remove(worktree.id).catch(() => {});
@@ -2487,7 +2678,7 @@ export class DesktopService {
 			const task: DesktopTask = {
 				id: conversation.id,
 				conversationId: conversation.id,
-				project,
+				project: rootProject,
 				workingDirectory: conversation.project,
 				worktreeId: worktree?.id,
 				title: conversation.title,
@@ -2503,6 +2694,9 @@ export class DesktopService {
 				...(input.disallowedTools?.length ? { disallowedTools: input.disallowedTools } : {}),
 				...(input.permissionMode ? { permissionMode: input.permissionMode } : {}),
 				...(input.maxTurns ? { maxTurns: input.maxTurns } : {}),
+				...(input.isFork ? { isFork: true } : {}),
+				...(input.omitClaudeMd ? { omitClaudeMd: true } : {}),
+				...(input.mcpServers ? { mcpServers: input.mcpServers } : {}),
 				...delegation,
 				...(systemPromptFile ? { systemPromptFile } : {}),
 			};
@@ -2514,14 +2708,54 @@ export class DesktopService {
 					input.disallowedTools,
 					input.permissionMode,
 					delegation.readOnly,
+					input.mcpServers,
 				);
 			}
 			this.store.tasks.unshift(task);
+			if (delegation && conversation.sessionFile) {
+				await this.writeSubagentMeta(task, conversation, conversation.sessionFile, worktree).catch(() => {});
+			}
 			this.updateTask(task, "queued");
 			await this.persist();
 			void this.scheduleTasks();
 			return structuredClone(task);
 		});
+	}
+
+	private async writeSubagentMeta(
+		task: DesktopTask,
+		conversation: Conversation,
+		sessionFile?: string,
+		knownWorktree?: WorktreeInfo,
+	): Promise<void> {
+		const sessionDir = join(this.options.dataDir, "sessions");
+		const file =
+			sessionFile ??
+			conversation.sessionFile ??
+			this.runtimes.get(conversation.id)?.state?.sessionFile ??
+			(await findSessionFileById(sessionDir, conversation.id).catch(() => undefined));
+		if (!file || !file.endsWith(".jsonl")) return;
+		const tree =
+			knownWorktree ??
+			(task.worktreeId ? (await this.worktrees.list().catch(() => [])).find((item) => item.id === task.worktreeId) : undefined);
+		const meta = {
+			agentId: task.id,
+			type: task.subagentType ?? "general-purpose",
+			parent: task.parentConversationId,
+			description: task.title,
+			model: task.model ? `${task.model.provider}/${task.model.id}` : undefined,
+			depth: task.delegationDepth ?? 1,
+			...(task.worktreeId
+				? {
+					worktree: {
+						id: task.worktreeId,
+						path: task.workingDirectory,
+						...(tree ? { branch: tree.branch, baseRef: tree.baseRef } : {}),
+					},
+				}
+				: {}),
+		};
+		await this.atomicFile(file.replace(/\.jsonl$/, ".meta.json"), JSON.stringify(meta, null, 2) + "\n");
 	}
 
 	async taskSnapshot(id: string): Promise<Snapshot> {
@@ -2750,14 +2984,37 @@ export class DesktopService {
 			});
 	}
 	/** A foreground child the parent stopped waiting for now reports back like a background child. */
-	private async detachTask(id: string): Promise<void> {
+	private async detachTask(id: string, userInitiated = false): Promise<void> {
 		const task = this.store.tasks.find((item) => item.id === id);
 		if (!task || task.runInBackground) return;
+		if (userInitiated) this.userBackgroundedTasks.add(task.id);
 		task.runInBackground = true;
 		task.revision = (task.revision ?? 0) + 1;
 		for (const listener of this.taskListeners) listener({ type: "task_updated", task: structuredClone(task) });
+		this.waiters.notify(task.id);
 		await this.persist();
-		if (task.parentConversationId) void this.flushNotifications(task.parentConversationId, "auto");
+		if (task.parentConversationId && !["queued", "running", "waiting_for_input"].includes(task.status)) {
+			void this.flushNotifications(task.parentConversationId, "auto");
+		}
+	}
+
+	/**
+	 * User-initiated "转到后台" (Ctrl+B or ToolCard button): detaches a foreground child
+	 * so the parent immediately receives an async_launched-style response and the child's
+	 * final result arrives later through the persisted outbox.
+	 */
+	async backgroundTask(id: string): Promise<DesktopTask> {
+		await this.operation;
+		if (this.closed) throw new Error("桌面服务已关闭。");
+		const task = this.task(id);
+		if (!["queued", "running", "waiting_for_input"].includes(task.status) || task.runInBackground) {
+			return structuredClone(task);
+		}
+		if (task.parentConversationId && !task.readOnly && !task.worktreeId) {
+			throw new Error("共享目录的可写子 Agent 无法转到后台运行，以免与主会话同时修改文件。");
+		}
+		await this.detachTask(task.id, true);
+		return structuredClone(task);
 	}
 
 	/** Number of background results the conversation holds without delivery. */
@@ -2842,6 +3099,7 @@ export class DesktopService {
 			delete task.result;
 			delete task.stopReason;
 			delete task.stats;
+			this.userBackgroundedTasks.delete(task.id);
 			if (task.parentConversationId) {
 				// The model chooses whether it waits; a user's message never blocks the parent,
 				// and reaches the parent only when the user asked for it.
@@ -2906,6 +3164,16 @@ export class DesktopService {
 			return reaped;
 		});
 	}
+	private hasActiveDescendant(parentId: string, visited = new Set<string>([parentId])): boolean {
+		const active = (status: string) => ["queued", "running", "waiting_for_input"].includes(status);
+		for (const item of this.store.tasks) {
+			if (item.parentConversationId !== parentId || visited.has(item.conversationId)) continue;
+			visited.add(item.conversationId);
+			if (active(item.status) || this.hasActiveDescendant(item.conversationId, visited)) return true;
+		}
+		return false;
+	}
+
 	private reapable(runtime: SessionRuntime): boolean {
 		const id = runtime.conversationId;
 		const task = this.store.tasks.find((item) => item.conversationId === id && item.parentConversationId);
@@ -2918,7 +3186,7 @@ export class DesktopService {
 			runtime.engineStatus !== "starting" && !runtime.pendingUI.size &&
 			!runtime.state?.isStreaming && !runtime.state?.isCompacting &&
 			id !== this.store.activeId && !this.viewing.has(id) &&
-			!this.store.tasks.some((item) => item.parentConversationId === id && active(item.status)) &&
+			!this.hasActiveDescendant(id) &&
 			!this.external.list(id).some((item) => active(item.status)) &&
 			!this.terminals.list().some((terminal) => terminal.conversationId === id && terminal.status !== "exited")
 		);
@@ -3133,6 +3401,8 @@ export class DesktopService {
 
 	async close(): Promise<void> {
 		this.closed = true;
+		this.agentWatcher?.stop();
+		this.agentWatcher = undefined;
 		if (this.reapTimer) clearInterval(this.reapTimer);
 		this.reapTimer = undefined;
 		this.delegation.dispose();
@@ -3285,6 +3555,7 @@ export class DesktopService {
 		if (task) task.checkpointId = checkpoint.id;
 	}
 	private async finishRuntime(runtime: SessionRuntime, aborted: boolean, error?: string): Promise<void> {
+		this.clearTaskProgressTimer(runtime);
 		try {
 			if (runtime.checkpointId) {
 				await this.git.finish(this.conversation(runtime.conversationId).project, runtime.checkpointId);
@@ -3294,13 +3565,21 @@ export class DesktopService {
 			await this.saveSessionLeaf(runtime).catch(() => {});
 			this.conversation(runtime.conversationId).updatedAt = Date.now();
 			const task = this.store.tasks.find((item) => item.conversationId === runtime.conversationId);
+			if (task?.parentConversationId && !runtime.metaWritten) {
+				const conv = this.conversation(runtime.conversationId);
+				await this.writeSubagentMeta(task, conv, conv.sessionFile).catch(() => {});
+				runtime.metaWritten = true;
+			}
 			// A maxTurns stop aborts the run but is a completed, partial result, not a cancellation.
 			const limitStop = task?.stopReason === "max_turns" && ["running", "waiting_for_input"].includes(task.status);
+			if (task) {
+				await this.recordRunStats(runtime, task).catch(() => {});
+				this.userBackgroundedTasks.delete(task.id);
+			}
 			if (task?.parentConversationId) {
 				// Record the result even when the process is already gone, so reading it later
 				// never needs to start the child again.
 				const text = await this.childFinalText(runtime).catch(() => undefined);
-				await this.recordRunStats(runtime, task).catch(() => {});
 				if (text !== undefined)
 					task.result = {
 						text: text.slice(0, MAX_AGENT_OUTPUT),
@@ -3365,6 +3644,7 @@ export class DesktopService {
 	}
 	private async stopRuntime(runtime: SessionRuntime, cursor: "capture" | "preserve" = "capture"): Promise<void> {
 		runtime.stopping = true;
+		this.clearTaskProgressTimer(runtime);
 		if (cursor === "capture" && runtime.agent && runtime.engineStatus === "ready") {
 			try {
 				if (runtime.busy || runtime.state?.isStreaming || runtime.state?.isCompacting || runtime.pendingUI.size) {
@@ -3385,6 +3665,8 @@ export class DesktopService {
 		if (runtime.settling) await runtime.settling;
 		if (runtime.checkpointId) await this.finishRuntime(runtime, true);
 		runtime.pendingUI.clear();
+		const stoppedTask = this.store.tasks.find((item) => item.conversationId === runtime.conversationId);
+		if (stoppedTask) delete stoppedTask.pendingApprovals;
 		if (runtime.navigation) await rm(runtime.navigation.directory, { recursive: true, force: true });
 		if (runtime.controls) {
 			this.toolHost.revoke(runtime.controls.hostToken);
@@ -3394,14 +3676,36 @@ export class DesktopService {
 		if (runtime.sandboxProfileFile) await rm(runtime.sandboxProfileFile, { force: true });
 		if (this.runtimes.get(runtime.conversationId) === runtime) this.runtimes.delete(runtime.conversationId);
 	}
+	private isSlotBorrower(task: DesktopTask): boolean {
+		if (!task.parentConversationId || task.runInBackground) return false;
+		const active = new Set(["running", "waiting_for_input"]);
+		const seen = new Set<string>([task.conversationId]);
+		let cursor: string | undefined = task.parentConversationId;
+		while (cursor && !seen.has(cursor)) {
+			seen.add(cursor);
+			const ancestor = this.store.tasks.find((item) => item.conversationId === cursor);
+			if (!ancestor) return false;
+			if (active.has(ancestor.status)) return true;
+			if (ancestor.runInBackground) return false;
+			cursor = ancestor.parentConversationId;
+		}
+		return false;
+	}
+
 	private async scheduleTasks(): Promise<void> {
 		if (this.scheduling || this.closed) return;
 		this.scheduling = true;
 		try {
 			await this.operation;
-			let active = this.store.tasks.filter((task) => ["running", "waiting_for_input"].includes(task.status)).length + this.external.countRunning();
+			const maxBase = this.options.maxConcurrentTasks ?? 4;
+			const maxBorrowed = this.options.maxBorrowedSlots ?? DEFAULT_MAX_BORROWED_SLOTS;
+			const runningTasks = this.store.tasks.filter((task) => ["running", "waiting_for_input"].includes(task.status));
+			let baseActive = runningTasks.filter((task) => !this.isSlotBorrower(task)).length + this.external.countRunning();
+			let borrowedActive = runningTasks.filter((task) => this.isSlotBorrower(task)).length;
 			for (const task of this.store.tasks.filter((item) => item.status === "queued").reverse()) {
-				if (active >= (this.options.maxConcurrentTasks ?? 4) || this.closed) break;
+				if (this.closed) break;
+				const borrow = this.isSlotBorrower(task);
+				if (borrow ? borrowedActive >= maxBorrowed : baseActive >= maxBase) continue;
 				try {
 					this.assertPathAvailable(task.workingDirectory, task.conversationId);
 				} catch {
@@ -3410,7 +3714,8 @@ export class DesktopService {
 				this.updateTask(task, "running");
 				const launch = (this.launches.get(task.conversationId) ?? 0) + 1;
 				this.launches.set(task.conversationId, launch);
-				active++;
+				if (borrow) borrowedActive++;
+				else baseActive++;
 				void this.runTask(task, launch);
 			}
 		} finally {
@@ -3440,16 +3745,14 @@ export class DesktopService {
 			if (!resumed && task.thinkingLevel) await agent.request({ type: "set_thinking_level", level: task.thinkingLevel });
 			if (this.closed || this.launches.get(task.conversationId) !== launch) return;
 			// A forked child starts with the parent's history; usage is measured from here.
-			if (task.parentConversationId) {
-				const baseline = await agent.request<SessionStats>({ type: "get_session_stats" }).catch(() => undefined);
-				task.statsAtTurnStart = {
-					tokens: statTokens(baseline?.tokens),
-					cost: finiteCount(baseline?.cost),
-					toolCalls: finiteCount(baseline?.toolCalls),
-					startedAt: Date.now(),
-				};
-				delete task.stats;
-			}
+			const baseline = await agent.request<SessionStats>({ type: "get_session_stats" }).catch(() => undefined);
+			task.statsAtTurnStart = {
+				tokens: statTokens(baseline?.tokens),
+				cost: finiteCount(baseline?.cost),
+				toolCalls: finiteCount(baseline?.toolCalls),
+				startedAt: Date.now(),
+			};
+			delete task.stats;
 			await this.command({ type: "prompt", message }, task.conversationId, launch);
 			// Pi accepted the message; it is part of the child's session now.
 			if (resumed && task.pendingMessage === message) {
@@ -3493,6 +3796,7 @@ export class DesktopService {
 			await this.stopRuntime(previous);
 		}
 		await this.persist();
+		this.ensureAgentWatcher(conversation.project);
 		if (await this.projectAvailable(conversation)) await this.ensureRuntime(conversation);
 	}
 
@@ -3515,6 +3819,7 @@ export class DesktopService {
 				busy: false,
 				bashBusy: false,
 				pendingUI: new Map(),
+				answeredUI: new Set(),
 				stopping: false,
 				lastActivity: Date.now(),
 			};
@@ -3584,17 +3889,28 @@ export class DesktopService {
 			env.PI_DESKTOP_CONNECTIONS = JSON.stringify(connections);
 			runtime.policyFile = join(this.options.dataDir, `policy-${conversation.id}-${randomBytes(8).toString("hex")}.json`);
 			env.PI_DESKTOP_POLICY_FILE = runtime.policyFile;
+			const task = this.store.tasks.find((item) => item.conversationId === conversation.id);
+			const delegated = task?.parentConversationId ? task : undefined;
 			delete env.PI_DESKTOP_SANDBOX_PROFILE;
+			const shouldConfineWorktreeChild = Boolean(
+				delegated && !delegated.readOnly && delegated.worktreeId && this.store.settings.confineSubagentBash !== false,
+			);
 			if (this.store.settings.sandbox) {
 				if (!(await probeSeatbeltSupport()).supported) throw new Error("无法启动命令沙箱。请在支持的环境中运行，或在设置中关闭沙箱。");
 				runtime.sandboxProfileFile = join(this.options.dataDir, `sandbox-${conversation.id}-${randomBytes(8).toString("hex")}.sb`);
 				await writeFile(runtime.sandboxProfileFile, buildSeatbeltProfile(conversation.project, [], this.store.settings.sandboxOffline), { mode: 0o600 });
 				env.PI_DESKTOP_SANDBOX_PROFILE = runtime.sandboxProfileFile;
+			} else if (shouldConfineWorktreeChild && (await probeSeatbeltSupport()).supported) {
+				runtime.sandboxProfileFile = join(this.options.dataDir, `sandbox-${conversation.id}-${randomBytes(8).toString("hex")}.sb`);
+				await writeFile(runtime.sandboxProfileFile, buildSeatbeltProfile(conversation.project, [], this.store.settings.sandboxOffline), { mode: 0o600 });
+				env.PI_DESKTOP_SANDBOX_PROFILE = runtime.sandboxProfileFile;
 			}
-			const delegated = this.store.tasks.find((task) => task.conversationId === conversation.id && task.parentConversationId);
 			// Set these explicitly so an inherited shell environment cannot change a session's role.
 			env.PI_DESKTOP_CHILD = delegated ? "1" : "0";
 			env.PI_DESKTOP_READ_ONLY_CHILD = delegated?.readOnly ? "1" : "0";
+			env.PI_DESKTOP_FORK_CHILD = delegated?.isFork ? "1" : "0";
+			env.PI_DESKTOP_DELEGATION_DEPTH = String(delegated ? (delegated.delegationDepth ?? 1) : 0);
+			env.PI_DESKTOP_MAX_DEPTH = String(this.store.settings.maxSubagentDepth ?? DEFAULT_MAX_SUBAGENT_DEPTH);
 			if (delegated?.maxTurns) env.PI_DESKTOP_MAX_TURNS = String(delegated.maxTurns);
 			else delete env.PI_DESKTOP_MAX_TURNS;
 			const toolExtension = this.options.toolControlExtension ?? join(runtimeDir, "tool-control-extension.mjs");
@@ -3639,17 +3955,24 @@ export class DesktopService {
 			const trustResources = await detectProjectTrustResources(conversation.project);
 			const trustProject = this.trustProjectFor(conversation.project);
 			const trustDecision = this.store.projectTrust?.[trustProject];
-			env.PI_DESKTOP_MEMORY_ROOT = trustDecision === "trusted" ? conversation.project : "";
-			env.PI_DESKTOP_MEMORY_FILE = trustDecision === "trusted" ? this.privateMemoryPath(trustProject) : "";
-			const userMemory = join(this.options.env?.HOME ?? homedir(), ".claude", "CLAUDE.md");
-			env.PI_DESKTOP_USER_MEMORY_FILE = await realpath(userMemory).then(
-				(path) => path,
-				() => "",
-			);
+			if (task?.omitClaudeMd) {
+				env.PI_DESKTOP_MEMORY_ROOT = "";
+				env.PI_DESKTOP_MEMORY_FILE = "";
+				env.PI_DESKTOP_USER_MEMORY_FILE = "";
+			} else {
+				env.PI_DESKTOP_MEMORY_ROOT = trustDecision === "trusted" ? conversation.project : "";
+				env.PI_DESKTOP_MEMORY_FILE = trustDecision === "trusted" ? this.privateMemoryPath(trustProject) : "";
+				const userMemory = join(this.options.env?.HOME ?? homedir(), ".claude", "CLAUDE.md");
+				env.PI_DESKTOP_USER_MEMORY_FILE = await realpath(userMemory).then(
+					(path) => path,
+					() => "",
+				);
+			}
 			const args = [
 				"--session-dir",
 				sessionDir,
 				...(sessionFile ? ["--session", sessionFile] : ["--session-id", conversation.id]),
+				...(task?.omitClaudeMd ? ["--no-context-files"] : []),
 				"--extension",
 				this.options.permissionExtension ?? join(runtimeDir, "permission-extension.mjs"),
 				...(navigationInstalled ? ["--extension", navigationExtension] : []),
@@ -3662,10 +3985,9 @@ export class DesktopService {
 				const model = this.store.settings.defaultModel;
 				args.push("--provider", model.provider, "--model", model.id);
 			}
-			const task = this.store.tasks.find((item) => item.conversationId === conversation.id);
 			const policy = this.permissionPolicy(conversation.id);
 			const policyMode = policy.mode;
-			args.push(...piToolArgs(task, policyMode));
+			args.push(...piToolArgs(task, policyMode, { canDelegate: this.canDelegateFurther(conversation.id) }));
 			if (task?.parentConversationId && task.systemPromptFile && !task.quarantined) {
 				// An explicit --append-system-prompt replaces Pi's APPEND_SYSTEM.md discovery;
 				// pass the file Pi would have found first so the child keeps it.
@@ -3729,6 +4051,162 @@ export class DesktopService {
 		}
 	}
 
+	private initTaskProgress(runtime: SessionRuntime, task: DesktopTask): void {
+		this.clearTaskProgressTimer(runtime);
+		const now = Date.now();
+		runtime.progress = {
+			taskId: task.id,
+			turn: task.turn ?? 1,
+			toolUses: 0,
+			tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			cost: 0,
+			startedAt: task.statsAtTurnStart?.startedAt ?? now,
+			recentActivities: [],
+			lastEmitAt: 0,
+			lastPersistAt: now,
+		};
+	}
+
+	private clearTaskProgressTimer(runtime: SessionRuntime): void {
+		if (runtime.progress?.emitTimer) {
+			clearTimeout(runtime.progress.emitTimer);
+			runtime.progress.emitTimer = undefined;
+		}
+	}
+
+	private buildTaskProgress(runtime: SessionRuntime, task: DesktopTask): TaskProgress | undefined {
+		const p = runtime.progress;
+		if (!p || p.taskId !== task.id) return undefined;
+		const now = Date.now();
+		return {
+			taskId: task.id,
+			status: task.status,
+			turn: p.turn,
+			toolUses: p.toolUses,
+			...(p.lastToolName ? { lastToolName: p.lastToolName } : {}),
+			tokens: { ...p.tokens },
+			cost: p.cost,
+			startedAt: p.startedAt,
+			durationMs: Math.max(0, now - p.startedAt),
+			...(runtime.pendingUI.size > 0 || task.status === "waiting_for_input" ? { waitingForApproval: true } : {}),
+			recentActivities: p.recentActivities.map((item) => ({ ...item })),
+		};
+	}
+
+	private emitTaskProgress(runtime: SessionRuntime, task: DesktopTask): void {
+		const p = runtime.progress;
+		if (!p || p.taskId !== task.id || this.closed) return;
+		const now = Date.now();
+		p.lastEmitAt = now;
+		const progress = this.buildTaskProgress(runtime, task);
+		if (!progress) return;
+		for (const listener of this.taskListeners) listener({ type: "task_progress", taskId: task.id, progress });
+		const direct = this.progressListeners.get(task.id);
+		if (direct) for (const listener of direct) listener(progress);
+		// Progress events never persist on every tick; flush running stats to disk at most every 5s.
+		if (now - p.lastPersistAt >= TASK_PROGRESS_PERSIST_MS && ["running", "waiting_for_input"].includes(task.status)) {
+			p.lastPersistAt = now;
+			const model = runtime.state?.model ? { provider: runtime.state.model.provider, id: runtime.state.model.id } : task.model;
+			task.stats = {
+				tokens: { ...p.tokens },
+				cost: p.cost,
+				toolUses: p.toolUses,
+				startedAt: p.startedAt,
+				durationMs: progress.durationMs,
+				...(model ? { model } : {}),
+			};
+			void this.persist().catch(() => {});
+		}
+	}
+
+	private scheduleProgressEmit(runtime: SessionRuntime, task: DesktopTask, immediate = false): void {
+		const p = runtime.progress;
+		if (!p || p.taskId !== task.id) return;
+		const elapsed = Date.now() - p.lastEmitAt;
+		if (immediate || elapsed >= TASK_PROGRESS_THROTTLE_MS) {
+			this.clearTaskProgressTimer(runtime);
+			this.emitTaskProgress(runtime, task);
+			return;
+		}
+		if (p.emitTimer) return;
+		p.emitTimer = setTimeout(() => {
+			if (runtime.progress) runtime.progress.emitTimer = undefined;
+			const latest = this.store.tasks.find((item) => item.id === task.id);
+			if (latest) this.emitTaskProgress(runtime, latest);
+		}, TASK_PROGRESS_THROTTLE_MS - elapsed);
+	}
+
+	private subscribeTaskProgress(taskId: string, listener: (progress: TaskProgress) => void): () => void {
+		let listeners = this.progressListeners.get(taskId);
+		if (!listeners) {
+			listeners = new Set();
+			this.progressListeners.set(taskId, listeners);
+		}
+		listeners.add(listener);
+		const task = this.store.tasks.find((item) => item.id === taskId);
+		const runtime = task ? this.runtimes.get(task.conversationId) : undefined;
+		if (task && runtime) {
+			const current = this.buildTaskProgress(runtime, task);
+			if (current) listener(current);
+		}
+		return () => {
+			listeners?.delete(listener);
+			if (listeners && !listeners.size) this.progressListeners.delete(taskId);
+		};
+	}
+
+	private syncTaskPendingApprovals(runtime: SessionRuntime, task: DesktopTask | undefined): void {
+		if (!task) return;
+		const approvals: TaskPendingApproval[] = [];
+		for (const req of runtime.pendingUI.values()) {
+			if (!["confirm", "select", "input", "editor"].includes(req.method)) continue;
+			approvals.push({
+				id: req.id,
+				method: req.method as TaskPendingApproval["method"],
+				title: truncateText("title" in req && typeof req.title === "string" ? req.title : "Pi 需要你的输入", 500),
+				...("message" in req && typeof req.message === "string" ? { message: truncateText(req.message, 4096) } : {}),
+				...("options" in req && Array.isArray(req.options)
+					? { options: req.options.slice(0, 50).map((item) => truncateText(String(item), 500)) }
+					: {}),
+				...("placeholder" in req && typeof req.placeholder === "string"
+					? { placeholder: truncateText(req.placeholder, 4096) }
+					: {}),
+				...("prefill" in req && typeof req.prefill === "string" ? { prefill: truncateText(req.prefill, 4096) } : {}),
+				...("timeout" in req && typeof req.timeout === "number" ? { timeout: req.timeout } : {}),
+			});
+		}
+		if (approvals.length > 0) task.pendingApprovals = approvals;
+		else delete task.pendingApprovals;
+	}
+
+	/** Recursively collect open interactive requests from all descendant tasks of `conversationId`. */
+	private collectChildApprovals(conversationId: string): ChildApprovalRequest[] {
+		const results: ChildApprovalRequest[] = [];
+		const visited = new Set<string>([conversationId]);
+		const walk = (parentId: string, depth: number) => {
+			for (const task of this.store.tasks) {
+				if (task.parentConversationId !== parentId || visited.has(task.conversationId)) continue;
+				visited.add(task.conversationId);
+				const runtime = this.runtimes.get(task.conversationId);
+				if (runtime) this.syncTaskPendingApprovals(runtime, task);
+				for (const req of task.pendingApprovals ?? []) {
+					results.push({
+						taskId: task.id,
+						conversationId: task.conversationId,
+						description: task.title || task.subagentType || task.id,
+						...(task.name ? { name: task.name } : {}),
+						...(task.subagentType ? { subagentType: task.subagentType } : {}),
+						depth,
+						request: { ...req, ...(req.options ? { options: [...req.options] } : {}) },
+					});
+				}
+				walk(task.conversationId, depth + 1);
+			}
+		};
+		walk(conversationId, 1);
+		return results;
+	}
+
 	private onEvent(runtime: SessionRuntime, event: DesktopEvent["event"]): void {
 		const conversationId = runtime.conversationId;
 		const sequence = ++this.eventSequence;
@@ -3751,8 +4229,11 @@ export class DesktopService {
 		const task = this.store.tasks.find((item) => item.conversationId === conversationId);
 		if (event.type === "extension_ui_request" && ["confirm", "select", "input", "editor"].includes(event.method)) {
 			runtime.pendingUI.set(event.id, event);
-			if (task && task.status !== "cancelled" && task.status !== "interrupted")
+			this.syncTaskPendingApprovals(runtime, task);
+			if (task && task.status !== "cancelled" && task.status !== "interrupted") {
 				this.updateTask(task, "waiting_for_input");
+				this.scheduleProgressEmit(runtime, task, true);
+			}
 			const conv = this.conversation(conversationId);
 			void this.hooks.run("Notification", {
 				project: this.trustProjectFor(conv.project),
@@ -3778,18 +4259,55 @@ export class DesktopService {
 				delete task.stopReason;
 				delete task.result;
 				this.updateTask(task, "running");
+				this.initTaskProgress(runtime, task);
+				this.scheduleProgressEmit(runtime, task, true);
 			}
+		}
+		if (event.type === "tool_execution_start" && task && ["running", "waiting_for_input"].includes(task.status)) {
+			if (!runtime.progress || runtime.progress.taskId !== task.id) this.initTaskProgress(runtime, task);
+			const p = runtime.progress!;
+			p.toolUses++;
+			p.lastToolName = event.toolName;
+			p.recentActivities.push({
+				toolName: event.toolName,
+				summary: summarizeToolActivity(event.toolName, event.args),
+				startedAt: Date.now(),
+			});
+			if (p.recentActivities.length > MAX_RECENT_TASK_ACTIVITIES) {
+				p.recentActivities.splice(0, p.recentActivities.length - MAX_RECENT_TASK_ACTIVITIES);
+			}
+			this.scheduleProgressEmit(runtime, task);
 		}
 		if (event.type === "compaction_start" && runtime.state) runtime.state.isCompacting = true;
 		if (event.type === "compaction_end" && runtime.state) runtime.state.isCompacting = false;
 		// Results deferred while an idle parent compacted are sent once compaction ends.
 		if (event.type === "compaction_end" && !runtime.busy) void this.flushNotifications(conversationId, "auto");
-		if (event.type === "message_end" && event.message.role === "assistant" && event.message.stopReason === "error")
-			runtime.lastError = event.message.errorMessage ?? "模型请求失败。";
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			if (event.message.stopReason === "error")
+				runtime.lastError = event.message.errorMessage ?? "模型请求失败。";
+			if (task && ["running", "waiting_for_input"].includes(task.status) && event.message.usage) {
+				if (!runtime.progress || runtime.progress.taskId !== task.id) this.initTaskProgress(runtime, task);
+				const p = runtime.progress!;
+				const usage = event.message.usage;
+				const input = finiteCount(usage.input);
+				const output = finiteCount(usage.output);
+				const cacheRead = finiteCount(usage.cacheRead);
+				const cacheWrite = finiteCount(usage.cacheWrite);
+				const total = finiteCount(usage.totalTokens) || input + output + cacheRead + cacheWrite;
+				p.tokens.input += input;
+				p.tokens.output += output;
+				p.tokens.cacheRead += cacheRead;
+				p.tokens.cacheWrite += cacheWrite;
+				p.tokens.total += total;
+				p.cost += finiteCount(usage.cost?.total);
+				this.scheduleProgressEmit(runtime, task);
+			}
+		}
 		if (event.type === "agent_settled") {
 			runtime.busy = false;
 			if (runtime.state) runtime.state.isStreaming = false;
 			runtime.pendingUI.clear();
+			this.syncTaskPendingApprovals(runtime, task);
 			runtime.settling = this.finishRuntime(runtime, event.aborted, runtime.lastError);
 			// Settlement is emitted after host cleanup; allocate its delivery sequence at that point.
 			void runtime.settling.finally(() => {
@@ -3806,6 +4324,7 @@ export class DesktopService {
 			runtime.engineStatus = "error";
 			runtime.engineError = event.message;
 			runtime.pendingUI.clear();
+			this.syncTaskPendingApprovals(runtime, task);
 			runtime.settling = this.finishRuntime(runtime, false, event.message);
 		}
 		if (event.type === "session_info_changed") {
@@ -3831,7 +4350,8 @@ export class DesktopService {
 		if (agent !== runtime.agent) return;
 		runtime.state = safeState(state);
 		const sessionFile = runtime.state.sessionFile;
-		this.conversation(runtime.conversationId).sessionFile = sessionFile
+		const conv = this.conversation(runtime.conversationId);
+		conv.sessionFile = sessionFile
 			? await stat(sessionFile).then(
 					() => sessionFile,
 					(error: NodeJS.ErrnoException) => {
@@ -3840,6 +4360,13 @@ export class DesktopService {
 					},
 				)
 			: undefined;
+		if (conv.sessionFile && !runtime.metaWritten) {
+			const task = this.store.tasks.find((item) => item.conversationId === runtime.conversationId && item.parentConversationId);
+			if (task) {
+				runtime.metaWritten = true;
+				await this.writeSubagentMeta(task, conv, conv.sessionFile).catch(() => {});
+			}
+		}
 	}
 
 	private async buildSnapshot(conversationId = this.store.activeId): Promise<Snapshot> {
@@ -3907,6 +4434,16 @@ export class DesktopService {
 			messages = storedMessages as Message[];
 		}
 		const trust = conversation ? await this.projectTrustState(conversation.project) : undefined;
+		const delegatedParents = new Map<string, string>();
+		for (const item of this.store.tasks) {
+			if (item.parentConversationId) delegatedParents.set(item.conversationId, item.parentConversationId);
+		}
+		const annotateConversation = (conv: Conversation): Conversation => {
+			const parentId = delegatedParents.get(conv.id);
+			if (!parentId) return conv;
+			return { ...conv, kind: "subagent", parentConversationId: conv.parentConversationId ?? parentId };
+		};
+		const conversations = this.store.conversations.map(annotateConversation);
 		return {
 			eventSequence,
 			activitySequence: this.eventSequence,
@@ -3917,8 +4454,8 @@ export class DesktopService {
 			bashBusy: runtime?.bashBusy ?? false,
 			liveTranscript,
 			projects: this.store.projects,
-			conversations: this.store.conversations,
-			active: conversationId ? this.conversation(conversationId) : undefined,
+			conversations,
+			active: conversationId ? annotateConversation(this.conversation(conversationId)) : undefined,
 			state: runtime ? runtime.state : undefined,
 			models: runtime ? runtime.models : [],
 			providerPresets,
@@ -3936,6 +4473,7 @@ export class DesktopService {
 			commands,
 			archived,
 			trust,
+			...(conversationId ? { childApprovals: this.collectChildApprovals(conversationId) } : {}),
 			...(conversationId && this.heldNotificationCount(conversationId) ? { pendingTaskNotifications: this.heldNotificationCount(conversationId) } : {}),
 		};
 	}
@@ -3989,7 +4527,7 @@ export class DesktopService {
 	}
 
 	private persist(): Promise<void> {
-		const serialized = JSON.stringify(this.store, null, 2);
+		const serialized = JSON.stringify(this.store, (key, value) => (key === "pendingApprovals" ? undefined : value), 2);
 		this.persistence = this.persistence
 			.catch(() => {})
 			.then(async () => {
@@ -4078,6 +4616,20 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 				(value.settings.foregroundSubagentTimeoutMs as number) <= MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS
 					? value.settings.foregroundSubagentTimeoutMs
 					: undefined,
+			forkSubagent: typeof value.settings.forkSubagent === "boolean" ? value.settings.forkSubagent : undefined,
+			confineSubagentBash: typeof value.settings.confineSubagentBash === "boolean" ? value.settings.confineSubagentBash : undefined,
+			maxSubagentDepth:
+				Number.isSafeInteger(value.settings.maxSubagentDepth) &&
+				(value.settings.maxSubagentDepth as number) >= 1 &&
+				(value.settings.maxSubagentDepth as number) <= MAX_DELEGATION_DEPTH
+					? value.settings.maxSubagentDepth
+					: undefined,
+			maxConcurrentSubagents:
+				Number.isSafeInteger(value.settings.maxConcurrentSubagents) &&
+				(value.settings.maxConcurrentSubagents as number) >= 1 &&
+				(value.settings.maxConcurrentSubagents as number) <= MAX_CONCURRENT_SUBAGENTS_LIMIT
+					? value.settings.maxConcurrentSubagents
+					: undefined,
 			defaultModel: value.settings.defaultModel,
 			connections: value.settings.connections ?? {},
 			agentDir: value.settings.agentDir,
@@ -4088,6 +4640,22 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 		projectTrust,
 	};
 	return { state, dropped };
+}
+
+function summarizeToolActivity(toolName: string, args: unknown): string | undefined {
+	if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+	const rec = args as Record<string, unknown>;
+	const pick = (keys: string[]): string | undefined => {
+		for (const key of keys) {
+			const val = rec[key];
+			if (typeof val === "string" && val.trim()) return truncateText(val.trim().replace(/\s+/g, " "), 120);
+		}
+		return undefined;
+	};
+	if (toolName === "bash" || toolName === "powershell") return pick(["command"]);
+	if (toolName === "read" || toolName === "write" || toolName === "edit") return pick(["path", "file_path"]);
+	if (toolName === "grep" || toolName === "find") return pick(["pattern", "path", "glob"]);
+	return pick(["path", "description", "query", "command", "task_id"]);
 }
 
 function safeState(state: RpcSessionState): RpcSessionState {

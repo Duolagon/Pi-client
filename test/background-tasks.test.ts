@@ -56,15 +56,24 @@ class TaskLog {
 		for (const listener of this.listeners) listener(event);
 	}
 	waitFor(id: string, status: TaskStatus): Promise<DesktopTask> {
-		const previous = this.events.find((event) => event.task.id === id && event.task.status === status);
+		const previous = this.events.find(
+			(event): event is Extract<TaskEvent, { type: "task_updated" }> => event.type === "task_updated" && event.task.id === id && event.task.status === status,
+		);
 		if (previous) return Promise.resolve(previous.task);
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.listeners.delete(listener);
-				reject(new Error(`Task ${id} did not reach ${status}; received ${this.events.map((event) => `${event.task.id}:${event.task.status}`).join(",")}`));
+				reject(
+					new Error(
+						`Task ${id} did not reach ${status}; received ${this.events
+							.filter((event): event is Extract<TaskEvent, { type: "task_updated" }> => event.type === "task_updated")
+							.map((event) => `${event.task.id}:${event.task.status}`)
+							.join(",")}`,
+					),
+				);
 			}, 15000);
 			const listener = (event: TaskEvent) => {
-				if (event.task.id !== id || event.task.status !== status) return;
+				if (event.type !== "task_updated" || event.task.id !== id || event.task.status !== status) return;
 				clearTimeout(timer);
 				this.listeners.delete(listener);
 				resolve(event.task);
@@ -250,6 +259,140 @@ test("restarting marks unfinished tasks interrupted without replaying their prom
 		assert.equal((await current.listWorktrees()).length, 2);
 	} finally {
 		await current.close();
+		await data.fixture.cleanup();
+	}
+});
+
+test("live task_progress increments toolUses monotonically and final task.stats matches get_session_stats", { timeout: 60000 }, async () => {
+	const data = await setup();
+	try {
+		await data.service.saveSettings({ permission: "auto", theme: "light" });
+		const task = await data.service.startTask({ message: "read-write-bash progress tracking" });
+		await data.tasks.waitFor(task.id, "completed");
+		const progressEvents = data.tasks.events.filter(
+			(event): event is Extract<TaskEvent, { type: "task_progress" }> => event.type === "task_progress" && event.taskId === task.id,
+		);
+		assert.ok(progressEvents.length >= 1, "expected at least one task_progress event");
+		for (let i = 1; i < progressEvents.length; i++) {
+			assert.ok(progressEvents[i].progress.toolUses >= progressEvents[i - 1].progress.toolUses, "toolUses must be monotonic");
+		}
+		const finished = (await data.service.listTasks()).find((item) => item.id === task.id)!;
+		const snap = await data.service.taskSnapshot(task.id);
+		assert.ok(finished.stats, "expected recorded task.stats on completion");
+		assert.equal(finished.stats.toolUses, snap.stats?.toolCalls ?? 3);
+		assert.equal(finished.stats.tokens.total, snap.stats?.tokens.total ?? 0);
+		assert.ok(finished.stats.toolUses >= 3, `expected >= 3 tool calls, got ${finished.stats.toolUses}`);
+	} finally {
+		await data.service.close();
+		await data.fixture.cleanup();
+	}
+});
+
+test("childApprovals surface to the parent, respond is idempotent and rejects foreign ids, and delegatedOnly rules apply only to descendants", { timeout: 60000 }, async () => {
+	const data = await setup();
+	try {
+		const otherRoot = (await data.service.newConversation()).active!.id;
+		await data.service.selectConversation(data.foregroundId);
+
+		// Spawn two delegated children under foregroundId and one under otherRoot.
+		const childA = await data.service.startTask(
+			{ message: "read-write-bash child-a", isolation: "worktree" },
+			{
+				parentConversationId: data.foregroundId,
+				parentToolCallId: "call-a",
+				subagentType: "general-purpose",
+				delegationDepth: 1,
+				readOnly: false,
+				runInBackground: true,
+				name: "alpha",
+			},
+		);
+		const childB = await data.service.startTask(
+			{ message: "read-write-bash child-b", isolation: "worktree" },
+			{
+				parentConversationId: data.foregroundId,
+				parentToolCallId: "call-b",
+				subagentType: "general-purpose",
+				delegationDepth: 1,
+				readOnly: false,
+				runInBackground: true,
+				name: "beta",
+			},
+		);
+		const foreignChild = await data.service.startTask(
+			{ message: "slow-stream foreign-child", isolation: "worktree" },
+			{
+				parentConversationId: otherRoot,
+				parentToolCallId: "call-foreign",
+				subagentType: "general-purpose",
+				delegationDepth: 1,
+				readOnly: false,
+				runInBackground: true,
+			},
+		);
+
+		const reqA = await approval(data.events, childA.conversationId);
+		const parentSnap = await data.service.snapshot();
+		assert.ok(parentSnap.childApprovals?.some((item) => item.taskId === childA.id && item.request.id === reqA.id && item.name === "alpha"));
+		const listedA = (await data.service.listTasks()).find((t) => t.id === childA.id);
+		assert.equal(listedA?.pendingApprovals?.[0]?.id, reqA.id);
+
+		// pendingApprovals is runtime-only and never persisted to desktop.json.
+		const rawStore = JSON.parse(await readFile(join(data.fixture.dataDir, "desktop.json"), "utf8"));
+		assert.equal(rawStore.tasks.find((t: { id: string }) => t.id === childA.id)?.pendingApprovals, undefined);
+
+		// Responding with a request id that belongs to childA against childB or otherRoot throws.
+		await assert.rejects(
+			data.service.respond({ type: "extension_ui_response", id: reqA.id, confirmed: true }, otherRoot),
+			/不属于当前会话|已失效/,
+		);
+		await assert.rejects(
+			data.service.respond({ type: "extension_ui_response", id: "non-existent-req-id", confirmed: true }, childA.conversationId),
+			/不属于当前会话|已失效/,
+		);
+
+		// Add a delegatedOnly rule on the root conversation: sibling children inherit it, but the root itself and otherRoot do not.
+		await data.service.upsertPermission({
+			id: "tree-allow-write",
+			scope: "conversation",
+			conversationId: data.foregroundId,
+			delegatedOnly: true,
+			action: "allow",
+			tool: "write",
+		});
+		assert.equal(
+			(await data.service.checkPermission({ conversationId: childB.conversationId, toolName: "write", input: { path: "generated.txt" } })).action,
+			"allow",
+			"sibling child in the same delegation tree inherits delegatedOnly rule",
+		);
+		assert.equal(
+			(await data.service.checkPermission({ conversationId: data.foregroundId, toolName: "write", input: { path: "generated.txt" } })).action,
+			"ask",
+			"root conversation itself is not relaxed by delegatedOnly rule",
+		);
+		assert.equal(
+			(await data.service.checkPermission({ conversationId: otherRoot, toolName: "write", input: { path: "generated.txt" } })).action,
+			"ask",
+			"other root conversation is unaffected",
+		);
+		assert.equal(
+			(await data.service.checkPermission({ conversationId: foreignChild.conversationId, toolName: "write", input: { path: "generated.txt" } })).action,
+			"ask",
+			"descendant of another root conversation is unaffected",
+		);
+
+		// First respond succeeds; a duplicate respond with the same id is a no-op (idempotent).
+		await data.service.respond({ type: "extension_ui_response", id: reqA.id, confirmed: true }, childA.id);
+		await data.service.respond({ type: "extension_ui_response", id: reqA.id, confirmed: true }, childA.conversationId);
+
+		// stopAllTasks stops only foregroundId's active background children, leaving foreignChild running.
+		const stopped = await data.service.stopAllTasks(data.foregroundId);
+		assert.ok(stopped.stopped >= 1);
+		const afterStop = await data.service.listTasks();
+		assert.equal(afterStop.find((t) => t.id === foreignChild.id)?.status, "running");
+		await data.service.cancelTask(foreignChild.id);
+	} finally {
+		await data.service.close();
 		await data.fixture.cleanup();
 	}
 });

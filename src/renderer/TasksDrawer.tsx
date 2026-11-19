@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import { Eye, GitBranch, GitMerge, Play, Send, Square, Trash2 } from "lucide-react";
+import { ArrowDownToLine, Eye, GitBranch, GitMerge, Play, Send, Square, Trash2 } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
 import { TranscriptView } from "./TranscriptView.tsx";
-import { transcript } from "./messages.ts";
-import type { DesktopTask, ExternalTask, Snapshot, WorktreeInfo } from "../shared.ts";
+import { applyEvent, transcript, type Transcript } from "./messages.ts";
+import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
+import type { DesktopTask, ExternalTask, RpcExtensionUIRequest, TaskProgress, WorktreeInfo } from "../shared.ts";
 
 export function TasksDrawer({
 	project,
@@ -24,8 +25,12 @@ export function TasksDrawer({
 	const [tab, setTab] = useState<"tasks" | "worktrees">("tasks");
 	const [tasks, setTasks] = useState<DesktopTask[]>([]);
 	const [externalTasks, setExternalTasks] = useState<ExternalTask[]>([]);
+	const [progressMap, setProgressMap] = useState<Record<string, TaskProgress>>({});
 	const [worktrees, setWorktrees] = useState<WorktreeInfo[]>([]);
-	const [detail, setDetail] = useState<Snapshot | null>(null);
+	const [detailTranscript, setDetailTranscript] = useState<Transcript | null>(null);
+	const [detailPendingUI, setDetailPendingUI] = useState<RpcExtensionUIRequest[]>([]);
+	const [approvalInputs, setApprovalInputs] = useState<Record<string, string>>({});
+	const [detailSeq, setDetailSeq] = useState(0);
 	const [detailTask, setDetailTask] = useState<DesktopTask | null>(null);
 	const [extDetail, setExtDetail] = useState<ExternalTask | null>(null);
 	const [extFollowUp, setExtFollowUp] = useState("");
@@ -47,7 +52,7 @@ export function TasksDrawer({
 			setTasks(sortedTasks);
 			setExternalTasks(sortedExt);
 			setWorktrees(wtList);
-			if (initialTaskId && !detail && !extDetail) {
+			if (initialTaskId && !detailTask && !extDetail) {
 				const piMatch = sortedTasks.find((t) => t.id === initialTaskId);
 				if (piMatch) void openDetail(piMatch);
 				else {
@@ -63,12 +68,24 @@ export function TasksDrawer({
 	useEffect(() => {
 		void refresh();
 		const unsubTasks = window.pi.tasks.onEvent((event) => {
+			if (event.type === "task_progress") {
+				setProgressMap((prev) => ({ ...prev, [event.taskId]: event.progress }));
+				return;
+			}
 			if (event.type === "task_updated") {
 				setTasks((prev) => {
 					const filtered = prev.filter((t) => t.id !== event.task.id);
 					return [event.task, ...filtered].sort((a, b) => b.updatedAt - a.updatedAt);
 				});
 				setDetailTask((prev) => (prev?.id === event.task.id ? event.task : prev));
+				if (!["queued", "running", "waiting_for_input"].includes(event.task.status)) {
+					setProgressMap((prev) => {
+						if (!(event.task.id in prev)) return prev;
+						const next = { ...prev };
+						delete next[event.task.id];
+						return next;
+					});
+				}
 			}
 		});
 		const unsubExternal = window.pi.externalAgents.onEvent((packet) => {
@@ -88,21 +105,56 @@ export function TasksDrawer({
 	}, [project]);
 
 	// A shown child conversation keeps its process; the host may stop idle finished ones otherwise.
-	const viewedTaskId = detailTask?.id;
+	const viewedConversationId = detailTask?.conversationId;
 	useEffect(() => {
-		if (!viewedTaskId) return;
-		void window.pi.tasks.viewing(viewedTaskId, true).catch(() => {});
+		if (!viewedConversationId) return;
+		void window.pi.tasks.viewing(viewedConversationId, true).catch(() => {});
 		return () => {
-			void window.pi.tasks.viewing(viewedTaskId, false).catch(() => {});
+			void window.pi.tasks.viewing(viewedConversationId, false).catch(() => {});
 		};
-	}, [viewedTaskId]);
+	}, [viewedConversationId]);
+
+	// Keep the opened Pi task detail live instead of a one-shot snapshot.
+	const detailTaskId = detailTask?.id;
+	useEffect(() => {
+		if (!viewedConversationId || !detailTaskId) return;
+		let applied = detailSeq;
+		const unsub = window.pi.onEvent((packet) => {
+			if (packet.conversationId !== viewedConversationId) return;
+			if (packet.sequence !== undefined) {
+				if (packet.sequence <= applied) return;
+				applied = packet.sequence;
+			}
+			const event = packet.event;
+			if (event.type === "extension_ui_request" && ["confirm", "select", "input", "editor"].includes(event.method)) {
+				setDetailPendingUI((prev) => (prev.some((item) => item.id === event.id) ? prev : [...prev, event]));
+				return;
+			}
+			if (event.type === "agent_settled") {
+				setDetailPendingUI([]);
+				void window.pi.tasks
+					.snapshot(detailTaskId)
+					.then((snap) => {
+						applied = snap.eventSequence ?? applied;
+						setDetailSeq(applied);
+						setDetailTranscript(transcript(snap.messages, snap.liveTranscript));
+						setDetailPendingUI(snap.pendingUI.filter((r) => ["confirm", "select", "input", "editor"].includes(r.method)));
+					})
+					.catch(() => {});
+			}
+			setDetailTranscript((prev) => (prev ? applyEvent(prev, event) : prev));
+		});
+		return unsub;
+	}, [viewedConversationId, detailTaskId, detailSeq]);
 
 	const openDetail = async (task: DesktopTask) => {
 		try {
 			const snap = await window.pi.tasks.snapshot(task.id);
 			setExtDetail(null);
 			setDetailTask(task);
-			setDetail(snap);
+			setDetailSeq(snap.eventSequence ?? 0);
+			setDetailTranscript(transcript(snap.messages, snap.liveTranscript));
+			setDetailPendingUI(snap.pendingUI.filter((r) => ["confirm", "select", "input", "editor"].includes(r.method)));
 		} catch (error) {
 			fail(error);
 		}
@@ -111,7 +163,8 @@ export function TasksDrawer({
 	const openExternalDetail = async (task: ExternalTask) => {
 		try {
 			const fresh = await window.pi.externalAgents.snapshot(task.id);
-			setDetail(null);
+			setDetailTranscript(null);
+			setDetailPendingUI([]);
 			setDetailTask(null);
 			setExtDetail(fresh);
 		} catch (error) {
@@ -238,7 +291,7 @@ export function TasksDrawer({
 
 				{tab === "tasks" && (
 					<div className="cc-controls-body">
-						{backgroundChildren > 0 && !detail && !extDetail && (
+						{backgroundChildren > 0 && !detailTranscript && !extDetail && (
 							<div className="cc-task-stop-all">
 								<span>当前会话有 {backgroundChildren} 个运行中的子 Agent。按 Esc 只会中断前台调用，后台子 Agent 会继续运行。</span>
 								<button
@@ -268,50 +321,141 @@ export function TasksDrawer({
 							</button>
 						</form>
 
-						{detail && detailTask ? (
+						{detailTranscript && detailTask ? (
 							<div className="cc-task-detail">
 								<div className="cc-rewind-head">
 									<div>
-										<strong>{detailTask.title || detailTask.subagentType || "子任务"}</strong>
+										<strong>{detailTask.name || detailTask.title || detailTask.subagentType || "子任务"}</strong>
+										{detailTask.subagentType && <span className="cc-source-tag">{detailTask.subagentType}</span>}
 										<span className="cc-source-tag">{detailTask.status}</span>
+										{detailTask.stopReason && <span className="cc-source-tag muted">{detailTask.stopReason}</span>}
+										{isActive(detailTask.status) && progressMap[detailTask.id] && (
+											<span className="cc-source-tag muted">{formatTaskProgressSummary(progressMap[detailTask.id])}</span>
+										)}
 									</div>
-									<button type="button" className="secondary-button" onClick={() => { setDetail(null); setDetailTask(null); }}>
-										返回列表
-									</button>
+									<div className="cc-tool-ctrl-actions">
+										{isActive(detailTask.status) && !detailTask.runInBackground && (detailTask.readOnly || detailTask.worktreeId) && (
+											<button
+												type="button"
+												className="cc-mini-btn"
+												onClick={() => void window.pi.tasks.background(detailTask.id).then(() => onNotice("已转到后台运行。")).catch(fail)}
+											>
+												<ArrowDownToLine size={12} /> 转后台
+											</button>
+										)}
+										<button type="button" className="secondary-button" onClick={() => { setDetailTranscript(null); setDetailPendingUI([]); setDetailTask(null); }}>
+											返回列表
+										</button>
+									</div>
 								</div>
-								{detail.pendingUI[0] && detail.pendingUI[0].method === "confirm" && (
-									<div className="cc-task-approval">
-										<span>待审批：{detail.pendingUI[0].title}</span>
+								{detailPendingUI.map((req) => (
+									<div key={req.id} className="cc-task-approval">
+										<span>
+											待审批 ({req.method})：{"title" in req ? req.title : "需要你的输入"}
+											{"message" in req && req.message ? ` — ${req.message.slice(0, 160)}` : ""}
+										</span>
 										<div>
-											<button
-												type="button"
-												className="secondary-button"
-												onClick={() =>
-													void window.pi.tasks
-														.respond(detailTask.id, { type: "extension_ui_response", id: detail.pendingUI[0].id, confirmed: false })
-														.then(() => openDetail(detailTask))
-														.catch(fail)
-												}
-											>
-												拒绝
-											</button>
-											<button
-												type="button"
-												className="primary-button"
-												onClick={() =>
-													void window.pi.tasks
-														.respond(detailTask.id, { type: "extension_ui_response", id: detail.pendingUI[0].id, confirmed: true })
-														.then(() => openDetail(detailTask))
-														.catch(fail)
-												}
-											>
-												允许
-											</button>
+											{req.method === "confirm" && (
+												<>
+													<button
+														type="button"
+														className="secondary-button"
+														onClick={() =>
+															void window.pi.tasks
+																.respond(detailTask.id, { type: "extension_ui_response", id: req.id, confirmed: false })
+																.then(() => setDetailPendingUI((prev) => prev.filter((item) => item.id !== req.id)))
+																.catch(fail)
+														}
+													>
+														拒绝
+													</button>
+													<button
+														type="button"
+														className="primary-button"
+														onClick={() =>
+															void window.pi.tasks
+																.respond(detailTask.id, { type: "extension_ui_response", id: req.id, confirmed: true })
+																.then(() => setDetailPendingUI((prev) => prev.filter((item) => item.id !== req.id)))
+																.catch(fail)
+														}
+													>
+														允许
+													</button>
+												</>
+											)}
+											{req.method === "select" && (
+												<>
+													{req.options.map((opt) => (
+														<button
+															key={opt}
+															type="button"
+															className="secondary-button"
+															onClick={() =>
+																void window.pi.tasks
+																	.respond(detailTask.id, { type: "extension_ui_response", id: req.id, value: opt })
+																	.then(() => setDetailPendingUI((prev) => prev.filter((item) => item.id !== req.id)))
+																	.catch(fail)
+															}
+														>
+															{opt}
+														</button>
+													))}
+													<button
+														type="button"
+														className="secondary-button"
+														onClick={() =>
+															void window.pi.tasks
+																.respond(detailTask.id, { type: "extension_ui_response", id: req.id, cancelled: true })
+																.then(() => setDetailPendingUI((prev) => prev.filter((item) => item.id !== req.id)))
+																.catch(fail)
+														}
+													>
+														取消
+													</button>
+												</>
+											)}
+											{(req.method === "input" || req.method === "editor") && (
+												<>
+													<input
+														placeholder={"placeholder" in req ? req.placeholder : "输入回复…"}
+														value={approvalInputs[req.id] ?? ("prefill" in req && req.prefill ? req.prefill : "")}
+														onChange={(e) => setApprovalInputs((prev) => ({ ...prev, [req.id]: e.target.value }))}
+													/>
+													<button
+														type="button"
+														className="secondary-button"
+														onClick={() =>
+															void window.pi.tasks
+																.respond(detailTask.id, { type: "extension_ui_response", id: req.id, cancelled: true })
+																.then(() => setDetailPendingUI((prev) => prev.filter((item) => item.id !== req.id)))
+																.catch(fail)
+														}
+													>
+														取消
+													</button>
+													<button
+														type="button"
+														className="primary-button"
+														onClick={() =>
+															void window.pi.tasks
+																.respond(detailTask.id, {
+																	type: "extension_ui_response",
+																	id: req.id,
+																	value: approvalInputs[req.id] ?? ("prefill" in req && req.prefill ? req.prefill : ""),
+																})
+																.then(() => setDetailPendingUI((prev) => prev.filter((item) => item.id !== req.id)))
+																.catch(fail)
+														}
+													>
+														提交
+													</button>
+												</>
+											)}
 										</div>
 									</div>
-								)}
+								))}
 								<div className="cc-task-transcript">
-									<TranscriptView transcript={transcript(detail.messages)} />
+									<TranscriptView transcript={detailTranscript} />
 								</div>
 								{!detailTask.quarantined && detailTask.status !== "queued" && (
 									<form className="cc-task-start" onSubmit={(e) => void sendPiFollowUp(e)}>
@@ -445,34 +589,60 @@ export function TasksDrawer({
 										</div>
 									</div>
 								))}
-								{tasks.map((task) => (
-									<div key={task.id} className="cc-tool-ctrl-row">
-										<div className="cc-tool-ctrl-info">
-											<div className="cc-tool-ctrl-name">
-												<strong>{task.title || task.prompt.slice(0, 60)}</strong>
-												{task.subagentType && <span className="cc-source-tag">{task.subagentType}</span>}
-												<span className={`cc-action-badge ${task.status === "completed" ? "allow" : task.status === "failed" || task.status === "cancelled" ? "deny" : "ask"}`}>
-													{task.status}
-												</span>
+								{tasks.map((task) => {
+									const active = isActive(task.status);
+									const prog = progressMap[task.id];
+									const modelId = task.stats?.model?.id ?? task.model?.id;
+									const totalTokens = active ? prog?.tokens.total : task.stats?.tokens.total;
+									const durationMs = active ? prog?.durationMs : task.stats?.durationMs;
+									const metaParts = [
+										modelId,
+										task.thinkingLevel ? `effort:${task.thinkingLevel}` : undefined,
+										totalTokens ? `${formatCompactTokens(totalTokens)} tokens` : undefined,
+										active && prog?.toolUses ? `${prog.toolUses} 次工具${prog.lastToolName ? ` (${prog.lastToolName})` : ""}` : task.stats?.toolUses ? `${task.stats.toolUses} 次工具` : undefined,
+										durationMs !== undefined ? formatCompactDuration(durationMs) : undefined,
+										task.stopReason ? `stop:${task.stopReason}` : undefined,
+									].filter(Boolean);
+									return (
+										<div key={task.id} className="cc-tool-ctrl-row">
+											<div className="cc-tool-ctrl-info">
+												<div className="cc-tool-ctrl-name">
+													<strong>{task.name ? `${task.name} · ${task.title || task.prompt.slice(0, 60)}` : task.title || task.prompt.slice(0, 60)}</strong>
+													{task.subagentType && <span className="cc-source-tag">{task.subagentType}</span>}
+													<span className={`cc-action-badge ${task.status === "completed" ? "allow" : task.status === "failed" || task.status === "cancelled" || task.status === "interrupted" ? "deny" : "ask"}`}>
+														{task.status}
+													</span>
+												</div>
+												<p className="cc-tool-ctrl-desc">
+													{metaParts.length ? `${metaParts.join(" · ")} · ` : ""}{task.workingDirectory}
+												</p>
 											</div>
-											<p className="cc-tool-ctrl-desc">{task.workingDirectory}</p>
-										</div>
-										<div className="cc-tool-ctrl-actions">
-											<button type="button" className="cc-mini-btn" onClick={() => void openDetail(task)}>
-												<Eye size={13} /> 详情
-											</button>
-											{(task.status === "running" || task.status === "queued" || task.status === "waiting_for_input") && (
-												<button
-													type="button"
-													className="cc-mini-btn danger"
-													onClick={() => void window.pi.tasks.cancel(task.id).then(refresh).catch(fail)}
-												>
-													<Square size={12} /> 停止
+											<div className="cc-tool-ctrl-actions">
+												{active && !task.runInBackground && (task.readOnly || task.worktreeId) && (
+													<button
+														type="button"
+														className="cc-mini-btn"
+														onClick={() => void window.pi.tasks.background(task.id).then(refresh).catch(fail)}
+													>
+														<ArrowDownToLine size={12} /> 转后台
+													</button>
+												)}
+												<button type="button" className="cc-mini-btn" onClick={() => void openDetail(task)}>
+													<Eye size={13} /> 详情
 												</button>
-											)}
+												{active && (
+													<button
+														type="button"
+														className="cc-mini-btn danger"
+														onClick={() => void window.pi.tasks.cancel(task.id).then(refresh).catch(fail)}
+													>
+														<Square size={12} /> 停止
+													</button>
+												)}
+											</div>
 										</div>
-									</div>
-								))}
+									);
+								})}
 								{!totalTasks && <p className="subtle-note">暂无后台任务或模型子 Agent。</p>}
 							</div>
 						)}

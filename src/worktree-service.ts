@@ -48,16 +48,26 @@ export class WorktreeService {
 			if ((await lstat(this.root)).isSymbolicLink() || (await realpath(this.root)) !== this.root)
 				throw new Error("Worktree 存储目录已被替换，未创建工作区。");
 			const repository = await this.repository(input.project);
-			const baseRef = input.baseRef?.trim() || "HEAD";
-			if (baseRef.startsWith("-") || baseRef.includes("\0") || baseRef.length > 512)
+			const explicitBaseRef = input.baseRef?.trim();
+			if (explicitBaseRef && (explicitBaseRef.startsWith("-") || explicitBaseRef.includes("\0") || explicitBaseRef.length > 512))
 				throw new Error("Git 基准引用无效。");
+			const resolveCommit = async (ref: string): Promise<string> =>
+				(await this.git(repository, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`])).trim();
+			let baseRef = explicitBaseRef || "origin/HEAD";
 			let baseCommit: string;
 			try {
-				baseCommit = (
-					await this.git(repository, ["rev-parse", "--verify", "--end-of-options", `${baseRef}^{commit}`])
-				).trim();
+				baseCommit = await resolveCommit(baseRef);
 			} catch {
-				throw new Error("找不到 Git 基准提交。请先为仓库创建提交，或选择有效引用。");
+				if (!explicitBaseRef) {
+					baseRef = "HEAD";
+					try {
+						baseCommit = await resolveCommit(baseRef);
+					} catch {
+						throw new Error("找不到 Git 基准提交。请先为仓库创建提交，或选择有效引用。");
+					}
+				} else {
+					throw new Error("找不到 Git 基准提交。请先为仓库创建提交，或选择有效引用。");
+				}
 			}
 			const id = randomUUID();
 			const branch = `pi-desktop/${id}`;

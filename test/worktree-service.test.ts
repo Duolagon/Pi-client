@@ -221,3 +221,30 @@ test("missing base references and unborn repositories fail without creating work
 		assert.deepEqual(await service.list(), []);
 	} finally { await data.cleanup(); }
 });
+
+test("omitted baseRef prefers origin/HEAD when present and falls back to HEAD otherwise", { timeout: 30000 }, async () => {
+	const data = await fixture();
+	const bareRemote = join(data.root, "remote.git");
+	const localClone = join(data.root, "local-clone");
+	const service = new WorktreeService({ dataDir: data.dataDir, env });
+	try {
+		const withoutRemote = await service.create({ project: data.project });
+		assert.equal(withoutRemote.baseRef, "HEAD");
+
+		await git(data.root, "clone", "--bare", data.project, bareRemote);
+		await git(data.root, "clone", bareRemote, localClone);
+		await git(localClone, "remote", "set-head", "origin", "main");
+		const originCommit = await git(localClone, "rev-parse", "origin/HEAD");
+
+		// Advance local main past origin/HEAD; omitted baseRef must still branch from origin/HEAD.
+		await writeFile(join(localClone, "local-only.txt"), "local ahead\n");
+		await git(localClone, "add", "--", "local-only.txt");
+		await commit(localClone, "local commit ahead of origin");
+		const localHead = await git(localClone, "rev-parse", "HEAD");
+		assert.notEqual(localHead, originCommit);
+
+		const fromOrigin = await service.create({ project: localClone });
+		assert.equal(fromOrigin.baseRef, "origin/HEAD");
+		assert.equal(fromOrigin.baseCommit, originCommit);
+	} finally { await data.cleanup(); }
+});

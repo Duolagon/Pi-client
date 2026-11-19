@@ -90,6 +90,7 @@ export function installWorkspaceHandlers(
 	handle("pi:task:list", () => service.listTasks());
 	handle("pi:task:snapshot", (taskId) => service.taskSnapshot(id(taskId)));
 	handle("pi:task:cancel", (taskId) => service.cancelTask(id(taskId)));
+	handle("pi:task:background", (taskId) => service.backgroundTask(id(taskId)));
 	// Both act only on the named conversation's own children; the host checks it exists.
 	handle("pi:task:stopAll", (conversationId) => service.stopAllTasks(id(conversationId)));
 	handle("pi:task:deliverNow", (conversationId) => service.deliverTaskNotifications(id(conversationId)));

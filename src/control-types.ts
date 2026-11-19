@@ -12,7 +12,7 @@ export interface ToolToggleInput extends ControlScope {
 	enabled: boolean | null;
 }
 export interface ControlEvent {
-	type: "tools_changed" | "permissions_changed";
+	type: "tools_changed" | "permissions_changed" | "agents_changed";
 	conversationIds: string[];
 }
 export interface PermissionSettings {

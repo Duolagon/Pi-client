@@ -3,8 +3,10 @@ import type { DesktopTask, TaskRunStats, TaskStopReason } from "./task-types.ts"
 import type { AgentDefinition } from "./agent-types.ts";
 import type { WorktreeInfo } from "./worktree-types.ts";
 import {
-	AGENT_CALL_NAME_PATTERN, DEFAULT_FOREGROUND_SUBAGENT_TIMEOUT_MS, MAX_AGENT_OUTPUT, MAX_AGENT_PROMPT,
-	MAX_AGENT_SYSTEM_PROMPT, MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS, MAX_SEND_MESSAGE, MAX_SEND_SUMMARY, MAX_SEND_TARGET, exceedsLength,
+	AGENT_CALL_NAME_PATTERN, DEFAULT_FOREGROUND_SUBAGENT_TIMEOUT_MS, DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+	DEFAULT_MAX_SUBAGENT_DEPTH, MAX_AGENT_OUTPUT, MAX_AGENT_PROMPT, MAX_AGENT_SYSTEM_PROMPT,
+	MAX_CONCURRENT_SUBAGENTS_LIMIT, MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS, MAX_SEND_MESSAGE,
+	MAX_SEND_SUMMARY, MAX_SEND_TARGET, exceedsLength,
 } from "./delegation-limits.ts";
 import { formatAgentToolText } from "./delegation-format.ts";
 import {
@@ -21,7 +23,6 @@ import {
 } from "./delegation-types.ts";
 
 const activeStatuses = new Set(["queued", "running", "waiting_for_input"]);
-const maxOutstanding = 8;
 /** Built-in agent types with native one-shot semantics: SendMessage cannot continue them. */
 const oneShotTypes = new Set(["Explore", "Plan"]);
 
@@ -86,7 +87,7 @@ export class ModelDelegation {
 			}
 			case "WorktreeCreate": {
 				only(input, ["base_ref"]);
-				await this.assertParent(context.conversationId);
+				await this.assertRootForWorktree(context.conversationId);
 				const owner = await this.callbacks.getConversation(context.conversationId);
 				return this.callbacks.createWorktree({
 					project: owner.project,
@@ -101,7 +102,7 @@ export class ModelDelegation {
 			case "WorktreeMerge":
 			case "WorktreeRemove": {
 				only(input, ["worktree_id"]);
-				await this.assertParent(context.conversationId);
+				await this.assertRootForWorktree(context.conversationId);
 				const id = text(input.worktree_id, "worktree_id", 200);
 				await this.ownedWorktree(context.conversationId, id);
 				return tool === "WorktreeMerge" ? this.callbacks.mergeWorktree(id, context.conversationId, context.toolCallId) : this.callbacks.removeWorktree(id, context.conversationId, context.toolCallId);
@@ -156,11 +157,30 @@ export class ModelDelegation {
 	 * report back; `backgroundOnly` is the user's explicit "stop all background agents".
 	 */
 	async cancelChildren(owner: string, options: { foregroundOnly?: boolean; backgroundOnly?: boolean; reason?: TaskStopReason } = {}): Promise<DesktopTask[]> {
-		const children = (await this.callbacks.listTasks()).filter(
-			(task) => task.parentConversationId === owner && activeStatuses.has(task.status) &&
-				!(options.foregroundOnly && task.runInBackground) && !(options.backgroundOnly && !task.runInBackground),
-		);
-		return Promise.all(children.map((task) => this.callbacks.cancelTask(task.id, options.reason ?? "parent_abort")));
+		const tasks = await this.callbacks.listTasks();
+		const targets: DesktopTask[] = [];
+		const visited = new Set<string>([owner]);
+		const collect = (parentId: string) => {
+			for (const task of tasks) {
+				if (task.parentConversationId !== parentId || visited.has(task.conversationId)) continue;
+				visited.add(task.conversationId);
+				const active = activeStatuses.has(task.status);
+				if (options.foregroundOnly) {
+					if (active && !task.runInBackground) targets.push(task);
+					else if (!active) collect(task.conversationId);
+					continue;
+				}
+				if (options.backgroundOnly) {
+					if (active && task.runInBackground) targets.push(task);
+					else collect(task.conversationId);
+					continue;
+				}
+				if (active) targets.push(task);
+				else collect(task.conversationId);
+			}
+		};
+		collect(owner);
+		return Promise.all(targets.map((task) => this.callbacks.cancelTask(task.id, options.reason ?? "parent_abort")));
 	}
 
 	/** Called after a persisted task transition; hands delivery to the host's outbox without blocking it. */
@@ -177,24 +197,37 @@ export class ModelDelegation {
 		const warnings = (input.ignored ?? []).map((name) => `Parameter '${name}' is not supported by this client and was ignored.`);
 		// "fork" (or the legacy fork flag) forks this conversation into a general-purpose child.
 		const fork = input.fork === true || input.subagent_type === "fork";
+		const isNativeFork = input.subagent_type === "fork";
 		const typeName = input.subagent_type === "fork" ? "general-purpose" : input.subagent_type;
+		if (fork && (await this.callbacks.forkSubagentEnabled?.()) === false)
+			throw new Error("Fork subagents are disabled in settings (forkSubagent).");
+		// A fork child itself cannot fork or spawn again: prevent infinite recursion.
+		const owner = await this.callbacks.getConversation(context.conversationId);
+		if (owner.origin === "fork") throw new Error("Forked agents cannot fork or spawn agents");
 		if (fork && input.model) warnings.push("A fork keeps this conversation's model; 'model' was ignored.");
 		// A narrow lock makes the per-parent cap and tool-call idempotency atomic.
 		const spawn = this.spawning.then(async () => {
 			this.checkAbort(context.signal);
-			await this.assertParent(context.conversationId);
+			const { depth: currentDepth, nextDepth, readOnlyParent } = await this.assertCanDelegate(context.conversationId);
 			const tasks = await this.callbacks.listTasks();
 			const previous = tasks.find(
 				(task) => task.parentConversationId === context.conversationId && task.parentToolCallId === context.toolCallId,
 			);
 			if (previous) return { task: previous, sharedWriter: !previous.readOnly && !previous.worktreeId };
-			if (tasks.filter((task) => task.parentConversationId === context.conversationId && activeStatuses.has(task.status)).length >= maxOutstanding)
-				throw new Error("This conversation already has 8 outstanding subagents; collect or stop one first");
+			const rawCap = (await this.callbacks.maxConcurrentSubagents?.()) ?? DEFAULT_MAX_CONCURRENT_SUBAGENTS;
+			const maxConcurrent = Math.max(1, Math.min(MAX_CONCURRENT_SUBAGENTS_LIMIT, Number.isFinite(rawCap) ? Math.floor(rawCap) : DEFAULT_MAX_CONCURRENT_SUBAGENTS));
+			if (tasks.filter((task) => task.parentConversationId === context.conversationId && activeStatuses.has(task.status)).length >= maxConcurrent) {
+				throw new Error(
+					`Concurrent subagent limit reached. You can run ${maxConcurrent} subagents at once. Do not retry; wait for a running agent to finish.`,
+				);
+			}
 			if (input.name && tasks.some((task) => task.parentConversationId === context.conversationId && task.name === input.name && activeStatuses.has(task.status)))
 				throw new Error(`An active subagent named '${input.name}' already exists in this conversation; choose another name`);
 			const owner = await this.callbacks.getConversation(context.conversationId);
 			const definition = await this.resolveAgent(owner.project, typeName);
 			const readOnly = definition?.readOnly ?? typeName !== "general-purpose";
+			if (readOnlyParent && !readOnly)
+				throw new Error("Read-only subagents cannot spawn writable subagents; use Explore, Plan, or a read-only agent");
 			if ((await this.callbacks.isPlanMode?.(owner.id)) && !readOnly)
 				throw new Error("Plan 模式下仅允许委派 Explore / Plan 等只读子 Agent。");
 			const selection = await this.callbacks.getSelection(owner.id);
@@ -206,9 +239,19 @@ export class ModelDelegation {
 			if (input.worktree_id && isolation === "shared") throw new Error("An existing worktree requires worktree isolation");
 			const explicitBackground = input.run_in_background ?? definition?.background;
 			const sharedWriter = !readOnly && isolation === "shared";
-			// Writable shared work defaults to the foreground: the parent then waits on this
-			// call and cannot write the same directory concurrently.
-			const runInBackground = explicitBackground ?? (sharedWriter ? false : (await this.callbacks.defaultBackground?.()) ?? true);
+			// Native `subagent_type: "fork"` forces background when isolated/git-backed (not sharedWriter).
+			// Nested delegators (depth >= 1) default to foreground so the subagent collects its child's result directly.
+			// Writable shared work defaults to foreground: the parent waits on this call so the two do not race.
+			const defaultBg = currentDepth >= 1 ? false : ((await this.callbacks.defaultBackground?.()) ?? true);
+			const runInBackground = isNativeFork && !sharedWriter
+				? true
+				: (explicitBackground ?? (sharedWriter ? false : defaultBg));
+			if (!readOnly && isolation === "worktree" && (await this.callbacks.confineSubagentBash?.()) !== false) {
+				const seatbelt = await this.callbacks.seatbeltSupport?.();
+				if (seatbelt && !seatbelt.supported) {
+					warnings.push(`Subagent Bash sandbox confinement (confineSubagentBash) is unavailable on this platform: ${seatbelt.reason ?? "Seatbelt unsupported"}`);
+				}
+			}
 			if (sharedWriter && runInBackground)
 				throw new Error(
 					"A background writable subagent cannot run alongside this parent in a shared directory; set run_in_background:false, or use worktree isolation in a Git repository",
@@ -243,19 +286,21 @@ export class ModelDelegation {
 					isolation,
 					worktreeId: input.worktree_id,
 					model,
-					thinkingLevel: definition?.thinkingLevel ?? selection.thinkingLevel,
+					thinkingLevel: fork ? selection.thinkingLevel : (definition?.thinkingLevel ?? selection.thinkingLevel),
 					...(definition?.tools ? { allowedTools: definition.tools } : {}),
 					...(definition?.disallowedTools?.length ? { disallowedTools: definition.disallowedTools } : {}),
 					...(definition?.permissionMode ? { permissionMode: definition.permissionMode } : {}),
 					...(definition?.maxTurns ? { maxTurns: definition.maxTurns } : {}),
-					...(fork ? { forkParentConversationId: owner.id } : {}),
+					...(definition?.omitClaudeMd ? { omitClaudeMd: true } : {}),
+					...(definition?.mcpServers ? { mcpServers: definition.mcpServers } : {}),
+					...(fork ? { forkParentConversationId: owner.id, isFork: true } : {}),
 					...(systemPrompt ? { systemPrompt } : {}),
 				},
 				{
 					parentConversationId: owner.id,
 					parentToolCallId: context.toolCallId,
 					subagentType: definition?.name ?? typeName,
-					delegationDepth: 1,
+					delegationDepth: nextDepth,
 					readOnly,
 					runInBackground,
 					...(input.name ? { name: input.name } : {}),
@@ -274,36 +319,58 @@ export class ModelDelegation {
 			const launched = await this.result(context.conversationId, { task_id: task.id });
 			return this.toolResult({ ...launched, ...(warnings.length ? { warnings } : {}) }, { launched: true });
 		}
-		const result = await this.waitForeground(context, task.id, sharedWriter);
-		return this.toolResult({ ...result, ...(warnings.length ? { warnings } : {}) });
+		const waited = await this.waitForeground(context, task.id, sharedWriter);
+		return this.toolResult({ ...waited.result, ...(warnings.length ? { warnings } : {}) }, { backgroundedByUser: waited.backgroundedByUser });
+	}
+
+	/** Move a foreground child to background delivery; its foreground waiter returns immediately. */
+	async detach(taskId: string): Promise<void> {
+		await this.callbacks.detachTask?.(taskId);
 	}
 
 	/**
 	 * Wait for a foreground child. A shared writer keeps the parent waiting until it ends,
 	 * through approvals too, so the two never write the same directory at once. Other
-	 * children are handed to background delivery once the configured wait has passed or
-	 * they wait for an approval. The parent's abort stops the child it waits for.
+	 * children are handed to background delivery once the configured wait has passed, the
+	 * user moves them to the background (Ctrl+B), or they wait for an approval. The parent's
+	 * abort stops the child it waits for.
 	 */
-	private async waitForeground(context: DelegationContext, taskId: string, sharedWriter: boolean): Promise<DelegatedTaskResult> {
+	private async waitForeground(
+		context: DelegationContext,
+		taskId: string,
+		sharedWriter: boolean,
+	): Promise<{ result: DelegatedTaskResult; backgroundedByUser: boolean }> {
+		const unsubProgress = context.onProgress ? this.callbacks.subscribeTaskProgress?.(taskId, context.onProgress) : undefined;
 		try {
 			const limit = sharedWriter ? 0 : await this.foregroundLimit();
 			const started = Date.now();
 			let result: DelegatedTaskResult;
+			let backgroundedByUser = false;
 			for (;;) {
-				await this.callbacks.waitForTask(taskId, sharedWriter ? (item) => !activeStatuses.has(item.status) : settledForReader, this.signal(context.signal), 60000);
+				await this.callbacks.waitForTask(
+					taskId,
+					sharedWriter ? (item) => !activeStatuses.has(item.status) : (item) => !activeStatuses.has(item.status) || Boolean(item.runInBackground),
+					this.signal(context.signal),
+					60000,
+				);
 				this.checkAbort(context.signal);
+				const current = (await this.callbacks.listTasks()).find((item) => item.id === taskId);
 				result = await this.result(context.conversationId, { task_id: taskId }, context.signal);
 				if (!activeStatuses.has(result.status)) break;
-				// A child waiting for a human returns control so the parent can surface it.
-				if (!sharedWriter && (result.pending_approvals > 0 || result.status === "waiting_for_input")) break;
+				if (!sharedWriter && current?.runInBackground) {
+					backgroundedByUser = this.callbacks.isUserBackgrounded?.(taskId) ?? true;
+					break;
+				}
 				if (limit > 0 && Date.now() - started >= limit) break;
 			}
 			// The parent stops waiting; the child now reports back like a background agent.
-			if (activeStatuses.has(result.status)) await this.callbacks.detachTask?.(taskId);
-			return result;
+			if (activeStatuses.has(result.status) && !backgroundedByUser) await this.callbacks.detachTask?.(taskId);
+			return { result, backgroundedByUser };
 		} catch (error) {
 			if (context.signal?.aborted) await this.callbacks.cancelTask(taskId, "parent_abort");
 			throw error;
+		} finally {
+			unsubProgress?.();
 		}
 	}
 
@@ -317,8 +384,10 @@ export class ModelDelegation {
 		// The same lock as Agent: the replay check and the resume are one atomic step.
 		const send = this.spawning.then(async () => {
 			this.checkAbort(context.signal);
-			await this.assertParent(context.conversationId);
+			const { depth: currentDepth, readOnlyParent } = await this.assertCanDelegate(context.conversationId);
 			const task = await this.resolveTarget(context.conversationId, input.to);
+			if (readOnlyParent && !task.readOnly)
+				throw new Error("Read-only subagents cannot continue writable subagents");
 			const sharedWriter = !task.readOnly && !task.worktreeId;
 			if (task.turnCalls?.includes(context.toolCallId)) return { task, sharedWriter, delivered: false };
 			if (task.quarantined) throw new Error("This agent's record is damaged and it cannot be continued; launch a new Agent instead");
@@ -328,7 +397,8 @@ export class ModelDelegation {
 			if (!running && !task.readOnly && (await this.callbacks.isPlanMode?.(context.conversationId)))
 				throw new Error("Plan 模式下不能继续可写的子 Agent。");
 			// A writable child sharing the parent's directory runs only while the parent waits on it.
-			const background = input.run_in_background ?? (options.legacy || sharedWriter ? false : (await this.callbacks.defaultBackground?.()) ?? true);
+			const defaultBg = currentDepth >= 1 ? false : ((await this.callbacks.defaultBackground?.()) ?? true);
+			const background = input.run_in_background ?? (options.legacy || sharedWriter ? false : defaultBg);
 			if (!running && sharedWriter) {
 				if (background)
 					throw new Error(
@@ -349,17 +419,19 @@ export class ModelDelegation {
 		// A replayed call of a turn that has already finished returns that turn's result.
 		if (!activeStatuses.has(task.status)) return this.toolResult(await this.result(context.conversationId, { task_id: task.id }));
 		if (task.runInBackground) return this.toolResult(await this.result(context.conversationId, { task_id: task.id }), { resumed: true });
-		return this.toolResult(await this.waitForeground(context, task.id, sharedWriter));
+		const waited = await this.waitForeground(context, task.id, sharedWriter);
+		return this.toolResult(waited.result, { backgroundedByUser: waited.backgroundedByUser });
 	}
 
 	/** Shape a child result as the native Agent tool result; usage is counted into the parent. */
-	private async toolResult(result: DelegatedTaskResult, options: { launched?: boolean; resumed?: boolean; delivered?: boolean } = {}): Promise<ModelToolResult<DelegatedTaskResult>> {
+	private async toolResult(result: DelegatedTaskResult, options: { launched?: boolean; resumed?: boolean; delivered?: boolean; backgroundedByUser?: boolean } = {}): Promise<ModelToolResult<DelegatedTaskResult>> {
 		const tree = result.worktree_id ? (await this.callbacks.listWorktrees().catch(() => [])).find((item) => item.id === result.worktree_id) : undefined;
 		const text = formatAgentToolText(result, {
 			launched: options.launched,
 			resumed: options.resumed,
 			delivered: options.delivered,
-			...(result.worktree_id ? { worktree: { path: result.working_directory, branch: tree?.branch } } : {}),
+			backgroundedByUser: options.backgroundedByUser,
+			...(result.worktree_id ? { worktree: { path: result.working_directory, branch: tree?.branch, baseRef: tree?.baseRef } } : {}),
 		});
 		const task = options.launched || options.resumed || options.delivered || activeStatuses.has(result.status) ? undefined : (await this.callbacks.listTasks()).find((item) => item.id === result.task_id);
 		const usage = task?.stats ? runToolUsage(task.stats) : undefined;
@@ -395,14 +467,30 @@ export class ModelDelegation {
 			: name === "general-purpose" || name === "Explore" || name === "Plan"
 				? { name, description: name, prompt: "", readOnly: name !== "general-purpose", scope: "builtin" as const }
 				: undefined;
-		if (definition) return definition;
+		if (definition) {
+			if (definition.definitionError) throw new Error(definition.definitionError);
+			return definition;
+		}
 		const available = (await this.callbacks.listAgentNames?.(project).catch(() => undefined)) ?? ["general-purpose", "Explore", "Plan"];
 		throw new Error(`Agent type '${name.slice(0, 100)}' not found. Available agents: ${available.slice(0, 64).join(", ")}`);
 	}
 
-	private async assertParent(owner: string): Promise<void> {
+	private async assertRootForWorktree(owner: string): Promise<void> {
 		if ((await this.callbacks.listTasks()).some((task) => task.conversationId === owner && (task.parentConversationId || task.quarantined)))
 			throw new Error("Subagents cannot spawn nested agents or manage additional worktrees");
+	}
+
+	private async assertCanDelegate(owner: string): Promise<{ depth: number; nextDepth: number; readOnlyParent: boolean }> {
+		const conv = await this.callbacks.getConversation(owner);
+		if (conv.origin === "fork") throw new Error("Forked agents cannot fork or spawn agents");
+		const task = (await this.callbacks.listTasks()).find((item) => item.conversationId === owner);
+		if (task?.quarantined) throw new Error("This agent's record is damaged and cannot spawn nested agents");
+		const depth = task?.parentConversationId ? (task.delegationDepth ?? 1) : 0;
+		const maxDepth = (await this.callbacks.maxSubagentDepth?.()) ?? DEFAULT_MAX_SUBAGENT_DEPTH;
+		if (depth >= maxDepth) {
+			throw new Error(`Subagent nesting limit reached (depth ${depth}). Complete this task directly; subagents cannot delegate, and cannot spawn nested agents.`);
+		}
+		return { depth, nextDepth: depth + 1, readOnlyParent: Boolean(task?.readOnly) };
 	}
 	/**
 	 * A child of `owner` by exact agentId, else by call-level name (the newest child with that

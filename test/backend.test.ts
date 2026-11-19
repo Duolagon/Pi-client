@@ -244,7 +244,10 @@ test(
 			await settled;
 			await assert.rejects(access(join(fixture.project, "denied.txt")));
 			assert.equal((await service.snapshot()).pendingUI.length, 0);
-			await assert.rejects(service.respond({ type: "extension_ui_response", id: request.id, confirmed: true }), /失效/);
+			// A duplicate reply is ignored rather than applied: the renderer may answer from
+			// both the parent conversation and the sub-agent view.
+			await service.respond({ type: "extension_ui_response", id: request.id, confirmed: true });
+			await assert.rejects(access(join(fixture.project, "denied.txt")));
 		} finally {
 			await service.close();
 			await fixture.cleanup();

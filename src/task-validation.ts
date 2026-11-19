@@ -1,6 +1,7 @@
 import { isAbsolute, join } from "node:path";
 import {
 	AGENT_CALL_NAME_PATTERN,
+	MAX_AGENT_MCP_SERVERS,
 	MAX_AGENT_OUTPUT,
 	MAX_AGENT_TURNS,
 	MAX_DELEGATION_DEPTH,
@@ -26,6 +27,7 @@ export interface TaskValidationOptions {
 
 const idPattern = /^[a-zA-Z0-9._-]{1,200}$/;
 const agentNamePattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const mcpServerNamePattern = /^[A-Za-z0-9_.-]{1,64}$/;
 const thinkingLevels = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const activeStatuses = new Set(["queued", "running", "waiting_for_input"]);
 /** Upper bound of a stored task turn counter. */
@@ -76,6 +78,11 @@ function bool(value: unknown, field: string): boolean {
 function toolList(value: unknown, field: string): string[] {
 	if (!Array.isArray(value) || value.length > MAX_TOOL_LIST) fail(field);
 	for (const name of value) if (typeof name !== "string" || !TOOL_NAME_PATTERN.test(name)) fail(field);
+	return [...value] as string[];
+}
+function mcpServerList(value: unknown, field: string): string[] {
+	if (!Array.isArray(value) || value.length > MAX_AGENT_MCP_SERVERS) fail(field);
+	for (const name of value) if (typeof name !== "string" || !mcpServerNamePattern.test(name)) fail(field);
 	return [...value] as string[];
 }
 
@@ -173,6 +180,7 @@ export function validateTask(value: unknown, conversationIds: ReadonlySet<string
 			if (typeof input.name !== "string" || !AGENT_CALL_NAME_PATTERN.test(input.name)) fail("name");
 			task.name = input.name;
 		}
+		if (input.isFork !== undefined) task.isFork = bool(input.isFork, "isFork");
 		if (input.systemPromptFile !== undefined) {
 			// The file is passed to the child's command line; only the host's own path is accepted.
 			const file = absolute(input.systemPromptFile, "systemPromptFile");
@@ -181,11 +189,13 @@ export function validateTask(value: unknown, conversationIds: ReadonlySet<string
 		}
 	} else if (
 		input.parentToolCallId !== undefined || input.subagentType !== undefined || input.delegationDepth !== undefined ||
-		input.name !== undefined || input.systemPromptFile !== undefined
+		input.name !== undefined || input.isFork !== undefined || input.systemPromptFile !== undefined
 	) {
 		fail("parentConversationId");
 	}
 	if (input.readOnly !== undefined) task.readOnly = bool(input.readOnly, "readOnly");
+	if (input.omitClaudeMd !== undefined) task.omitClaudeMd = bool(input.omitClaudeMd, "omitClaudeMd");
+	if (input.mcpServers !== undefined) task.mcpServers = mcpServerList(input.mcpServers, "mcpServers");
 	if (input.runInBackground !== undefined) task.runInBackground = bool(input.runInBackground, "runInBackground");
 	if (input.allowedTools !== undefined) task.allowedTools = toolList(input.allowedTools, "allowedTools");
 	if (input.disallowedTools !== undefined) task.disallowedTools = toolList(input.disallowedTools, "disallowedTools");

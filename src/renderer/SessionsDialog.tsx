@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { Copy, GitFork, Import } from "lucide-react";
+import { Bot, Copy, GitFork, Import } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
-import type { CliSessionHistoryItem, SessionTreeResult, Snapshot } from "../shared.ts";
+import type { CliSessionHistoryItem, Conversation, SessionTreeResult, Snapshot } from "../shared.ts";
 
 type TreeNode = SessionTreeResult["tree"][number];
 
@@ -25,6 +25,9 @@ function nodeSummary(node: TreeNode): string {
 export function SessionsDialog({
 	conversationId,
 	project,
+	orphanedSubagents = [],
+	allSubagents = [],
+	onSelectConversation,
 	onSnapshot,
 	onEditorText,
 	close,
@@ -32,12 +35,17 @@ export function SessionsDialog({
 }: {
 	conversationId?: string;
 	project?: string;
+	/** Sub-agent conversations whose parent conversation was deleted. */
+	orphanedSubagents?: Conversation[];
+	/** All sub-agent conversations (for discovery outside the folded sidebar). */
+	allSubagents?: Conversation[];
+	onSelectConversation?: (id: string) => void;
 	onSnapshot: (snapshot: Snapshot) => void;
 	onEditorText?: (text: string) => void;
 	close: () => void;
 	fail: (error: unknown) => void;
 }) {
-	const [tab, setTab] = useState<"tree" | "cli">("tree");
+	const [tab, setTab] = useState<"tree" | "cli" | "subagents">("tree");
 	const [treeData, setTreeData] = useState<SessionTreeResult | null>(null);
 	const [cliSessions, setCliSessions] = useState<CliSessionHistoryItem[]>([]);
 	const [busy, setBusy] = useState(false);
@@ -162,6 +170,9 @@ export function SessionsDialog({
 				<button type="button" role="tab" aria-selected={tab === "cli"} onClick={() => setTab("cli")}>
 					Pi CLI 历史 ({cliSessions.length})
 				</button>
+				<button type="button" role="tab" aria-selected={tab === "subagents"} onClick={() => setTab("subagents")}>
+					<Bot size={13} /> 子 Agent ({allSubagents.length})
+				</button>
 			</div>
 
 			{tab === "tree" && (
@@ -197,6 +208,65 @@ export function SessionsDialog({
 							</div>
 						))}
 						{!cliSessions.length && <p className="subtle-note">未发现可导入的 Pi CLI 历史会话。</p>}
+					</div>
+				</div>
+			)}
+
+			{tab === "subagents" && (
+				<div className="cc-controls-body">
+					<div className="cc-list-scroll">
+						{orphanedSubagents.length > 0 && (
+							<div className="cc-subagent-group-label">孤儿子 Agent（父会话已删除）</div>
+						)}
+						{orphanedSubagents.map((item) => (
+							<div key={item.id} className="cc-tool-ctrl-row">
+								<div className="cc-tool-ctrl-info">
+									<div className="cc-tool-ctrl-name">
+										<strong>{item.title}</strong>
+										<span className="cc-source-tag">孤儿</span>
+									</div>
+									<p className="cc-tool-ctrl-desc">{item.project}</p>
+								</div>
+								{onSelectConversation && (
+									<button
+										type="button"
+										className="cc-mini-btn"
+										disabled={busy}
+										onClick={() => {
+											onSelectConversation(item.id);
+											close();
+										}}
+									>
+										打开
+									</button>
+								)}
+							</div>
+						))}
+						{allSubagents.filter((s) => !orphanedSubagents.some((o) => o.id === s.id)).map((item) => (
+							<div key={item.id} className="cc-tool-ctrl-row">
+								<div className="cc-tool-ctrl-info">
+									<div className="cc-tool-ctrl-name">
+										<strong>{item.title}</strong>
+										<span className="cc-source-tag muted">子 Agent</span>
+									</div>
+									<p className="cc-tool-ctrl-desc">{item.project}</p>
+								</div>
+								{onSelectConversation && (
+									<button
+										type="button"
+										className="cc-mini-btn"
+										disabled={busy}
+										onClick={() => {
+											onSelectConversation(item.id);
+											close();
+										}}
+									>
+										打开
+									</button>
+								)}
+							</div>
+						))}
+						{!allSubagents.length && <p className="subtle-note">暂无子 Agent 会话。</p>}
 					</div>
 				</div>
 			)}

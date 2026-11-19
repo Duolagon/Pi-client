@@ -105,6 +105,8 @@ export function LiveComposer({
 	onBuiltinSlash,
 	onCompactInstructions,
 	onBtw,
+	onFocusSubagentPanel,
+	inputRef,
 	fail,
 }: {
 	snapshot: Snapshot;
@@ -122,6 +124,9 @@ export function LiveComposer({
 	onBuiltinSlash: (action: BuiltinSlashAction) => void;
 	onCompactInstructions?: (instructions: string) => void;
 	onBtw?: (question: string) => void;
+	/** Focus the sub-agent panel above the composer when ArrowUp is pressed on an empty input. */
+	onFocusSubagentPanel?: () => boolean;
+	inputRef?: React.MutableRefObject<HTMLTextAreaElement | null>;
 	fail: (error: unknown) => void;
 }) {
 	const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -477,7 +482,10 @@ export function LiveComposer({
 					</div>
 				)}
 				<textarea
-					ref={textarea}
+					ref={(el) => {
+						textarea.current = el;
+						if (inputRef) inputRef.current = el;
+					}}
 					aria-label="输入任务"
 					value={draft}
 					style={{ minHeight: "62px", maxHeight: "200px" }}
@@ -556,6 +564,10 @@ export function LiveComposer({
 						if (event.key === "Escape" && running) {
 							event.preventDefault();
 							stop();
+							return;
+						}
+						if (event.key === "ArrowUp" && draft === "" && historyCursor.current === -1 && onFocusSubagentPanel?.()) {
+							event.preventDefault();
 							return;
 						}
 						if (event.key === "ArrowUp" && !draft.includes("\n") && promptHistory.current.length > 0) {

@@ -12,6 +12,7 @@ import {
 } from "../src/permission-policy.ts";
 import type { PermissionRule, RuntimePermissionPolicy } from "../src/permission-types.ts";
 import permissions from "../src/permission-extension.ts";
+import { formatClaudePermissionSpec, parseClaudePermissionRules } from "../src/claude-settings-sync.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 async function fixture() {
@@ -280,6 +281,41 @@ test("TodoWrite and WebFetch follow policy modes and SSRF host guards", async ()
 		else process.env.PI_DESKTOP_CONNECTION_TEST = previousTest;
 		if (previousChild === undefined) delete process.env.PI_DESKTOP_CHILD;
 		else process.env.PI_DESKTOP_CHILD = previousChild;
+		await f.cleanup();
+	}
+});
+
+test("Agent(<type>) rules and allowedMcpServers restrictions are validated, synced and enforced", async () => {
+	const f = await fixture();
+	try {
+		const inlineDeny = validatePermissionRule(f.rule({ id: "deny-fork", action: "deny", tool: "Agent(fork)" }));
+		assert.equal(inlineDeny.tool, "Agent(fork)");
+		assert.throws(() => validatePermissionRule(f.rule({ tool: "Agent()" })));
+		assert.throws(() => validatePermissionRule(f.rule({ tool: "Agent(bad/type)" })));
+		assert.throws(() => validatePermissionRule(f.rule({ tool: "Agent(fork)", agentType: "fork" })));
+
+		assert.equal((await evaluatePermission(f.policy({ mode: "auto", rules: [inlineDeny] }), { toolName: "Agent", input: { description: "f", prompt: "p", fork: true } })).action, "deny");
+		assert.equal((await evaluatePermission(f.policy({ mode: "auto", rules: [inlineDeny] }), { toolName: "Agent", input: { description: "f", prompt: "p", subagent_type: "fork" } })).action, "deny");
+		assert.equal((await evaluatePermission(f.policy({ mode: "auto", rules: [inlineDeny] }), { toolName: "Agent", input: { description: "f", prompt: "p", subagent_type: "Explore", fork: true } })).action, "deny");
+		assert.equal((await evaluatePermission(f.policy({ mode: "auto", rules: [inlineDeny] }), { toolName: "Agent", input: { description: "g", prompt: "p" } })).action, "allow");
+
+		const parsedFork = parseClaudePermissionRules("Agent(fork)", "deny", f.project);
+		assert.equal(parsedFork.length, 1);
+		assert.equal(parsedFork[0].tool, "Agent");
+		assert.equal(parsedFork[0].agentType, "fork");
+		assert.equal(formatClaudePermissionSpec(parsedFork[0]), "Agent(fork)");
+		assert.equal(formatClaudePermissionSpec(inlineDeny), "Agent(fork)");
+
+		const parsedTask = parseClaudePermissionRules("Task(Explore)", "allow", f.project);
+		assert.equal(parsedTask[0].tool, "Agent");
+		assert.equal(parsedTask[0].agentType, "Explore");
+		assert.equal((await evaluatePermission(f.policy({ mode: "ask", rules: parsedTask }), { toolName: "Agent", input: { description: "e", prompt: "p", subagent_type: "Explore" } })).action, "allow");
+
+		const mcpPolicy = validateRuntimePolicy(f.policy({ mode: "auto", allowedMcpServers: ["github"] }));
+		assert.equal((await evaluatePermission(mcpPolicy, { toolName: "mcp__github__list_issues", input: {} })).action, "allow");
+		assert.equal((await evaluatePermission(mcpPolicy, { toolName: "mcp__slack__post_message", input: {} })).action, "deny");
+		assert.throws(() => validateRuntimePolicy({ ...f.policy(), allowedMcpServers: ["bad server"] }));
+	} finally {
 		await f.cleanup();
 	}
 });

@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const exec = promisify(execFile);
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { AgentRegistry } from "../src/agent-definitions.ts";
 import { DesktopService } from "../src/backend.ts";
@@ -694,6 +698,287 @@ test("maxTurns stops a real Pi child after exactly N model requests with a compl
 		assert.equal(calls.length, 2, `expected exactly 2 model requests, saw: ${calls.join(", ")}`);
 		assert.equal((await readFile(stopMarker, "utf8")).trim().split("\n").length, 1, "SubagentStop runs once and cannot continue the run");
 		assert.equal((await service.listTasks()).find((item) => item.id === result.task_id)?.status, "completed");
+	} finally {
+		await service.close();
+		await fixture.cleanup();
+	}
+});
+
+test("P6: fork tool parity, SubagentStart additionalContext, SubagentStop transcript, omitClaudeMd, disable-model-invocation & hot reload", { timeout: 60000 }, async () => {
+	const fixture = await createCoreFixture();
+	const toolsProbeFile = join(fixture.root, "fork-tools.json");
+	const subagentStartMarker = join(fixture.root, "p6-start.json");
+	const subagentStopMarker = join(fixture.root, "p6-stop.json");
+	const startScript = join(fixture.root, "p6-start-hook.mjs");
+	const stopScript = join(fixture.root, "p6-stop-hook.mjs");
+
+	// Augment this test's isolated faux-provider with P6_FORK_PROBE (records declared tools and attempts nested Agent call)
+	// and P6_CTX_PROBE (inspects system prompt for CLAUDE.md and SubagentStart additionalContext).
+	const fauxProviderFile = join(fixture.agentDir, "extensions", "faux-provider.js");
+	const originalFaux = await readFile(fauxProviderFile, "utf8");
+	const patchedFaux = originalFaux
+		.replace('import { appendFileSync } from "node:fs";', 'import { appendFileSync, writeFileSync } from "node:fs";')
+		.replace(
+			"\t\t\t} else {\n\t\t\t\tresponse = fauxAssistantMessage(`STREAM_COMPLETE ${model.id}: ${text}`);",
+			`\t\t\t} else if (text.includes("P6_FORK_PROBE")) {
+				if (results.length === 0) {
+					if (process.env.PI_P6_TOOLS_FILE) {
+						const declaredSet = new Set();
+						for (const m of context.messages) {
+							if (m.role === "system") {
+								for (const t of m.toolsAdded ?? []) declaredSet.add(t.name ?? t);
+								for (const t of m.toolsRemoved ?? []) declaredSet.delete(t.name ?? t);
+							}
+						}
+						for (const t of context.tools ?? []) declaredSet.add(t.name);
+						writeFileSync(process.env.PI_P6_TOOLS_FILE, JSON.stringify([...declaredSet].sort()));
+					}
+					response = fauxAssistantMessage(fauxToolCall("Agent", { description: "nested attempt", prompt: "hi", subagent_type: "Explore" }), { stopReason: "toolUse" });
+				} else {
+					const errText = JSON.stringify(results[0].content);
+					response = fauxAssistantMessage("FORK_NESTED=" + (results[0].isError ? "blocked" : "allowed") + ":" + errText);
+				}
+			} else if (text.includes("P6_CTX_PROBE")) {
+				const sys = context.messages
+					.filter((message) => message.role === "system")
+					.map((message) => [typeof message.content === "string" ? message.content : message.content.map((block) => block.text ?? "").join("\\n"), ...Object.values(message.sections ?? {})].join("\\n"))
+					.join("\\n");
+				response = fauxAssistantMessage("CTX_CLAUDE=" + sys.includes("SECRET_CLAUDE_MD_LINE") + " CTX_HOOK=" + sys.includes("SUBAGENT_START_CTX_LINE"));
+			} else {
+				response = fauxAssistantMessage(\`STREAM_COMPLETE \${model.id}: \${text}\`);`,
+		);
+	assert.notEqual(patchedFaux, originalFaux, "test fixture faux-provider patch must apply");
+	await writeFile(fauxProviderFile, patchedFaux);
+
+	await writeFile(join(fixture.project, "CLAUDE.md"), "# Project Rules\nSECRET_CLAUDE_MD_LINE\n");
+	await writeFile(
+		startScript,
+		[
+			`import { readFileSync, writeFileSync } from "node:fs";`,
+			`const input = JSON.parse(readFileSync(0, "utf8"));`,
+			`writeFileSync(${JSON.stringify(subagentStartMarker)}, JSON.stringify(input));`,
+			`console.log(JSON.stringify({ hookSpecificOutput: { additionalContext: "SUBAGENT_START_CTX_LINE" } }));`,
+		].join("\n"),
+	);
+	await writeFile(
+		stopScript,
+		[
+			`import { readFileSync, writeFileSync } from "node:fs";`,
+			`const input = JSON.parse(readFileSync(0, "utf8"));`,
+			`writeFileSync(${JSON.stringify(subagentStopMarker)}, JSON.stringify(input));`,
+			`console.log("{}");`,
+		].join("\n"),
+	);
+
+	// Make fixture.project a git repo so worktree isolation and baseRef apply to subagent_type: "fork".
+	await exec("git", ["-c", "init.defaultBranch=main", "init"], { cwd: fixture.project });
+	await exec("git", ["add", "-A"], { cwd: fixture.project });
+	await exec("git", ["-c", "user.name=Test", "-c", "user.email=test@invalid", "-c", "commit.gpgSign=false", "commit", "-m", "init"], { cwd: fixture.project });
+
+	await mkdir(join(fixture.project, ".claude", "agents"), { recursive: true });
+	await mkdir(join(fixture.project, ".claude", "skills", "blocked-skill"), { recursive: true });
+	await writeFile(
+		join(fixture.project, ".claude", "skills", "blocked-skill", "SKILL.md"),
+		"---\nname: blocked-skill\ndescription: blocked\ndisable-model-invocation: true\n---\n\nNever preload.\n",
+	);
+	await writeFile(
+		join(fixture.project, ".claude", "agents", "no-claude-md.md"),
+		[
+			"---",
+			"name: no-claude-md",
+			'description: "Omits CLAUDE.md"',
+			"tools: [Read]",
+			"omitClaudeMd: true",
+			"isolation: shared",
+			"---",
+			"",
+			"Custom instructions only.",
+			"",
+		].join("\n"),
+	);
+	await writeFile(
+		join(fixture.project, ".claude", "agents", "blocked-skill-agent.md"),
+		"---\nname: blocked-skill-agent\ndescription: bad\ntools: [Read]\nskills: [blocked-skill]\n---\n\nPrompt.\n",
+	);
+	await writeFile(
+		join(fixture.project, ".claude", "agents", "conflict-agent.md"),
+		"---\nname: conflict-agent\ndescription: bad\ntools: [Read]\nmemory: project\n---\n\nPrompt.\n",
+	);
+
+	const service = new DesktopService({
+		dataDir: fixture.dataDir,
+		executable: process.execPath,
+		entry: fixture.entry,
+		permissionExtension: extensionPath,
+		toolControlExtension: toolControlPath,
+		navigationExtension: navigationPath,
+		historyEntry: historyPath,
+		env: { ...fixture.env, HOME: fixture.root, PI_P6_TOOLS_FILE: toolsProbeFile },
+		initialProject: fixture.project,
+	});
+	try {
+		await new HooksService({ agentDir: () => fixture.agentDir }).save({
+			event: "SubagentStart",
+			command: `node ${JSON.stringify(startScript)}`,
+			scope: "project",
+			project: fixture.project,
+		});
+		await new HooksService({ agentDir: () => fixture.agentDir }).save({
+			event: "SubagentStop",
+			command: `node ${JSON.stringify(stopScript)}`,
+			scope: "project",
+			project: fixture.project,
+		});
+
+		const snap = await service.initialize();
+		assert.equal(snap.engineStatus, "ready");
+		await service.setProjectTrust({ project: fixture.project, decision: "trusted" });
+
+		// Seed parent conversation with a turn so fork has history to snapshot.
+		await service.command({ type: "prompt", message: "PARENT_HISTORY_SEED" });
+		await new Promise<void>((resolveReady) => {
+			const unsub = service.subscribe((ev) => {
+				if (ev.event.type === "agent_settled") {
+					unsub();
+					resolveReady();
+				}
+			});
+		});
+
+		const parentTools = (await service.listTools(snap.active!.id)).filter((t) => t.modelVisible).map((t) => t.name).sort();
+		assert.ok(parentTools.includes("Agent"), "parent has Agent declared");
+		assert.ok(parentTools.includes("SendMessage"), "parent has SendMessage declared");
+
+		const delegation = (service as unknown as {
+			delegation: {
+				handle: (ctx: { conversationId: string; toolCallId: string }, tool: string, input: unknown) => Promise<{
+					text: string;
+					details: { task_id: string; conversation_id: string; status: string; output: string; worktree_id?: string };
+				}>;
+			};
+		}).delegation;
+
+		// 1. Native `subagent_type: "fork"` forces background in git repo, reports worktreeBase, preserves Agent/SendMessage tool declarations,
+		// blocks nested Agent execution with "Forked agents cannot fork or spawn agents", delivers agent_id to SubagentStart,
+		// writes <session>.meta.json, and sends real .jsonl transcript path to SubagentStop.
+		const parentSettledAfterFork = new Promise<void>((resolveSettled) => {
+			const unsub = service.subscribe((ev) => {
+				if (ev.conversationId === snap.active!.id && ev.event.type === "agent_settled") {
+					unsub();
+					resolveSettled();
+				}
+			});
+		});
+		const forkLaunch = await delegation.handle(
+			{ conversationId: snap.active!.id, toolCallId: "p6-fork-call" },
+			"Agent",
+			{ description: "Native fork parity test", prompt: "P6_FORK_PROBE", subagent_type: "fork", run_in_background: false },
+		);
+		assert.match(forkLaunch.text, /Async agent launched successfully/);
+		assert.match(forkLaunch.text, /worktreeBase: HEAD/);
+
+		const waitTask = async (id: string) => {
+			for (let i = 0; i < 100; i++) {
+				const found = (await service.listTasks()).find((t) => t.id === id);
+				if (found && !["queued", "running", "waiting_for_input"].includes(found.status)) return found;
+				await new Promise((r) => setTimeout(r, 100));
+			}
+			throw new Error(`Task ${id} did not finish in time`);
+		};
+		const forkTask = await waitTask(forkLaunch.details.task_id);
+		assert.equal(forkTask.status, "completed");
+		assert.match(forkTask.result?.text ?? "", /FORK_NESTED=blocked:.*Forked agents cannot fork or spawn agents/);
+
+		const childTools = JSON.parse(await readFile(toolsProbeFile, "utf8")) as string[];
+		assert.ok(childTools.includes("Agent"), `fork child keeps Agent declaration, saw: ${childTools.join(",")}`);
+		assert.ok(childTools.includes("SendMessage"), `fork child keeps SendMessage declaration, saw: ${childTools.join(",")}`);
+		assert.deepEqual(childTools, parentTools, "fork child tool declarations match parent tool declarations");
+
+		const startPayload = JSON.parse(await readFile(subagentStartMarker, "utf8")) as { agent_id?: string };
+		assert.equal(startPayload.agent_id, forkTask.id, "SubagentStart receives preallocated task.id as agent_id");
+
+		// Wait briefly for SubagentStop hook
+		let stopPayload: { agent_id?: string; agent_transcript_path?: string } = {};
+		for (let i = 0; i < 50; i++) {
+			try {
+				stopPayload = JSON.parse(await readFile(subagentStopMarker, "utf8")) as typeof stopPayload;
+				break;
+			} catch {
+				await new Promise((r) => setTimeout(r, 100));
+			}
+		}
+		assert.equal(stopPayload.agent_id, forkTask.id);
+		assert.ok(stopPayload.agent_transcript_path?.endsWith(".jsonl"), `SubagentStop receives .jsonl path, got: ${stopPayload.agent_transcript_path}`);
+		await stat(stopPayload.agent_transcript_path!);
+		const metaJson = JSON.parse(await readFile(stopPayload.agent_transcript_path!.replace(/\.jsonl$/, ".meta.json"), "utf8")) as {
+			agentId: string;
+			type: string;
+			parent: string;
+			description: string;
+			depth: number;
+			worktree?: { id: string; branch?: string; baseRef?: string };
+		};
+		assert.equal(metaJson.agentId, forkTask.id);
+		assert.equal(metaJson.parent, snap.active!.id);
+		assert.equal(metaJson.description, "Native fork parity test");
+		assert.equal(metaJson.depth, 1);
+		assert.equal(metaJson.worktree?.baseRef, "HEAD");
+
+		// 2. Agent(fork) deny rule blocks fork; forkSubagent: false blocks fork.
+		await service.upsertPermission({ id: "deny-fork-test", scope: "project", project: fixture.project, action: "deny", tool: "Agent(fork)" });
+		assert.equal((await service.checkPermission({ conversationId: snap.active!.id, toolName: "Agent", input: { description: "f", prompt: "p", subagent_type: "fork" } })).action, "deny");
+		await service.removePermission("deny-fork-test");
+
+		// Background completion delivers a notification turn into the parent; wait for that turn to settle before saveSettings.
+		await parentSettledAfterFork;
+		for (let i = 0; i < 60; i++) {
+			const s = await service.snapshot();
+			if (!s.busy) break;
+			await new Promise((r) => setTimeout(r, 50));
+		}
+
+		await service.saveSettings({ permission: "ask", theme: "light", forkSubagent: false });
+		await assert.rejects(
+			() => delegation.handle({ conversationId: snap.active!.id, toolCallId: "p6-fork-off" }, "Agent", { description: "disabled", prompt: "hi", subagent_type: "fork" }),
+			/forkSubagent|disabled/,
+		);
+		await service.saveSettings({ permission: "ask", theme: "light", forkSubagent: true });
+
+		// 3. omitClaudeMd hides CLAUDE.md while SubagentStart additionalContext still injects into child system prompt.
+		const noMd = await delegation.handle(
+			{ conversationId: snap.active!.id, toolCallId: "p6-no-claudemd" },
+			"Agent",
+			{ description: "Omit CLAUDE.md check", prompt: "P6_CTX_PROBE", subagent_type: "no-claude-md", run_in_background: false },
+		);
+		assert.match(noMd.details.output, /CTX_CLAUDE=false CTX_HOOK=true/, `expected CLAUDE.md omitted and hook context injected, got: ${noMd.details.output}`);
+
+		// 4. disable-model-invocation skill and readOnly+memory definitionError fail delegation loudly.
+		await assert.rejects(
+			() => delegation.handle({ conversationId: snap.active!.id, toolCallId: "p6-blocked-skill" }, "Agent", { description: "bad", prompt: "hi", subagent_type: "blocked-skill-agent" }),
+			/disable-model-invocation/,
+		);
+		await assert.rejects(
+			() => delegation.handle({ conversationId: snap.active!.id, toolCallId: "p6-conflict" }, "Agent", { description: "bad", prompt: "hi", subagent_type: "conflict-agent" }),
+			/只读.*memory|memory.*只读/,
+		);
+
+		// 5. Hot reload emits "agents_changed" within 2.5s of modifying an agent file.
+		let reloaded = false;
+		const unsubControls = service.subscribeControls((ev) => {
+			if (ev.type === "agents_changed") reloaded = true;
+		});
+		try {
+			await new Promise((r) => setTimeout(r, 100));
+			await writeFile(
+				join(fixture.project, ".claude", "agents", "hot-reloaded.md"),
+				"---\nname: hot-reloaded\ndescription: Hot\n---\n\nHot prompt.\n",
+			);
+			const deadline = Date.now() + 2500;
+			while (!reloaded && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+			assert.ok(reloaded, "editing an agent file should emit agents_changed within 2.5s");
+		} finally {
+			unsubControls();
+		}
 	} finally {
 		await service.close();
 		await fixture.cleanup();

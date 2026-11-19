@@ -314,9 +314,10 @@ test("a waiting reader wakes on the task update itself, without a polling timer"
 	assert.equal(result.output, "woken");
 });
 
-test("a foreground child that outlives the wait is handed to background delivery", async (t) => {
+test("a foreground child that outlives a configured wait limit is handed to background delivery", async (t) => {
 	const data = fixture();
 	t.after(() => data.service.dispose());
+	data.callbacks.foregroundTimeoutMs = () => 300_000;
 	// Every bounded wait times out immediately, as if 300 seconds had passed.
 	const now = Date.now;
 	let offset = 0;
@@ -728,4 +729,107 @@ test("SendMessage host validation matches the schema limits", () => {
 	assert.throws(() => validateDesktopToolInput("SendMessage", { to: "worker", message: "hi", task_id: "x" }), /Unknown tool input field/);
 	assert.throws(() => validateDesktopToolInput("SendMessage", { to: "worker", message: "hi", summary: "x".repeat(201) }), /Invalid summary/);
 	assert.throws(() => validateDesktopToolInput("SendMessage", { to: "worker", message: "hi", run_in_background: "yes" }), /Invalid run_in_background/);
+});
+
+test("detaching a foreground child returns immediately, streams progress, and notifies once on completion", async (t) => {
+	const data = fixture();
+	t.after(() => data.service.dispose());
+	const progressListeners = new Map<string, Set<(progress: import("../src/task-types.ts").TaskProgress) => void>>();
+	const userBackgrounded = new Set<string>();
+	const flushed: string[] = [];
+	const waiters = new Map<string, Array<() => void>>();
+	data.callbacks.waitForTask = async (id, predicate, signal) => {
+		for (;;) {
+			const task = data.tasks.find((item) => item.id === id);
+			if (!task || predicate(task)) return task;
+			if (signal?.aborted) return task;
+			await new Promise<void>((resolve) => {
+				const list = waiters.get(id) ?? [];
+				list.push(resolve);
+				waiters.set(id, list);
+				signal?.addEventListener("abort", () => resolve(), { once: true });
+			});
+		}
+	};
+	const notifyWaiter = (id: string) => {
+		for (const fn of waiters.get(id) ?? []) fn();
+		waiters.delete(id);
+	};
+	data.callbacks.detachTask = (id) => {
+		const task = data.tasks.find((item) => item.id === id);
+		if (!task || task.runInBackground) return;
+		task.runInBackground = true;
+		userBackgrounded.add(id);
+		data.detached.push(id);
+		notifyWaiter(id);
+	};
+	data.callbacks.isUserBackgrounded = (id) => userBackgrounded.has(id);
+	data.callbacks.subscribeTaskProgress = (id, listener) => {
+		const set = progressListeners.get(id) ?? new Set();
+		set.add(listener);
+		progressListeners.set(id, set);
+		return () => { set.delete(listener); };
+	};
+	data.callbacks.flushNotifications = (owner) => { flushed.push(owner); };
+
+	const seenProgress: import("../src/task-types.ts").TaskProgress[] = [];
+	const pending = data.service.handle(
+		{ ...context, onProgress: (p) => seenProgress.push(p) },
+		"Agent",
+		{ ...background, subagent_type: "Explore", run_in_background: false },
+	) as Promise<ModelToolResult<DelegatedTaskResult>>;
+	await delay(20);
+	const child = data.tasks[0];
+	assert.equal(child.runInBackground, false);
+	for (const listener of progressListeners.get(child.id) ?? []) {
+		listener({
+			taskId: child.id,
+			status: "running",
+			turn: 1,
+			toolUses: 2,
+			lastToolName: "read",
+			tokens: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, total: 150 },
+			cost: 0.001,
+			startedAt: Date.now() - 1000,
+			durationMs: 1000,
+			recentActivities: [{ toolName: "read", summary: "seed.txt", startedAt: Date.now() }],
+		});
+	}
+	await data.service.detach(child.id);
+	const detachedResult = await pending;
+	assert.equal(seenProgress.length, 1);
+	assert.equal(seenProgress[0].toolUses, 2);
+	assert.equal(progressListeners.get(child.id)?.size ?? 0, 0, "progress listener is cleaned up after detach");
+	assert.match(detachedResult.text, /moved to the background by the user/);
+	assert.equal(flushed.length, 0);
+
+	// Once the detached child finishes, observeTask triggers background delivery once.
+	child.status = "completed";
+	child.result = { text: "final answer", truncated: false };
+	data.service.observeTask(child);
+	assert.deepEqual(flushed, ["parent"]);
+});
+
+test("foreground Agent call keeps waiting while a worktree child waits for approval and returns final output once approved", async (t) => {
+	const data = fixture();
+	t.after(() => data.service.dispose());
+	let settled = false;
+	const pending = agent(
+		data.service.handle(context, "Agent", { ...background, subagent_type: "general-purpose", isolation: "worktree", run_in_background: false }),
+	).then((res) => {
+		settled = true;
+		return res;
+	});
+	await delay(20);
+	data.tasks[0].status = "waiting_for_input";
+	data.setPending([{ id: "req-1" }]);
+	await delay(40);
+	assert.equal(settled, false, "foreground delegation must keep waiting during approval");
+	assert.deepEqual(data.detached, []);
+	data.setPending([]);
+	data.tasks[0].status = "completed";
+	data.tasks[0].result = { text: "approved and completed", truncated: false };
+	const result = await pending;
+	assert.equal(result.status, "completed");
+	assert.equal(result.output, "approved and completed");
 });

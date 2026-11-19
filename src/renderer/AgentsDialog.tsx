@@ -62,6 +62,9 @@ export function AgentsDialog({
 	const [permissionMode, setPermissionMode] = useState<AgentPermissionMode | "">("");
 	const [maxTurnsText, setMaxTurnsText] = useState("");
 	const [skillsText, setSkillsText] = useState("");
+	const [mcpServersText, setMcpServersText] = useState("");
+	const [colorText, setColorText] = useState("");
+	const [omitClaudeMd, setOmitClaudeMd] = useState(false);
 	const [memory, setMemory] = useState<AgentMemoryScope | "">("");
 	const [isolation, setIsolation] = useState<"" | "worktree" | "shared">("");
 	const [background, setBackground] = useState(false);
@@ -104,6 +107,9 @@ export function AgentsDialog({
 		setPermissionMode(agent.permissionMode ?? "");
 		setMaxTurnsText(agent.maxTurns ? String(agent.maxTurns) : "");
 		setSkillsText((agent.skills ?? []).join(", "));
+		setMcpServersText((agent.mcpServers ?? []).join(", "));
+		setColorText(agent.color ?? "");
+		setOmitClaudeMd(Boolean(agent.omitClaudeMd));
 		setMemory(agent.memory ?? "");
 		setIsolation(agent.isolation ?? "");
 		setBackground(Boolean(agent.background));
@@ -144,6 +150,7 @@ export function AgentsDialog({
 		const tools = splitList(toolsText);
 		const disallowedTools = splitList(disallowedToolsText);
 		const skills = splitList(skillsText);
+		const mcpServers = splitList(mcpServersText);
 		setBusy(true);
 		setError("");
 		try {
@@ -156,6 +163,9 @@ export function AgentsDialog({
 				permissionMode: permissionMode || undefined,
 				maxTurns: maxTurnsParsed,
 				...(skills.length ? { skills } : {}),
+				...(mcpServers.length ? { mcpServers } : {}),
+				...(colorText.trim() ? { color: colorText.trim() } : {}),
+				...(omitClaudeMd ? { omitClaudeMd: true } : {}),
 				memory: memory || undefined,
 				isolation: isolation || undefined,
 				...(background ? { background: true } : {}),
@@ -213,6 +223,9 @@ export function AgentsDialog({
 								setPermissionMode("");
 								setMaxTurnsText("");
 								setSkillsText("");
+								setMcpServersText("");
+								setColorText("");
+								setOmitClaudeMd(false);
 								setMemory("");
 								setIsolation("");
 								setBackground(false);
@@ -230,7 +243,7 @@ export function AgentsDialog({
 							className={`cc-agent-item ${selected?.name === agent.name ? "active" : ""}`}
 							onClick={() => select(agent)}
 						>
-							<Bot size={14} />
+							<Bot size={14} style={agent.color ? { color: agent.color } : undefined} />
 							<span className="cc-agent-item-main">
 								<strong>{agent.name}</strong>
 								<small>{agent.description}</small>
@@ -389,12 +402,39 @@ export function AgentsDialog({
 										</select>
 									</label>
 								</div>
+								<div className="cc-agent-row">
+									<label className="field-label">
+										MCP 服务器名称 mcpServers（逗号分隔）
+										<input
+											value={mcpServersText}
+											disabled={busy}
+											placeholder="github, postgres"
+											onChange={(event) => setMcpServersText(event.target.value)}
+										/>
+									</label>
+									<label className="field-label">
+										主题色 color（名称或 #RRGGBB）
+										<input
+											value={colorText}
+											disabled={busy}
+											placeholder="blue 或 #3b82f6"
+											onChange={(event) => setColorText(event.target.value)}
+										/>
+									</label>
+								</div>
 								<label className="live-setting-toggle">
 									<input type="checkbox" checked={background} disabled={busy} onChange={(event) => setBackground(event.target.checked)} />
 									默认后台运行（background: true）
 								</label>
+								<label className="live-setting-toggle">
+									<input type="checkbox" checked={omitClaudeMd} disabled={busy} onChange={(event) => setOmitClaudeMd(event.target.checked)} />
+									不注入 CLAUDE.md / AGENTS.md 上下文（omitClaudeMd）
+								</label>
 							</div>
 						</details>
+					)}
+					{selected?.definitionError && (
+						<p className="cc-agent-error" role="alert">配置冲突：{selected.definitionError}</p>
 					)}
 					{selected?.hooks && selected.hooks.length > 0 && (
 						<p className="cc-agent-note">此 Agent 定义包含 {selected.hooks.length} 个作用域专属 Hook（随此 Agent 生命周期触发）。</p>

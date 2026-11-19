@@ -10,8 +10,9 @@ import {
 } from "./tool-control-types.ts";
 import { MAX_AGENT_PROMPT, MAX_NOTIFICATION, MAX_SEND_MESSAGE, MAX_SEND_SUMMARY, MAX_SEND_TARGET } from "./delegation-limits.ts";
 import { formatAgentListing, parseAgentListing } from "./agent-listing.ts";
-import { TASK_NOTIFICATION_TYPE } from "./delegation-format.ts";
-import { postLoopbackJson } from "./loopback-request.ts";
+import { TASK_NOTIFICATION_TYPE, formatTaskProgressSummary } from "./delegation-format.ts";
+import { postLoopbackJson, postLoopbackNdjson } from "./loopback-request.ts";
+import type { TaskProgress } from "./task-types.ts";
 
 const NOTIFICATION_ACK = "desktop_notification_ack";
 const NOTIFICATION_WAKE = "desktop_task_notification_wake";
@@ -19,6 +20,7 @@ const NOTIFICATION_WAKE = "desktop_task_notification_wake";
 export const AGENT_LISTING_SECTION = "agent_types";
 const nativeTools = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"]);
 const safeChildTools = new Set(["read", "grep", "find", "ls", "AgentExecutors", "TaskOutput", "TaskStop", "TaskList", "WorktreeList"]);
+const worktreeMutationTools = new Set(["WorktreeCreate", "WorktreeMerge", "WorktreeRemove"]);
 /**
  * Calls that never change the parent's working directory. Other Agent calls are checked by
  * the host itself (a second shared writer finds the directory busy; external agents and
@@ -107,7 +109,13 @@ export default function toolControl(pi: ExtensionAPI): void {
 	const toolsFile = process.env.PI_DESKTOP_TOOLS_FILE;
 	const baselineFile = process.env.PI_DESKTOP_TOOLS_BASELINE_FILE;
 	const readOnlyChild = process.env.PI_DESKTOP_READ_ONLY_CHILD === "1";
-	const child = process.env.PI_DESKTOP_CHILD === "1" || readOnlyChild;
+	const forkChild = process.env.PI_DESKTOP_FORK_CHILD === "1";
+	const rawDepth = Number(process.env.PI_DESKTOP_DELEGATION_DEPTH ?? (process.env.PI_DESKTOP_CHILD === "1" || readOnlyChild || forkChild ? "1" : "0"));
+	const rawMaxDepth = Number(process.env.PI_DESKTOP_MAX_DEPTH ?? "1");
+	const delegationDepth = Number.isFinite(rawDepth) && rawDepth >= 0 ? Math.floor(rawDepth) : 1;
+	const maxDepth = Number.isFinite(rawMaxDepth) && rawMaxDepth >= 1 ? Math.floor(rawMaxDepth) : 1;
+	const child = process.env.PI_DESKTOP_CHILD === "1" || readOnlyChild || forkChild || delegationDepth > 0;
+	const canDelegate = !forkChild && delegationDepth < maxDepth;
 	const host = hostConfig();
 	if (!directory && !token && !command && !toolsFile && !host) return;
 	if (!directory || !isAbsolute(directory) || !token || !/^[a-f0-9]{64}$/.test(token) ||
@@ -122,7 +130,7 @@ export default function toolControl(pi: ExtensionAPI): void {
 		const writers = batches.get(toolCallId);
 		return writers === undefined ? undefined : { writers };
 	};
-	if (host && !child) {
+	if (host && canDelegate) {
 		pi.on("message_end", (event) => {
 			const message = event?.message as { role?: string; content?: unknown } | undefined;
 			if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
@@ -140,23 +148,43 @@ export default function toolControl(pi: ExtensionAPI): void {
 			pi.registerTool({
 				name, label: name, description: descriptions[name], promptSnippet: descriptions[name].split(". ")[0],
 				promptGuidelines: name === "Agent" ? ["Delegate independent focused research or implementation when it can progress separately; collect the child's result and review worktree changes before merging."] : undefined,
-				parameters: toolSchemas[name], exposure: "model-only", defaultActive: !delegating(name) || !child,
+				parameters: toolSchemas[name], exposure: "model-only", defaultActive: forkChild || (delegating(name) ? canDelegate : !(child && worktreeMutationTools.has(name))),
 				executionMode: [...delegatingToolNames, "TaskOutput"].includes(name) ? "parallel" : "sequential",
 				// AgentSend stays callable for older prompts, but SendMessage is the declared tool.
 				...(name === "AgentSend" ? { prepareLoadout: () => ({ hiddenDeclarations: ["AgentSend"] }) } : {}),
 				prepareArguments: (input) => validateDesktopToolInput(name, input),
 				async execute(toolCallId, input, signal, onUpdate) {
 					const params = validateDesktopToolInput(name, input);
-					if (child && delegating(name)) throw new Error("Subagents cannot delegate further tasks");
-					if (readOnlyChild && !safeChildTools.has(name)) throw new Error("This subagent is read-only");
+					if (forkChild && delegating(name)) throw new Error("Forked agents cannot fork or spawn agents");
+					if (!canDelegate && delegating(name)) throw new Error(`Subagent nesting limit reached (depth ${delegationDepth}). Complete this task directly; subagents cannot delegate, and cannot spawn nested agents.`);
+					if (child && worktreeMutationTools.has(name)) throw new Error("Subagents cannot spawn nested agents or manage additional worktrees");
+					if (readOnlyChild && !safeChildTools.has(name) && !(canDelegate && delegating(name))) throw new Error("This subagent is read-only");
 					signal?.throwIfAborted();
 					onUpdate?.({ content: [{ type: "text", text: name === "Agent" ? "Delegating task…" : `Running ${name}…` }], details: { tool: name, toolCallId } });
-					// Not fetch(): Pi's dispatcher times a request out after httpIdleTimeoutMs, and a
-					// foreground Agent call can wait longer. Only Pi's own abort ends this request.
-					const response = await postLoopbackJson(host.url, "/invoke", host.token, {
+					const payload = {
 						tool: name, toolCallId, input: params,
 						...((batchedToolNames as readonly string[]).includes(name) ? { batch: batchFor(toolCallId) } : {}),
-					}, signal);
+					};
+					// Not fetch(): Pi's dispatcher times a request out after httpIdleTimeoutMs, and a
+					// foreground Agent call can wait longer. Only Pi's own abort ends this request.
+					const streamable = name === "Agent" || name === "SendMessage";
+					const response = streamable
+						? await postLoopbackNdjson(
+							host.url,
+							"/invoke",
+							host.token,
+							payload,
+							(raw) => {
+								if (!raw || typeof raw !== "object") return;
+								const progress = raw as TaskProgress;
+								const text = typeof progress.status === "string" && typeof progress.toolUses === "number"
+									? formatTaskProgressSummary(progress)
+									: name === "Agent" ? "Delegating task…" : `Running ${name}…`;
+								onUpdate?.({ content: [{ type: "text", text }], details: { tool: name, toolCallId, progress } });
+							},
+							signal,
+						)
+						: await postLoopbackJson(host.url, "/invoke", host.token, payload, signal);
 					const result = response.body;
 					if (!result || typeof result !== "object" || !("ok" in result)) throw new Error("Invalid desktop tool response");
 					const record = result as { ok: boolean; data?: unknown; error?: string };
@@ -204,8 +232,9 @@ export default function toolControl(pi: ExtensionAPI): void {
 			if (!(name in previousOverrides) && !baseline.has(name)) baseline.set(name, active.has(name));
 			if (enabled) active.add(name); else active.delete(name);
 		}
-		if (child) for (const name of delegatingToolNames) active.delete(name);
-		if (readOnlyChild) for (const name of active) if (!safeChildTools.has(name)) active.delete(name);
+		if (!canDelegate && !forkChild) for (const name of delegatingToolNames) active.delete(name);
+		if (child && !forkChild) for (const name of worktreeMutationTools) active.delete(name);
+		if (readOnlyChild) for (const name of active) if (!safeChildTools.has(name) && !(canDelegate && delegating(name))) active.delete(name);
 		previousOverrides = settings.overrides;
 		pi.setActiveTools([...active]);
 		if (baselineFile) {
@@ -216,7 +245,7 @@ export default function toolControl(pi: ExtensionAPI): void {
 	}
 	function inventory(settings: ToolOverrides): DesktopToolInfo[] {
 		const active = new Set(pi.getActiveTools());
-		return pi.getAllTools().map((tool) => describeTool(tool, active, settings.overrides, child, readOnlyChild));
+		return pi.getAllTools().map((tool) => describeTool(tool, active, settings.overrides, child, canDelegate, readOnlyChild));
 	}
 	// Results queued as `nextTurn` in this process; Pi consumes them when the next run starts.
 	const queuedNotifications = new Map<string, NotificationUsage | undefined>();
@@ -240,7 +269,7 @@ export default function toolControl(pi: ExtensionAPI): void {
 		// sections (user and project memory) and freezes the tool snippets for the whole run;
 		// a section is diffed like the rest and is byte-stable for the same definitions.
 		const sections = event?.systemPromptOptions?.sections;
-		if (!sections || child || !host || !pi.getActiveTools().includes("Agent")) return;
+		if (!sections || (!canDelegate && !forkChild) || !host || !pi.getActiveTools().includes("Agent")) return;
 		let listing: string;
 		try {
 			listing = formatAgentListing(parseAgentListing(JSON.parse(await readFile(join(directory, "agents.json"), "utf8"))));
@@ -250,9 +279,17 @@ export default function toolControl(pi: ExtensionAPI): void {
 	// The active set changes what is declared to the model. A fresh guard also denies stale or nested calls.
 	pi.on("tool_call", async (event) => {
 		try {
+			if (forkChild && delegating(event.toolName)) return { block: true, reason: "Forked agents cannot fork or spawn agents" };
+			if (!canDelegate && delegating(event.toolName)) {
+				return { block: true, reason: `Subagent nesting limit reached (depth ${delegationDepth}). Complete this task directly; subagents cannot delegate, and cannot spawn nested agents.` };
+			}
+			if (child && worktreeMutationTools.has(event.toolName)) {
+				return { block: true, reason: "Subagents cannot spawn nested agents or manage additional worktrees" };
+			}
 			const settings = await config();
-			if (settings.overrides[event.toolName] === false || (child && delegating(event.toolName)) ||
-				(readOnlyChild && !safeChildTools.has(event.toolName))) return { block: true, reason: "此工具已被客户端禁用。" };
+			if (settings.overrides[event.toolName] === false || (readOnlyChild && !safeChildTools.has(event.toolName) && !(canDelegate && delegating(event.toolName)))) {
+				return { block: true, reason: "此工具已被客户端禁用。" };
+			}
 		} catch { return { block: true, reason: "无法读取工具启停设置，已阻止执行。" }; }
 	});
 	const expectedToken = Buffer.from(token);
@@ -329,12 +366,16 @@ function recordUsage(ctx: unknown, usage: NotificationUsage, key: string): void 
 	} catch {}
 }
 
-function describeTool(tool: ToolInfo, active: Set<string>, overrides: Record<string, boolean>, child: boolean, readOnlyChild: boolean): DesktopToolInfo {
+function describeTool(tool: ToolInfo, active: Set<string>, overrides: Record<string, boolean>, child: boolean, canDelegate: boolean, readOnlyChild: boolean): DesktopToolInfo {
 	const sourcePath = tool.sourceInfo?.path;
 	const source: DesktopToolInfo["source"] = tool.name.startsWith("mcp__") ? "mcp" :
 		desktopModelToolNames.includes(tool.name as DesktopModelToolName) && sourcePath?.includes("tool-control-extension") ? "desktop" :
 		nativeTools.has(tool.name) && sourcePath?.startsWith("builtin:") || sourcePath?.startsWith("builtin:") ? "builtin" : "extension";
-	const blocked = overrides[tool.name] === false || child && delegating(tool.name) || readOnlyChild && !safeChildTools.has(tool.name);
+	const blocked =
+		overrides[tool.name] === false ||
+		(!canDelegate && delegating(tool.name)) ||
+		(child && worktreeMutationTools.has(tool.name)) ||
+		(readOnlyChild && !safeChildTools.has(tool.name) && !(canDelegate && delegating(tool.name)));
 	// AgentSend is an active, callable alias whose declaration requests leave out.
 	const modelVisible = active.has(tool.name) && tool.exposure !== "hidden" && tool.name !== "AgentSend";
 	return {

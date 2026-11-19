@@ -148,6 +148,8 @@ export interface ToolHostContext {
 	toolCallId: string;
 	signal: AbortSignal;
 	batch?: ToolCallBatch;
+	/** Streaming progress sink for NDJSON `/invoke` requests (UI-only). */
+	onProgress?: (progress: unknown) => void;
 }
 
 function object(value: unknown): Record<string, unknown> {

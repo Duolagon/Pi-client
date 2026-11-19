@@ -62,7 +62,7 @@ export default function (pi) {
 	const events: DesktopEvent[] = [];
 	const tasks: TaskEvent[] = [];
 	service.subscribe((event) => events.push(event));
-	service.subscribeTasks((event) => tasks.push(event));
+	service.subscribeTasks((event) => { if (event.type === "task_updated") tasks.push(event); });
 	try {
 		const snapshot = await service.initialize();
 		assert.equal(snapshot.engineStatus, "ready", snapshot.engineError);

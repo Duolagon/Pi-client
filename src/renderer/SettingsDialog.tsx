@@ -63,8 +63,12 @@ export function SettingsDialog({
 	const [sandbox, setSandbox] = useState<boolean>(Boolean(settings.sandbox));
 	const [notifications, setNotifications] = useState<boolean>(settings.notifications !== false);
 	const [subagentBackground, setSubagentBackground] = useState<boolean>(settings.subagentDefaultBackground !== false);
-	const initialForegroundMinutes = String(Math.round((settings.foregroundSubagentTimeoutMs ?? 300000) / 60000));
+	const initialForegroundMinutes = String(Math.round((settings.foregroundSubagentTimeoutMs ?? 0) / 60000));
 	const [foregroundMinutes, setForegroundMinutes] = useState(initialForegroundMinutes);
+	const [forkSubagent, setForkSubagent] = useState<boolean>(settings.forkSubagent !== false);
+	const [confineSubagentBash, setConfineSubagentBash] = useState<boolean>(settings.confineSubagentBash !== false);
+	const [maxSubagentDepthText, setMaxSubagentDepthText] = useState(String(settings.maxSubagentDepth ?? 1));
+	const [maxConcurrentText, setMaxConcurrentText] = useState(String(settings.maxConcurrentSubagents ?? 8));
 	const [sandboxOffline, setSandboxOffline] = useState(Boolean(settings.sandboxOffline));
 	const [sandboxInfo, setSandboxInfo] = useState<SandboxStatus | null>(null);
 	const [provider, setProvider] = useState<Provider>(initialProvider);
@@ -99,6 +103,10 @@ export function SettingsDialog({
 		notifications !== (settings.notifications !== false) ||
 		subagentBackground !== (settings.subagentDefaultBackground !== false) ||
 		foregroundMinutes.trim() !== initialForegroundMinutes ||
+		forkSubagent !== (settings.forkSubagent !== false) ||
+		confineSubagentBash !== (settings.confineSubagentBash !== false) ||
+		maxSubagentDepthText.trim() !== String(settings.maxSubagentDepth ?? 1) ||
+		maxConcurrentText.trim() !== String(settings.maxConcurrentSubagents ?? 8) ||
 		agentDir.trim() !== (settings.agentDir ?? "");
 	const connectionChanged =
 		Boolean(apiKey.trim()) ||
@@ -155,12 +163,26 @@ export function SettingsDialog({
 			setError("前台子 Agent 等待时长需为 0–1440 分钟的整数。");
 			return;
 		}
+		const depthNum = Number(maxSubagentDepthText.trim());
+		if (!/^\d+$/.test(maxSubagentDepthText.trim()) || !Number.isSafeInteger(depthNum) || depthNum < 1 || depthNum > 3) {
+			setError("子 Agent 最大嵌套深度需为 1–3 的整数。");
+			return;
+		}
+		const concurrentNum = Number(maxConcurrentText.trim());
+		if (!/^\d+$/.test(maxConcurrentText.trim()) || !Number.isSafeInteger(concurrentNum) || concurrentNum < 1 || concurrentNum > 20) {
+			setError("最大并发子 Agent 数量需为 1–20 的整数。");
+			return;
+		}
 		setSaving(true);
 		try {
 			const update: Parameters<DesktopAPI["saveSettings"]>[0] = {
 				permission, theme, sandbox, sandboxOffline: sandbox && sandboxOffline, notifications,
 				subagentDefaultBackground: subagentBackground,
 				...(foregroundMinutes.trim() !== initialForegroundMinutes ? { foregroundSubagentTimeoutMs: minutes * 60000 } : {}),
+				forkSubagent,
+				confineSubagentBash,
+				...(maxSubagentDepthText.trim() !== String(settings.maxSubagentDepth ?? 1) ? { maxSubagentDepth: depthNum } : {}),
+				...(maxConcurrentText.trim() !== String(settings.maxConcurrentSubagents ?? 8) ? { maxConcurrentSubagents: concurrentNum } : {}),
 			};
 			if (agentDir.trim() !== (settings.agentDir ?? "")) update.agentDir = agentDir.trim();
 			if (connectionChanged) Object.assign(update, connectionInput);
@@ -466,6 +488,54 @@ export function SettingsDialog({
 								onChange={(event) => setForegroundMinutes(event.target.value)}
 							/>
 							<small>超时后子 Agent 转为后台继续运行，结果稍后送达；0 表示一直等待。非 Git 项目中的可写子 Agent 始终等待完成。</small>
+						</label>
+						<label className="live-setting-toggle">
+							<input
+								type="checkbox"
+								aria-label="允许 fork 子 Agent"
+								checked={forkSubagent}
+								disabled={pending}
+								onChange={(event) => setForkSubagent(event.target.checked)}
+							/>
+							允许模型使用 fork 方式继承当前对话上下文创建子 Agent
+						</label>
+						<label className="live-setting-toggle">
+							<input
+								type="checkbox"
+								aria-label="隔离可写 worktree 子 Agent Bash"
+								checked={confineSubagentBash}
+								disabled={pending}
+								onChange={(event) => setConfineSubagentBash(event.target.checked)}
+							/>
+							可写 worktree 子 Agent 在 macOS 上默认启用 Seatbelt，将 Bash 写操作限制在 worktree 目录内
+						</label>
+						<label className="field-label">
+							最大嵌套深度 maxSubagentDepth（1–3）
+							<input
+								type="number"
+								aria-label="子 Agent 最大嵌套深度"
+								min={1}
+								max={3}
+								step={1}
+								value={maxSubagentDepthText}
+								disabled={pending}
+								onChange={(event) => setMaxSubagentDepthText(event.target.value)}
+							/>
+							<small>默认为 1（仅允许主会话委派）；调大至 2–3 允许子 Agent 继续委派下级子 Agent。</small>
+						</label>
+						<label className="field-label">
+							每个父会话最大并发子 Agent 数（1–20）
+							<input
+								type="number"
+								aria-label="最大并发子 Agent 数"
+								min={1}
+								max={20}
+								step={1}
+								value={maxConcurrentText}
+								disabled={pending}
+								onChange={(event) => setMaxConcurrentText(event.target.value)}
+							/>
+							<small>默认为 8；超过限制后模型需等待已有子 Agent 完成。</small>
 						</label>
 					</div>
 				</details>

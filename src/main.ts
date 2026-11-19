@@ -214,6 +214,24 @@ function installHandlers() {
 			throw new Error("通知开关格式错误。");
 		if (settings.subagentDefaultBackground !== undefined && typeof settings.subagentDefaultBackground !== "boolean")
 			throw new Error("子 Agent 默认后台设置格式错误。");
+		if (settings.forkSubagent !== undefined && typeof settings.forkSubagent !== "boolean")
+			throw new Error("子 Agent fork 开关设置格式错误。");
+		if (settings.confineSubagentBash !== undefined && typeof settings.confineSubagentBash !== "boolean")
+			throw new Error("子 Agent 沙箱隔离设置格式错误。");
+		if (
+			settings.maxSubagentDepth !== undefined &&
+			(!Number.isSafeInteger(settings.maxSubagentDepth) ||
+				(settings.maxSubagentDepth as number) < 1 ||
+				(settings.maxSubagentDepth as number) > 3)
+		)
+			throw new Error("子 Agent 最大嵌套深度需为 1–3 的整数。");
+		if (
+			settings.maxConcurrentSubagents !== undefined &&
+			(!Number.isSafeInteger(settings.maxConcurrentSubagents) ||
+				(settings.maxConcurrentSubagents as number) < 1 ||
+				(settings.maxConcurrentSubagents as number) > 20)
+		)
+			throw new Error("最大并发子 Agent 数量需为 1–20 的整数。");
 		if (
 			settings.foregroundSubagentTimeoutMs !== undefined &&
 			(!Number.isSafeInteger(settings.foregroundSubagentTimeoutMs) ||

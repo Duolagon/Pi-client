@@ -70,6 +70,8 @@ export interface HookRunContext {
 	notificationType?: string;
 	agentId?: string;
 	agentType?: string;
+	additionalContext?: string;
+	transcriptPath?: string;
 	stopHookActive?: boolean;
 	lastAssistantMessage?: string;
 	trigger?: "manual" | "auto";
@@ -545,6 +547,7 @@ export class HooksService {
 				: {}),
 			...(context.agentId !== undefined ? { agent_id: context.agentId } : {}),
 			...(context.agentType !== undefined ? { agent_type: context.agentType } : {}),
+			...(context.transcriptPath !== undefined ? { agent_transcript_path: context.transcriptPath } : {}),
 			...(context.stopHookActive !== undefined ? { stop_hook_active: context.stopHookActive } : {}),
 			...(context.lastAssistantMessage !== undefined ? { last_assistant_message: context.lastAssistantMessage } : {}),
 			...(context.trigger !== undefined ? { trigger: context.trigger } : {}),

@@ -54,6 +54,18 @@ export default function uiProvider(pi) {
 			} else if (prompt.includes("审批拒绝验证")) {
 				response = results.length ? fauxAssistantMessage(results[0].isError ? "写入已按你的选择取消。" : "写入已执行。")
 					: fauxAssistantMessage(fauxToolCall("write", { path: "denied.txt", content: "should be denied\n" }), { stopReason: "toolUse" });
+			} else if (prompt.includes("子Agent审批面板验证")) {
+				response = results.length
+					? fauxAssistantMessage("已派发后台子 Agent 并准备处理结果。")
+					: fauxAssistantMessage(
+							fauxToolCall("Agent", {
+								description: "E2E 子审批",
+								prompt: "审批拒绝验证",
+								subagent_type: "general-purpose",
+								run_in_background: true,
+							}),
+							{ stopReason: "toolUse" },
+						);
 			} else {
 				response = fauxAssistantMessage("已收到补充指令，客户端与 Pi 引擎连接正常。");
 			}

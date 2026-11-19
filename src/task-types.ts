@@ -68,6 +68,9 @@ export interface DesktopTask {
 	disallowedTools?: string[];
 	permissionMode?: AgentPermissionMode;
 	maxTurns?: number;
+	isFork?: boolean;
+	omitClaudeMd?: boolean;
+	mcpServers?: string[];
 	runInBackground?: boolean;
 	/** `partial` marks a result cut short by maxTurns. */
 	result?: { text: string; truncated: boolean; partial?: boolean };
@@ -102,6 +105,8 @@ export interface DesktopTask {
 	 * instead of falling back to an unrestricted root conversation.
 	 */
 	quarantined?: boolean;
+	/** Runtime-only sanitized view of open interactive requests; never written to disk. */
+	pendingApprovals?: TaskPendingApproval[];
 }
 
 export interface TaskStartInput {
@@ -118,12 +123,61 @@ export interface TaskStartInput {
 	permissionMode?: AgentPermissionMode;
 	maxTurns?: number;
 	forkParentConversationId?: string;
+	isFork?: boolean;
+	omitClaudeMd?: boolean;
+	mcpServers?: string[];
 	/** Appended to the child's system prompt (definition body, skills, memory). */
 	systemPrompt?: string;
 }
 
+export interface TaskProgressActivity {
+	toolName: string;
+	summary?: string;
+	startedAt: number;
+}
+/**
+ * Sanitized view of an open interactive request (`extension_ui_request`) on a task.
+ * Bounded (message <= 4 KiB, options <= 50) and runtime-only (never persisted to disk).
+ */
+export interface TaskPendingApproval {
+	id: string;
+	method: "confirm" | "select" | "input" | "editor";
+	title: string;
+	message?: string;
+	options?: string[];
+	placeholder?: string;
+	prefill?: string;
+	timeout?: number;
+}
+/** A descendant task's open approval surfaced to its ancestor conversation. */
+export interface ChildApprovalRequest {
+	taskId: string;
+	conversationId: string;
+	description: string;
+	name?: string;
+	subagentType?: string;
+	depth: number;
+	request: TaskPendingApproval;
+}
+/** Live progress of an active child run; emitted throttled without persisting on every tick. */
+export interface TaskProgress {
+	taskId: string;
+	status: TaskStatus;
+	turn: number;
+	toolUses: number;
+	lastToolName?: string;
+	tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+	cost: number;
+	startedAt: number;
+	durationMs: number;
+	waitingForApproval?: boolean;
+	recentActivities: TaskProgressActivity[];
+}
+
 export type TaskEvent =
 	| { type: "task_updated"; task: DesktopTask }
+	/** Throttled live progress for an active task; never persisted on each event. */
+	| { type: "task_progress"; taskId: string; progress: TaskProgress }
 	/**
 	 * Background results held for a parent conversation: queued for its next turn or
 	 * waiting for a parent runtime. The renderer shows them with a "立即交付" action.

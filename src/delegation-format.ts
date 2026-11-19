@@ -1,5 +1,5 @@
 import { MAX_AGENT_OUTPUT, MAX_NOTIFICATION, truncateText } from "./delegation-limits.ts";
-import type { DesktopTask } from "./task-types.ts";
+import type { DesktopTask, TaskProgress } from "./task-types.ts";
 import type { DelegatedTaskResult } from "./delegation-types.ts";
 
 /**
@@ -186,13 +186,13 @@ const activeStatuses = new Set(["queued", "running", "waiting_for_input"]);
  */
 export function formatAgentToolText(
 	result: DelegatedTaskResult,
-	options: { launched?: boolean; resumed?: boolean; delivered?: boolean; worktree?: { path: string; branch?: string } } = {},
+	options: { launched?: boolean; resumed?: boolean; delivered?: boolean; backgroundedByUser?: boolean; worktree?: { path: string; branch?: string; baseRef?: string } } = {},
 ): string {
 	const id = escapeMarkup(result.task_id);
 	const handle = result.name ? ` (name: ${escapeMarkup(result.name)})` : "";
 	const warnings = result.warnings?.length ? `\n\nNote: ${result.warnings.map((item) => escapeMarkup(item)).join(" ")}` : "";
 	const worktree = options.worktree
-		? `\nworktreePath: ${escapeMarkup(options.worktree.path)}${options.worktree.branch ? `\nworktreeBranch: ${escapeMarkup(options.worktree.branch)}` : ""}`
+		? `\nworktreePath: ${escapeMarkup(options.worktree.path)}${options.worktree.branch ? `\nworktreeBranch: ${escapeMarkup(options.worktree.branch)}` : ""}${options.worktree.baseRef ? `\nworktreeBase: ${escapeMarkup(options.worktree.baseRef)}` : ""}`
 		: "";
 	if (options.launched) {
 		const queued = result.status === "queued" ? " It is queued and starts when a slot is free." : "";
@@ -208,7 +208,10 @@ export function formatAgentToolText(
 	if (activeStatuses.has(result.status)) {
 		const waiting = result.pending_approvals ? ` It is waiting for ${result.pending_approvals} approval(s) from the user.` : "";
 		const partial = result.output ? `\n\nLatest output so far:\n${escapeSubagentOutput(result.output, { taskId: result.task_id, truncated: result.truncated }).text}` : "";
-		return `The agent is still running in the background (status: ${result.status}).${waiting}\nagentId: ${id}${handle}${worktree}\nIts result will be delivered to you automatically as a <task-notification> message; do not poll.${partial}${warnings}`;
+		const intro = options.backgroundedByUser
+			? `Agent was moved to the background by the user (status: ${result.status}).`
+			: `The agent is still running in the background (status: ${result.status}).`;
+		return `${intro}${waiting}\nagentId: ${id}${handle}${worktree}\nIts result will be delivered to you automatically as a <task-notification> message; do not poll.${partial}${warnings}`;
 	}
 	const report = result.output
 		? escapeSubagentOutput(result.output, { taskId: result.task_id, truncated: result.truncated }).text
@@ -226,4 +229,42 @@ export function formatAgentToolText(
 	const resumable = result.subagent_type !== "Explore" && result.subagent_type !== "Plan";
 	const hint = resumable ? ` (use SendMessage with to: ${id} to continue this agent)` : "";
 	return `${header}${report}\n\nagentId: ${id}${handle}${hint}${worktree}${usage}${warnings}`;
+}
+
+/** Format compact token count, e.g. `23.4k` or `850`. */
+export function formatCompactTokens(tokens: number): string {
+	if (!Number.isFinite(tokens) || tokens < 0) return "0";
+	if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+	if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}k`;
+	return String(Math.round(tokens));
+}
+
+/** Format compact elapsed duration, e.g. `1m12s` or `8s`. */
+export function formatCompactDuration(ms: number): string {
+	if (!Number.isFinite(ms) || ms < 0) return "0s";
+	const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+	const minutes = Math.floor(totalSeconds / 60);
+	const seconds = totalSeconds % 60;
+	if (minutes >= 60) {
+		const hours = Math.floor(minutes / 60);
+		return `${hours}h${minutes % 60}m`;
+	}
+	if (minutes > 0) return `${minutes}m${seconds}s`;
+	return `${seconds}s`;
+}
+
+/** One-line UI progress summary for a running sub-agent (never injected into the parent model context). */
+export function formatTaskProgressSummary(progress: TaskProgress): string {
+	const state =
+		progress.waitingForApproval || progress.status === "waiting_for_input"
+			? "待审批"
+			: progress.status === "queued"
+				? "排队中"
+				: "运行中";
+	const parts: string[] = [state];
+	if (progress.toolUses > 0) parts.push(`${progress.toolUses} 次工具`);
+	if (progress.lastToolName) parts.push(progress.lastToolName);
+	if (progress.tokens.total > 0) parts.push(`${formatCompactTokens(progress.tokens.total)} tokens`);
+	parts.push(formatCompactDuration(progress.durationMs));
+	return parts.join(" · ");
 }

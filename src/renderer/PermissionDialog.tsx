@@ -2,20 +2,34 @@ import { useEffect, useMemo, useState } from "react";
 import { ShieldCheck } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
 import { CodeLines, InlineEditDiff } from "./DiffView.tsx";
-import type { DesktopAPI, RpcExtensionUIRequest } from "../shared.ts";
+import type { DesktopAPI, RpcExtensionUIRequest, TaskPendingApproval } from "../shared.ts";
 
 type Response = Parameters<DesktopAPI["respond"]>[0];
+export interface SubagentApprovalSource {
+	taskId: string;
+	name?: string;
+	description: string;
+	subagentType?: string;
+	depth: number;
+	rootConversationId: string;
+}
+
 export function PermissionDialog({
 	request,
 	conversationId,
 	project,
+	subagentSource,
+	queuePosition,
 	respond,
 	defer,
 	fail,
 }: {
-	request: RpcExtensionUIRequest;
+	request: RpcExtensionUIRequest | TaskPendingApproval;
 	conversationId?: string;
 	project?: string;
+	/** Present when this approval bubbled up from a delegated sub-agent. */
+	subagentSource?: SubagentApprovalSource;
+	queuePosition?: { index: number; total: number };
 	respond: (response: Response) => Promise<void>;
 	defer?: () => void;
 	fail: (error: unknown) => void;
@@ -73,11 +87,12 @@ export function PermissionDialog({
 
 	const parsedConfirm = useMemo(() => {
 		if (request.method !== "confirm") return null;
-		const splitAt = request.message.indexOf("\n\n");
+		const msg = request.message ?? "";
+		const splitAt = msg.indexOf("\n\n");
 		if (splitAt === -1) return null;
-		const reason = request.message.slice(0, splitAt);
+		const reason = msg.slice(0, splitAt);
 		try {
-			const input = JSON.parse(request.message.slice(splitAt + 2)) as Record<string, unknown>;
+			const input = JSON.parse(msg.slice(splitAt + 2)) as Record<string, unknown>;
 			if (!input || typeof input !== "object") return null;
 			return { reason, input };
 		} catch {
@@ -132,16 +147,28 @@ export function PermissionDialog({
 		if (!inferredTool || !allowSelector) return;
 		setPending(true);
 		try {
-			const scope = project ? "project" : conversationId ? "conversation" : "global";
-			await window.pi.permissions.upsert({
-				id: `allow-${inferredTool}-${Date.now().toString(36)}`,
-				scope,
-				...(scope === "project" ? { project } : {}),
-				...(scope === "conversation" ? { conversationId } : {}),
-				action: "allow",
-				tool: inferredTool,
-				...allowSelector.extra,
-			});
+			if (subagentSource) {
+				await window.pi.permissions.upsert({
+					id: `allow-tree-${inferredTool}-${Date.now().toString(36)}`,
+					scope: "conversation",
+					conversationId: subagentSource.rootConversationId,
+					delegatedOnly: true,
+					action: "allow",
+					tool: inferredTool,
+					...allowSelector.extra,
+				});
+			} else {
+				const scope = project ? "project" : conversationId ? "conversation" : "global";
+				await window.pi.permissions.upsert({
+					id: `allow-${inferredTool}-${Date.now().toString(36)}`,
+					scope,
+					...(scope === "project" ? { project } : {}),
+					...(scope === "conversation" ? { conversationId } : {}),
+					action: "allow",
+					tool: inferredTool,
+					...allowSelector.extra,
+				});
+			}
 			await respond({ type: "extension_ui_response", id: request.id, confirmed: true });
 		} catch (error) {
 			fail(error);
@@ -149,15 +176,25 @@ export function PermissionDialog({
 		}
 	};
 
+	const subagentLabel = subagentSource
+		? `子 Agent ‹${subagentSource.name || subagentSource.description}› (${subagentSource.subagentType || "general-purpose"})`
+		: undefined;
+	const queueTag = queuePosition && queuePosition.total > 1 ? ` [${queuePosition.index + 1}/${queuePosition.total}]` : "";
+	const modalTitle = subagentLabel ? `${subagentLabel} 请求：${title}${queueTag}` : `${title}${queueTag}`;
+
 	return (
-		<Modal title={title} close={cancel}>
+		<Modal title={modalTitle} close={cancel}>
 			{defer && !("timeout" in request && request.timeout) && (
 				<button type="button" className="cc-mini-btn cc-defer-approval" disabled={pending} onClick={defer}>稍后处理</button>
 			)}
 			<div className="simple-dialog permission-dialog">
 				<div className="live-permission-note">
 					<ShieldCheck size={17} />
-					<span>此请求来自正在运行的 Pi 会话。</span>
+					<span>
+						{subagentLabel
+							? `此请求来自 ${subagentLabel}；按 Esc 仅拒绝本次调用，不会停止子 Agent。`
+							: "此请求来自正在运行的 Pi 会话。"}
+					</span>
 				</div>
 				{request.method === "confirm" && (
 					<>
@@ -204,9 +241,13 @@ export function PermissionDialog({
 									disabled={pending}
 									onClick={() => void alwaysAllow()}
 									className="secondary-button"
-									title={`在当前${project ? "项目" : "会话"}始终允许 ${allowSelector.label}`}
+									title={
+										subagentSource
+											? `对当前会话的所有子 Agent（委派树）始终允许 ${allowSelector.label}，不放宽主会话自身`
+											: `在当前${project ? "项目" : "会话"}始终允许 ${allowSelector.label}`
+									}
 								>
-									始终允许 {allowSelector.label}
+									{subagentSource ? `对所有子 Agent 始终允许 ${allowSelector.label}` : `始终允许 ${allowSelector.label}`}
 								</button>
 							)}
 							<button
@@ -222,7 +263,7 @@ export function PermissionDialog({
 				)}
 				{request.method === "select" && (
 					<div className="live-options">
-						{request.options.map((option) => (
+						{(request.options ?? []).map((option) => (
 							<button
 								disabled={pending}
 								key={option}

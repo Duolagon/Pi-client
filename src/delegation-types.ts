@@ -1,6 +1,6 @@
 import type { Conversation, Message, ThinkingLevel } from "./shared.ts";
 import type { AgentDefinition, AgentModelAlias } from "./agent-types.ts";
-import type { DesktopTask, TaskSendResult, TaskStartInput, TaskStatus, TaskStopReason } from "./task-types.ts";
+import type { DesktopTask, TaskProgress, TaskSendResult, TaskStartInput, TaskStatus, TaskStopReason } from "./task-types.ts";
 import type {
 	WorktreeCreateInput,
 	WorktreeInfo,
@@ -14,7 +14,7 @@ export interface DelegationMetadata {
 	parentConversationId: string;
 	parentToolCallId: string;
 	subagentType: SubagentType;
-	delegationDepth: 1;
+	delegationDepth: number;
 	readOnly: boolean;
 	runInBackground: boolean;
 	/** Call-level Agent `name`. */
@@ -26,6 +26,8 @@ export interface DelegationContext {
 	signal?: AbortSignal;
 	/** The other calls of the Agent call's assistant message, when the parent reported them. */
 	batch?: { writers: number };
+	/** Optional live progress sink for streaming `/invoke` (UI-only, never sent to the parent model). */
+	onProgress?: (progress: TaskProgress) => void;
 }
 export interface DelegatedTaskResult {
 	task_id: string;
@@ -131,6 +133,16 @@ export interface DelegationCallbacks {
 	defaultBackground?(): boolean | Promise<boolean>;
 	/** `settings.foregroundSubagentTimeoutMs`; 0 waits without limit. */
 	foregroundTimeoutMs?(): number | Promise<number>;
+	/** `settings.forkSubagent`; true when absent. */
+	forkSubagentEnabled?(): boolean | Promise<boolean>;
+	/** `settings.confineSubagentBash`; true when absent. */
+	confineSubagentBash?(): boolean | Promise<boolean>;
+	/** Check whether macOS Seatbelt sandboxing is available in this runtime environment. */
+	seatbeltSupport?(): { supported: boolean; reason?: string } | Promise<{ supported: boolean; reason?: string }>;
+	/** `settings.maxSubagentDepth`; 1 when absent. */
+	maxSubagentDepth?(): number | Promise<number>;
+	/** `settings.maxConcurrentSubagents`; 8 when absent. */
+	maxConcurrentSubagents?(): number | Promise<number>;
 	/** Load preloaded skills and persistent agent memory block for a custom agent. */
 	prepareAgentContext?(project: string, definition: AgentDefinition): Promise<string | undefined>;
 	/** Persist metadata and apply inherited permissions before the task is scheduled. */
@@ -170,6 +182,10 @@ export interface DelegationCallbacks {
 	 * reaches the parent through the persisted outbox once it finishes.
 	 */
 	detachTask?(id: string): void | Promise<void>;
+	/** Subscribe to live throttled progress events for a running task. */
+	subscribeTaskProgress?(id: string, listener: (progress: TaskProgress) => void): () => void;
+	/** Return true if the user manually moved this foreground task to the background (Ctrl+B / button). */
+	isUserBackgrounded?(id: string): boolean;
 	/**
 	 * Deliver pending background results of `parentConversationId` from the host's
 	 * persisted outbox. Never starts a stopped parent runtime.

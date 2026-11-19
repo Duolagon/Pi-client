@@ -283,7 +283,28 @@ try {
 	await page.getByRole("combobox", { name: "模型服务商", exact: true }).selectOption("deepseek");
 	assert.ok((await page.getByRole("combobox", { name: "默认模型", exact: true }).locator("option").count()) >= 2);
 	assert.equal(await page.getByLabel("API Key", { exact: true }).inputValue(), "");
-	await page.getByRole("button", { name: "取消", exact: true }).click();
+	await page.getByText("权限与外观", { exact: true }).click();
+	assert.equal(await page.getByRole("checkbox", { name: "允许 fork 子 Agent", exact: true }).isChecked(), true);
+	assert.equal(await page.getByRole("checkbox", { name: "隔离可写 worktree 子 Agent Bash", exact: true }).isChecked(), true);
+	await page.getByRole("checkbox", { name: "允许 fork 子 Agent", exact: true }).uncheck();
+	await page.getByRole("spinbutton", { name: "子 Agent 最大嵌套深度", exact: true }).fill("2");
+	await page.getByRole("spinbutton", { name: "最大并发子 Agent 数", exact: true }).fill("6");
+	await page.getByRole("button", { name: "保存设置", exact: true }).click();
+	await until(
+		async () => {
+			const s = (await snapshot()).settings;
+			return s.forkSubagent === false && s.maxSubagentDepth === 2 && s.maxConcurrentSubagents === 6;
+		},
+		"P6/P7 settings saved",
+	);
+	await page.getByRole("button", { name: "设置", exact: true }).click();
+	await page.getByText("权限与外观", { exact: true }).click();
+	await page.getByRole("checkbox", { name: "允许 fork 子 Agent", exact: true }).check();
+	await page.getByRole("spinbutton", { name: "子 Agent 最大嵌套深度", exact: true }).fill("1");
+	await page.getByRole("spinbutton", { name: "最大并发子 Agent 数", exact: true }).fill("8");
+	await page.getByRole("button", { name: "保存设置", exact: true }).click();
+	await until(async () => (await page.getByRole("dialog", { name: /设置/ }).count()) === 0, "settings dialog closed");
+	checks.push("P6/P7 settings dialog controls and persistence");
 	await page.getByRole("button", { name: "搜索会话", exact: true }).click();
 	await page.getByRole("textbox", { name: "搜索会话标题或项目", exact: true }).fill("实现问候函数");
 	await page.locator(".search-results button").filter({ hasText: "实现问候函数与测试" }).click();
@@ -566,11 +587,18 @@ try {
 	await page.getByRole("textbox", { name: "禁用工具 disallowedTools", exact: true }).fill("Write, Edit, Bash");
 	await page.getByRole("textbox", { name: "系统提示词", exact: true }).fill("Review only. Do not edit files.");
 	await page.getByRole("combobox", { name: "保存位置", exact: true }).selectOption("user");
+	await page.getByText("Claude Code 高级兼容配置（Skills / Memory / 轮次 / 隔离）", { exact: true }).click();
+	await page.getByRole("textbox", { name: "MCP 服务器名称 mcpServers（逗号分隔）", exact: true }).fill("github");
+	await page.getByRole("textbox", { name: "主题色 color（名称或 #RRGGBB）", exact: true }).fill("#3b82f6");
+	await page.getByRole("checkbox", { name: "不注入 CLAUDE.md / AGENTS.md 上下文（omitClaudeMd）", exact: true }).check();
 	await page.getByRole("button", { name: "保存 Agent", exact: true }).click();
 	await page.getByText("e2e-reviewer", { exact: true }).waitFor();
 	const savedAgentText = await readFile(join(agentDir, "agents", "e2e-reviewer.md"), "utf8");
 	assert.match(savedAgentText, /name: e2e-reviewer/);
 	assert.match(savedAgentText, /disallowedTools: \[write, edit, bash\]/);
+	assert.match(savedAgentText, /mcpServers: \[github\]/);
+	assert.match(savedAgentText, /color: "#3b82f6"/);
+	assert.match(savedAgentText, /omitClaudeMd: true/);
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
 	await page.getByRole("button", { name: "MCP 服务器", exact: true }).click();
@@ -643,6 +671,35 @@ try {
 		return installed?.status === "exited" && installed.exitCode === 0;
 	}, secondSession.id), "the bundled Pi package CLI");
 	checks.push("bundled Pi CLI and interactive terminal");
+
+	// Verify live SubagentPanel, sidebar (+N) folding, SubagentTranscriptView and SubagentApprovals bubbling
+	await page.locator(".cl-conv").filter({ hasText: originalSession.title }).first().click();
+	await ready();
+	await page.evaluate(
+		(proj) => window.pi.permissions.upsert({ id: "e2e-allow-agent", scope: "project", project: proj, action: "allow", tool: "Agent" }),
+		originalSession.project,
+	);
+	await submit("子Agent审批面板验证");
+	await page.getByRole("region", { name: "子 Agent 面板", exact: true }).waitFor();
+	await page.locator(".cc-subagent-row").filter({ hasText: "E2E 子审批" }).waitFor();
+	await page.locator(".cl-conv-fold").filter({ hasText: "(+1)" }).waitFor();
+	await page.getByRole("dialog", { name: /子 Agent ‹E2E 子审批›.*允许执行 write？/ }).waitFor();
+	await page.getByRole("button", { name: "稍后处理", exact: true }).click();
+	await page.getByRole("button", { name: "继续处理子 Agent 审批 (1)", exact: true }).waitFor();
+	await page.locator(".cc-subagent-row").filter({ hasText: "E2E 子审批" }).click();
+	await page.getByRole("button", { name: "返回主会话", exact: true }).waitFor();
+	await page.getByRole("button", { name: "返回主会话", exact: true }).click();
+	await page.getByRole("button", { name: "继续处理子 Agent 审批 (1)", exact: true }).click();
+	await page.getByRole("dialog", { name: /子 Agent ‹E2E 子审批›.*允许执行 write？/ }).waitFor();
+	await page.getByRole("button", { name: "拒绝", exact: true }).click();
+	await until(async () => {
+		const list = await page.evaluate(() => window.pi.tasks.list());
+		const sub = list.find((t) => t.title === "E2E 子审批");
+		return sub && sub.status === "completed";
+	}, "bubbled child approval completion");
+	await idle();
+	await page.evaluate(() => window.pi.permissions.remove("e2e-allow-agent"));
+	checks.push("SubagentPanel, sidebar (+N) folding, SubagentTranscriptView and SubagentApprovals E2E UI");
 
 
 	assert.deepEqual(pageErrors, []);

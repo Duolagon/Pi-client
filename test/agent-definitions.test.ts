@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { test } from "node:test";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { AgentRegistry } from "../src/agent-definitions.ts";
+import { SkillRegistry } from "../src/skill-registry.ts";
+
+const exec = promisify(execFile);
 
 async function fixture() {
 	const root = await mkdtemp(join(tmpdir(), "pi-agents-"));
@@ -191,6 +196,100 @@ test("preserves unknown frontmatter when editing an existing agent", async () =>
 		const content = await readFile(join(directory, "custom.md"), "utf8");
 		assert.match(content, /allowed-tools:/);
 		assert.match(content, /New prompt\./);
+	} finally {
+		await f.cleanup();
+	}
+});
+
+test("resolves project ancestors with .claude > .pi priority, detects memory/skills/mcp errors, and hot-reloads", async () => {
+	const f = await fixture();
+	try {
+		await exec("git", ["-c", "init.defaultBranch=main", "init"], { cwd: f.project });
+		const nested = join(f.project, "packages", "web");
+		await mkdir(join(f.project, ".pi", "agents"), { recursive: true });
+		await mkdir(join(f.project, ".claude", "agents"), { recursive: true });
+		await mkdir(join(nested, ".pi", "agents"), { recursive: true });
+		await mkdir(join(nested, ".claude", "agents"), { recursive: true });
+
+		await writeFile(join(f.project, ".pi", "agents", "shared.md"), "---\nname: shared\ndescription: root-pi\n---\n\nRoot pi.\n");
+		await writeFile(join(nested, ".pi", "agents", "shared.md"), "---\nname: shared\ndescription: nested-pi\n---\n\nNested pi.\n");
+		await writeFile(join(f.project, ".claude", "agents", "shared.md"), "---\nname: shared\ndescription: root-claude\n---\n\nRoot claude.\n");
+		await writeFile(join(nested, ".claude", "agents", "shared.md"), "---\nname: shared\ndescription: nested-claude\n---\n\nNested claude.\n");
+
+		const registry = f.registries();
+		const resolved = await registry.resolve(nested, "shared", true);
+		assert.equal(resolved?.description, "nested-claude");
+		assert.equal(resolved?.prompt, "Nested claude.");
+
+		// Strict read-only + memory conflict sets definitionError on load and throws on save
+		await writeFile(
+			join(nested, ".claude", "agents", "bad-mem.md"),
+			"---\nname: bad-mem\ndescription: bad\ntools: [Read, Grep]\nmemory: project\n---\n\nShould error.\n",
+		);
+		const badMem = await registry.resolve(nested, "bad-mem", true);
+		assert.match(badMem?.definitionError ?? "", /只读.*memory|memory.*只读/);
+		await assert.rejects(
+			() => registry.save(nested, { name: "bad2", description: "d", prompt: "p", tools: ["read"], memory: "project", scope: "project" }),
+			/只读.*memory|memory.*只读/,
+		);
+
+		// Inline mcpServers rejected, named mcpServers / omitClaudeMd / color / effort accepted
+		await writeFile(
+			join(nested, ".claude", "agents", "bad-mcp.md"),
+			"---\nname: bad-mcp\ndescription: bad\nmcpServers:\n  github:\n    command: npx\n---\n\nPrompt.\n",
+		);
+		assert.match((await registry.resolve(nested, "bad-mcp", true))?.definitionError ?? "", /mcpServers/);
+
+		await registry.save(nested, {
+			name: "valid-ext",
+			description: "Valid extended",
+			prompt: "Prompt.",
+			tools: ["read", "write"],
+			mcpServers: ["github", "postgres"],
+			omitClaudeMd: true,
+			color: "#3b82f6",
+			thinkingLevel: "high",
+			scope: "project",
+		});
+		const validExt = await registry.resolve(nested, "valid-ext", true);
+		assert.deepEqual(validExt?.mcpServers, ["github", "postgres"]);
+		assert.equal(validExt?.omitClaudeMd, true);
+		assert.equal(validExt?.color, "#3b82f6");
+		assert.equal(validExt?.thinkingLevel, "high");
+		assert.equal(validExt?.definitionError, undefined);
+
+		// >32 skills sets definitionError
+		const manySkills = Array.from({ length: 33 }, (_, i) => `s${i}`).join(", ");
+		await writeFile(
+			join(nested, ".claude", "agents", "too-many-skills.md"),
+			`---\nname: too-many-skills\ndescription: d\nskills: [${manySkills}]\n---\n\nPrompt.\n`,
+		);
+		assert.match((await registry.resolve(nested, "too-many-skills", true))?.definitionError ?? "", /32/);
+
+		// disable-model-invocation parsed by SkillRegistry
+		await mkdir(join(nested, ".claude", "skills", "manual-only"), { recursive: true });
+		await writeFile(
+			join(nested, ".claude", "skills", "manual-only", "SKILL.md"),
+			"---\nname: manual-only\ndescription: manual\ndisable-model-invocation: true\n---\n\nSecret skill body.\n",
+		);
+		const skills = await new SkillRegistry({ agentDir: () => f.agentDir }).list(nested, true);
+		assert.equal(skills.find((s) => s.name === "manual-only")?.disableModelInvocation, true);
+
+		// watchProject triggers within 2s after changing an agent definition file
+		let changes = 0;
+		const unwatch = registry.watchProject(nested, true, () => { changes++; });
+		try {
+			await new Promise((r) => setTimeout(r, 80));
+			await writeFile(
+				join(nested, ".claude", "agents", "watched.md"),
+				"---\nname: watched\ndescription: watched\n---\n\nWatched prompt.\n",
+			);
+			const deadline = Date.now() + 2500;
+			while (changes === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+			assert.ok(changes >= 1, "watchProject should fire debounced change callback");
+		} finally {
+			unwatch();
+		}
 	} finally {
 		await f.cleanup();
 	}

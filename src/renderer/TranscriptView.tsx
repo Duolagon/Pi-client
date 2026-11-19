@@ -1,7 +1,8 @@
 import { useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
-import { Check, Circle, CircleAlert, ChevronRight, Copy, Eye, GitFork, LoaderCircle, RotateCcw } from "lucide-react";
-import type { DesktopTask, ExternalTask, Message } from "../shared.ts";
+import { ArrowDownToLine, Check, Circle, CircleAlert, ChevronRight, Copy, Eye, GitFork, LoaderCircle, RotateCcw, Square } from "lucide-react";
+import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
+import type { DesktopTask, ExternalTask, Message, TaskProgress } from "../shared.ts";
 import type { Transcript, ToolProgress } from "./messages.ts";
 import { CodeLines, InlineEditDiff, computeLineDiff } from "./DiffView.tsx";
 import { highlightCode } from "./highlight.tsx";
@@ -212,7 +213,10 @@ export function TranscriptView({
 	transcript: state,
 	tasks = [],
 	externalTasks = [],
+	taskProgressMap = {},
 	onOpenTask,
+	onBackgroundTask,
+	onStopTask,
 	onRewindPrompt,
 	onForkPrompt,
 	onOpenPreview,
@@ -220,7 +224,10 @@ export function TranscriptView({
 	transcript: Transcript;
 	tasks?: DesktopTask[];
 	externalTasks?: ExternalTask[];
+	taskProgressMap?: Record<string, TaskProgress>;
 	onOpenTask?: (taskId: string) => void;
+	onBackgroundTask?: (taskId: string) => void;
+	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
 	onRewindPrompt?: (text: string) => void;
 	onForkPrompt?: (text: string) => void;
 	onOpenPreview?: (url: string) => void;
@@ -351,7 +358,10 @@ export function TranscriptView({
 								isFirst={part === 0}
 								tasks={tasks}
 								externalTasks={externalTasks}
+								taskProgressMap={taskProgressMap}
 								onOpenTask={onOpenTask}
+								onBackgroundTask={onBackgroundTask}
+								onStopTask={onStopTask}
 								onOpenPreview={onOpenPreview}
 							/>
 						))}
@@ -389,7 +399,10 @@ function TurnBlocks({
 	isFirst,
 	tasks,
 	externalTasks,
+	taskProgressMap,
 	onOpenTask,
+	onBackgroundTask,
+	onStopTask,
 	onOpenPreview,
 }: {
 	message: Assistant;
@@ -398,7 +411,10 @@ function TurnBlocks({
 	isFirst: boolean;
 	tasks: DesktopTask[];
 	externalTasks: ExternalTask[];
+	taskProgressMap: Record<string, TaskProgress>;
 	onOpenTask?: (taskId: string) => void;
+	onBackgroundTask?: (taskId: string) => void;
+	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
 	onOpenPreview?: (url: string) => void;
 }) {
 	return message.content.map((block, part) => {
@@ -433,7 +449,9 @@ function TurnBlocks({
 			(item): item is Extract<Message, { role: "toolResult" }> => item.role === "toolResult" && item.toolCallId === block.id,
 		);
 		const progress = state.tools[block.id];
-		const matchedTask = tasks.find((t) => t.parentToolCallId === block.id) ?? externalTasks.find((t) => t.parentToolCallId === block.id);
+		const matchedTask =
+			tasks.find((t) => t.parentToolCallId === block.id || t.turnCalls?.includes(block.id)) ??
+			externalTasks.find((t) => t.parentToolCallId === block.id);
 		return (
 			<ToolCard
 				key={block.id}
@@ -442,7 +460,10 @@ function TurnBlocks({
 				progress={progress}
 				result={result}
 				matchedTask={matchedTask}
+				taskProgress={matchedTask ? taskProgressMap[matchedTask.id] : undefined}
 				onOpenTask={onOpenTask}
+				onBackgroundTask={onBackgroundTask}
+				onStopTask={onStopTask}
 			/>
 		);
 	});
@@ -745,20 +766,46 @@ function InlineBashBlock({
 	);
 }
 
+function formatMatchedTaskSummary(task: DesktopTask | ExternalTask, taskProgress?: TaskProgress): string {
+	const active = task.status === "queued" || task.status === "running" || task.status === "waiting_for_input";
+	if (active) {
+		if (taskProgress) return formatTaskProgressSummary(taskProgress);
+		return `${task.status === "waiting_for_input" ? "待审批" : task.status === "queued" ? "排队中" : "运行中"} · ${task.workingDirectory}`;
+	}
+	if ("executor" in task) {
+		return `${task.executor} · ${task.status} · ${formatCompactDuration(Math.max(0, task.updatedAt - task.createdAt))}`;
+	}
+	const parts: string[] = [];
+	const model = task.stats?.model?.id ?? task.model?.id;
+	if (model) parts.push(model);
+	if (task.stats?.tokens.total) parts.push(`${formatCompactTokens(task.stats.tokens.total)} tokens`);
+	if (task.stats?.toolUses) parts.push(`${task.stats.toolUses} 次工具`);
+	if (task.stats?.durationMs !== undefined) parts.push(formatCompactDuration(task.stats.durationMs));
+	else parts.push(formatCompactDuration(Math.max(0, task.updatedAt - task.createdAt)));
+	if (task.stopReason) parts.push(task.stopReason);
+	return parts.length ? parts.join(" · ") : `${task.status} · ${task.workingDirectory}`;
+}
+
 function ToolCard({
 	name,
 	args,
 	progress,
 	result,
 	matchedTask,
+	taskProgress,
 	onOpenTask,
+	onBackgroundTask,
+	onStopTask,
 }: {
 	name: string;
 	args: unknown;
 	progress?: ToolProgress;
 	result?: Extract<Message, { role: "toolResult" }>;
 	matchedTask?: DesktopTask | ExternalTask;
+	taskProgress?: TaskProgress;
 	onOpenTask?: (taskId: string) => void;
+	onBackgroundTask?: (taskId: string) => void;
+	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
 }) {
 	const output = result
 		? result.content
@@ -771,8 +818,16 @@ function ToolCard({
 		: [];
 	const status = result ? (result.isError ? "error" : "done") : (progress?.status ?? "running");
 	const info = presentTool(name, args, output, status);
+	const matchedActive = matchedTask ? ["queued", "running", "waiting_for_input"].includes(matchedTask.status) : false;
+	const matchedKind: "pi" | "external" = matchedTask && "executor" in matchedTask ? "external" : "pi";
+	const canBackground =
+		Boolean(matchedTask) &&
+		matchedActive &&
+		matchedKind === "pi" &&
+		!(matchedTask as DesktopTask).runInBackground &&
+		Boolean((matchedTask as DesktopTask).readOnly || (matchedTask as DesktopTask).worktreeId);
 	const effectiveStatus = matchedTask
-		? matchedTask.status === "failed" || matchedTask.status === "cancelled"
+		? matchedTask.status === "failed" || matchedTask.status === "cancelled" || matchedTask.status === "interrupted"
 			? "error"
 			: matchedTask.status === "completed"
 				? "done"
@@ -781,6 +836,11 @@ function ToolCard({
 	const dotClass = effectiveStatus === "error" ? "err" : effectiveStatus === "done" ? "ok" : "run";
 	const [open, setOpen] = useState(false);
 	const isOpen = open || status === "running";
+	const summaryLine = matchedTask
+		? formatMatchedTaskSummary(matchedTask, taskProgress)
+		: status === "running" && (name === "Agent" || name === "SendMessage") && progress?.output
+			? progress.output
+			: info.treeSummary;
 
 	return (
 		<div className={`cl-tool ${effectiveStatus} ${isOpen ? "is-open" : ""}`}>
@@ -798,15 +858,23 @@ function ToolCard({
 				{!matchedTask && info.badge && <span className={`cc-tool-badge ${status === "error" ? "err" : ""}`}>{info.badge}</span>}
 				<ChevronRight size={13} className="cl-tool-chevron" />
 			</button>
-			{info.treeSummary && (
+			{summaryLine && (
 				<div className="cc-tree-summary">
 					<span className="cc-tree-arm">⎿</span>
-					<span className="cc-tree-text">
-						{matchedTask ? `${matchedTask.status} · ${matchedTask.workingDirectory}` : info.treeSummary}
-					</span>
+					<span className="cc-tree-text">{summaryLine}</span>
+					{canBackground && matchedTask && onBackgroundTask && (
+						<button type="button" className="cc-inline-task-btn" title="转到后台运行 (Ctrl+B)" onClick={() => onBackgroundTask(matchedTask.id)}>
+							<ArrowDownToLine size={11} /> 转到后台
+						</button>
+					)}
+					{matchedActive && matchedTask && onStopTask && (
+						<button type="button" className="cc-inline-task-btn danger" onClick={() => onStopTask(matchedTask.id, matchedKind)}>
+							<Square size={10} /> 停止
+						</button>
+					)}
 					{matchedTask && onOpenTask && (
 						<button type="button" className="cc-inline-task-btn" onClick={() => onOpenTask(matchedTask.id)}>
-							<Eye size={11} /> 查看子会话
+							<Eye size={11} /> 打开子 Agent
 						</button>
 					)}
 				</div>
