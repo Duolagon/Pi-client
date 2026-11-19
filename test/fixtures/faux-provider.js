@@ -1,4 +1,5 @@
 // This test-only provider emits scripted model output; the actual Pi tools still execute.
+import { appendFileSync } from "node:fs";
 import { fauxProvider, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 
 const providerName = "desktop-test";
@@ -39,12 +40,27 @@ export default function desktopTestProvider(pi) {
 		})),
 		streamSimple(model, context, streamOptions) {
 			const { text, results } = lastPrompt(context);
+			// Every provider request is recorded, whatever its prompt, for exact call counting.
+			if (process.env.PI_DESKTOP_TEST_LLM_LOG)
+				appendFileSync(process.env.PI_DESKTOP_TEST_LLM_LOG, `call ${JSON.stringify(text.slice(0, 80))}\n`);
 			if (text.includes("slow-stream")) {
 				slow.setResponses([fauxAssistantMessage("Cancellable stream ".repeat(500))]);
 				return slow.provider.streamSimple(model, context, streamOptions);
 			}
 			let response;
-			if (text.includes("read-write-bash")) {
+			if (text.includes("ECHO_SYSTEM_MARKERS")) {
+				// Report which markers reached the system prompt (system messages) versus the user message.
+				const system = context.messages
+					.filter((message) => message.role === "system")
+					.map((message) => [typeof message.content === "string" ? message.content : message.content.map((block) => block.text ?? "").join("\n"), ...Object.values(message.sections ?? {})].join("\n"))
+					.join("\n");
+				const markers = ["SUBAGENT_SYSTEM_INSTRUCTIONS", "PRELOADED_SKILL_GUIDE", "PRIOR_AGENT_MEMORY"];
+				response = fauxAssistantMessage(`ECHO user=${text} system=${markers.filter((marker) => system.includes(marker)).join(",")}`);
+			} else if (text.includes("loop-tool-calls")) {
+				// Never finishes on its own: every response asks for another tool call, so only a
+				// host-enforced turn limit can end the run.
+				response = fauxAssistantMessage(fauxToolCall("read", { path: "seed.txt" }), { stopReason: "toolUse" });
+			} else if (text.includes("read-write-bash")) {
 				const steps = [
 					fauxToolCall("read", { path: "seed.txt" }),
 					fauxToolCall("write", { path: "generated.txt", content: "written by real Pi tool\n" }),

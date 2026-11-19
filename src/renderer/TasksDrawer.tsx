@@ -7,12 +7,15 @@ import type { DesktopTask, ExternalTask, Snapshot, WorktreeInfo } from "../share
 
 export function TasksDrawer({
 	project,
+	conversationId,
 	initialTaskId,
 	close,
 	onNotice,
 	fail,
 }: {
 	project?: string;
+	/** Active conversation; "停止全部后台子 Agent" acts only on its own children. */
+	conversationId?: string;
 	initialTaskId?: string;
 	close: () => void;
 	onNotice: (msg: string) => void;
@@ -26,6 +29,8 @@ export function TasksDrawer({
 	const [detailTask, setDetailTask] = useState<DesktopTask | null>(null);
 	const [extDetail, setExtDetail] = useState<ExternalTask | null>(null);
 	const [extFollowUp, setExtFollowUp] = useState("");
+	const [piFollowUp, setPiFollowUp] = useState("");
+	const [notifyParent, setNotifyParent] = useState(false);
 	const [newPrompt, setNewPrompt] = useState("");
 	const [isolation, setIsolation] = useState<"worktree" | "shared">("worktree");
 	const [busy, setBusy] = useState(false);
@@ -63,6 +68,7 @@ export function TasksDrawer({
 					const filtered = prev.filter((t) => t.id !== event.task.id);
 					return [event.task, ...filtered].sort((a, b) => b.updatedAt - a.updatedAt);
 				});
+				setDetailTask((prev) => (prev?.id === event.task.id ? event.task : prev));
 			}
 		});
 		const unsubExternal = window.pi.externalAgents.onEvent((packet) => {
@@ -80,6 +86,16 @@ export function TasksDrawer({
 			unsubExternal();
 		};
 	}, [project]);
+
+	// A shown child conversation keeps its process; the host may stop idle finished ones otherwise.
+	const viewedTaskId = detailTask?.id;
+	useEffect(() => {
+		if (!viewedTaskId) return;
+		void window.pi.tasks.viewing(viewedTaskId, true).catch(() => {});
+		return () => {
+			void window.pi.tasks.viewing(viewedTaskId, false).catch(() => {});
+		};
+	}, [viewedTaskId]);
 
 	const openDetail = async (task: DesktopTask) => {
 		try {
@@ -138,6 +154,26 @@ export function TasksDrawer({
 		}
 	};
 
+	const sendPiFollowUp = async (e: React.FormEvent) => {
+		e.preventDefault();
+		if (!detailTask || !piFollowUp.trim()) return;
+		setBusy(true);
+		try {
+			const sent = await window.pi.tasks.send({
+				taskId: detailTask.id,
+				message: piFollowUp.trim(),
+				...(detailTask.parentConversationId ? { notifyParent } : {}),
+			});
+			setPiFollowUp("");
+			onNotice(sent.status === "delivered_to_running_agent" ? "消息已送达运行中的子 Agent。" : "已继续对话，任务正在执行。");
+			await openDetail(sent.task);
+		} catch (error) {
+			fail(error);
+		} finally {
+			setBusy(false);
+		}
+	};
+
 	const mergeWorktree = async (id: string) => {
 		setBusy(true);
 		try {
@@ -168,6 +204,25 @@ export function TasksDrawer({
 	};
 
 	const totalTasks = tasks.length + externalTasks.length;
+	const isActive = (status: string) => status === "running" || status === "queued" || status === "waiting_for_input";
+	const backgroundChildren = conversationId
+		? tasks.filter((task) => task.parentConversationId === conversationId && task.runInBackground && isActive(task.status)).length +
+			externalTasks.filter((task) => task.parentConversationId === conversationId && isActive(task.status)).length
+		: 0;
+	const stopAllBackground = async () => {
+		if (!conversationId || !backgroundChildren) return;
+		if (!window.confirm(`停止当前会话的全部 ${backgroundChildren} 个后台子 Agent？已完成的修改会保留，主会话会收到“已停止”的结果。`)) return;
+		setBusy(true);
+		try {
+			const { stopped } = await window.pi.tasks.stopAll(conversationId);
+			onNotice(stopped ? `已停止 ${stopped} 个后台子 Agent。` : "当前会话没有运行中的后台子 Agent。");
+			await refresh();
+		} catch (error) {
+			fail(error);
+		} finally {
+			setBusy(false);
+		}
+	};
 
 	return (
 		<Modal title="后台任务、子 Agent 与 Worktree (/tasks)" close={close} wide>
@@ -183,6 +238,20 @@ export function TasksDrawer({
 
 				{tab === "tasks" && (
 					<div className="cc-controls-body">
+						{backgroundChildren > 0 && !detail && !extDetail && (
+							<div className="cc-task-stop-all">
+								<span>当前会话有 {backgroundChildren} 个运行中的子 Agent。按 Esc 只会中断前台调用，后台子 Agent 会继续运行。</span>
+								<button
+									type="button"
+									className="cc-mini-btn danger"
+									title="停止全部后台子 Agent（Ctrl+X Ctrl+K）"
+									disabled={busy}
+									onClick={() => void stopAllBackground()}
+								>
+									<Square size={12} /> 停止全部后台子 Agent
+								</button>
+							</div>
+						)}
 						<form className="cc-task-start" onSubmit={(e) => void startTask(e)}>
 							<input
 								placeholder="新建后台任务指令…"
@@ -244,6 +313,25 @@ export function TasksDrawer({
 								<div className="cc-task-transcript">
 									<TranscriptView transcript={transcript(detail.messages)} />
 								</div>
+								{!detailTask.quarantined && detailTask.status !== "queued" && (
+									<form className="cc-task-start" onSubmit={(e) => void sendPiFollowUp(e)}>
+										<input
+											placeholder={isActive(detailTask.status) ? "向运行中的子 Agent 补充说明…" : "继续对话（保留之前的上下文）…"}
+											value={piFollowUp}
+											onChange={(e) => setPiFollowUp(e.target.value)}
+											disabled={busy}
+										/>
+										{detailTask.parentConversationId && !isActive(detailTask.status) && (
+											<label className="cc-task-notify" title="本轮完成后，把结果作为子 Agent 通知交付给发起它的会话">
+												<input type="checkbox" checked={notifyParent} onChange={(e) => setNotifyParent(e.target.checked)} disabled={busy} />
+												完成后通知父会话
+											</label>
+										)}
+										<button type="submit" className="primary-button" disabled={busy || !piFollowUp.trim()}>
+											<Send size={13} /> {isActive(detailTask.status) ? "发送" : "继续对话"}
+										</button>
+									</form>
+								)}
 							</div>
 						) : extDetail ? (
 							<div className="cc-task-detail">

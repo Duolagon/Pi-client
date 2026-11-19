@@ -194,7 +194,10 @@ test("validators reject unknown fields, malformed scopes and unsafe command sele
 		assert.throws(() => validatePermissionRule(f.rule({ scope: "project" })));
 		assert.throws(() => validatePermissionRule(f.rule({ scope: "conversation" })));
 		assert.throws(() => validatePermissionRule({ ...f.rule(), unexpected: true }));
-		assert.throws(() => validatePermissionRule(f.rule({ command: { type: "prefix", argv: ["npm"] } })));
+		assert.throws(() => validatePermissionRule(f.rule({ command: { type: "prefix", argv: [] } })));
+		assert.throws(() => validatePermissionRule(f.rule({ command: { type: "prefix", argv: ["sudo"] } })));
+		// Claude Code's `Bash(npm:*)` selects every npm invocation.
+		assert.doesNotThrow(() => validatePermissionRule(f.rule({ command: { type: "prefix", argv: ["npm"] } })));
 		assert.throws(() => validatePermissionRule(f.rule({ command: { type: "exact", value: "npm test && touch x" } })));
 		assert.throws(() => validatePermissionRule(f.rule({ command: { type: "exact", value: "sh -c 'touch x'" } })));
 		assert.throws(() => validateRuntimePolicy(f.policy({ rules: [f.rule(), f.rule()] })));

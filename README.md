@@ -73,7 +73,7 @@ DeepSeek 默认使用 `deepseek-flash`，并提供 `deepseek-v4-pro`；模型与
 - MCP 服务器管理（`/mcp`）：读写用户 `~/.pi/agent/mcp.json` 与项目 `.pi/mcp.json`，支持 stdio/HTTP 增删、启停和描述；保存后重启当前项目会话，已启用的 HTTP 服务器可从管理面板打开 OAuth 登录终端，凭据由 Pi 保存。
 - 项目信任：打开含 `.pi/settings.json`、`.pi/mcp.json`、`.pi/agents`、`.claude/agents`、`.pi/extensions`、`.pi/skills`、`.pi/prompts`、`.pi/SYSTEM.md` 或祖先 `.agents/skills` 的项目时显示信任横幅与资源清单；未信任时不加载这些项目配置，信任后重启会话生效，顶栏可随时更改。`跳过确认（危险）` 模式有常驻风险提示。
 - 模型主动 `Agent` 委派、前台等待／后台结果回传、只读 Explore／Plan 与 Worktree 编码子任务；后台任务与 Worktree 弹窗支持查看详情、子任务审批、停止、快进合并与安全清理。
-- 自定义 Agent（`/agents`）：读取 `.claude/agents` 与 `.pi/agents`（项目级需项目信任），支持名称、描述、提示词、工具白名单、模型和思考强度；`Agent` 工具可按名称委派，只读定义自动共享、可写定义默认 Worktree。
+- 自定义 Agent（`/agents`）：兼容读取 `.claude/agents` 与 `.pi/agents`（项目级需项目信任），支持名称、描述、提示词、工具白名单 / `disallowedTools`、模型/别名（`sonnet`/`opus`/`haiku`/`inherit`）、思考强度（`effort`/`thinkingLevel`）、`permissionMode`（含 `dontAsk`）、`maxTurns`、预加载 `skills`、`memory`（`agent-memory`）、`isolation`/`background` 与作用域 `hooks`；`Agent` 工具可按名称委派，支持 `fork: true` 继承父会话上下文快照，只读定义自动共享、可写定义默认 Worktree。
 - 本机 Codex／Claude Code／Kimi Code 执行器：主动委派、原生会话持续协作、审批、结果回传和取消；支持在界面启用/停用、配置可执行路径并管理任务审批与续写。
 - Git 检查点（`/rewind`）：Pi 提示和直接命令自动捕获，支持弹窗差异对比、按单文件或全部安全恢复及冲突提示。
 - Git 暂存、放弃修改与提交，以及 Unified / Split（分栏）Diff 视图切换。
@@ -81,7 +81,7 @@ DeepSeek 默认使用 `deepseek-flash`，并提供 `deepseek-v4-pro`；模型与
 - 会话分支树与 Pi CLI 历史导入（`/sessions`）：浏览会话分支树、节点跳转/分叉、克隆当前分支，以及发现并显式导入 Pi CLI 历史副本。
 - Claude Code 对等增强（Phase 1–3）：
   - **引擎级 Plan 模式 & 结构化交互**：独立 `plan` 权限模式（只读调研、放行 `WebFetch` 与 `Explore/Plan` 只读子 Agent、允许写入 `.pi/plans/<id>.md` 并阻断源码写入与写命令），配合 `ExitPlanMode`、计划正文预览/编辑审批栏与 `AskUserQuestion` 多选/表单提问卡片；另内置 `TodoWrite` 任务进度清单、`WebFetch`（带内网隔离）与 `NotebookEdit`（`.ipynb` 单元格编辑）。
-  - **Claude 兼容 Hooks 引擎（`/hooks`）**：支持 `~/.claude/settings.json`、`~/.pi/agent/hooks.json` 以及受信任项目内的 `.claude/settings.json` / `.pi/hooks.json`，涵盖 `PreToolUse`、`PostToolUse`、`UserPromptSubmit`、`Stop`、`SessionStart`、`Notification`，支持正则 matcher、exit code `2` / JSON 决策拦截与测试触发。
+  - **Claude 兼容 Hooks 引擎（`/hooks`）**：支持 `~/.claude/settings*.json`、`~/.pi/agent/hooks.json`、受信任项目内 `.claude/settings*.json` / `.pi/hooks.json` 以及 Agent frontmatter 作用域 hooks，涵盖 11 个事件（`PreToolUse`、`PostToolUse`、`PostToolUseFailure`、`PermissionRequest`、`UserPromptSubmit`、`Stop`、`SubagentStart`、`SubagentStop`、`PreCompact`、`SessionStart`、`Notification`），支持 `command` 与 `http`（`allowedEnvVars` Header 注入）handler、正则 matcher、`updatedInput`（带权限二次重验）、exit code `2` / JSON 决策拦截、防循环 Stop 阻断与测试触发。
   - **上下文分析、分层记忆与压缩控制（`/memory` / `/context` / `/status`）**：支持编辑根目录 `AGENTS.md` / `AGENTS.override.md` / `CLAUDE.md` / `CLAUDE.local.md` 与 `.claude/rules/*.md`（含 `paths:` 与 `@import` 解析）、`/init` 引导、分段上下文占用可视化、缓存命中率、`autoCompaction` / `autoRetry` 开关以及 `/compact [指令]`。
   - **权限规则共享、Skills、侧问与效率工具**：支持将项目规则双向导入/导出 `.claude/settings.json`；`/skills` 支持查看与新建 `.pi/skills` / `.claude/skills`；支持 `/btw <问题>` 不污染主会话的独立侧问、`/preview` 本地网页预览（仅 `localhost`）、`⌘F` 会话内检索、`⌘P` 全局命令面板、窗口失焦桌面通知，以及设置中可选的 macOS `sandbox-exec`（Seatbelt）Bash 命令沙箱开关。
 

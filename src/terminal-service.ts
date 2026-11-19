@@ -88,6 +88,16 @@ export class TerminalService {
 			LINES: String(rows),
 			PWD: project,
 		});
+		// Apps launched from Finder/launchd usually have no locale, which makes
+		// readline treat multibyte input (Chinese, emoji) as meta keys.
+		const utf8 = (value?: string) => Boolean(value && /utf-?8/i.test(value));
+		if (!utf8(environment.LC_ALL || environment.LC_CTYPE || environment.LANG)) {
+			// Fix only the variable that decides the character set; keep the user's
+			// language for messages and collation when it is already UTF-8.
+			if (environment.LC_ALL) environment.LC_ALL = "en_US.UTF-8";
+			else if (environment.LC_CTYPE) environment.LC_CTYPE = "en_US.UTF-8";
+			else environment.LANG = "en_US.UTF-8";
+		}
 		if (this.disposed) throw new Error("终端服务已关闭。");
 		if (
 			[...this.records.values()].filter((item) => item.info.status !== "exited").length >=

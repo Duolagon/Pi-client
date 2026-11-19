@@ -128,6 +128,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [mcpOpen, setMcpOpen] = useState(false);
 	const [todoExpanded, setTodoExpanded] = useState(false);
 	const [tasksMap, setTasksMap] = useState<Record<string, DesktopTask>>({});
+	/** Held background results per parent conversation ("N 条子 Agent 结果待交付"). */
+	const [heldResults, setHeldResults] = useState<Record<string, number>>({});
+	const [delivering, setDelivering] = useState(false);
+	/** Ctrl+X Ctrl+K arms "stop all background sub-agents"; a second chord within 3 s confirms. */
+	const stopChord = useRef<{ x?: number; armed?: number }>({});
 	const [externalTasksMap, setExternalTasksMap] = useState<Record<string, ExternalTask>>({});
 	const [gitSummary, setGitSummary] = useState<{ branch: string; count: number; isGit: boolean } | null>(null);
 	const [rename, setRename] = useState<string | null>(null);
@@ -158,6 +163,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			setExternalTasksMap(next);
 		}).catch(() => {});
 		const unsub = api.tasks.onEvent((event) => {
+			if (event.type === "task_notifications") {
+				setHeldResults((prev) => ({ ...prev, [event.conversationId]: event.pending }));
+				return;
+			}
 			if (event.type === "task_updated") {
 				setTasksMap((prev) => {
 					const current = prev[event.task.id];
@@ -198,6 +207,34 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			active = false;
 		};
 	}, [snapshot?.active?.project, app.revision]);
+	const activeHeldId = snapshot?.active?.id;
+	const activeHeldCount = snapshot?.pendingTaskNotifications;
+	useEffect(() => {
+		if (activeHeldId) setHeldResults((prev) => ({ ...prev, [activeHeldId]: activeHeldCount ?? 0 }));
+	}, [activeHeldId, activeHeldCount]);
+	const heldCount = activeHeldId ? heldResults[activeHeldId] ?? 0 : 0;
+	const deliverHeldResults = async () => {
+		if (!activeHeldId || delivering) return;
+		setDelivering(true);
+		try {
+			const { pending } = await api.tasks.deliverNow(activeHeldId);
+			setHeldResults((prev) => ({ ...prev, [activeHeldId]: pending }));
+			app.setNotice(pending ? `仍有 ${pending} 条子 Agent 结果未能交付，请稍后重试。` : "已交付子 Agent 结果，主会话开始处理。");
+		} catch (error) {
+			app.fail(error);
+		} finally {
+			setDelivering(false);
+		}
+	};
+	const stopAllBackground = async () => {
+		if (!snapshot?.active) return;
+		try {
+			const { stopped } = await api.tasks.stopAll(snapshot.active.id);
+			app.setNotice(stopped ? `已停止 ${stopped} 个后台子 Agent。` : "当前会话没有运行中的后台子 Agent。");
+		} catch (error) {
+			app.fail(error);
+		}
+	};
 	const blocked = running || changing || bashBusy;
 	const project = snapshot?.projects.find((item) => item.path === snapshot.active?.project);
 	const taskList = [...Object.values(tasksMap), ...Object.values(externalTasksMap)];
@@ -318,6 +355,23 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		const onKey = (event: KeyboardEvent) => {
 			if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
 			const lower = event.key.toLowerCase();
+			// Ctrl+X Ctrl+K: stop all background sub-agents of this conversation (press twice to confirm).
+			if (event.ctrlKey && !event.metaKey && lower === "x") {
+				stopChord.current.x = Date.now();
+				return;
+			}
+			if (event.ctrlKey && !event.metaKey && lower === "k" && stopChord.current.x && Date.now() - stopChord.current.x < 1500) {
+				event.preventDefault();
+				stopChord.current.x = undefined;
+				if (stopChord.current.armed && Date.now() - stopChord.current.armed < 3000) {
+					stopChord.current.armed = undefined;
+					void stopAllBackground();
+				} else {
+					stopChord.current.armed = Date.now();
+					app.setNotice("再按一次 Ctrl+X Ctrl+K 停止当前会话的全部后台子 Agent。");
+				}
+				return;
+			}
 			if (lower === "k") {
 				event.preventDefault();
 				setQuery("");
@@ -854,6 +908,18 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								)}
 							</div>
 						)}
+						{heldCount > 0 && (
+							<div className="cc-plan-bar cc-held-results" role="region" aria-label="待交付的子 Agent 结果">
+								<div className="cc-plan-bar-top">
+									<span>{heldCount} 条子 Agent 结果待交付：主会话未运行时完成的结果会随下一条消息一起交给 Pi。</span>
+									<div className="cc-plan-bar-actions">
+										<button type="button" className="primary-button" disabled={delivering} onClick={() => void deliverHeldResults()}>
+											立即交付
+										</button>
+									</div>
+								</div>
+							</div>
+						)}
 						<LiveComposer
 							key={snapshot.active?.id ?? "no-conversation"}
 							snapshot={snapshot}
@@ -1059,6 +1125,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			{tasksOpen && (
 				<TasksDrawer
 					project={snapshot.active?.project}
+					conversationId={snapshot.active?.id}
 					initialTaskId={taskInitialId}
 					close={() => setTasksOpen(false)}
 					onNotice={(msg) => app.setNotice(msg)}

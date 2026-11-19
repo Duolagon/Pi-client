@@ -36,15 +36,15 @@ capabilities 返回 transport、continuation、approvals、cancellation、readOn
 {"tool":"AgentExecutors","input":{}}
 {"tool":"Agent","input":{"executor":"codex","description":"修复解析器","prompt":"定位并修复解析错误，补充测试，报告变更。","subagent_type":"general-purpose","run_in_background":true}}
 {"tool":"TaskOutput","input":{"task_id":"external-...","block":true,"timeout":60000}}
-{"tool":"AgentSend","input":{"task_id":"external-...","message":"复核者发现空字符串边界，请继续修复并跑测试。","run_in_background":true}}
+{"tool":"SendMessage","input":{"to":"external-...","message":"复核者发现空字符串边界，请继续修复并跑测试。","run_in_background":true}}
 {"tool":"TaskStop","input":{"task_id":"external-..."}}
 ```
 
-Agent 的 executor 为 `pi / codex / claude / kimi`，省略仍为 Pi。AgentExecutors 返回本机可用性和限制；模型不能配置可执行文件。TaskList/TaskOutput/TaskStop 同时支持 Pi 与外部任务，外部结果带 executor 区分。AgentSend 当前用于外部任务，不能给其他父会话的任务发消息。
+Agent 的 executor 为 `pi / codex / claude / kimi`，省略仍为 Pi。AgentExecutors 返回本机可用性和限制；模型不能配置可执行文件。TaskList/TaskOutput/TaskStop 同时支持 Pi 与外部任务，外部结果带 executor 区分。SendMessage（兼容别名 AgentSend，`task_id` 即 `to`）先按 id 匹配外部任务，否则继续 Pi 子 Agent；不能给其他父会话的任务发消息。外部任务没有 name，只能按 task_id 寻址。
 
-每个外部任务保留固定执行器、父会话、Worktree 和原生 session/thread ID。AgentSend 是下一轮指令，必须等待上一轮终止；若只剩进程清理会等待清理完成，若上一轮仍在运行则明确报错。它不会把消息投给“此目录最近的一段聊天”。进程按需关闭，下一轮显式恢复同一原生会话，不重放上一条 prompt。
+每个外部任务保留固定执行器、父会话、Worktree 和原生 session/thread ID。SendMessage/AgentSend 是下一轮指令，必须等待上一轮终止；若只剩进程清理会等待清理完成，若上一轮仍在运行则明确报错。它不会把消息投给“此目录最近的一段聊天”。进程按需关闭，下一轮显式恢复同一原生会话，不重放上一条 prompt。
 
-持续协作采用主 Agent 路由：主 Agent 可把 Claude 的复核结论发给原 Codex 任务，再让 Kimi 补测试。原生子执行器不会自行调用宿主的 AgentSend 或直接读取其他任务；完整父聊天也不会复制给它们。不同执行器的可写任务各用一个 Worktree，主 Agent 审核后显式整合成果，不自动同步未提交改动。
+持续协作采用主 Agent 路由：主 Agent 可把 Claude 的复核结论发给原 Codex 任务，再让 Kimi 补测试。原生子执行器不会自行调用宿主的 SendMessage/AgentSend 或直接读取其他任务；完整父聊天也不会复制给它们。不同执行器的可写任务各用一个 Worktree，主 Agent 审核后显式整合成果，不自动同步未提交改动。
 
 ## 前端 API
 
@@ -63,7 +63,7 @@ await window.pi.externalAgents.cancel(task.id);
 
 start 的 subagent_type 可省略，默认 general-purpose。Explore/Plan 要求可强制执行的只读能力；Kimi 不支持此组合。可写任务必须用 Worktree，非 Git 目录不能启动可写任务；只读任务默认共享项目读取。可传 isolation 和已归属父会话的 worktree_id。项目由 conversationId 绑定，模型不能指定任意目录。
 
-start/send 的前端 API 返回任务状态，不阻塞等待模型完成；result 支持 block 和 0–60000 毫秒等待。模型前台 Agent/AgentSend 最多等待 5 分钟；遇人工审批提前返回状态，继续完成后再回传。run_in_background/runInBackground 为 true 时，完成或失败会通过 `desktop_task_result` 通知仍存活的父 Pi 会话并触发继续处理；正常情况下每轮仅通知一次。父进程不可用时不自动重启它，结果仍可查询。
+start/send 的前端 API 返回任务状态，不阻塞等待模型完成；result 支持 block 和 0–60000 毫秒等待。模型调用 Agent 时未传 run_in_background 则按设置 `subagentDefaultBackground`（默认 true）后台运行（外部可写任务总是使用 Worktree，不适用 Pi 在非 git 项目中的“可写默认前台”规则）；外部执行器不支持 fork 和 `isolation: "remote"`，结果仍为 JSON 结构。模型前台 Agent/SendMessage 最多等待 5 分钟（SendMessage 未传 run_in_background 时按 `subagentDefaultBackground` 默认后台，AgentSend 别名默认前台）；遇人工审批提前返回状态，继续完成后再回传。run_in_background/runInBackground 为 true 时，完成、失败或被停止（用户停止、宿主权限变更、执行器自行取消、应用重启/关闭中断）会在该轮记下输出后经宿主的持久化 outbox 以 `desktop_task_notification` 交给父 Pi 会话：父会话 runtime 在运行时立即投递并触发继续处理（父会话正在一轮运行中则等这一轮结束再投递）；父进程不可用时不自动重启它，结果留到父会话下次打开（排入下一轮，界面可“立即交付”）。每轮只交付一次，应用重启后仍会补交。模型 TaskStop 和父会话中止造成的取消不通知；父会话中止（Esc）只取消前台外部任务。
 
 任务有 id、executor、parentConversationId、parentToolCallId、title、project、workingDirectory、worktreeId、subagentType、readOnly、status、revision、turn、eventSequence、nativeSessionId、output、truncated、error、pendingApprovals。外部 ID 以 external- 开头，不能交给 Pi 的 tasks.snapshot/sessions API。
 

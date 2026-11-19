@@ -1,6 +1,10 @@
+import type { HookEntry } from "./hook-types.ts";
 import type { ThinkingLevel } from "./shared.ts";
 
 export type AgentScope = "builtin" | "project" | "user";
+export type AgentPermissionMode = "default" | "acceptEdits" | "plan" | "dontAsk" | "bypassPermissions" | "read";
+export type AgentMemoryScope = "user" | "project" | "local";
+export type AgentModelAlias = "sonnet" | "opus" | "haiku" | "fable" | "inherit";
 
 /** A resolved subagent definition. Built-ins have no source path. */
 export interface AgentDefinition {
@@ -8,8 +12,17 @@ export interface AgentDefinition {
 	description: string;
 	prompt: string;
 	tools?: string[];
+	disallowedTools?: string[];
 	model?: { provider: string; id: string };
+	modelAlias?: AgentModelAlias;
 	thinkingLevel?: ThinkingLevel;
+	permissionMode?: AgentPermissionMode;
+	maxTurns?: number;
+	skills?: string[];
+	memory?: AgentMemoryScope;
+	isolation?: "worktree" | "shared";
+	background?: boolean;
+	hooks?: HookEntry[];
 	readOnly: boolean;
 	scope: AgentScope;
 	source?: string;
@@ -24,9 +37,16 @@ export interface AgentSaveInput {
 	description: string;
 	prompt: string;
 	tools?: string[];
-	/** `provider/model-id`; omitted to inherit the parent model. */
+	disallowedTools?: string[];
+	/** `provider/model-id` or Claude alias (`sonnet`/`opus`/`haiku`/`inherit`); omitted to inherit. */
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
+	permissionMode?: AgentPermissionMode;
+	maxTurns?: number;
+	skills?: string[];
+	memory?: AgentMemoryScope;
+	isolation?: "worktree" | "shared";
+	background?: boolean;
 	scope: "project" | "user";
 	project?: string;
 }

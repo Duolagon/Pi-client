@@ -2,7 +2,7 @@ import { isAbsolute } from "node:path";
 import type { ExternalAdapter, ExternalApprovalRequest, ExternalApprovalResponse, ExternalSession, ExternalSessionOptions, ExternalTurnResult } from "./external-types.ts";
 import { JsonLineProcess, type RpcId } from "./external-rpc.ts";
 
-const desktopTools = new Set(["Agent", "AgentSend", "AgentExecutors", "AgentMessage", "TaskOutput", "TaskStop", "TaskList", "WorktreeCreate", "WorktreeList", "WorktreeMerge", "WorktreeRemove"]);
+const desktopTools = new Set(["Agent", "SendMessage", "AgentSend", "AgentExecutors", "AgentMessage", "TaskOutput", "TaskStop", "TaskList", "WorktreeCreate", "WorktreeList", "WorktreeMerge", "WorktreeRemove"]);
 const limit = 1024 * 1024;
 type RecordValue = Record<string, unknown>;
 interface Turn {

@@ -17,17 +17,17 @@ export default function externalDelegationProvider(pi) {
 			const results = context.messages.slice(index + 1).filter((message) => message.role === "toolResult");
 			const executor = text.split(" ")[1] ?? "codex";
 			let response;
-			if (text.includes('"task_id"') && text.includes('"parent_conversation_id"') && text.includes('"executor"')) {
+			if (text.includes("<task-notification>") && text.includes("<task-id>external-")) {
 				response = fauxAssistantMessage("EXTERNAL_HANDBACK_COMPLETE " + text);
 			} else if (text.startsWith("EXTERNAL_CONTINUE ")) {
 				if (!results.length) response = tool("AgentExecutors", {});
-				else if (results.length === 1) response = tool("Agent", { executor, description: "External implementation", prompt: "WRITE first", subagent_type: "general-purpose" });
+				else if (results.length === 1) response = tool("Agent", { executor, description: "External implementation", prompt: "WRITE first", subagent_type: "general-purpose", run_in_background: false });
 				else if (results.length === 2) response = tool("AgentSend", { task_id: parsed(results[1]).task_id, message: "WRITE second" });
 				else if (results.length === 3) response = tool("TaskOutput", { task_id: parsed(results[1]).task_id, block: false });
 				else if (results.length === 4) response = tool("TaskList", {});
 				else response = fauxAssistantMessage("EXTERNAL_CONTINUE_COMPLETE " + results.map((result) => `${result.toolName}:${result.isError ? "error" : "ok"}:${textOf(result)}`).join("\n"));
 			} else if (text.startsWith("EXTERNAL_APPROVAL ")) {
-				response = !results.length ? tool("Agent", { executor, description: "Native approval", prompt: "WAIT_APPROVAL", subagent_type: "general-purpose" }) : fauxAssistantMessage("EXTERNAL_APPROVAL_RETURNED " + textOf(results[0]));
+				response = !results.length ? tool("Agent", { executor, description: "Native approval", prompt: "WAIT_APPROVAL", subagent_type: "general-purpose", run_in_background: false }) : fauxAssistantMessage("EXTERNAL_APPROVAL_RETURNED " + textOf(results[0]));
 			} else if (text.startsWith("EXTERNAL_BACKGROUND ")) {
 				response = !results.length ? tool("Agent", { executor, description: "External background", prompt: "SLOW_DONE", subagent_type: "general-purpose", run_in_background: true }) : fauxAssistantMessage("EXTERNAL_BACKGROUND_LAUNCHED " + textOf(results[0]));
 			} else if (text.startsWith("EXTERNAL_CANCEL_TOOL ")) {
@@ -36,6 +36,15 @@ export default function externalDelegationProvider(pi) {
 				else response = fauxAssistantMessage("EXTERNAL_CANCEL_COMPLETE " + textOf(results[1]));
 			} else if (text.startsWith("EXTERNAL_BLOCK ")) {
 				response = !results.length ? tool("Agent", { executor, description: "External parent cancellation", prompt: "BLOCK", subagent_type: "general-purpose", run_in_background: true }) : fauxAssistantMessage("EXTERNAL_BLOCK_LAUNCHED " + textOf(results[0]));
+			} else if (text.startsWith("EXTERNAL_PARAMS ")) {
+				// Call-level parameters an external executor cannot honour fail visibly or warn.
+				const calls = [
+					{ executor, description: "External with model", prompt: "WRITE model", model: "opus", run_in_background: true },
+					{ executor, description: "External with name", prompt: "WRITE name", name: "reviewer", run_in_background: true },
+					{ executor, description: "External with team", prompt: "SLOW_DONE", model: "inherit", mode: "plan", team_name: "core", run_in_background: true },
+				];
+				response = results.length < calls.length ? tool("Agent", calls[results.length])
+					: fauxAssistantMessage("EXTERNAL_PARAMS_COMPLETE " + results.map((result) => `${result.isError ? "error" : "ok"}:${textOf(result)}`).join("\n"));
 			} else if (text.startsWith("EXTERNAL_FOREIGN ")) {
 				response = !results.length ? tool("AgentSend", { task_id: text.split(" ")[1], message: "WRITE forbidden" }) : fauxAssistantMessage("EXTERNAL_FOREIGN_COMPLETE " + (results[0].isError ? "DENIED " : "ALLOWED ") + textOf(results[0]));
 			} else if (text.startsWith("PI_MANUAL_SLOW")) {

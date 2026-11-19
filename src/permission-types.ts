@@ -15,13 +15,17 @@ export interface PermissionRule {
 	tool: string;
 	/** Project-relative or absolute path glob. * stays in one segment; ** crosses segments. */
 	path?: string;
-	/** A literal Bash command, or a token prefix (at least executable and one argument). */
+	/** A literal Bash command, or a token prefix (an executable and optional leading arguments). */
 	command?: PermissionCommandSelector;
+	/** URL host for WebFetch-style tools: `example.com` or `*.example.com`. */
+	domain?: string;
 }
 
 export interface RuntimePermissionPolicy {
 	version: 1;
 	mode: "ask" | "acceptEdits" | "auto" | "read" | "plan";
+	/** Automatically deny any tool that would require an interactive confirmation prompt. */
+	dontAsk?: boolean;
 	/** The host resolves global/project/conversation scopes before writing this list. */
 	rules: PermissionRule[];
 	disabledTools: string[];

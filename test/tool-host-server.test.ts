@@ -54,6 +54,11 @@ test("tool host rejects invalid schemas and privilege escalation fields before i
 			{ tool: "TaskOutput", toolCallId: "call", input: { task_id: "id", timeout: 60001 } },
 			{ tool: "TaskOutput", toolCallId: "call", input: { task_id: "id", timeout: 1.5 } },
 			{ tool: "TaskStop", toolCallId: "", input: { task_id: "id" } },
+			{ tool: "TaskList", toolCallId: "call", input: {}, batch: { writers: 0 } },
+			{ tool: "Agent", toolCallId: "call", input: { prompt: "do it", description: "a" }, batch: { writers: -1 } },
+			{ tool: "Agent", toolCallId: "call", input: { prompt: "do it", description: "a" }, batch: { writers: 1.5 } },
+			{ tool: "Agent", toolCallId: "call", input: { prompt: "do it", description: "a" }, batch: { writers: 1, names: ["write"] } },
+			{ tool: "Agent", toolCallId: "call", input: { prompt: "do it", description: "a" }, batch: [1] },
 		]) {
 			const response = await fetch(`${url}/invoke`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(payload) });
 			assert.equal(response.status, 400);

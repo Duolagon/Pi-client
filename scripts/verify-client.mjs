@@ -505,6 +505,11 @@ try {
 	await page.getByRole("textbox", { name: "Hook 命令", exact: true }).fill("echo HOOK_UI_OK");
 	await page.getByRole("button", { name: "添加 Hook", exact: true }).click();
 	await page.getByText("echo HOOK_UI_OK", { exact: true }).waitFor();
+	await page.getByRole("combobox", { name: "Hook 类型", exact: true }).selectOption("http");
+	await page.getByRole("textbox", { name: "Hook URL", exact: true }).fill(new URL("/hook-test", previewUrl).href);
+	await page.getByRole("button", { name: "添加 Hook", exact: true }).click();
+	await page.getByText(new URL("/hook-test", previewUrl).href, { exact: true }).waitFor();
+	await page.getByRole("combobox", { name: "Hook 类型", exact: true }).selectOption("command");
 	await page.getByRole("button", { name: "测试触发", exact: true }).click();
 	await page.getByText(/执行 .* 个 Hook/).waitFor();
 	await page.getByRole("tab", { name: /^Skills/ }).click();
@@ -558,11 +563,14 @@ try {
 	await page.getByRole("button", { name: "新建", exact: true }).click();
 	await page.getByRole("textbox", { name: "Agent 名称", exact: true }).fill("e2e-reviewer");
 	await page.getByRole("textbox", { name: "描述（模型据此决定何时委派）", exact: true }).fill("E2E reviewer");
+	await page.getByRole("textbox", { name: "禁用工具 disallowedTools", exact: true }).fill("Write, Edit, Bash");
 	await page.getByRole("textbox", { name: "系统提示词", exact: true }).fill("Review only. Do not edit files.");
 	await page.getByRole("combobox", { name: "保存位置", exact: true }).selectOption("user");
 	await page.getByRole("button", { name: "保存 Agent", exact: true }).click();
 	await page.getByText("e2e-reviewer", { exact: true }).waitFor();
-	assert.match(await readFile(join(agentDir, "agents", "e2e-reviewer.md"), "utf8"), /name: e2e-reviewer/);
+	const savedAgentText = await readFile(join(agentDir, "agents", "e2e-reviewer.md"), "utf8");
+	assert.match(savedAgentText, /name: e2e-reviewer/);
+	assert.match(savedAgentText, /disallowedTools: \[write, edit, bash\]/);
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
 	await page.getByRole("button", { name: "MCP 服务器", exact: true }).click();

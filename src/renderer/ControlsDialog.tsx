@@ -6,6 +6,7 @@ import type {
 	DesktopToolInfo,
 	HookEntry,
 	HookEventName,
+	HookHandlerType,
 	HookRunResult,
 	PermissionAction,
 	PermissionRule,
@@ -20,8 +21,13 @@ export type ControlsTab = "tools" | "permissions" | "hooks" | "skills" | "execut
 const HOOK_EVENTS: HookEventName[] = [
 	"PreToolUse",
 	"PostToolUse",
+	"PostToolUseFailure",
+	"PermissionRequest",
 	"UserPromptSubmit",
 	"Stop",
+	"SubagentStart",
+	"SubagentStop",
+	"PreCompact",
 	"SessionStart",
 	"Notification",
 ];
@@ -60,8 +66,11 @@ export function ControlsDialog({
 
 	// Hook form
 	const [hookEvent, setHookEvent] = useState<HookEventName>("PreToolUse");
+	const [hookType, setHookType] = useState<HookHandlerType>("command");
 	const [hookMatcher, setHookMatcher] = useState("");
 	const [hookCommand, setHookCommand] = useState("");
+	const [hookUrl, setHookUrl] = useState("");
+	const [hookEnvVars, setHookEnvVars] = useState("");
 	const [hookScope, setHookScope] = useState<"project" | "user">(project ? "project" : "user");
 	const [hookTestResult, setHookTestResult] = useState<HookRunResult | null>(null);
 
@@ -179,7 +188,9 @@ export function ControlsDialog({
 		try {
 			const res = await window.pi.importClaudePermissions();
 			setPerms(await window.pi.permissions.list(conversationId));
-			const msg = `已从 .claude/settings.json 导入 ${res.imported ?? 0} 条规则`;
+			const skipped = res.skipped ?? [];
+			const msg = `已从 .claude/settings.json 导入 ${res.imported ?? 0} 条规则` +
+				(skipped.length ? `；${skipped.length} 条无法等价转换、未导入：${skipped.slice(0, 5).join("，")}${skipped.length > 5 ? " 等" : ""}` : "");
 			setSyncMsg(msg);
 			onNotice?.(msg);
 		} catch (error) {
@@ -200,18 +211,27 @@ export function ControlsDialog({
 
 	const addHook = async (event: React.FormEvent) => {
 		event.preventDefault();
-		if (!hookCommand.trim()) return;
+		if (hookType === "http" ? !hookUrl.trim() : !hookCommand.trim()) return;
+		const allowedEnvVars = hookEnvVars
+			.split(",")
+			.map((v) => v.trim())
+			.filter(Boolean);
 		try {
 			const next = await window.pi.hooks.save({
 				event: hookEvent,
+				handlerType: hookType,
 				matcher: hookMatcher.trim() || undefined,
-				command: hookCommand.trim(),
+				...(hookType === "http"
+					? { url: hookUrl.trim(), ...(allowedEnvVars.length ? { allowedEnvVars } : {}) }
+					: { command: hookCommand.trim() }),
 				scope: project ? hookScope : "user",
 				project,
 			});
 			setHooks(next);
 			setHookMatcher("");
 			setHookCommand("");
+			setHookUrl("");
+			setHookEnvVars("");
 			onNotice?.("已保存 Hook");
 		} catch (error) {
 			fail(error);
@@ -219,6 +239,7 @@ export function ControlsDialog({
 	};
 
 	const deleteHook = async (entry: HookEntry) => {
+		if (entry.scope === "agent") return;
 		try {
 			setHooks(await window.pi.hooks.remove({ id: entry.id, scope: entry.scope, project }));
 		} catch (error) {
@@ -233,6 +254,9 @@ export function ControlsDialog({
 				toolName: hookMatcher.trim() || "bash",
 				toolInput: { command: "echo test" },
 				prompt: "hook test",
+				agentType: hookMatcher.trim() || "Explore",
+				trigger: "manual",
+				notificationType: "permission_prompt",
 				project,
 			});
 			setHookTestResult(res);
@@ -390,9 +414,10 @@ export function ControlsDialog({
 									<span className="cc-rule-main">
 										<code>{rule.tool}</code>
 										{rule.path && <span className="cc-rule-extra">path: {rule.path}</span>}
+										{rule.domain && <span className="cc-rule-extra">domain: {rule.domain}</span>}
 										{rule.command && (
 											<span className="cc-rule-extra">
-												cmd: {rule.command.type === "exact" ? rule.command.value : rule.command.argv.join(" ")}
+												cmd: {rule.command.type === "exact" ? rule.command.value : `${rule.command.argv.join(" ")} *`}
 											</span>
 										)}
 									</span>
@@ -409,18 +434,29 @@ export function ControlsDialog({
 
 				{tab === "hooks" && (
 					<div className="cc-controls-body">
-						<form className="cc-hook-form" onSubmit={(e) => void addHook(e)}>
+						<form className="cc-hook-form cc-hook-form-wide" onSubmit={(e) => void addHook(e)}>
 							<select aria-label="Hook 事件" value={hookEvent} onChange={(e) => setHookEvent(e.target.value as HookEventName)}>
 								{HOOK_EVENTS.map((ev) => (
 									<option key={ev} value={ev}>{ev}</option>
 								))}
 							</select>
+							<select aria-label="Hook 类型" value={hookType} onChange={(e) => setHookType(e.target.value as HookHandlerType)}>
+								<option value="command">Shell 命令</option>
+								<option value="http">HTTP Webhook</option>
+							</select>
 							<select aria-label="Hook 作用域" value={hookScope} onChange={(e) => setHookScope(e.target.value as "project" | "user")}>
 								<option value="project" disabled={!project}>当前项目 (.pi/hooks.json)</option>
 								<option value="user">全局用户</option>
 							</select>
-							<input aria-label="Hook 匹配器" placeholder="Matcher 正则 (可选，如 edit|write)" value={hookMatcher} onChange={(e) => setHookMatcher(e.target.value)} />
-							<input aria-label="Hook 命令" placeholder="Shell 命令（通过 stdin 接收 Claude JSON）" value={hookCommand} onChange={(e) => setHookCommand(e.target.value)} />
+							<input aria-label="Hook 匹配器" placeholder="Matcher 正则 (可选，如 Bash|Write)" value={hookMatcher} onChange={(e) => setHookMatcher(e.target.value)} />
+							{hookType === "http" ? (
+								<>
+									<input aria-label="Hook URL" type="url" placeholder="https://example.com/hook" value={hookUrl} onChange={(e) => setHookUrl(e.target.value)} />
+									<input aria-label="允许的环境变量" placeholder="允许 Header 变量 (逗号分隔，可选)" value={hookEnvVars} onChange={(e) => setHookEnvVars(e.target.value)} />
+								</>
+							) : (
+								<input aria-label="Hook 命令" placeholder="Shell 命令（stdin 接收 Claude Hook JSON）" value={hookCommand} onChange={(e) => setHookCommand(e.target.value)} />
+							)}
 							<button type="submit" className="primary-button">
 								<Plus size={14} /> 添加 Hook
 							</button>
@@ -434,13 +470,14 @@ export function ControlsDialog({
 								{hookTestResult.additionalContext ? ` · 上下文：${hookTestResult.additionalContext}` : ""}
 							</div>
 						)}
-						<p className="subtle-note">兼容读取 ~/.claude/settings.json 与受信任项目的 .claude/settings.json、.pi/hooks.json。</p>
+						<p className="subtle-note">兼容 ~/.claude/settings*.json 与受信任项目的 .claude/settings*.json、.pi/hooks.json；支持 command 与 http handler。</p>
 						<div className="cc-list-scroll">
 							{hooks.map((item) => (
 								<div key={item.id} className="cc-rule-row">
 									<span className="cc-source-tag">{item.event}</span>
-									<span className="cc-rule-main">
-										<code>{item.command}</code>
+									<span className="cc-source-tag muted">{item.handlerType === "http" ? "HTTP" : "CMD"}</span>
+									<span className="cc-rule-main" title={item.sourceFile}>
+										<code>{item.handlerType === "http" ? item.url : item.command}</code>
 										{item.matcher && <span className="cc-rule-extra">matcher: {item.matcher}</span>}
 									</span>
 									<span className="cc-source-tag muted">{item.scope}</span>

@@ -41,7 +41,7 @@ export default function delegationPolicyProvider(pi) {
 			let response;
 			if (text.startsWith("POLICY_PARENT")) {
 				response = results.length === 0
-					? tool("Agent", { description: "Verify child policy inheritance", prompt: text.includes("LIVE") ? "POLICY_CHILD_LIVE" : "POLICY_CHILD_INITIAL", subagent_type: "general-purpose" })
+					? tool("Agent", { description: "Verify child policy inheritance", prompt: text.includes("LIVE") ? "POLICY_CHILD_LIVE" : "POLICY_CHILD_INITIAL", subagent_type: "general-purpose", run_in_background: false })
 					: fauxAssistantMessage("POLICY_PARENT_COMPLETE " + resultText(results[0]));
 			} else if (text.startsWith("POLICY_CHILD")) {
 				const steps = [

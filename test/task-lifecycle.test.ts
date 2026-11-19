@@ -189,8 +189,11 @@ test(
 		const data = await setup();
 		try {
 			const task = await data.service.startTask({ message: "read-write-bash archived task" });
+			// "completed" is reported before the host finishes settling the run (checkpoint,
+			// hooks); restoring needs an idle project, so also wait for the settlement event.
 			await waitFor(
-				() => data.tasks.some((event) => event.task.id === task.id && event.task.status === "completed"),
+				() => data.tasks.some((event) => event.task.id === task.id && event.task.status === "completed") &&
+					data.events.some((packet) => packet.conversationId === task.conversationId && packet.event.type === "agent_settled"),
 				"task completion",
 			);
 			const [checkpoint] = await data.service.listCheckpoints(task.conversationId);

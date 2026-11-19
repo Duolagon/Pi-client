@@ -1,19 +1,31 @@
 export type HookEventName =
 	| "PreToolUse"
 	| "PostToolUse"
+	| "PostToolUseFailure"
+	| "PermissionRequest"
 	| "UserPromptSubmit"
 	| "Stop"
+	| "SubagentStart"
+	| "SubagentStop"
+	| "PreCompact"
 	| "SessionStart"
 	| "Notification";
 
-export type HookScope = "user" | "project";
+export type HookHandlerType = "command" | "http";
+
+export type HookScope = "user" | "project" | "agent";
 
 export interface HookEntry {
 	id: string;
 	event: HookEventName;
+	handlerType?: HookHandlerType;
 	matcher?: string;
-	command: string;
+	command?: string;
+	url?: string;
+	headers?: Record<string, string>;
+	allowedEnvVars?: string[];
 	timeout?: number;
+	statusMessage?: string;
 	scope: HookScope;
 	sourceFile: string;
 	editable: boolean;
@@ -22,16 +34,21 @@ export interface HookEntry {
 export interface HookSaveInput {
 	id?: string;
 	event: HookEventName;
+	handlerType?: HookHandlerType;
 	matcher?: string;
-	command: string;
+	command?: string;
+	url?: string;
+	headers?: Record<string, string>;
+	allowedEnvVars?: string[];
 	timeout?: number;
-	scope: HookScope;
+	statusMessage?: string;
+	scope: "user" | "project";
 	project?: string;
 }
 
 export interface HookRemoveInput {
 	id: string;
-	scope: HookScope;
+	scope: "user" | "project";
 	project?: string;
 }
 
@@ -41,6 +58,8 @@ export interface HookRunResult {
 	reason?: string;
 	additionalContext?: string;
 	systemMessage?: string;
+	updatedInput?: Record<string, unknown>;
+	suppressOutput?: boolean;
 	executedCount: number;
 }
 
@@ -49,6 +68,10 @@ export interface HookTestInput {
 	toolName?: string;
 	toolInput?: Record<string, unknown>;
 	prompt?: string;
+	error?: string;
+	agentType?: string;
+	trigger?: "manual" | "auto";
+	notificationType?: string;
 	project?: string;
 }
 

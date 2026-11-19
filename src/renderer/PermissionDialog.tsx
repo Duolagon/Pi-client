@@ -98,17 +98,49 @@ export function PermissionDialog({
 		return [];
 	}, [parsedConfirm, inferredTool]);
 
+	// Narrow the remembered rule like Claude Code: a command prefix for bash and
+	// a host for WebFetch, never the whole tool when a narrower selector exists.
+	const allowSelector = useMemo((): { label: string; extra: Record<string, unknown> } | null | undefined => {
+		if (!inferredTool) return null;
+		const input = parsedConfirm?.input;
+		if (inferredTool === "bash") {
+			const command = typeof input?.command === "string" ? input.command.trim() : "";
+			// Compound commands get no remembered rule; later arguments may be quoted.
+			if (!command || /[;&|\n\r`]|\$\(/.test(command)) return null;
+			const words = command.split(/\s+/);
+			const plain = /^[\w./@%+=,:-]+$/;
+			const wrappers = ["sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", ".", "env", "sudo", "doas", "exec", "command", "xargs", "timeout", "time", "nice", "nohup", "stdbuf"];
+			if (!plain.test(words[0]) || wrappers.includes(words[0].split("/").at(-1)!) || /^[a-zA-Z_][a-zA-Z0-9_]*=/.test(words[0])) return null;
+			// Keep a subcommand or option (`git commit`, `rm -rf`, `node build.js`) so one click never allows the whole executable.
+			const argv = words.length > 1 && plain.test(words[1]) ? words.slice(0, 2) : words.length === 1 ? words : null;
+			if (!argv) return null;
+			return { label: `${argv.join(" ")} *`, extra: { command: { type: "prefix", argv } } };
+		}
+		if (inferredTool === "WebFetch") {
+			try {
+				const host = new URL(String(input?.url ?? "")).hostname.toLowerCase().replace(/\.$/, "");
+				const valid = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/.test(host);
+				return valid ? { label: `WebFetch(${host})`, extra: { domain: host } } : null;
+			} catch {
+				return null;
+			}
+		}
+		return { label: inferredTool, extra: {} };
+	}, [inferredTool, parsedConfirm]);
+
 	const alwaysAllow = async () => {
-		if (!inferredTool) return;
+		if (!inferredTool || !allowSelector) return;
 		setPending(true);
 		try {
+			const scope = project ? "project" : conversationId ? "conversation" : "global";
 			await window.pi.permissions.upsert({
 				id: `allow-${inferredTool}-${Date.now().toString(36)}`,
-				scope: project ? "project" : "global",
-				project,
-				conversationId: project ? undefined : conversationId,
+				scope,
+				...(scope === "project" ? { project } : {}),
+				...(scope === "conversation" ? { conversationId } : {}),
 				action: "allow",
 				tool: inferredTool,
+				...allowSelector.extra,
 			});
 			await respond({ type: "extension_ui_response", id: request.id, confirmed: true });
 		} catch (error) {
@@ -167,14 +199,14 @@ export function PermissionDialog({
 							>
 								拒绝
 							</button>
-							{inferredTool && (
+							{inferredTool && allowSelector && (
 								<button
 									disabled={pending}
 									onClick={() => void alwaysAllow()}
 									className="secondary-button"
-									title={`在当前${project ? "项目" : "全局"}始终允许 ${inferredTool}`}
+									title={`在当前${project ? "项目" : "会话"}始终允许 ${allowSelector.label}`}
 								>
-									始终允许 {inferredTool}
+									始终允许 {allowSelector.label}
 								</button>
 							)}
 							<button

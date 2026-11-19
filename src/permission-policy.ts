@@ -16,6 +16,39 @@ const editTools = new Set(["edit", "write", "NotebookEdit"]);
 const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite", "AskUserQuestion", "ExitPlanMode"]);
 const pathTools = new Set([...readingTools, "edit", "write", "NotebookEdit"]);
 const wrappers = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", ".", "env", "sudo", "doas", "exec", "command", "xargs"]);
+/** Pass-through process wrappers that Claude Code strips before matching command rules. */
+const processWrappers = new Set(["timeout", "time", "nice", "nohup", "stdbuf"]);
+
+function executableName(word: string): string {
+	return word.split("/").at(-1)!;
+}
+
+/** Remove leading `timeout 5`, `nice -n 10`, `nohup`, `time`, `stdbuf -oL` so rules match the real command. */
+function stripProcessWrappers(argv: string[]): string[] {
+	let words = argv;
+	for (let guard = 0; guard < 8 && words.length; guard++) {
+		const name = executableName(words[0]);
+		if (!processWrappers.has(name)) break;
+		let index = 1;
+		if (name === "timeout") {
+			while (index < words.length && words[index].startsWith("-")) {
+				// -s SIGNAL / -k DURATION take a separate value unless attached.
+				if (/^-(?:s|k)$|^--(?:signal|kill-after)$/.test(words[index])) index++;
+				index++;
+			}
+			index++; // duration
+		} else if (name === "nice") {
+			while (index < words.length && words[index].startsWith("-")) {
+				if (words[index] === "-n" || words[index] === "--adjustment") index++;
+				index++;
+			}
+		} else if (name === "stdbuf" || name === "time") {
+			while (index < words.length && words[index].startsWith("-")) index++;
+		}
+		words = words.slice(index);
+	}
+	return words;
+}
 
 function object(value: unknown, label: string): Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label}必须是对象。`);
@@ -35,7 +68,7 @@ function keys(record: Record<string, unknown>, allowed: string[], label: string)
 /** Validate stored or IPC-supplied rules instead of trusting TypeScript at a data boundary. */
 export function validatePermissionRule(value: unknown): PermissionRule {
 	const record = object(value, "权限规则");
-	keys(record, ["id", "scope", "project", "conversationId", "action", "tool", "path", "command"], "权限规则");
+	keys(record, ["id", "scope", "project", "conversationId", "action", "tool", "path", "command", "domain"], "权限规则");
 	const id = text(record.id, "规则标识", 200);
 	if (!/^[a-zA-Z0-9._-]+$/.test(id)) throw new Error("规则标识无效。");
 	if (!["global", "project", "conversation"].includes(record.scope as string)) throw new Error("权限作用域无效。");
@@ -63,13 +96,20 @@ export function validatePermissionRule(value: unknown): PermissionRule {
 			command = { type: "exact", value };
 		} else if (selector.type === "prefix") {
 			keys(selector, ["type", "argv"], "命令选择器");
-			if (!Array.isArray(selector.argv) || selector.argv.length < 2 || selector.argv.length > 100)
-				throw new Error("命令前缀必须包含可执行文件和至少一个参数。");
+			if (!Array.isArray(selector.argv) || selector.argv.length < 1 || selector.argv.length > 100)
+				throw new Error("命令前缀必须包含可执行文件。");
 			const argv = selector.argv.map((item) => text(item, "命令参数", 4096));
-			if (argv[0].includes(" ") || wrappers.has(argv[0].split("/").at(-1)!))
-				throw new Error("命令前缀不能使用 Shell 包装器。");
+			if (argv[0].includes(" ") || wrappers.has(executableName(argv[0])) || processWrappers.has(executableName(argv[0])))
+				throw new Error("命令前缀不能使用 Shell 或进程包装器。");
 			command = { type: "prefix", argv };
 		} else throw new Error("命令选择器类型无效。");
+	}
+	let domain: string | undefined;
+	if (record.domain !== undefined) {
+		domain = text(record.domain, "域名", 253).toLowerCase();
+		if (!/^(?:\*\.)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/.test(domain))
+			throw new Error("域名选择器无效。");
+		if (path !== undefined || command !== undefined) throw new Error("域名规则不能同时指定路径或命令。");
 	}
 	return {
 		id,
@@ -80,14 +120,37 @@ export function validatePermissionRule(value: unknown): PermissionRule {
 		...(conversationId !== undefined ? { conversationId } : {}),
 		...(path !== undefined ? { path } : {}),
 		...(command !== undefined ? { command } : {}),
+		...(domain !== undefined ? { domain } : {}),
 	};
+}
+
+function requestHost(input: Record<string, unknown>): string | undefined {
+	if (typeof input.url !== "string") return;
+	try {
+		return new URL(input.url).hostname.toLowerCase().replace(/\.$/, "") || undefined;
+	} catch {
+		return;
+	}
+}
+
+/**
+ * Allow rules match only the named host (or an explicit `*.` wildcard); deny
+ * and ask rules also cover subdomains so a narrower host cannot slip past.
+ */
+function domainMatches(rule: PermissionRule, host: string | undefined): boolean {
+	if (host === undefined) return rule.action !== "allow";
+	const domain = rule.domain!;
+	if (domain.startsWith("*.")) return host.endsWith(domain.slice(1));
+	return host === domain || (rule.action !== "allow" && host.endsWith(`.${domain}`));
 }
 
 export function validateRuntimePolicy(value: unknown): RuntimePermissionPolicy {
 	const record = object(value, "运行时权限配置");
-	keys(record, ["version", "mode", "rules", "disabledTools", "project"], "运行时权限配置");
+	keys(record, ["version", "mode", "dontAsk", "rules", "disabledTools", "project"], "运行时权限配置");
 	if (record.version !== 1 || !["ask", "acceptEdits", "auto", "read", "plan"].includes(record.mode as string))
 		throw new Error("运行时权限版本或模式无效。");
+	if (record.dontAsk !== undefined && typeof record.dontAsk !== "boolean")
+		throw new Error("运行时 dontAsk 配置无效。");
 	if (!Array.isArray(record.rules) || record.rules.length > 2000) throw new Error("权限规则列表无效。");
 	if (!Array.isArray(record.disabledTools) || record.disabledTools.length > 10000) throw new Error("停用工具列表无效。");
 	const rules = record.rules.map(validatePermissionRule);
@@ -99,7 +162,14 @@ export function validateRuntimePolicy(value: unknown): RuntimePermissionPolicy {
 	});
 	const project = text(record.project, "运行时项目目录");
 	if (!isAbsolute(project)) throw new Error("运行时项目目录必须为绝对路径。");
-	return { version: 1, mode: record.mode as RuntimePermissionPolicy["mode"], rules, disabledTools, project };
+	return {
+		version: 1,
+		mode: record.mode as RuntimePermissionPolicy["mode"],
+		...(record.dontAsk === true ? { dontAsk: true } : {}),
+		rules,
+		disabledTools,
+		project,
+	};
 }
 
 /** The file is deliberately read for every call so revocation also stops stale tool calls. */
@@ -283,9 +353,51 @@ function parseShell(command: string): ShellCommand {
 	return { commands, compound, opaque };
 }
 
-function commandMatches(selector: PermissionCommandSelector, argv: string[]): boolean {
+function commandMatches(selector: PermissionCommandSelector, rawArgv: string[], action: PermissionAction): boolean {
 	const expected = selector.type === "prefix" ? selector.argv : parseShell(selector.value).commands[0];
-	return expected.every((word, index) => argv[index] === word) && (selector.type === "prefix" || argv.length === expected.length);
+	const argv = stripProcessWrappers(rawArgv);
+	if (!argv.length) return false;
+	// Deny/ask rules also catch `/bin/rm` for `rm`; allow rules stay literal.
+	const first = action !== "allow" && !expected[0].includes("/") ? executableName(argv[0]) : argv[0];
+	return [first, ...argv.slice(1)].length >= expected.length &&
+		expected.every((word, index) => (index === 0 ? first : argv[index]) === word) &&
+		(selector.type === "prefix" || argv.length === expected.length);
+}
+
+/**
+ * Remove grep/find/ls result lines whose file a deny or ask path rule covers,
+ * so a recursive search cannot reveal a file that `read` would refuse.
+ */
+export async function redactSearchOutput(
+	policy: RuntimePermissionPolicy,
+	toolName: string,
+	input: unknown,
+	text: string,
+): Promise<{ text: string; removed: number }> {
+	const rules = policy.rules.filter(
+		(rule) => rule.action !== "allow" && rule.path !== undefined && !rule.command && !rule.domain && segmentMatches(rule.tool, toolName),
+	);
+	if (!rules.length || !["grep", "find", "ls"].includes(toolName)) return { text, removed: 0 };
+	const project = await canonicalPermissionPath(policy.project, policy.project);
+	const record = input && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
+	const root = await nativeToolTarget(typeof record.path === "string" ? record.path : ".", project, false);
+	let removed = 0;
+	const kept: string[] = [];
+	for (const line of text.split("\n")) {
+		let relativePath: string | undefined;
+		if (toolName === "grep") relativePath = /^(.+?)(?::\d+: |-\d+- )/.exec(line)?.[1];
+		else if (line.trim() && !line.startsWith("[")) relativePath = line.replace(/\/$/, "");
+		if (relativePath !== undefined) {
+			const target = relativePath === "" ? root : resolve(root, relativePath);
+			const hidden = await Promise.all(rules.map((rule) => pathMatches(rule.path!, target, project)));
+			if (hidden.some(Boolean)) {
+				removed++;
+				continue;
+			}
+		}
+		kept.push(line);
+	}
+	return { text: kept.join("\n"), removed };
 }
 
 function contained(project: string, path: string): boolean {
@@ -327,7 +439,9 @@ export async function evaluatePermission(
 		]);
 		const inPlanDir = (target: string) => planDirs.some((dir) => contained(dir, target) && target !== dir);
 		writingPlanFile = (call.toolName === "write" || call.toolName === "edit") && targets.length > 0 && targets.every(inPlanDir);
-		const isSafePlanAgent = call.toolName === "Agent" && input.subagent_type !== "general-purpose";
+		// An omitted type and "fork" both start a writable general-purpose child.
+		const agentType = input.subagent_type ?? "general-purpose";
+		const isSafePlanAgent = call.toolName === "Agent" && agentType !== "general-purpose" && agentType !== "fork" && input.fork !== true;
 		const allowedInPlan =
 			readingTools.has(call.toolName) ||
 			harmlessDesktopTools.has(call.toolName) ||
@@ -342,6 +456,7 @@ export async function evaluatePermission(
 	const matches: { rule: PermissionRule; conservative: boolean }[] = [];
 	for (const rule of policy.rules) {
 		if (!segmentMatches(rule.tool, call.toolName)) continue;
+		if (rule.domain !== undefined && !domainMatches(rule, requestHost(input))) continue;
 		if (rule.path !== undefined) {
 			if (!targets.length) continue;
 			const pathResults = await Promise.all(targets.map((target) => pathMatches(rule.path!, target, project)));
@@ -355,20 +470,34 @@ export async function evaluatePermission(
 				// A shell program may hide a denied command in expansion, a wrapper, or redirection.
 				conservative = true;
 			} else if (rule.action === "allow" && shell.compound) continue;
-			else if (!shell.commands.some((argv) => commandMatches(rule.command!, argv))) continue;
+			else if (!shell.commands.some((argv) => commandMatches(rule.command!, argv, rule.action))) continue;
 		}
 		matches.push({ rule, conservative });
 	}
 	for (const action of ["deny", "ask", "allow"] as const) {
 		const match = matches.find((candidate) => candidate.rule.action === action);
-		if (match) return {
-			action,
-			ruleId: match.rule.id,
-			reason: match.conservative ? `复杂 Shell 语法无法安全排除规则 ${match.rule.id}，按规则保守处理。` : `匹配权限规则 ${match.rule.id}。`,
-			...(targets.length ? { targets } : {}),
-		};
+		if (match) {
+			if (action === "ask" && policy.dontAsk) {
+				return {
+					action: "deny",
+					ruleId: match.rule.id,
+					reason: `dontAsk 模式自动拒绝需确认规则 ${match.rule.id}。`,
+					...(targets.length ? { targets } : {}),
+				};
+			}
+			return {
+				action,
+				ruleId: match.rule.id,
+				reason: match.conservative ? `复杂 Shell 语法无法安全排除规则 ${match.rule.id}，按规则保守处理。` : `匹配权限规则 ${match.rule.id}。`,
+				...(targets.length ? { targets } : {}),
+			};
+		}
 	}
-	const result = (action: PermissionAction, reason: string): PermissionDecision => ({ action, reason, ...(targets.length ? { targets } : {}) });
+	const result = (action: PermissionAction, reason: string): PermissionDecision => {
+		if (action === "ask" && policy.dontAsk)
+			return { action: "deny", reason: `dontAsk 模式自动拒绝未预授权的操作：${reason}`, ...(targets.length ? { targets } : {}) };
+		return { action, reason, ...(targets.length ? { targets } : {}) };
+	};
 	if (policy.mode === "plan") {
 		if (writingPlanFile) return result("allow", "Plan 模式：允许编辑计划文件。");
 		if (call.toolName === "Agent" && (input.subagent_type === "Explore" || input.subagent_type === "Plan"))

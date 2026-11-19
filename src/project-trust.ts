@@ -11,6 +11,8 @@ export const projectTrustResources = [
 	".pi/hooks.json",
 	".pi/agents",
 	".claude/agents",
+	".claude/skills",
+	".claude/commands",
 	".pi/SYSTEM.md",
 	".pi/APPEND_SYSTEM.md",
 	".pi/extensions",

@@ -4,6 +4,7 @@ import { isAbsolute, join, relative, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { discoverExecutors, executablePath, validateExecutorInput } from "./external-executors.ts";
 import type { ExternalExecutorSettings } from "./external-executors.ts";
+import { MAX_AGENT_OUTPUT, exceedsLength } from "./delegation-limits.ts";
 import { evaluatePermission, validateRuntimePolicy } from "./permission-policy.ts";
 import type { PermissionRule, RuntimePermissionPolicy } from "./permission-types.ts";
 import type { WorktreeCreateInput, WorktreeInfo } from "./worktree-types.ts";
@@ -14,8 +15,20 @@ import type {
 } from "./external-types.ts";
 
 const active = new Set(["queued", "running", "waiting_for_input"]);
-const outputLimit = 48 * 1024;
-interface StoredTask { task: ExternalTask; policy: RuntimePermissionPolicy; prompt: string; notify: boolean; notifiedTurn?: number }
+const outputLimit = MAX_AGENT_OUTPUT;
+/**
+ * Why an external task stopped. A background parent is told about every stop except its own
+ * TaskStop (`model_stop`, the tool result already said so) and its own abort (`parent_abort`).
+ * `policy_change`: host permissions changed; `restart`: the app quit or restarted;
+ * `executor_stop`: the external executor ended the turn as cancelled by itself.
+ */
+export type ExternalStopReason = "user_stop" | "model_stop" | "parent_abort" | "policy_change" | "restart" | "executor_stop";
+const stopReasons: readonly ExternalStopReason[] = ["user_stop", "model_stop", "parent_abort", "policy_change", "restart", "executor_stop"];
+const silentStops: ReadonlySet<ExternalStopReason> = new Set(["model_stop", "parent_abort"]);
+/** `notify` marks a background task whose result is delivered through the host's outbox. */
+interface StoredTask { task: ExternalTask; policy: RuntimePermissionPolicy; prompt: string; notify: boolean; notifiedTurn?: number; stopReason?: ExternalStopReason }
+/** A finished background turn whose result the parent has not received yet. */
+export interface ExternalNotification { task: ExternalTask; stopReason?: ExternalStopReason }
 interface Runtime {
 	session?: ExternalSession;
 	abort?: AbortController;
@@ -25,6 +38,8 @@ interface Runtime {
 	logBytes: number;
 	logWrites: Promise<void>;
 	approvals: Map<string, { request: ExternalApprovalRequest; resolve(response: ExternalApprovalResponse): void }>;
+	/** The run has not recorded its final output yet; a stopped task is delivered after it has. */
+	executing?: boolean;
 }
 export interface ExternalAgentOptions {
 	dataDir: string;
@@ -40,7 +55,8 @@ export interface ExternalAgentOptions {
 	listWorktrees(): Promise<WorktreeInfo[]>;
 	canStart(task: ExternalTask): boolean;
 	capacity(): number;
-	notify(conversationId: string, result: ExternalTaskResult): Promise<void>;
+	/** Deliver pending background results of a parent from the host's persisted outbox. */
+	flushNotifications(conversationId: string): void;
 	onActivityChange(): void;
 }
 
@@ -79,8 +95,12 @@ export class ExternalAgents {
 					throw new Error("外部任务存档无效。");
 				if (task.nativeSessionId !== undefined && (typeof task.nativeSessionId !== "string" || task.nativeSessionId.length > 500 || task.nativeSessionId.includes("\0"))) throw new Error("外部会话标识无效。");
 				task.pendingApprovals = [];
-				if (active.has(task.status)) { task.status = "interrupted"; task.error = "应用已重启；未重放任务，可显式发送新指令恢复原生会话。"; }
-				this.tasks.set(task.id, { task, policy: validateRuntimePolicy(record.policy), prompt: record.prompt, notify: Boolean(record.notify), notifiedTurn: record.notifiedTurn });
+				if (record.notifiedTurn !== undefined && (!Number.isSafeInteger(record.notifiedTurn) || record.notifiedTurn < 1 || record.notifiedTurn > task.turn)) throw new Error("外部任务通知状态无效。");
+				if (record.stopReason !== undefined && !stopReasons.includes(record.stopReason)) throw new Error("外部任务停止原因无效。");
+				// A turn the app lost while it ran is reported to a background parent as stopped.
+				// Records interrupted before stop reasons existed carry none and are never replayed.
+				if (active.has(task.status)) { task.status = "interrupted"; task.error = "应用已重启；未重放任务，可显式发送新指令恢复原生会话。"; record.stopReason = "restart"; }
+				this.tasks.set(task.id, { task, policy: validateRuntimePolicy(record.policy), prompt: record.prompt, notify: Boolean(record.notify), notifiedTurn: record.notifiedTurn, stopReason: record.stopReason });
 				// The event log can be newer than the last atomic task snapshot after a crash.
 				const recovered = await this.replay(task.id);
 				task.eventSequence = Math.max(task.eventSequence, recovered.latestSequence);
@@ -158,7 +178,7 @@ export class ExternalAgents {
 			if (active.has(task.status)) throw new Error("子任务仍在运行；请先等待完成或取消，再发送下一轮指令。");
 			await this.runtimes.get(task.id)?.running;
 			await realpath(task.workingDirectory);
-			record.prompt = input.message; record.notify = input.runInBackground ?? false;
+			record.prompt = input.message; record.notify = input.runInBackground ?? false; record.stopReason = undefined;
 			task.turn++; task.output = ""; task.error = undefined; task.truncated = false;
 			this.update(task, "queued"); await this.persist(); this.pump(); return structuredClone(task);
 		});
@@ -184,33 +204,63 @@ export class ExternalAgents {
 			const started = Date.now();
 			do { result = await this.result(id, { block: true, timeout: 60000 }, owner, signal); }
 			while (active.has(result.status) && !result.pending_approvals && Date.now() - started < 300000);
-			if (active.has(result.status)) this.record(id, owner).notify = true;
+			if (active.has(result.status)) {
+				// The parent stops waiting; the result now reaches it through the outbox.
+				this.record(id, owner).notify = true;
+				await this.persist();
+				this.options.flushNotifications(owner);
+			}
 			return result;
-		} catch (error) { if (signal?.aborted) await this.cancel(id, owner); throw error; }
+		} catch (error) { if (signal?.aborted) await this.cancel(id, owner, "parent_abort"); throw error; }
 	}
 
-	async cancel(id: string, owner?: string): Promise<ExternalTask> {
-		const task = this.record(id, owner).task;
+	/** `reason` records who stopped the task; see `ExternalStopReason` for which stops notify. */
+	async cancel(id: string, owner?: string, reason: ExternalStopReason = "user_stop", error?: string): Promise<ExternalTask> {
+		const record = this.record(id, owner);
+		const task = record.task;
 		if (!active.has(task.status)) return structuredClone(task);
-		this.update(task, "cancelled");
+		record.stopReason = reason;
+		this.update(task, "cancelled", error);
 		const runtime = this.runtimes.get(id);
 		this.clearApprovals(task, runtime);
 		runtime?.abort?.abort(new Error("用户取消了外部任务。"));
 		await runtime?.session?.interrupt().catch(() => {});
-		await this.persist(); this.pump(); return structuredClone(task);
+		await this.persist(); this.pump();
+		// A running turn is delivered once it has recorded its output (see run()).
+		if (record.notify && !silentStops.has(reason)) this.options.flushNotifications(task.parentConversationId);
+		return structuredClone(task);
 	}
-	async cancelChildren(owner: string): Promise<void> {
-		await Promise.all(this.list(owner).filter((task) => active.has(task.status)).map((task) => this.cancel(task.id, owner)));
+	/**
+	 * Cancel a parent's active external children. `foregroundOnly` is the parent's Esc
+	 * (background children keep running); `backgroundOnly` is "stop all background agents".
+	 */
+	async cancelChildren(owner: string, options: { foregroundOnly?: boolean; backgroundOnly?: boolean; reason?: ExternalStopReason } = {}): Promise<ExternalTask[]> {
+		const targets = [...this.tasks.values()].filter(({ task, notify }) => task.parentConversationId === owner && active.has(task.status) &&
+			!(options.foregroundOnly && notify) && !(options.backgroundOnly && !notify));
+		return Promise.all(targets.map(({ task }) => this.cancel(task.id, owner, options.reason ?? "parent_abort")));
+	}
+	/** Finished background turns of `owner` that have not been delivered yet. */
+	pendingNotifications(owner: string): ExternalNotification[] {
+		return [...this.tasks.values()]
+			.filter(({ task, notify, notifiedTurn, stopReason }) => notify && task.parentConversationId === owner && notifiedTurn !== task.turn &&
+				!this.runtimes.get(task.id)?.executing &&
+				(["completed", "failed"].includes(task.status) ||
+					(["cancelled", "interrupted"].includes(task.status) && stopReason !== undefined && !silentStops.has(stopReason))))
+			.map(({ task, stopReason }) => ({ task: structuredClone(task), ...(stopReason ? { stopReason } : {}) }));
+	}
+	/** Record a delivered turn; a later turn of the same task notifies again. */
+	async markNotified(id: string, turn: number): Promise<void> {
+		const record = this.tasks.get(id);
+		if (!record || record.task.turn !== turn) return;
+		record.notifiedTurn = turn;
+		await this.persist();
 	}
 	/** Protocols without a per-tool authorization hook cannot safely keep running after revocation. */
 	async invalidatePolicies(): Promise<void> {
 		for (const { task } of this.tasks.values()) {
 			if (task.executor === "claude") continue;
-			if (active.has(task.status)) {
-				await this.cancel(task.id);
-				task.error = "宿主权限已更改，外部任务已停止；请在新权限下显式继续。";
-				this.event(task, { type: "task_updated", task: structuredClone(task) });
-			}
+			if (active.has(task.status))
+				await this.cancel(task.id, undefined, "policy_change", "宿主权限已更改，外部任务已停止；请在新权限下显式继续。");
 		}
 		await this.persist();
 	}
@@ -258,6 +308,7 @@ export class ExternalAgents {
 				const runtime = this.runtime(record.task.id);
 				if (runtime.running) continue;
 				this.update(record.task, "running");
+				runtime.executing = true;
 				runtime.abort = new AbortController();
 				runtime.running = this.run(record, runtime).finally(() => { runtime.running = undefined; this.options.onActivityChange(); this.pump(); });
 			}
@@ -268,7 +319,10 @@ export class ExternalAgents {
 		this.closed = true;
 		for (const { task } of this.tasks.values()) {
 			const runtime = this.runtimes.get(task.id);
-			if (active.has(task.status)) { this.update(task, "interrupted", "应用已关闭；任务未自动重放。"); runtime?.abort?.abort(); }
+			if (active.has(task.status)) {
+				this.tasks.get(task.id)!.stopReason = "restart";
+				this.update(task, "interrupted", "应用已关闭；任务未自动重放。"); runtime?.abort?.abort();
+			}
 			this.clearApprovals(task, runtime);
 		}
 		await Promise.allSettled([...this.runtimes.values()].map(async (runtime) => { await runtime.session?.close(); await runtime.running; await runtime.logWrites; }));
@@ -296,18 +350,21 @@ export class ExternalAgents {
 			const result = await runtime.session.run(record.prompt, runtime.abort!.signal);
 			if (result.sessionId) task.nativeSessionId = result.sessionId;
 			if (result.text) { task.output = result.text.slice(0, outputLimit); task.truncated = result.text.length > outputLimit; }
-			if (active.has(task.status)) this.update(task, result.status === "cancelled" ? "cancelled" : "completed");
+			if (active.has(task.status)) {
+				if (result.status === "cancelled") record.stopReason = "executor_stop";
+				this.update(task, result.status === "cancelled" ? "cancelled" : "completed");
+			}
 		} catch (error) {
-			if (active.has(task.status)) this.update(task, runtime.abort?.signal.aborted ? "cancelled" : "failed", error instanceof Error ? error.message : String(error));
+			if (active.has(task.status)) {
+				if (runtime.abort?.signal.aborted) record.stopReason = "executor_stop";
+				this.update(task, runtime.abort?.signal.aborted ? "cancelled" : "failed", error instanceof Error ? error.message : String(error));
+			}
 		} finally {
 			this.clearApprovals(task, runtime);
 			await runtime.session?.close().catch(() => {}); runtime.session = undefined;
+			runtime.executing = false;
 			await this.persist();
-			if (!this.closed && record.notify && record.notifiedTurn !== task.turn && ["completed", "failed"].includes(task.status)) {
-				record.notifiedTurn = task.turn;
-				await this.options.notify(task.parentConversationId, await this.result(task.id)).catch(() => { record.notifiedTurn = undefined; });
-				await this.persist();
-			}
+			if (!this.closed && record.notify) this.options.flushNotifications(task.parentConversationId);
 		}
 	}
 
@@ -352,7 +409,7 @@ export class ExternalAgents {
 		}
 		const rules = [...unique.values()].map((rule, index) => ({ ...rule, id: `external-${index}-${rule.id.slice(0, 150)}` }));
 		return { version: 1, project: task.workingDirectory, mode: task.readOnly || current.mode === "read" || record.policy.mode === "read" ? "read" : current.mode === "ask" || record.policy.mode === "ask" ? "ask" : "auto",
-			rules, disabledTools: [...new Set([...record.policy.disabledTools, ...current.disabledTools, "Agent", "AgentSend"])] };
+			rules, disabledTools: [...new Set([...record.policy.disabledTools, ...current.disabledTools, "Agent", "SendMessage", "AgentSend"])] };
 	}
 	private adapterEvent(task: ExternalTask, event: ExternalAdapterEvent): void {
 		if (event.type === "session") {
@@ -408,8 +465,8 @@ export class ExternalAgents {
 	}
 }
 
-function validatePrompt(value: string): void { if (typeof value !== "string" || !value.trim() || value.length > 2 * 1024 * 1024 || value.includes("\0")) throw new Error("外部任务指令无效。"); }
-function validateDescription(value: string): void { if (typeof value !== "string" || !value.trim() || value.length > 160 || value.includes("\0")) throw new Error("外部任务名称无效。"); }
+function validatePrompt(value: string): void { if (typeof value !== "string" || !value.trim() || exceedsLength(value, 2 * 1024 * 1024) || value.includes("\0")) throw new Error("外部任务指令无效。"); }
+function validateDescription(value: string): void { if (typeof value !== "string" || !value.trim() || exceedsLength(value, 160) || value.includes("\0")) throw new Error("外部任务名称无效。"); }
 function contains(root: string, path: string): boolean { const part = relative(root, path); return !isAbsolute(part) && part !== ".." && !part.startsWith(`..${sep}`); }
 function overlaps(left: string, right: string): boolean { return contains(left, right) || contains(right, left); }
 function normalizeCall(request: ExternalApprovalRequest) {

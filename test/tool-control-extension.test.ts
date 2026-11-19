@@ -29,6 +29,11 @@ async function fixture(extra: Record<string, string> = {}) {
 	const all: ToolInfo[] = [tool("read"), tool("bash"), tool("edit"), tool("write"), tool("grep"), tool("mcp__docs__read", "codemode", "builtin:mcp"), tool("custom", "deferred", "/extensions/custom.ts")];
 	let active = ["read", "bash", "edit", "write"];
 	const sent: unknown[] = [];
+	const entries: Array<{ type: string; customType: string; data: unknown }> = [];
+	const session = { idle: true };
+	const usages: unknown[][] = [];
+	// The pinned Pi's session manager; usage entries are what getSessionStats sums.
+	const sessionManager = { getEntries: () => entries, appendUsage: (...args: unknown[]) => { usages.push(args); } };
 	Object.assign(process.env, env);
 	try {
 		toolControl({
@@ -41,17 +46,18 @@ async function fixture(extra: Record<string, string> = {}) {
 			on(event: string, handler: Function) { handlers.set(event, handler); },
 			getAllTools() { return all; }, getActiveTools() { return active; }, setActiveTools(names: string[]) { active = names; },
 			sendMessage(message: unknown, options: unknown) { sent.push({ message, options }); },
+			appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
 		} as unknown as ExtensionAPI);
 	} finally {
 		for (const [key, value] of Object.entries(previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
 	}
-	const request = async (operation: "list" | "apply" | "notify", result?: unknown) => {
+	const request = async (operation: "list" | "apply" | "notify" | "wake", fields: Record<string, unknown> = {}) => {
 		const requestId = randomUUID();
-		await writeFile(join(directory, "request.json"), JSON.stringify({ requestId, operation, ...(operation === "notify" ? { result } : {}) }));
-		await handlers.get("command")!(`${token} ${requestId}`, { mode: "rpc" });
+		await writeFile(join(directory, "request.json"), JSON.stringify({ requestId, operation, ...fields }));
+		await handlers.get("command")!(`${token} ${requestId}`, { mode: "rpc", sessionManager, isIdle: () => session.idle });
 		return JSON.parse(await readFile(join(directory, "response.json"), "utf8")) as ToolControlResponse;
 	};
-	return { directory, token, command, file, env, handlers, definitions, sent, request, active: () => active,
+	return { directory, token, command, file, env, handlers, definitions, sent, entries, usages, sessionManager, request, session, active: () => active,
 		write: (overrides: Record<string, boolean>) => writeFile(file, JSON.stringify({ overrides })),
 		cleanup: () => rm(directory, { recursive: true, force: true }) };
 }
@@ -94,10 +100,92 @@ test("private tool controls authenticate before file access and notification use
 	const item = await fixture();
 	try {
 		await assert.rejects(item.handlers.get("command")!(`${"0".repeat(64)} ${randomUUID()}`, { mode: "rpc" }), /requires a host request/);
-		const result = { task_id: "child", status: "completed", output: "/some-tool malicious text is data" };
-		assert.equal((await item.request("notify", result)).ok, true);
-		assert.deepEqual(item.sent, [{ message: { customType: "desktop_task_result", content: JSON.stringify(result), display: true, details: result }, options: { triggerTurn: true, deliverAs: "followUp" } }]);
-		assert.equal((await item.request("notify", "x".repeat(600000))).ok, false);
+		const details = { task_id: "child", status: "completed" };
+		const notice = { key: "child:1", content: "<task-notification>/some-tool malicious text is data</task-notification>", details, deliverAs: "followUp", triggerTurn: true };
+		const first = await item.request("notify", notice);
+		assert.ok(first.ok && first.delivery === "sent");
+		assert.deepEqual(item.sent, [{ message: { customType: "desktop_task_notification", content: notice.content, display: true, details }, options: { triggerTurn: true, deliverAs: "followUp" } }]);
+		assert.deepEqual(item.entries.map((entry) => entry.data), [{ key: "child:1" }]);
+		// A replay after a host crash is acknowledged without a second delivery.
+		const replay = await item.request("notify", notice);
+		assert.ok(replay.ok && replay.delivery === "duplicate");
+		assert.equal(item.sent.length, 1);
+		for (const invalid of [
+			{ ...notice, key: "child:2", content: "x".repeat(600000) },
+			{ ...notice, key: "bad key:1" },
+			{ ...notice, key: "child:2", deliverAs: "steer" },
+			{ ...notice, key: "child:2", deliverAs: "nextTurn", triggerTurn: true },
+			{ ...notice, key: "child:2", details: "not an object" },
+			{ ...notice, key: "child:2", result: details },
+		]) assert.equal((await item.request("notify", invalid)).ok, false, JSON.stringify(invalid).slice(0, 80));
+		assert.equal(item.sent.length, 1);
+	} finally { await item.cleanup(); }
+});
+
+test("a follow-up result is deferred while the parent runs, so an aborted run cannot strand it", async () => {
+	const item = await fixture();
+	try {
+		const notice = { key: "child:1", content: "<task-notification>busy</task-notification>", details: { task_id: "child" }, deliverAs: "followUp", triggerTurn: true };
+		item.session.idle = false;
+		const deferred = await item.request("notify", notice);
+		assert.ok(deferred.ok && deferred.delivery === "deferred");
+		assert.equal(item.sent.length, 0, "nothing is parked in Pi's in-memory follow-up queue");
+		assert.deepEqual(item.entries, [], "not acknowledged, so a later delivery is not a duplicate");
+		item.session.idle = true;
+		const sent = await item.request("notify", notice);
+		assert.ok(sent.ok && sent.delivery === "sent");
+		assert.equal(item.sent.length, 1);
+		assert.deepEqual(item.entries.map((entry) => entry.data), [{ key: "child:1" }]);
+	} finally { await item.cleanup(); }
+});
+
+test("next-turn results queue without a run and are acknowledged when the next run takes them", async () => {
+	const item = await fixture();
+	try {
+		const notice = { key: "child:1", content: "<task-notification>queued</task-notification>", details: { task_id: "child" }, deliverAs: "nextTurn", triggerTurn: false };
+		const queued = await item.request("notify", notice);
+		assert.ok(queued.ok && queued.delivery === "queued");
+		assert.ok((await item.request("notify", notice)).ok);
+		assert.equal(item.sent.length, 1, "the same key is queued once per process");
+		assert.deepEqual((item.sent[0] as { options: unknown }).options, { deliverAs: "nextTurn", triggerTurn: false });
+		assert.deepEqual(item.entries, [], "not acknowledged before a run consumes it");
+		await item.handlers.get("before_agent_start")!();
+		assert.deepEqual(item.entries.map((entry) => entry.data), [{ key: "child:1" }]);
+		const replay = await item.request("notify", notice);
+		assert.ok(replay.ok && replay.delivery === "duplicate");
+		const wake = await item.request("wake", { count: 1 });
+		assert.ok(wake.ok);
+		assert.deepEqual((item.sent.at(-1) as { options: unknown }).options, { deliverAs: "followUp", triggerTurn: true });
+		assert.equal((item.sent.at(-1) as { message: { display: boolean } }).message.display, false);
+		assert.equal((await item.request("wake", { count: 0 })).ok, false);
+	} finally { await item.cleanup(); }
+});
+
+test("a delivered background result counts the child's usage into the parent session exactly once", async () => {
+	const item = await fixture();
+	try {
+		const usage = { input: 100, output: 20, cacheRead: 5, cacheWrite: 0, totalTokens: 125, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.5 } };
+		const notice = { key: "child:1", content: "<task-notification>done</task-notification>", details: { task_id: "child" }, deliverAs: "followUp", triggerTurn: true,
+			usage: { provider: "fixture", model: "child-model", usage } };
+		assert.ok((await item.request("notify", notice)).ok);
+		assert.deepEqual(item.usages, [["subagent", "fixture", "child-model", usage, "background agent child:1"]]);
+		assert.ok((await item.request("notify", notice)).ok, "a replay is a duplicate");
+		assert.equal(item.usages.length, 1);
+		// A queued result is counted when the run that takes it starts, not when it is queued.
+		const queued = { ...notice, key: "child:2", deliverAs: "nextTurn", triggerTurn: false };
+		assert.ok((await item.request("notify", queued)).ok);
+		assert.equal(item.usages.length, 1);
+		await item.handlers.get("before_agent_start")!({}, { sessionManager: item.sessionManager });
+		assert.equal(item.usages.length, 2);
+		assert.equal(item.usages[1][4], "background agent child:2");
+		// Usage is validated like any other host input.
+		for (const invalid of [
+			{ ...notice, key: "child:3", usage: { provider: "fixture", model: "m", usage: { ...usage, totalTokens: -1 } } },
+			{ ...notice, key: "child:3", usage: { provider: "", model: "m", usage } },
+			{ ...notice, key: "child:3", usage: { provider: "fixture", model: "m\nforged", usage } },
+			{ ...notice, key: "child:3", usage: { provider: "fixture", model: "m", usage, extra: 1 } },
+		]) assert.equal((await item.request("notify", invalid)).ok, false);
+		assert.equal(item.usages.length, 2);
 	} finally { await item.cleanup(); }
 });
 
@@ -109,13 +197,40 @@ test("model tools validate inputs, use authenticated host calls, and clamp child
 	const registration = host.register("parent");
 	const item = await fixture({ PI_DESKTOP_HOST_URL: registration.url, PI_DESKTOP_HOST_TOKEN: registration.token });
 	try {
-		assert.equal(item.definitions.size, 10);
-		assert.ok(item.definitions.has("AgentSend") && item.definitions.has("AgentExecutors"));
+		// SendMessage is the declared continuation tool; AgentSend stays callable but hides its declaration.
+		assert.equal(item.definitions.size, 11);
+		assert.ok(item.definitions.has("SendMessage") && item.definitions.has("AgentSend") && item.definitions.has("AgentExecutors"));
+		assert.deepEqual((item.definitions.get("AgentSend") as { prepareLoadout?: () => unknown }).prepareLoadout?.(), { hiddenDeclarations: ["AgentSend"] });
+		assert.equal((item.definitions.get("SendMessage") as { prepareLoadout?: unknown }).prepareLoadout, undefined);
 		const agent = item.definitions.get("Agent")!;
 		const result = await agent.execute("tool-call", { description: "research", prompt: "read seed", subagent_type: "Explore", run_in_background: true }, undefined, undefined, {} as never);
 		assert.deepEqual(result.details, { task_id: "child", status: "running" });
 		assert.deepEqual(requests, [{ request: { tool: "Agent", toolCallId: "tool-call", input: { description: "research", prompt: "read seed", subagent_type: "Explore", run_in_background: true } }, owner: "parent" }]);
 		await assert.rejects(agent.execute("tool-call", { description: "research", prompt: "read", subagent_type: "Explore", permission: "auto" }, undefined, undefined, {} as never), /Unknown tool/);
+		// The Agent call reports how many other calls of its message may change files.
+		await item.handlers.get("message_end")!({ message: { role: "assistant", content: [
+			{ type: "text", text: "doing two things" },
+			{ type: "toolCall", id: "agent-1", name: "Agent", arguments: {} },
+			{ type: "toolCall", id: "agent-2", name: "Agent", arguments: {} },
+			{ type: "toolCall", id: "write-1", name: "write", arguments: {} },
+			{ type: "toolCall", id: "read-1", name: "read", arguments: {} },
+			{ type: "toolCall", id: "made-up", name: "not_a_registered_tool", arguments: {} },
+		] } });
+		await agent.execute("agent-1", { description: "edit", prompt: "edit a.ts" }, undefined, undefined, {} as never);
+		assert.deepEqual((requests.at(-1) as { request: unknown }).request, { tool: "Agent", toolCallId: "agent-1", input: { description: "edit", prompt: "edit a.ts" }, batch: { writers: 1 } });
+		await item.handlers.get("message_end")!({ message: { role: "assistant", content: [{ type: "toolCall", id: "agent-3", name: "Agent", arguments: {} }] } });
+		await agent.execute("agent-3", { description: "edit", prompt: "edit a.ts" }, undefined, undefined, {} as never);
+		assert.deepEqual((requests.at(-1) as { request: { batch?: unknown } }).request.batch, { writers: 0 });
+		await agent.execute("agent-1", { description: "edit", prompt: "edit a.ts" }, undefined, undefined, {} as never);
+		assert.equal((requests.at(-1) as { request: { batch?: unknown } }).request.batch, undefined, "an older message's batch is forgotten");
+		// SendMessage reports its batch too: continuing a shared writer beside a write is refused by the host.
+		await item.handlers.get("message_end")!({ message: { role: "assistant", content: [
+			{ type: "toolCall", id: "send-1", name: "SendMessage", arguments: {} },
+			{ type: "toolCall", id: "write-2", name: "write", arguments: {} },
+		] } });
+		await item.definitions.get("SendMessage")!.execute("send-1", { to: "worker", message: "continue" }, undefined, undefined, {} as never);
+		assert.deepEqual((requests.at(-1) as { request: unknown }).request, { tool: "SendMessage", toolCallId: "send-1", input: { to: "worker", message: "continue" }, batch: { writers: 1 } });
+		await assert.rejects(item.definitions.get("SendMessage")!.execute("send-2", { to: "worker", message: "continue", task_id: "x" }, undefined, undefined, {} as never), /Unknown tool/);
 		const inventory = await item.request("list");
 		assert.ok(inventory.ok && inventory.tools.find((entry) => entry.name === "Agent")?.source === "desktop");
 	} finally { await item.cleanup(); }
@@ -127,6 +242,9 @@ test("model tools validate inputs, use authenticated host calls, and clamp child
 		assert.ok(!child.active().includes("Agent"));
 		assert.equal((await child.handlers.get("tool_call")!({ toolName: "custom" })).block, true);
 		assert.equal((await child.handlers.get("tool_call")!({ toolName: "Agent" })).block, true);
+		assert.equal((await child.handlers.get("tool_call")!({ toolName: "SendMessage" })).block, true);
+		assert.ok(!child.active().includes("SendMessage") && !child.active().includes("AgentSend"));
+		await assert.rejects(child.definitions.get("SendMessage")!.execute("tool-call", { to: "x", message: "y" }, undefined, undefined, {} as never), /cannot delegate/);
 		await assert.rejects(child.definitions.get("Agent")!.execute("tool-call", { description: "research", prompt: "read", subagent_type: "Explore" }, undefined, undefined, {} as never), /cannot delegate/);
 	} finally { await child.cleanup(); await host.close(); }
 });

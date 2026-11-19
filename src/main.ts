@@ -9,6 +9,7 @@ import { installExternalHandlers } from "./external-ipc.ts";
 import type { Command, ConnectionInput, DesktopAPI } from "./shared.ts";
 import { checkPreview } from "./preview-check.ts";
 import { captureToolPath } from "./tool-path.ts";
+import { MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS } from "./delegation-limits.ts";
 import type { RpcExtensionUIResponse } from "@earendil-works/pi-coding-agent";
 
 app.setName("Pi Desktop");
@@ -211,6 +212,15 @@ function installHandlers() {
 			throw new Error("沙箱开关格式错误。");
 		if (settings.notifications !== undefined && typeof settings.notifications !== "boolean")
 			throw new Error("通知开关格式错误。");
+		if (settings.subagentDefaultBackground !== undefined && typeof settings.subagentDefaultBackground !== "boolean")
+			throw new Error("子 Agent 默认后台设置格式错误。");
+		if (
+			settings.foregroundSubagentTimeoutMs !== undefined &&
+			(!Number.isSafeInteger(settings.foregroundSubagentTimeoutMs) ||
+				(settings.foregroundSubagentTimeoutMs as number) < 0 ||
+				(settings.foregroundSubagentTimeoutMs as number) > MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS)
+		)
+			throw new Error("前台子 Agent 等待时长格式错误。");
 		if (settings.provider !== undefined) connection(settings);
 		if (settings.agentDir !== undefined) string(settings.agentDir, "Pi 配置目录", 16384);
 		return service.saveSettings(settings as Parameters<DesktopAPI["saveSettings"]>[0]);
@@ -274,9 +284,16 @@ void app.whenReady().then(() => {
 			notifyDesktop("Pi 任务已结束", packet.event.aborted ? "当前回合已停止。" : "回复与工具执行已完成。");
 		}
 	});
+	// Last status seen per task: bookkeeping updates (a delivered result, a detached child)
+	// re-emit an unchanged status and must not raise the OS notification again.
+	const taskStatuses = new Map<string, string>();
 	service.subscribeTasks((event) => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:task:event", event);
 		if (event.type === "task_updated") {
+			const previous = taskStatuses.get(event.task.id);
+			taskStatuses.set(event.task.id, event.task.status);
+			// A task first seen in its final state finished before this process watched it.
+			if (previous === undefined || previous === event.task.status) return;
 			if (event.task.status === "waiting_for_input") notifyDesktop("后台子任务需要确认", event.task.title);
 			else if (event.task.status === "completed") notifyDesktop("后台子任务已完成", event.task.title);
 			else if (event.task.status === "failed") notifyDesktop("后台子任务失败", event.task.error || event.task.title);

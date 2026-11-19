@@ -1,5 +1,6 @@
 import type { DesktopService } from "./backend.ts";
 import type { Command, RpcExtensionUIResponse, TaskStartInput, WorktreeCreateInput } from "./shared.ts";
+import { MAX_SEND_MESSAGE } from "./delegation-limits.ts";
 
 type Handle = (channel: string, action: (...args: unknown[]) => Promise<unknown>) => void;
 
@@ -89,6 +90,23 @@ export function installWorkspaceHandlers(
 	handle("pi:task:list", () => service.listTasks());
 	handle("pi:task:snapshot", (taskId) => service.taskSnapshot(id(taskId)));
 	handle("pi:task:cancel", (taskId) => service.cancelTask(id(taskId)));
+	// Both act only on the named conversation's own children; the host checks it exists.
+	handle("pi:task:stopAll", (conversationId) => service.stopAllTasks(id(conversationId)));
+	handle("pi:task:deliverNow", (conversationId) => service.deliverTaskNotifications(id(conversationId)));
+	// The user's "继续对话": a message for an existing task (resume a finished one, steer a running one).
+	handle("pi:task:send", (value) => {
+		const input = object(value);
+		if (Object.keys(input).some((key) => !["taskId", "message", "notifyParent"].includes(key))) throw new Error("请求参数格式错误。");
+		if (input.notifyParent !== undefined && typeof input.notifyParent !== "boolean") throw new Error("通知选项格式错误。");
+		const message = string(input.message, "消息内容", MAX_SEND_MESSAGE);
+		if (!message.trim()) throw new Error("请输入消息内容。");
+		return service.sendToTask({ taskId: id(input.taskId), message, notifyParent: input.notifyParent as boolean | undefined });
+	});
+	// A shown conversation (e.g. a task detail view) keeps its child process from being reaped.
+	handle("pi:conversation:viewing", async (conversationId, viewing) => {
+		if (typeof viewing !== "boolean") throw new Error("查看状态格式错误。");
+		service.setConversationViewing(id(conversationId), viewing);
+	});
 	handle("pi:task:command", (taskId, value) => service.command(command(value), id(taskId)));
 	handle("pi:task:respond", (taskId, value) => {
 		const response = object(value);

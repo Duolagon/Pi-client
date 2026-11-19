@@ -1,4 +1,4 @@
-import { projectMemoryContext } from "./project-memory.ts";
+import { projectMemoryContext, userMemoryContext } from "./project-memory.ts";
 import { get as getHttp } from "node:http";
 import { get as getHttps } from "node:https";
 import { Readable } from "node:stream";
@@ -10,10 +10,27 @@ import type { ExtensionAPI, ModelRegistry, ProviderModelConfig, ToolDefinition }
 import type { ConnectionMode, ConnectionProtocol, Provider } from "./shared.ts";
 import { connectionDefaults, connectionMode } from "./model-connections.ts";
 import { providerModels } from "./provider-presets.ts";
-import { evaluatePermission, loadRuntimePermissionPolicy } from "./permission-policy.ts";
+import { evaluatePermission, loadRuntimePermissionPolicy, redactSearchOutput } from "./permission-policy.ts";
 
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function textFromBlocks(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((b): b is { type?: unknown; text?: unknown } => Boolean(b && typeof b === "object"))
+		.filter((b) => b.type === "text" && typeof b.text === "string")
+		.map((b) => b.text as string)
+		.join("\n");
+}
+
+function applyUpdatedInput(target: Record<string, unknown>, patch: Record<string, unknown>): void {
+	for (const [key, value] of Object.entries(patch)) {
+		if (key === "__proto__" || key === "constructor" || key === "prototype") continue;
+		target[key] = value;
+	}
 }
 
 async function callHost(path: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown> | undefined> {
@@ -173,7 +190,12 @@ async function readLimited(response: Response): Promise<{ text: string; truncate
 	return { text: new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)))), truncated };
 }
 
-async function fetchPublic(url: URL, signal: AbortSignal): Promise<{ response: Response; url: URL }> {
+/**
+ * Follow redirects only within the requested host. A redirect to another host
+ * is returned to the model so the new URL goes through the permission check
+ * (domain rules, hooks, approvals) like a fresh WebFetch call, as in Claude Code.
+ */
+async function fetchPublic(url: URL, signal: AbortSignal): Promise<{ response: Response; url: URL } | { redirect: URL; status: number }> {
 	let current = url;
 	for (let redirects = 0; redirects <= maxRedirects; redirects++) {
 		const response = await fetchPinned(current, signal);
@@ -184,6 +206,7 @@ async function fetchPublic(url: URL, signal: AbortSignal): Promise<{ response: R
 			const next = new URL(location, current);
 			if (next.protocol !== "http:" && next.protocol !== "https:")
 				throw new Error("Only http and https redirects are supported.");
+			if (next.hostname.toLowerCase() !== url.hostname.toLowerCase()) return { redirect: next, status: response.status };
 			current = next;
 			continue;
 		}
@@ -262,7 +285,17 @@ export default function permissions(pi: ExtensionAPI) {
 				const onAbort = () => controller.abort();
 				signal?.addEventListener("abort", onAbort, { once: true });
 				try {
-					const { response, url } = await fetchPublic(parsed, controller.signal);
+					const fetched = await fetchPublic(parsed, controller.signal);
+					if ("redirect" in fetched) {
+						return {
+							content: [{
+								type: "text",
+								text: `HTTP ${fetched.status} redirect to a different host: ${fetched.redirect.toString()}\nThe redirect was not followed. Call WebFetch again with this URL if you still need it.`,
+							}],
+							details: { url: parsed.toString(), status: fetched.status, truncated: false, redirect: fetched.redirect.toString() } as { url: string; status: number; truncated: boolean; redirect?: string },
+						};
+					}
+					const { response, url } = fetched;
 					if (!response.ok) {
 						await response.body?.cancel().catch(() => {});
 						throw new Error(`HTTP ${response.status} ${response.statusText}`);
@@ -492,8 +525,9 @@ export default function permissions(pi: ExtensionAPI) {
 	for (const [provider, connection] of Object.entries(connections))
 		registerConnection(provider as Provider, connection);
 	const memoryRoot = process.env.PI_DESKTOP_MEMORY_ROOT;
+	const userMemoryFile = process.env.PI_DESKTOP_USER_MEMORY_FILE;
 	const memoryToolPaths = new Set<string>();
-	if (memoryRoot) {
+	if (memoryRoot || userMemoryFile) {
 		let prompt = "";
 		let system = "";
 		let context: string | undefined;
@@ -506,7 +540,11 @@ export default function permissions(pi: ExtensionAPI) {
 		});
 		pi.on("context_with_system", async (event) => {
 			if (analyzedPaths !== memoryToolPaths.size) {
-				context = await projectMemoryContext(memoryRoot, prompt, process.env.PI_DESKTOP_MEMORY_FILE, [...memoryToolPaths], system);
+				const user = userMemoryFile ? await userMemoryContext(userMemoryFile, system) : "";
+				const project = memoryRoot
+					? await projectMemoryContext(memoryRoot, prompt, process.env.PI_DESKTOP_MEMORY_FILE, [...memoryToolPaths], system)
+					: "";
+				context = [user, project].filter(Boolean).join("\n\n") || undefined;
 				analyzedPaths = memoryToolPaths.size;
 			}
 			const first = event.messages[0];
@@ -526,10 +564,95 @@ export default function permissions(pi: ExtensionAPI) {
 			}
 		}
 	});
+	const maxTurnsRaw = Number(process.env.PI_DESKTOP_MAX_TURNS);
+	const maxTurns = Number.isSafeInteger(maxTurnsRaw) && maxTurnsRaw > 0 ? maxTurnsRaw : 0;
+	let turnCount = 0;
+	let stopHookActive = false;
+	let maxTurnsStopped = false;
+
+	pi.on("before_agent_start", () => {
+		turnCount = 0;
+		stopHookActive = false;
+		maxTurnsStopped = false;
+	});
+	pi.on("turn_start", () => {
+		turnCount++;
+	});
+	pi.on("turn_end", async (event, ctx) => {
+		if (maxTurns > 0 && turnCount >= maxTurns) {
+			// `continue:false` alone does not end a run that still has tool results to answer:
+			// the loop would make one more model request. Abort the run instead, after the host
+			// has recorded that this stop is the limit (a completed, partial result) rather than
+			// a cancellation. SubagentStop hooks cannot extend the run past maxTurns.
+			// The aborted request's own turn_end must not repeat the notice.
+			if (maxTurnsStopped) return;
+			const pendingWork = Boolean(event?.toolResults?.length) || Boolean(ctx?.hasPendingMessages?.());
+			if (pendingWork) {
+				maxTurnsStopped = true;
+				await callHost("/hook", { phase: "max_turns", toolCallId: `max-turns-${Date.now()}` }).catch(() => undefined);
+				ctx?.abort?.();
+			}
+			return {
+				continue: false,
+				entries: [
+					{
+						type: "custom_message",
+						customType: "desktop_max_turns",
+						content: `已达到子 Agent 最大轮次上限 (${maxTurns})。`,
+						display: true,
+					},
+				],
+			};
+		}
+	});
+	pi.on("session_before_compact", async (event) => {
+		if (testingConnection) return;
+		const hook = await callHost(
+			"/hook",
+			{
+				phase: "compact",
+				toolCallId: `compact-${Date.now()}`,
+				trigger: event.reason === "manual" ? "manual" : "auto",
+				...(event.customInstructions ? { customInstructions: event.customInstructions } : {}),
+			},
+			event.signal,
+		).catch(() => undefined);
+		if (hook?.blocked) return { cancel: true };
+	});
+	pi.on("agent_before_settle", async (event) => {
+		if (testingConnection || event.outcome !== "completed") return;
+		if (maxTurns > 0 && turnCount >= maxTurns) return;
+		const lastAssistant = [...event.context.contextMessages].reverse().find((msg) => msg.role === "assistant");
+		const lastAssistantMessage = lastAssistant ? textFromBlocks(lastAssistant.content).slice(0, 16384) : undefined;
+		const hook = await callHost("/hook", {
+			phase: "stop",
+			toolCallId: `stop-${Date.now()}`,
+			stopHookActive,
+			...(lastAssistantMessage ? { lastAssistantMessage } : {}),
+		}).catch(() => undefined);
+		if (hook?.blocked && !stopHookActive && event.context.canContinue) {
+			stopHookActive = true;
+			const reason = typeof hook.reason === "string" && hook.reason.trim() ? hook.reason.trim() : "Stop Hook 要求补充完成后再结束。";
+			return {
+				continue: true,
+				entries: [
+					{
+						type: "custom_message",
+						customType: "hook_stop_feedback",
+						content: `[Hook Stop Blocked] ${reason}`,
+						display: true,
+					},
+				],
+			};
+		}
+	});
 	pi.on("tool_call", async (event, ctx) => {
 		try {
+			if (maxTurns > 0 && turnCount > maxTurns) {
+				return { block: true, reason: `已达到子 Agent 最大轮次上限 (${maxTurns})，停止执行工具。`, terminate: true };
+			}
 			const policy = await loadRuntimePermissionPolicy();
-			const decision = await evaluatePermission(policy, event);
+			let decision = await evaluatePermission(policy, event);
 			if (decision.action === "deny") return { block: true, reason: decision.reason };
 			let effectiveAction = decision.action;
 			let confirmReason = decision.reason;
@@ -543,10 +666,41 @@ export default function permissions(pi: ExtensionAPI) {
 				if (hook?.blocked || hook?.permissionDecision === "deny") {
 					return { block: true, reason: typeof hook.reason === "string" ? hook.reason : "PreToolUse Hook 阻止了此工具执行。" };
 				}
-				if (hook?.permissionDecision === "allow" && effectiveAction === "ask") effectiveAction = "allow";
-				else if (hook?.permissionDecision === "ask" && effectiveAction === "allow") {
+				if (hook?.updatedInput && typeof hook.updatedInput === "object" && !Array.isArray(hook.updatedInput)) {
+					applyUpdatedInput(event.input as Record<string, unknown>, hook.updatedInput as Record<string, unknown>);
+					decision = await evaluatePermission(policy, event);
+					if (decision.action === "deny") return { block: true, reason: decision.reason };
+					effectiveAction = decision.action;
+					confirmReason = decision.reason;
+				}
+				if (hook?.permissionDecision === "allow" && effectiveAction === "ask" && !decision.ruleId) {
+					effectiveAction = "allow";
+				} else if (hook?.permissionDecision === "ask" && effectiveAction === "allow") {
 					effectiveAction = "ask";
 					confirmReason = typeof hook.reason === "string" ? hook.reason : "PreToolUse Hook 要求人工确认。";
+				}
+			}
+			if (effectiveAction === "ask") {
+				if (!testingConnection) {
+					const permHook = await callHost("/hook", {
+						phase: "permission",
+						toolName: event.toolName,
+						toolCallId: event.toolCallId,
+						toolInput: (event.input ?? {}) as Record<string, unknown>,
+					}).catch(() => undefined);
+					if (permHook?.blocked || permHook?.permissionDecision === "deny") {
+						return { block: true, reason: typeof permHook.reason === "string" ? permHook.reason : "PermissionRequest Hook 拒绝了此操作。" };
+					}
+					if (permHook?.updatedInput && typeof permHook.updatedInput === "object" && !Array.isArray(permHook.updatedInput)) {
+						applyUpdatedInput(event.input as Record<string, unknown>, permHook.updatedInput as Record<string, unknown>);
+						decision = await evaluatePermission(await loadRuntimePermissionPolicy(), event);
+						if (decision.action === "deny") return { block: true, reason: decision.reason };
+					}
+					if (permHook?.permissionDecision === "allow") {
+						const recheck = await evaluatePermission(await loadRuntimePermissionPolicy(), event);
+						if (recheck.action === "deny") return { block: true, reason: recheck.reason };
+						effectiveAction = "allow";
+					}
 				}
 			}
 			if (effectiveAction === "ask") {
@@ -571,21 +725,56 @@ export default function permissions(pi: ExtensionAPI) {
 	pi.on("tool_result", async (event) => {
 		if (memoryRoot && !event.isError && ["read", "write", "edit"].includes(event.toolName) && typeof event.input.path === "string" && memoryToolPaths.size < 64)
 			memoryToolPaths.add(event.input.path);
-		if (testingConnection) return;
+		// grep/find/ls search a directory; hide individual results that path deny
+		// rules (e.g. an imported Claude `Read(.env)`) would refuse to read.
+		const redacted = event.isError
+			? undefined
+			: await redactSearchResult(await loadRuntimePermissionPolicy().catch(() => undefined), event.toolName, event.input, event.content);
+		if (redacted) event = { ...event, content: redacted } as typeof event;
+		const changed = () => (redacted ? { content: redacted } : undefined);
+		if (testingConnection) return changed();
+		const errorText = event.isError ? textFromBlocks(event.content).slice(0, 4000) : undefined;
 		const hook = await callHost("/hook", {
 			phase: "post",
 			toolName: event.toolName,
 			toolCallId: event.toolCallId,
 			toolInput: (event.input ?? {}) as Record<string, unknown>,
 			toolResponse: { isError: event.isError, content: event.content },
+			isError: event.isError,
+			...(errorText !== undefined ? { error: errorText } : {}),
 		}).catch(() => undefined);
-		if (!hook) return;
-		if (hook.blocked) {
+		if (!hook) return changed();
+		if (hook.blocked && !event.isError) {
 			const reason = typeof hook.reason === "string" ? hook.reason : "PostToolUse Hook 报告检查失败。";
 			return { content: [...event.content, { type: "text" as const, text: `\n\n[Hook Blocked] ${reason}` }], isError: true };
 		}
-		if (typeof hook.additionalContext === "string" && hook.additionalContext.trim()) {
+		if (!hook.suppressOutput && typeof hook.additionalContext === "string" && hook.additionalContext.trim()) {
 			return { content: [...event.content, { type: "text" as const, text: `\n\n[Hook Context]\n${hook.additionalContext.trim()}` }] };
 		}
+		return changed();
 	});
+}
+
+async function redactSearchResult<T extends { type: string }>(
+	policy: Awaited<ReturnType<typeof loadRuntimePermissionPolicy>> | undefined,
+	toolName: string,
+	input: unknown,
+	blocks: T[],
+): Promise<T[] | undefined> {
+	if (!policy || !["grep", "find", "ls"].includes(toolName)) return;
+	let removed = 0;
+	const content: T[] = [];
+	for (const block of blocks) {
+		const text = (block as { text?: unknown }).text;
+		if (block.type !== "text" || typeof text !== "string") {
+			content.push(block);
+			continue;
+		}
+		const result = await redactSearchOutput(policy, toolName, input, text);
+		removed += result.removed;
+		content.push({ ...block, text: result.text });
+	}
+	if (!removed) return;
+	content.push({ type: "text", text: `\n[已按权限规则隐藏 ${removed} 条结果]` } as unknown as T);
+	return content;
 }

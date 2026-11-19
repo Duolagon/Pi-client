@@ -1,6 +1,6 @@
 import { constants as fs } from "node:fs";
 import { createHash } from "node:crypto";
-import { open, readdir } from "node:fs/promises";
+import { open, readdir, stat } from "node:fs/promises";
 import { dirname, join, matchesGlob, relative, resolve, sep } from "node:path";
 import { managedDirectory, managedFile } from "./managed-path.ts";
 
@@ -106,7 +106,12 @@ export async function projectMemoryContext(root: string, prompt: string, private
 		if (notes) append(privateMemoryLabel, notes);
 	}
 	// Pi supplies root project instructions. Load their imports and Desktop-only rules here.
+	// AGENTS.override.md replaces AGENTS.md (Pi loads only the override), so
+	// never re-inject the shadowed file.
+	// Match Pi's existsSync + statSync().isFile() check (symlinks and large files included).
+	const overridden = await stat(join(root, "AGENTS.override.md")).then((info) => info.isFile(), () => false);
 	for (const path of ["AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md"]) {
+		if (path === "AGENTS.md" && overridden) continue;
 		await visit(path, 0, true);
 	}
 	for (const folder of [".claude/rules", ".pi/rules"]) {
@@ -114,4 +119,17 @@ export async function projectMemoryContext(root: string, prompt: string, private
 	}
 	for (const path of promptPaths) await visit(path, 0, true);
 	return parts.length ? `# Pi Desktop 项目上下文${parts.join("")}` : "";
+}
+
+/**
+ * Claude Code's user memory (`~/.claude/CLAUDE.md`). Pi only reads its own
+ * agent directory, so Desktop injects this file for every conversation,
+ * independent of project trust.
+ */
+export async function userMemoryContext(file: string, currentSystem = ""): Promise<string> {
+	// Read past the budget and truncate; dropping a large file silently would hide all of it.
+	const body = await readProjectText(dirname(file), file.split(sep).at(-1)!, 4 * 1024 * 1024);
+	if (!body?.trim() || currentSystem.includes(body.trim())) return "";
+	const text = Buffer.from(body).subarray(0, memoryLimit).toString("utf8").replace(/\uFFFD$/, "");
+	return `# 用户记忆（~/.claude/CLAUDE.md）\n\n${text}`;
 }

@@ -74,6 +74,21 @@ const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[
 	{ name: "cost", description: "查看当前会话 Token 与费用统计" },
 ];
 
+/**
+ * Claude Code built-in commands with no Pi Desktop equivalent. Sending them as
+ * prompts would only make the model answer the literal text, so the composer
+ * stops them instead. Pi commands, skills and templates with the same name win.
+ */
+const CLAUDE_ONLY_COMMANDS = new Set([
+	"add-dir", "advisor", "agents-view", "autocompact", "background", "batch", "branch", "bug", "chrome", "copy",
+	"desktop", "diff", "doctor", "effort", "exit", "export", "fast", "feedback", "fork", "goal", "help", "ide",
+	"insights", "install-github-app", "keybindings", "login", "logout", "loop", "mobile", "model", "output-style",
+	"plugin", "pr-comments", "privacy-settings", "quit", "recap", "release-notes", "remote-control", "rename",
+	"resume", "review", "run", "sandbox", "schedule", "security-review", "simplify", "stats", "statusline",
+	"subtask", "teleport", "terminal-setup", "theme", "upgrade", "usage", "verify", "vim", "voice", "workflows",
+	"config", "code-review",
+]);
+
 export function LiveComposer({
 	snapshot,
 	draft,
@@ -222,6 +237,72 @@ export function LiveComposer({
 			if (builtin && trimmed === `/${cmdName}`) {
 				setDraft("");
 				onBuiltinSlash(builtin.name);
+				return;
+			}
+			const piCommand = snapshot.commands.some((c) => c.name.toLowerCase() === cmdName);
+			// Claude Code invokes skills as /name; Pi registers them as /skill:name.
+			const skill = !piCommand && snapshot.commands.find((c) => c.name.toLowerCase() === `skill:${cmdName}`);
+			if (skill) {
+				if (disabled) return;
+				setSending(true);
+				try {
+					await send(promptInput(`/${skill.name}${argText ? ` ${argText}` : ""}`, []));
+				} catch {
+					/* The controller keeps the draft and displays the failure. */
+				} finally {
+					setSending(false);
+				}
+				return;
+			}
+			if (!piCommand && CLAUDE_ONLY_COMMANDS.has(cmdName)) {
+				if (cmdName === "resume") {
+					setDraft("");
+					onBuiltinSlash("sessions");
+					return;
+				}
+				if (cmdName === "config") {
+					setDraft("");
+					openSettings();
+					return;
+				}
+				if ((cmdName === "model" || cmdName === "effort") && !argText) {
+					const current = cmdName === "model"
+						? `${snapshot.state?.model?.name ?? snapshot.state?.model?.id ?? "未连接"}；用 /model <名称> 切换，例如 /model opus`
+						: `${snapshot.state?.thinkingLevel ?? "off"}；可选 ${snapshot.thinkingLevels.join(" / ") || "无"}`;
+					fail(new Error(`当前${cmdName === "model" ? "模型" : "思考强度"}：${current}。`));
+					return;
+				}
+				if (cmdName === "model" && argText) {
+					const wanted = argText.toLowerCase();
+					// Like Claude Code, an alias such as "opus" selects the newest matching model.
+					const candidates = snapshot.models
+						.filter((m) => m.id.toLowerCase().includes(wanted) || (m.name ?? "").toLowerCase().includes(wanted))
+						.sort((a, b) =>
+							Number(/\d{8}$/.test(b.id)) - Number(/\d{8}$/.test(a.id)) ||
+							a.id.localeCompare(b.id, undefined, { numeric: true }),
+						);
+					const model =
+						snapshot.models.find((m) => m.id.toLowerCase() === wanted || `${m.provider}/${m.id}`.toLowerCase() === wanted) ??
+						candidates.at(-1);
+					if (!model) {
+						fail(new Error(`没有匹配“${argText}”的模型。可用模型见输入框下方的模型选择器。`));
+						return;
+					}
+					setDraft("");
+					await command({ type: "set_model", provider: model.provider, modelId: model.id }).catch(fail);
+					return;
+				}
+				if (cmdName === "effort" && argText) {
+					const level = snapshot.thinkingLevels.find((l) => l === argText.toLowerCase());
+					if (!level) {
+						fail(new Error(`当前模型支持的思考强度：${snapshot.thinkingLevels.join(" / ") || "无"}。`));
+						return;
+					}
+					setDraft("");
+					await command({ type: "set_thinking_level", level }).catch(fail);
+					return;
+				}
+				fail(new Error(`/${cmdName} 是 Claude Code 命令，Pi Desktop 暂不支持，未发送给模型。输入 / 查看可用命令。`));
 				return;
 			}
 		}

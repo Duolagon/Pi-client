@@ -166,7 +166,7 @@ test("control IPC rejects malformed objects, scopes, booleans, selectors, payloa
 		["pi:permissions:upsert", { id: "x", scope: "project", action: "allow", tool: "read" }],
 		["pi:permissions:upsert", { id: "x", scope: "conversation", action: "allow", tool: "read" }],
 		["pi:permissions:upsert", { id: "x", scope: "conversation", conversationId: "missing-id", action: "allow", tool: "read" }],
-		["pi:permissions:upsert", { id: "x", scope: "global", action: "allow", tool: "bash", command: { type: "prefix", argv: ["node"] } }],
+		["pi:permissions:upsert", { id: "x", scope: "global", action: "allow", tool: "bash", command: { type: "prefix", argv: [] } }],
 		["pi:permissions:upsert", { id: "x", scope: "global", action: "allow", tool: "bash", command: { type: "exact", value: "node --version; echo injected" } }],
 		["pi:permissions:remove", ""],
 		["pi:permissions:check", { toolName: "read", input: [] }],

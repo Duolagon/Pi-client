@@ -13,6 +13,7 @@ import type {
 	Snapshot,
 } from "../shared.ts";
 import { Modal } from "../prototype/ui.tsx";
+import { parseForegroundMinutes } from "./settings-input.ts";
 
 const protocols: { value: ConnectionProtocol; label: string }[] = [
 	{ value: "anthropic-messages", label: "Anthropic Messages" },
@@ -61,6 +62,9 @@ export function SettingsDialog({
 	const [theme, setTheme] = useState<Settings["theme"]>(settings.theme);
 	const [sandbox, setSandbox] = useState<boolean>(Boolean(settings.sandbox));
 	const [notifications, setNotifications] = useState<boolean>(settings.notifications !== false);
+	const [subagentBackground, setSubagentBackground] = useState<boolean>(settings.subagentDefaultBackground !== false);
+	const initialForegroundMinutes = String(Math.round((settings.foregroundSubagentTimeoutMs ?? 300000) / 60000));
+	const [foregroundMinutes, setForegroundMinutes] = useState(initialForegroundMinutes);
 	const [sandboxOffline, setSandboxOffline] = useState(Boolean(settings.sandboxOffline));
 	const [sandboxInfo, setSandboxInfo] = useState<SandboxStatus | null>(null);
 	const [provider, setProvider] = useState<Provider>(initialProvider);
@@ -93,6 +97,8 @@ export function SettingsDialog({
 		sandbox !== Boolean(settings.sandbox) ||
 		(sandbox && sandboxOffline) !== Boolean(settings.sandboxOffline) ||
 		notifications !== (settings.notifications !== false) ||
+		subagentBackground !== (settings.subagentDefaultBackground !== false) ||
+		foregroundMinutes.trim() !== initialForegroundMinutes ||
 		agentDir.trim() !== (settings.agentDir ?? "");
 	const connectionChanged =
 		Boolean(apiKey.trim()) ||
@@ -143,9 +149,19 @@ export function SettingsDialog({
 			setError(`请填写 ${preset.name} 的 API Key。`);
 			return;
 		}
+		// An emptied field is invalid rather than 0 ("wait without limit").
+		const minutes = parseForegroundMinutes(foregroundMinutes);
+		if (minutes === undefined) {
+			setError("前台子 Agent 等待时长需为 0–1440 分钟的整数。");
+			return;
+		}
 		setSaving(true);
 		try {
-			const update: Parameters<DesktopAPI["saveSettings"]>[0] = { permission, theme, sandbox, sandboxOffline: sandbox && sandboxOffline, notifications };
+			const update: Parameters<DesktopAPI["saveSettings"]>[0] = {
+				permission, theme, sandbox, sandboxOffline: sandbox && sandboxOffline, notifications,
+				subagentDefaultBackground: subagentBackground,
+				...(foregroundMinutes.trim() !== initialForegroundMinutes ? { foregroundSubagentTimeoutMs: minutes * 60000 } : {}),
+			};
 			if (agentDir.trim() !== (settings.agentDir ?? "")) update.agentDir = agentDir.trim();
 			if (connectionChanged) Object.assign(update, connectionInput);
 			const next = await window.pi.saveSettings(update);
@@ -427,6 +443,29 @@ export function SettingsDialog({
 								onChange={(event) => setNotifications(event.target.checked)}
 							/>
 							窗口未聚焦时发送任务完成/待审批系统通知
+						</label>
+						<label className="live-setting-toggle">
+							<input
+								type="checkbox"
+								aria-label="子 Agent 默认后台运行"
+								checked={subagentBackground}
+								disabled={pending}
+								onChange={(event) => setSubagentBackground(event.target.checked)}
+							/>
+							子 Agent 默认后台运行（结果完成后自动送回主会话；非 Git 项目中的可写子 Agent 仍在前台运行）
+						</label>
+						<label className="field-label">
+							前台子 Agent 最长等待（分钟）
+							<input
+								type="number"
+								min={0}
+								max={1440}
+								step={1}
+								value={foregroundMinutes}
+								disabled={pending}
+								onChange={(event) => setForegroundMinutes(event.target.value)}
+							/>
+							<small>超时后子 Agent 转为后台继续运行，结果稍后送达；0 表示一直等待。非 Git 项目中的可写子 Agent 始终等待完成。</small>
 						</label>
 					</div>
 				</details>

@@ -43,19 +43,47 @@ export function installControlHandlers(handle: Handle, service: DesktopService):
 		const input = object(value);
 		if (input.scope !== "project" && input.scope !== "user") throw new Error("Agent 作用域无效。");
 		const tools = input.tools === undefined ? undefined : stringArray(input.tools, 50, 80);
+		const disallowedTools = input.disallowedTools === undefined ? undefined : stringArray(input.disallowedTools, 50, 80);
+		const skills = input.skills === undefined ? undefined : stringArray(input.skills, 50, 80);
 		const thinkingLevel = input.thinkingLevel;
 		if (
 			thinkingLevel !== undefined &&
 			!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(thinkingLevel))
 		)
 			throw new Error("Agent 思考强度无效。");
+		const permissionMode = input.permissionMode;
+		if (
+			permissionMode !== undefined &&
+			!["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "read"].includes(String(permissionMode))
+		)
+			throw new Error("Agent 权限模式无效。");
+		if (
+			input.maxTurns !== undefined &&
+			(!Number.isSafeInteger(input.maxTurns) || Number(input.maxTurns) < 1 || Number(input.maxTurns) > 200)
+		)
+			throw new Error("Agent 最大轮次需在 1–200 之间。");
+		const memory = input.memory;
+		if (memory !== undefined && !["user", "project", "local"].includes(String(memory)))
+			throw new Error("Agent 记忆作用域无效。");
+		const isolation = input.isolation;
+		if (isolation !== undefined && isolation !== "worktree" && isolation !== "shared")
+			throw new Error("Agent 隔离模式无效。");
+		if (input.background !== undefined && typeof input.background !== "boolean")
+			throw new Error("Agent 后台标志无效。");
 		const request: AgentSaveInput = {
 			name: text(input.name, 64),
 			description: text(input.description, 500),
 			prompt: text(input.prompt, 64 * 1024),
 			tools,
+			disallowedTools,
 			model: input.model === undefined ? undefined : text(input.model, 300),
 			thinkingLevel: thinkingLevel as AgentSaveInput["thinkingLevel"],
+			permissionMode: permissionMode as AgentSaveInput["permissionMode"],
+			maxTurns: input.maxTurns as number | undefined,
+			skills,
+			memory: memory as AgentSaveInput["memory"],
+			isolation: isolation as AgentSaveInput["isolation"],
+			background: input.background as boolean | undefined,
 			scope: input.scope,
 			project: optionalPath(input.project),
 		};
@@ -109,14 +137,30 @@ export function installControlHandlers(handle: Handle, service: DesktopService):
 		const input = object(value);
 		if (!hookEventNames.includes(String(input.event) as HookEventName)) throw new Error("不支持的 Hook 事件。");
 		if (input.scope !== "user" && input.scope !== "project") throw new Error("Hook 作用域无效。");
-		if (input.timeout !== undefined && (!Number.isSafeInteger(input.timeout) || Number(input.timeout) < 500 || Number(input.timeout) > 30000))
-			throw new Error("Hook 超时须在 500–30000ms 之间。");
+		if (input.handlerType !== undefined && input.handlerType !== "command" && input.handlerType !== "http")
+			throw new Error("Hook 类型无效。");
+		const handlerType = input.handlerType === "http" ? "http" : "command";
+		if (input.timeout !== undefined && (!Number.isSafeInteger(input.timeout) || Number(input.timeout) < 500 || Number(input.timeout) > 60000))
+			throw new Error("Hook 超时须在 500–60000ms 之间。");
+		let headers: Record<string, string> | undefined;
+		if (input.headers !== undefined) {
+			const rawHeaders = object(input.headers);
+			headers = {};
+			for (const [k, v] of Object.entries(rawHeaders)) {
+				headers[text(k, 128)] = text(v, 4096);
+			}
+		}
 		const request: HookSaveInput = {
 			id: input.id === undefined ? undefined : text(input.id, 200),
 			event: input.event as HookEventName,
+			handlerType,
 			matcher: input.matcher === undefined || input.matcher === "" ? undefined : text(input.matcher, 300),
-			command: text(input.command, 16384),
+			command: handlerType === "command" ? text(input.command, 16384) : undefined,
+			url: handlerType === "http" ? text(input.url, 2048) : undefined,
+			headers,
+			allowedEnvVars: input.allowedEnvVars === undefined ? undefined : stringArray(input.allowedEnvVars, 32, 128),
 			timeout: input.timeout as number | undefined,
+			statusMessage: input.statusMessage === undefined ? undefined : text(input.statusMessage, 200),
 			scope: input.scope,
 			project: optionalPath(input.project),
 		};
@@ -135,11 +179,17 @@ export function installControlHandlers(handle: Handle, service: DesktopService):
 	handle("pi:hooks:test", (value) => {
 		const input = object(value);
 		if (!hookEventNames.includes(String(input.event) as HookEventName)) throw new Error("不支持的 Hook 事件。");
+		if (input.trigger !== undefined && input.trigger !== "manual" && input.trigger !== "auto")
+			throw new Error("Hook 触发类型无效。");
 		const request: HookTestInput = {
 			event: input.event as HookEventName,
 			toolName: input.toolName === undefined ? undefined : text(input.toolName, 300),
 			toolInput: input.toolInput === undefined ? undefined : object(input.toolInput),
 			prompt: input.prompt === undefined ? undefined : text(input.prompt, 16384),
+			error: input.error === undefined ? undefined : text(input.error, 8192),
+			agentType: input.agentType === undefined ? undefined : text(input.agentType, 128),
+			trigger: input.trigger as "manual" | "auto" | undefined,
+			notificationType: input.notificationType === undefined ? undefined : text(input.notificationType, 128),
 			project: optionalPath(input.project),
 		};
 		return service.testHook(request);

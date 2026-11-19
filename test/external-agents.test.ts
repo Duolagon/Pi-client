@@ -85,7 +85,14 @@ async function setup(config: { maxConcurrent?: number; capacity?: () => number; 
 			trees.push(tree); return tree;
 		},
 		listWorktrees: async () => structuredClone(trees), canStart: config.canStart ?? (() => true), capacity: config.capacity ?? (() => 4),
-		notify: async (owner, result) => { notifications.push({ owner, result }); }, onActivityChange: () => { activity++; },
+		// Mirrors the host outbox: deliver each pending turn once and record it.
+		flushNotifications: (owner) => {
+			for (const { task } of manager.pendingNotifications(owner)) {
+				notifications.push({ owner, result: { task_id: task.id, status: task.status, turn: task.turn, output: task.output, error: task.error } as ExternalTaskResult });
+				void manager.markNotified(task.id, task.turn);
+			}
+		},
+		onActivityChange: () => { activity++; },
 	};
 	const manager = new ExternalAgents(options);
 	await manager.initialize();
@@ -246,6 +253,65 @@ test("external permissions retain the spawn ceiling, map absolute paths into the
 		assert.equal(data.manager.snapshot(running.id).status, "cancelled");
 		assert.match(data.manager.snapshot(running.id).error ?? "", /权限已更改/);
 	} finally { await data.cleanup(); }
+});
+
+test("every external background stop except the parent's own reaches the parent once, after the output is recorded", async () => {
+	const data = await setup();
+	try {
+		// A user stop of a running turn is delivered with the output the turn produced.
+		const stopped = await data.manager.start({ executor: "codex", description: "User stop", prompt: "hold user", run_in_background: true }, "parent-a", "call-user");
+		await until(() => data.adapter.releases.has("hold user"), Boolean, "user-stop task running");
+		await data.manager.cancel(stopped.id, "parent-a", "user_stop");
+		const userStop = await until(() => data.notifications.filter((item) => item.result.task_id === stopped.id), (items) => items.length > 0, "user stop delivered");
+		assert.equal(userStop.length, 1);
+		assert.equal(userStop[0].result.status, "cancelled");
+		assert.equal(userStop[0].result.output, "result:hold user", "delivered after the run recorded its output");
+		// A host permission change stops the task and tells the parent why.
+		const revoked = await data.manager.start({ executor: "codex", description: "Revoked", prompt: "hold policy", run_in_background: true }, "parent-a", "call-policy");
+		await until(() => data.adapter.releases.has("hold policy"), Boolean, "policy task running");
+		await data.manager.invalidatePolicies();
+		const policy = await until(() => data.notifications.filter((item) => item.result.task_id === revoked.id), (items) => items.length > 0, "policy stop delivered");
+		assert.equal(policy[0].result.status, "cancelled");
+		assert.match(policy[0].result.error ?? "", /权限已更改/);
+		// The parent's own TaskStop and abort are not reported back.
+		for (const [prompt, reason] of [["hold model", "model_stop"], ["hold abort", "parent_abort"]] as const) {
+			const task = await data.manager.start({ executor: "codex", description: reason, prompt, run_in_background: true }, "parent-a", `call-${reason}`);
+			await until(() => data.adapter.releases.has(prompt), Boolean, `${reason} running`);
+			await data.manager.cancel(task.id, "parent-a", reason);
+			await until(() => data.manager.snapshot(task.id), terminal, `${reason} stopped`);
+			await delay(50);
+			assert.equal(data.notifications.filter((item) => item.result.task_id === task.id).length, 0, reason);
+			assert.equal(data.manager.pendingNotifications("parent-a").length, 0);
+		}
+		await delay(50);
+		assert.equal(data.notifications.length, 2);
+	} finally { await data.cleanup(); }
+});
+
+test("an external background turn lost to an app restart is reported once; legacy interrupted records are not replayed", async () => {
+	const data = await setup();
+	const task = await data.manager.start({ executor: "codex", description: "Restarted", prompt: "hold restart notify", run_in_background: true }, "parent-a", "call-restart");
+	await until(() => data.adapter.releases.has("hold restart notify"), Boolean, "native started");
+	await data.manager.close();
+	let after = new ExternalAgents(data.options);
+	try {
+		await after.initialize();
+		const pending = after.pendingNotifications("parent-a");
+		assert.equal(pending.length, 1);
+		assert.equal(pending[0].task.status, "interrupted");
+		assert.equal(pending[0].stopReason, "restart");
+		await after.markNotified(task.id, 1);
+		assert.equal(after.pendingNotifications("parent-a").length, 0);
+		await after.close();
+		// A record interrupted before stop reasons existed was never meant to notify.
+		const file = join(data.dataDir, "external-agents.json");
+		const stored = JSON.parse(await readFile(file, "utf8"));
+		for (const record of stored.tasks) { delete record.stopReason; delete record.notifiedTurn; }
+		await writeFile(file, JSON.stringify(stored));
+		after = new ExternalAgents(data.options);
+		await after.initialize();
+		assert.equal(after.pendingNotifications("parent-a").length, 0);
+	} finally { await after.close(); await data.cleanup(); }
 });
 
 test("external task input and executor settings reject recursion, unsafe shared writes and invalid ownership", async () => {

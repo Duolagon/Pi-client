@@ -2,12 +2,24 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { validateToolInvocation, type DesktopToolInvocation, type ToolHostContext } from "./tool-control-types.ts";
 
+export interface HookBridgeRequest {
+	/** `max_turns` lets a child mark its own limit stop before it aborts its run. */
+	phase: "pre" | "post" | "permission" | "compact" | "stop" | "max_turns";
+	toolName?: string;
+	toolCallId: string;
+	toolInput?: Record<string, unknown>;
+	toolResponse?: unknown;
+	isError?: boolean;
+	error?: string;
+	trigger?: "manual" | "auto";
+	customInstructions?: string;
+	stopHookActive?: boolean;
+	lastAssistantMessage?: string;
+}
+
 export interface ToolHostServerOptions {
 	handle: (request: DesktopToolInvocation, context: ToolHostContext) => Promise<unknown>;
-	handleHook?: (
-		request: { phase: "pre" | "post"; toolName: string; toolCallId: string; toolInput: Record<string, unknown>; toolResponse?: unknown },
-		context: ToolHostContext,
-	) => Promise<unknown>;
+	handleHook?: (request: HookBridgeRequest, context: ToolHostContext) => Promise<unknown>;
 	handlePlanExit?: (
 		request: { title?: string; plan?: string; toolCallId: string },
 		context: ToolHostContext,
@@ -110,18 +122,30 @@ export class ToolHostServer {
 			const parsedBody: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 			if (request.url === "/hook") {
 				const rec = parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody) ? (parsedBody as Record<string, unknown>) : null;
-				if (!rec || (rec.phase !== "pre" && rec.phase !== "post") || typeof rec.toolName !== "string" || !rec.toolName || rec.toolName.length > 300 || typeof rec.toolCallId !== "string" || !rec.toolCallId || rec.toolCallId.length > 300 || !rec.toolInput || typeof rec.toolInput !== "object" || Array.isArray(rec.toolInput))
-					return reply(400, { ok: false, error: "Invalid hook payload" });
+				const phase = rec?.phase;
+				const validPhase = phase === "pre" || phase === "post" || phase === "permission" || phase === "compact" || phase === "stop" || phase === "max_turns";
+				const toolCallId = typeof rec?.toolCallId === "string" && rec.toolCallId && rec.toolCallId.length <= 300 ? rec.toolCallId : undefined;
+				if (!rec || !validPhase || !toolCallId) return reply(400, { ok: false, error: "Invalid hook payload" });
+				if (phase === "pre" || phase === "post" || phase === "permission") {
+					if (typeof rec.toolName !== "string" || !rec.toolName || rec.toolName.length > 300 || !rec.toolInput || typeof rec.toolInput !== "object" || Array.isArray(rec.toolInput))
+						return reply(400, { ok: false, error: "Invalid hook payload" });
+				}
 				const data = this.options.handleHook
 					? await this.options.handleHook(
 							{
-								phase: rec.phase,
-								toolName: rec.toolName,
-								toolCallId: rec.toolCallId,
-								toolInput: rec.toolInput as Record<string, unknown>,
+								phase,
+								toolCallId,
+								toolName: typeof rec.toolName === "string" ? rec.toolName : undefined,
+								toolInput: rec.toolInput as Record<string, unknown> | undefined,
 								toolResponse: rec.toolResponse,
+								isError: typeof rec.isError === "boolean" ? rec.isError : undefined,
+								error: typeof rec.error === "string" ? rec.error.slice(0, 8192) : undefined,
+								trigger: rec.trigger === "manual" || rec.trigger === "auto" ? rec.trigger : undefined,
+								customInstructions: typeof rec.customInstructions === "string" ? rec.customInstructions.slice(0, 16384) : undefined,
+								stopHookActive: typeof rec.stopHookActive === "boolean" ? rec.stopHookActive : undefined,
+								lastAssistantMessage: typeof rec.lastAssistantMessage === "string" ? rec.lastAssistantMessage.slice(0, 65536) : undefined,
 							},
-							{ conversationId, toolCallId: rec.toolCallId, signal: controller.signal },
+							{ conversationId, toolCallId, signal: controller.signal },
 						)
 					: { blocked: false };
 				if (!controller.signal.aborted) reply(200, { ok: true, data });
@@ -147,7 +171,10 @@ export class ToolHostServer {
 			let invocation: DesktopToolInvocation;
 			try { invocation = validateToolInvocation(parsedBody); }
 			catch (error) { return reply(400, { ok: false, error: error instanceof Error ? error.message : "Invalid request" }); }
-			const data = await this.options.handle(invocation, { conversationId, toolCallId: invocation.toolCallId, signal: controller.signal });
+			const data = await this.options.handle(invocation, {
+				conversationId, toolCallId: invocation.toolCallId, signal: controller.signal,
+				...(invocation.batch ? { batch: invocation.batch } : {}),
+			});
 			if (!controller.signal.aborted) reply(200, { ok: true, data });
 		} catch (error) {
 			if (!controller.signal.aborted) reply(400, { ok: false, error: error instanceof Error ? error.message : "Tool request failed" });

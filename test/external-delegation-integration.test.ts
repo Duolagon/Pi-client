@@ -117,8 +117,23 @@ test("native approval waits on the external task, resumes after a response and h
 		await data.service.respondExternal(task.id, task.pendingApprovals[0].id, { decision: "allow" });
 		await until(() => data.service.externalSnapshot(task.id), (value) => value.status === "completed", "native task complete");
 		const completed = await until(() => data.service.snapshot(), (value) => contains(value, "EXTERNAL_HANDBACK_COMPLETE") && !value.state?.isStreaming, "approval handback");
-		assert.equal(completed.messages.filter((message) => "customType" in message && message.customType === "desktop_task_result").length, 1);
+		assert.equal(completed.messages.filter((message) => "customType" in message && message.customType === "desktop_task_notification").length, 1);
 		await assert.rejects(data.service.respondExternal(task.id, task.pendingApprovals[0].id, { decision: "allow" }), /失效/);
+	} finally { await data.service.close(); await data.fixture.cleanup(); }
+});
+
+test("an external Agent call rejects model and name it cannot honour and warns about ignored team fields", { timeout: 45000 }, async () => {
+	const data = await setup();
+	try {
+		const result = await run(data.service, "EXTERNAL_PARAMS codex", "EXTERNAL_PARAMS_COMPLETE");
+		const answer = result.messages.filter((message) => message.role === "assistant").map(text).find((value) => value.includes("EXTERNAL_PARAMS_COMPLETE"))!;
+		const [model, name, team] = answer.replace("EXTERNAL_PARAMS_COMPLETE ", "").split("\n");
+		assert.match(model, /^error:.*External executors use their own configured model/);
+		assert.match(name, /^error:.*External executors cannot be named/);
+		assert.match(team, /^ok:/);
+		assert.match(team, /Parameter 'mode' is not supported by this client and was ignored/);
+		assert.match(team, /Parameter 'team_name' is not supported by this client and was ignored/);
+		assert.equal(data.service.listExternal(data.parentId).length, 1, "only the valid call started an external task");
 	} finally { await data.service.close(); await data.fixture.cleanup(); }
 });
 
@@ -128,7 +143,7 @@ test("background native results reach the parent once and another conversation c
 		await run(data.service, "EXTERNAL_BACKGROUND codex", "EXTERNAL_BACKGROUND_LAUNCHED");
 		const completed = await until(() => data.service.snapshot(), (value) => contains(value, "EXTERNAL_HANDBACK_COMPLETE") && !value.state?.isStreaming, "native background handback");
 		const [task] = data.service.listExternal(data.parentId); assert.equal(task.status, "completed");
-		assert.equal(completed.messages.filter((message) => "customType" in message && message.customType === "desktop_task_result").length, 1);
+		assert.equal(completed.messages.filter((message) => "customType" in message && message.customType === "desktop_task_notification").length, 1);
 		await data.service.newConversation();
 		const denied = await run(data.service, `EXTERNAL_FOREIGN ${task.id}`, "EXTERNAL_FOREIGN_COMPLETE DENIED");
 		assert.ok(contains(denied, "没有该外部子任务"));
@@ -136,7 +151,7 @@ test("background native results reach the parent once and another conversation c
 	} finally { await data.service.close(); await data.fixture.cleanup(); }
 });
 
-test("TaskStop and explicit parent abort cancel external children while preserving an independent Pi task", { timeout: 45000 }, async () => {
+test("TaskStop cancels an external child; Esc keeps background externals and stop-all stops them, preserving an independent Pi task", { timeout: 45000 }, async () => {
 	const data = await setup();
 	try {
 		await run(data.service, "EXTERNAL_CANCEL_TOOL kimi", "EXTERNAL_CANCEL_COMPLETE");
@@ -146,8 +161,15 @@ test("TaskStop and explicit parent abort cancel external children while preservi
 		await run(data.service, "EXTERNAL_BLOCK codex", "EXTERNAL_BLOCK_LAUNCHED");
 		await until(() => data.service.listExternal(data.parentId), (tasks) => tasks.some((task) => task.executor === "codex" && task.status === "running"), "external child started");
 		await data.service.command({ type: "abort" });
+		// Esc only interrupts foreground work; the background external child keeps running.
+		assert.equal(data.service.listExternal(data.parentId).find((task) => task.executor === "codex")?.status, "running");
+		assert.deepEqual(await data.service.stopAllTasks(data.parentId), { stopped: 1 });
 		assert.ok(data.service.listExternal(data.parentId).every((task) => task.status === "cancelled"));
 		assert.equal((await data.service.listTasks()).find((task) => task.id === independent.id)?.status, "running");
+		// The user-stopped background child is reported to the parent exactly once.
+		const reported = await until(() => data.service.snapshot(), (value) => contains(value, "EXTERNAL_HANDBACK_COMPLETE") && !value.state?.isStreaming, "stopped external reported");
+		assert.ok(contains(reported, "<status>stopped</status>"));
+		assert.equal(reported.messages.filter((message) => "customType" in message && message.customType === "desktop_task_notification").length, 1);
 	} finally { await data.service.close(); await data.fixture.cleanup(); }
 });
 

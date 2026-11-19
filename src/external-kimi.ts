@@ -7,7 +7,7 @@ import type {
 } from "./external-types.ts";
 
 const desktopTools = new Set([
-	"Agent", "AgentSend", "AgentExecutors", "TaskOutput", "TaskStop", "TaskList",
+	"Agent", "SendMessage", "AgentSend", "AgentExecutors", "TaskOutput", "TaskStop", "TaskList",
 	"WorktreeCreate", "WorktreeList", "WorktreeMerge", "WorktreeRemove",
 ]);
 const outputLimit = 1024 * 1024;

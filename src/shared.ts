@@ -10,7 +10,7 @@ import type {
 import type { GitCheckpoint, GitCheckpointDiff, GitRestoreResult } from "./git-types.ts";
 import type { TerminalCreateInput, TerminalEvent, TerminalInfo, TerminalReplay } from "./terminal-types.ts";
 import type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRemoveResult } from "./worktree-types.ts";
-import type { DesktopTask, TaskEvent, TaskStartInput } from "./task-types.ts";
+import type { DesktopTask, TaskEvent, TaskSendInput, TaskSendResult, TaskStartInput } from "./task-types.ts";
 import type { DesktopSessionAPI } from "./session-types.ts";
 import type { LiveTranscript } from "./transcript.ts";
 import type { DesktopToolsAPI, DesktopPermissionsAPI } from "./control-types.ts";
@@ -42,7 +42,7 @@ export type * from "./session-history-types.ts";
 export type { GitCheckpoint, GitCheckpointDiff, GitRestoreResult } from "./git-types.ts";
 export type { TerminalCreateInput, TerminalEvent, TerminalInfo, TerminalReplay } from "./terminal-types.ts";
 export type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRemoveResult } from "./worktree-types.ts";
-export type { DesktopTask, TaskEvent, TaskStartInput, TaskStatus } from "./task-types.ts";
+export type { DesktopTask, TaskEvent, TaskSendInput, TaskSendResult, TaskStartInput, TaskStatus } from "./task-types.ts";
 
 export interface CheckpointInput {
 	conversationId?: string;
@@ -79,6 +79,18 @@ export interface DesktopTaskAPI {
 	list(): Promise<DesktopTask[]>;
 	snapshot(id: string): Promise<Snapshot>;
 	cancel(id: string): Promise<DesktopTask>;
+	/** Stop every background sub-agent (Pi and external) that this conversation delegated. */
+	stopAll(conversationId: string): Promise<{ stopped: number }>;
+	/** Deliver held background results to this conversation now and start a run for them. */
+	deliverNow(conversationId: string): Promise<{ pending: number }>;
+	/**
+	 * Continue a task with a message ("继续对话"): a finished one starts its next run with its
+	 * history, a running one receives it before its next model call. `notifyParent` delivers
+	 * the finished run's result to the delegating conversation (default: not delivered).
+	 */
+	send(input: TaskSendInput): Promise<TaskSendResult>;
+	/** Report that a task conversation is shown (or no longer shown); a shown child keeps its process. */
+	viewing(conversationId: string, viewing: boolean): Promise<void>;
 	result(id: string, options?: { block?: boolean; timeout?: number }): Promise<DelegatedTaskResult>;
 	command(id: string, command: Command): Promise<unknown>;
 	respond(id: string, response: RpcExtensionUIResponse): Promise<void>;
@@ -178,6 +190,13 @@ export interface Settings {
 	sandbox?: boolean;
 	sandboxOffline?: boolean;
 	notifications?: boolean;
+	/** Agent calls without run_in_background run in the background; absent means true. */
+	subagentDefaultBackground?: boolean;
+	/**
+	 * How long a foreground Agent call waits before the child is handed to background
+	 * delivery, in milliseconds; 0 waits without limit. Absent means 300000.
+	 */
+	foregroundSubagentTimeoutMs?: number;
 	configuredProviders: Provider[];
 	connections: Partial<
 		Record<Provider, { baseUrl?: string; modelId?: string; api?: ConnectionProtocol; mode?: ConnectionMode }>
@@ -204,6 +223,8 @@ export interface ClaudePermissionsSyncResult {
 	path: string;
 	imported?: number;
 	exported?: number;
+	/** Claude specs that have no safe Desktop equivalent and were not imported. */
+	skipped?: string[];
 }
 export interface DesktopSkillsAPI {
 	list(project?: string): Promise<SkillDefinitionEntry[]>;
@@ -276,6 +297,8 @@ export interface Snapshot {
 	commands: SlashCommand[];
 	/** Trust state for the active project; absent when no project is active. */
 	trust?: ProjectTrustState;
+	/** Background sub-agent results this conversation holds without delivery ("待交付"). */
+	pendingTaskNotifications?: number;
 }
 export type DesktopEvent = {
 	conversationId: string;
@@ -340,6 +363,8 @@ export interface DesktopAPI {
 		sandbox?: boolean;
 		sandboxOffline?: boolean;
 		notifications?: boolean;
+		subagentDefaultBackground?: boolean;
+		foregroundSubagentTimeoutMs?: number;
 		provider?: Provider;
 		mode?: ConnectionMode;
 		apiKey?: string;

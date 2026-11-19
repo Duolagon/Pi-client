@@ -174,6 +174,23 @@ test("task IPC routes approvals, commands, file access, diffs, and automatic che
 		await assert.rejects(access(join(data.project, "denied.txt")));
 		assert.equal((await data.invoke<DesktopTask>("pi:task:cancel", task.id)).status, "completed");
 		assert.ok(data.packets.some((packet) => packet.conversationId === task.conversationId && packet.event.type === "tool_execution_end"));
+		// Stop-all and "立即交付" act only on a named, existing conversation's own children.
+		await assert.rejects(data.invoke("pi:task:stopAll", "../escape"), /标识符/);
+		await assert.rejects(data.invoke("pi:task:stopAll", "missing-conversation"), /会话不存在/);
+		await assert.rejects(data.invoke("pi:task:deliverNow", { id: data.conversationId }), /标识符|格式/);
+		assert.deepEqual(await data.invoke("pi:task:stopAll", data.conversationId), { stopped: 0 });
+		assert.equal((await data.invoke<DesktopTask[]>("pi:task:list")).find((item) => item.id === task.id)?.status, "completed", "a manual task is not a child");
+		assert.deepEqual(await data.invoke("pi:task:deliverNow", data.conversationId), { pending: 0 });
+		// "继续对话" and the viewing report validate their input at the IPC boundary.
+		await assert.rejects(data.invoke("pi:task:send", { taskId: "../escape", message: "x" }), /标识符/);
+		await assert.rejects(data.invoke("pi:task:send", { taskId: task.id, message: "x", forged: true }), /格式/);
+		await assert.rejects(data.invoke("pi:task:send", { taskId: task.id, message: "x", notifyParent: "yes" }), /通知选项/);
+		await assert.rejects(data.invoke("pi:task:send", { taskId: task.id, message: "   " }), /请输入/);
+		await assert.rejects(data.invoke("pi:task:send", { taskId: "missing-task", message: "x" }), /后台任务不存在/);
+		await assert.rejects(data.invoke("pi:conversation:viewing", task.conversationId, "yes"), /查看状态/);
+		await assert.rejects(data.invoke("pi:conversation:viewing", "missing-conversation", true), /会话不存在/);
+		assert.equal(await data.invoke("pi:conversation:viewing", task.conversationId, true), undefined);
+		assert.equal(await data.invoke("pi:conversation:viewing", task.conversationId, false), undefined);
 	} finally {
 		await data.service.close();
 		await data.fixture.cleanup();

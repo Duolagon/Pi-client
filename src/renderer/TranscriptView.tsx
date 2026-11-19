@@ -158,6 +158,56 @@ function CopyTurnButton({ text }: { text: string }) {
 	);
 }
 
+const noticeStatusLabel: Record<string, string> = { completed: "已完成", failed: "失败", stopped: "已停止" };
+const noticeStopLabel: Record<string, string> = { user_stop: "用户停止", restart: "应用重启" };
+
+/** Background sub-agent result delivered into this conversation; the report is untrusted Markdown. */
+function TaskNotificationCard({ details, onOpenTask }: { details: unknown; onOpenTask?: (taskId: string) => void }) {
+	const info = (details && typeof details === "object" ? details : {}) as Record<string, unknown>;
+	const str = (value: unknown) => (typeof value === "string" ? value : undefined);
+	const status = str(info.status) ?? "completed";
+	const taskId = str(info.task_id);
+	const description = str(info.description) ?? taskId ?? "子 Agent";
+	const kind = str(info.executor) ?? str(info.subagent_type);
+	const result = str(info.result) ?? "";
+	const error = str(info.error);
+	const duration = typeof info.duration_ms === "number" && Number.isFinite(info.duration_ms) ? info.duration_ms : undefined;
+	const stopReason = str(info.stop_reason);
+	const meta = [
+		kind,
+		duration !== undefined ? `耗时 ${duration >= 60000 ? `${Math.round(duration / 60000)} 分钟` : `${Math.max(1, Math.round(duration / 1000))} 秒`}` : undefined,
+		info.partial === true ? "达到轮次上限，结果不完整" : undefined,
+		info.truncated === true ? "结果已截断" : undefined,
+		stopReason && noticeStopLabel[stopReason] ? noticeStopLabel[stopReason] : undefined,
+		Array.isArray(info.flagged) && info.flagged.length ? "含疑似指令内容，已作为数据处理" : undefined,
+	].filter(Boolean);
+	return (
+		<details className="cl-tool done">
+			<summary>
+				<span className={`cc-dot ${status === "completed" ? "ok" : status === "failed" ? "err" : ""}`} />
+				<span className="cc-tool-head">
+					<span className="cc-tool-verb">子 Agent</span>
+					<span className="cl-tool-name">{description}</span>
+					<span className={`cc-task-notice-status ${status}`}>{noticeStatusLabel[status] ?? status}</span>
+				</span>
+				<ChevronRight size={13} className="cl-tool-chevron" />
+			</summary>
+			<div className="cl-tool-body">
+				<div className="cc-summary-pad">
+					{meta.length > 0 && <p className="cc-task-notice-meta">{meta.join(" · ")}</p>}
+					{error && <p className="live-error">{error}</p>}
+					{result ? <MarkdownContent text={result} /> : <p className="subtle-note">子 Agent 没有返回文本结果。</p>}
+					{taskId && onOpenTask && (
+						<button type="button" className="cc-mini-btn" onClick={() => onOpenTask(taskId)}>
+							查看任务
+						</button>
+					)}
+				</div>
+			</div>
+		</details>
+	);
+}
+
 export function TranscriptView({
 	transcript: state,
 	tasks = [],
@@ -180,6 +230,9 @@ export function TranscriptView({
 			{units(state.messages).map((unit, index) => {
 				if (unit.kind === "user") {
 					const message = unit.message;
+					if (message.role === "custom" && message.customType === "desktop_task_notification") {
+						return <TaskNotificationCard key={`tasknote-${message.timestamp}-${index}`} details={message.details} onOpenTask={onOpenTask} />;
+					}
 					if (message.role === "custom" && message.customType === "desktop_task_result") {
 						const text =
 							typeof message.content === "string"
@@ -594,6 +647,21 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 		};
 	}
 
+	if (name === "SendMessage" || (name === "AgentSend" && typeof a.task_id === "string")) {
+		const to = typeof a.to === "string" ? a.to : typeof a.task_id === "string" ? a.task_id : "";
+		const summary = typeof a.summary === "string" && a.summary ? a.summary : undefined;
+		return {
+			verb: "SendMessage",
+			target: summary ? `${to} · ${summary}` : to,
+			badge: status,
+			treeSummary: output?.startsWith("Message delivered to the running agent")
+				? "消息已送达运行中的子 Agent"
+				: output?.startsWith("Agent resumed in the background")
+					? "子 Agent 已在后台继续，完成后结果自动回传"
+					: summarizeDesktopJson(output, status === "running" ? "子 Agent 继续执行中…" : "已完成"),
+		};
+	}
+
 	if (name === "Agent" || name === "AgentSend") {
 		const subType = typeof a.subagent_type === "string" ? a.subagent_type : "general-purpose";
 		const desc = typeof a.description === "string" ? a.description : typeof a.task_id === "string" ? a.task_id : "Subagent task";
@@ -602,7 +670,9 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 			verb: name === "AgentSend" ? "AgentSend" : `Agent(${subType})`,
 			target: desc,
 			badge: executor ? `${executor} · ${status}` : status,
-			treeSummary: summarizeDesktopJson(output, status === "running" ? "子任务执行中…" : "已完成"),
+			treeSummary: output?.startsWith("Async agent launched")
+				? "已在后台启动，完成后结果自动回传"
+				: summarizeDesktopJson(output, status === "running" ? "子任务执行中…" : "已完成"),
 		};
 	}
 

@@ -1,7 +1,13 @@
 import { useEffect, useState } from "react";
 import { Bot, Plus, Save, Trash2 } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
-import type { AgentDefinition, AgentSaveInput, ThinkingLevel } from "../shared.ts";
+import type {
+	AgentDefinition,
+	AgentMemoryScope,
+	AgentPermissionMode,
+	AgentSaveInput,
+	ThinkingLevel,
+} from "../shared.ts";
 
 const thinkingOptions: { value: ThinkingLevel | ""; label: string }[] = [
 	{ value: "", label: "继承父会话" },
@@ -12,6 +18,23 @@ const thinkingOptions: { value: ThinkingLevel | ""; label: string }[] = [
 	{ value: "high", label: "high" },
 	{ value: "xhigh", label: "xhigh" },
 	{ value: "max", label: "max" },
+];
+
+const permissionModeOptions: { value: AgentPermissionMode | ""; label: string }[] = [
+	{ value: "", label: "继承当前会话" },
+	{ value: "default", label: "default（手动确认）" },
+	{ value: "acceptEdits", label: "acceptEdits（自动允许编辑）" },
+	{ value: "plan", label: "plan（仅调研/规划）" },
+	{ value: "dontAsk", label: "dontAsk（未授权操作自动拒绝）" },
+	{ value: "bypassPermissions", label: "bypassPermissions（仅父会话 auto 时沿用）" },
+	{ value: "read", label: "read（只读）" },
+];
+
+const memoryOptions: { value: AgentMemoryScope | ""; label: string }[] = [
+	{ value: "", label: "无持久化记忆" },
+	{ value: "user", label: "user (~/.pi/agent/agent-memory)" },
+	{ value: "project", label: "project (.claude/agent-memory)" },
+	{ value: "local", label: "local (.claude/agent-memory-local)" },
 ];
 
 function emptyForm(): AgentSaveInput {
@@ -33,8 +56,15 @@ export function AgentsDialog({
 	const [selected, setSelected] = useState<AgentDefinition | null>(null);
 	const [form, setForm] = useState<AgentSaveInput>(emptyForm());
 	const [toolsText, setToolsText] = useState("");
+	const [disallowedToolsText, setDisallowedToolsText] = useState("");
 	const [modelText, setModelText] = useState("");
 	const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel | "">("");
+	const [permissionMode, setPermissionMode] = useState<AgentPermissionMode | "">("");
+	const [maxTurnsText, setMaxTurnsText] = useState("");
+	const [skillsText, setSkillsText] = useState("");
+	const [memory, setMemory] = useState<AgentMemoryScope | "">("");
+	const [isolation, setIsolation] = useState<"" | "worktree" | "shared">("");
+	const [background, setBackground] = useState(false);
 	const [busy, setBusy] = useState(false);
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState("");
@@ -68,8 +98,15 @@ export function AgentsDialog({
 			scope: agent.scope === "user" ? "user" : "project",
 		});
 		setToolsText((agent.tools ?? []).join(", "));
-		setModelText(agent.model ? `${agent.model.provider}/${agent.model.id}` : "");
+		setDisallowedToolsText((agent.disallowedTools ?? []).join(", "));
+		setModelText(agent.model ? `${agent.model.provider}/${agent.model.id}` : (agent.modelAlias ?? ""));
 		setThinkingLevel(agent.thinkingLevel ?? "");
+		setPermissionMode(agent.permissionMode ?? "");
+		setMaxTurnsText(agent.maxTurns ? String(agent.maxTurns) : "");
+		setSkillsText((agent.skills ?? []).join(", "));
+		setMemory(agent.memory ?? "");
+		setIsolation(agent.isolation ?? "");
+		setBackground(Boolean(agent.background));
 	};
 
 	useEffect(() => {
@@ -94,17 +131,34 @@ export function AgentsDialog({
 			setError("请填写名称、描述和系统提示词。");
 			return;
 		}
+		const maxTurnsParsed = maxTurnsText.trim() ? Number(maxTurnsText.trim()) : undefined;
+		if (maxTurnsParsed !== undefined && (!Number.isSafeInteger(maxTurnsParsed) || maxTurnsParsed < 1 || maxTurnsParsed > 200)) {
+			setError("最大轮次须为 1–200 的整数。");
+			return;
+		}
+		const splitList = (raw: string) =>
+			raw
+				.split(",")
+				.map((item) => item.trim())
+				.filter(Boolean);
+		const tools = splitList(toolsText);
+		const disallowedTools = splitList(disallowedToolsText);
+		const skills = splitList(skillsText);
 		setBusy(true);
 		setError("");
 		try {
 			const list = await window.pi.agents.save({
 				...form,
-				tools: toolsText
-					.split(",")
-					.map((item) => item.trim())
-					.filter(Boolean),
+				tools,
+				...(disallowedTools.length ? { disallowedTools } : {}),
 				model: modelText.trim() || undefined,
 				thinkingLevel: thinkingLevel || undefined,
+				permissionMode: permissionMode || undefined,
+				maxTurns: maxTurnsParsed,
+				...(skills.length ? { skills } : {}),
+				memory: memory || undefined,
+				isolation: isolation || undefined,
+				...(background ? { background: true } : {}),
 				project,
 			});
 			setAgents(list);
@@ -146,7 +200,25 @@ export function AgentsDialog({
 				<div className="cc-agent-list">
 					<div className="cc-agent-list-head">
 						<span>可用 Agent ({agents.length})</span>
-						<button type="button" className="cc-mini-btn" onClick={() => { setSelected(null); setForm(emptyForm()); setToolsText(""); setModelText(""); setThinkingLevel(""); setError(""); }}>
+						<button
+							type="button"
+							className="cc-mini-btn"
+							onClick={() => {
+								setSelected(null);
+								setForm(emptyForm());
+								setToolsText("");
+								setDisallowedToolsText("");
+								setModelText("");
+								setThinkingLevel("");
+								setPermissionMode("");
+								setMaxTurnsText("");
+								setSkillsText("");
+								setMemory("");
+								setIsolation("");
+								setBackground(false);
+								setError("");
+							}}
+						>
 							<Plus size={13} /> 新建
 						</button>
 					</div>
@@ -202,7 +274,7 @@ export function AgentsDialog({
 					</label>
 					<div className="cc-agent-row">
 						<label className="field-label">
-							工具（逗号分隔，留空 = 全部）
+							工具白名单（逗号分隔，留空 = 全部）
 							<input
 								value={toolsText}
 								disabled={busy || builtin}
@@ -211,24 +283,49 @@ export function AgentsDialog({
 							/>
 						</label>
 						<label className="field-label">
-							模型（provider/model-id，留空继承）
+							禁用工具 disallowedTools
 							<input
-								value={modelText}
+								value={disallowedToolsText}
 								disabled={busy || builtin}
-								placeholder="anthropic/claude-opus-5-5"
-								onChange={(event) => setModelText(event.target.value)}
+								placeholder="Write, Edit, Bash"
+								onChange={(event) => setDisallowedToolsText(event.target.value)}
 							/>
 						</label>
 					</div>
 					<div className="cc-agent-row">
 						<label className="field-label">
-							思考强度
+							模型（provider/id 或 sonnet / opus / haiku）
+							<input
+								value={modelText}
+								disabled={busy || builtin}
+								placeholder="sonnet 或 anthropic/claude-opus-5-5"
+								onChange={(event) => setModelText(event.target.value)}
+							/>
+						</label>
+						<label className="field-label">
+							思考强度 / effort
 							<select
 								value={thinkingLevel}
 								disabled={busy || builtin}
 								onChange={(event) => setThinkingLevel(event.target.value as ThinkingLevel | "")}
 							>
 								{thinkingOptions.map((option) => (
+									<option key={option.value} value={option.value}>
+										{option.label}
+									</option>
+								))}
+							</select>
+						</label>
+					</div>
+					<div className="cc-agent-row">
+						<label className="field-label">
+							权限模式
+							<select
+								value={permissionMode}
+								disabled={busy || builtin}
+								onChange={(event) => setPermissionMode(event.target.value as AgentPermissionMode | "")}
+							>
+								{permissionModeOptions.map((option) => (
 									<option key={option.value} value={option.value}>
 										{option.label}
 									</option>
@@ -247,6 +344,61 @@ export function AgentsDialog({
 							</select>
 						</label>
 					</div>
+					{!builtin && (
+						<details className="live-settings-section">
+							<summary>Claude Code 高级兼容配置（Skills / Memory / 轮次 / 隔离）</summary>
+							<div className="live-settings-section-content">
+								<div className="cc-agent-row">
+									<label className="field-label">
+										预加载 Skills（逗号分隔）
+										<input
+											value={skillsText}
+											disabled={busy}
+											placeholder="api-conventions, security-audit"
+											onChange={(event) => setSkillsText(event.target.value)}
+										/>
+									</label>
+									<label className="field-label">
+										最大轮次 maxTurns
+										<input
+											type="number"
+											min="1"
+											max="200"
+											value={maxTurnsText}
+											disabled={busy}
+											placeholder="不限"
+											onChange={(event) => setMaxTurnsText(event.target.value)}
+										/>
+									</label>
+								</div>
+								<div className="cc-agent-row">
+									<label className="field-label">
+										持久化记忆 memory
+										<select value={memory} disabled={busy} onChange={(event) => setMemory(event.target.value as AgentMemoryScope | "")}>
+											{memoryOptions.map((opt) => (
+												<option key={opt.value} value={opt.value}>{opt.label}</option>
+											))}
+										</select>
+									</label>
+									<label className="field-label">
+										隔离方式 isolation
+										<select value={isolation} disabled={busy} onChange={(event) => setIsolation(event.target.value as "" | "worktree" | "shared")}>
+											<option value="">自动（只读共享 / 可写 Worktree）</option>
+											<option value="worktree">worktree</option>
+											<option value="shared">shared（仅只读可用）</option>
+										</select>
+									</label>
+								</div>
+								<label className="live-setting-toggle">
+									<input type="checkbox" checked={background} disabled={busy} onChange={(event) => setBackground(event.target.checked)} />
+									默认后台运行（background: true）
+								</label>
+							</div>
+						</details>
+					)}
+					{selected?.hooks && selected.hooks.length > 0 && (
+						<p className="cc-agent-note">此 Agent 定义包含 {selected.hooks.length} 个作用域专属 Hook（随此 Agent 生命周期触发）。</p>
+					)}
 					<label className="field-label cc-agent-prompt">
 						系统提示词
 						<textarea

@@ -13,7 +13,7 @@
 | `pi.externalAgents` | `executors / configure / start / list / snapshot / send / result / cancel / respond / replay / onEvent` | 本机 Codex／Claude／Kimi 协作与独立审批流 |
 | `pi.git` | `begin / finish / list / diff / restore` | 工作树检查点与安全恢复 |
 | `pi.terminals` | `create / list / write / resize / close / replay / onEvent / ssh / mcpOAuth / packages` | PTY 与输出回放、SSH、MCP OAuth 和 Pi CLI 扩展管理 |
-| `pi.tasks` | `start / list / snapshot / result / cancel / command / respond / files / readFile / workspace / diff / onEvent` | 后台任务、模型委派结果与指定会话操作 |
+| `pi.tasks` | `start / list / snapshot / result / cancel / stopAll / deliverNow / command / respond / files / readFile / workspace / diff / onEvent` | 后台任务、模型委派结果与指定会话操作；`stopAll` 停止会话的全部后台子 Agent，`deliverNow` 立即交付待交付的子 Agent 结果 |
 | `pi.worktrees` | `create / list / remove / merge` | 托管 Worktree 生命周期 |
 | `pi.sessions` | `fork / clone / entries / tree / forkMessages / navigate / history / importHistory` | 会话分支、树导航和 CLI 历史导入 |
 | `pi.setProjectTrust` | `setProjectTrust({ project, decision })` | 保存项目信任决定、重启相关会话并返回新快照 |
@@ -64,9 +64,11 @@ await window.pi.agents.save({
 });
 ```
 
-定义格式为 Markdown frontmatter + 正文提示词；兼容 Claude Code 的 `Read/Grep/Glob/Edit/Write/Bash` 工具名，并归一化为 Pi 工具名。`tools` 为工具白名单，仅内置 Pi 工具会传给 `--tools`；显式白名单过滤为空时传空工具集，不会退化为全部工具。只含只读工具的定义按只读子 Agent 运行，其余默认 Worktree。项目级 `.pi/agents`/`.claude/agents` 仅在项目信任后加载，未信任时只返回内置和用户级 Agent。`model` 留空继承父会话；`thinkingLevel` 留空继承父会话。`.claude/agents` 条目只读展示，保存会在 `.pi/agents` 创建同名覆盖。内置 `general-purpose / Explore / Plan` 不可覆盖或删除。
+定义格式为 Markdown frontmatter + 正文提示词（支持多行 YAML 数组与嵌套 `hooks`）；兼容 Claude Code 的 `Read/Grep/Glob/Edit/Write/NotebookEdit/WebFetch/Bash` 等工具名，支持 `tools` 白名单、`disallowedTools` 黑名单、`model`（`provider/model-id` 或 `sonnet`/`opus`/`haiku`/`fable`/`inherit`）、`effort`/`thinkingLevel`、`permissionMode`（含 `default/acceptEdits/plan/dontAsk/bypassPermissions/read`，且不突破只读/Plan/显式规则上限）、`maxTurns`、预加载 `skills`、`memory`（`user/project/local`）、`isolation`、`background` 与作用域 `hooks`（子 Agent 结束时 frontmatter `Stop` 自动映射为 `SubagentStop`）。项目级定义与项目 `skills`/`memory`/`hooks` 仅在项目信任后加载。`.claude/agents` 条目只读展示，保存会在 `.pi/agents` 创建同名覆盖（保留既有 `hooks` 块）。内置 `general-purpose / Explore / Plan` 不可覆盖或删除。
 
-`Agent` 工具的 `subagent_type` 接受内置名或自定义名；未知名称会被拒绝。自定义提示词会前置到子任务正文，模型/思考强度/工具白名单按定义应用。
+`Agent` 工具的 `subagent_type` 可省略（默认 general-purpose），接受内置名或自定义名；未知名称报错并列出可用 Agent；`subagent_type: "fork"`（或兼容参数 `fork: true`）可将父会话当前干净上下文分支快照复制到子会话（裁剪未闭合末尾工具调用）。定义正文（内置 Agent 也有原生风格提示词）、预加载 Skill 与记忆写入私有文件，以 `--append-system-prompt` 追加到子 Agent 的 system prompt，首条用户消息只放任务本身；模型（调用参数 `model` 优先于定义）、思考强度、权限、轮次、工具策略按定义应用。父会话每轮的 system prompt 末尾附有可用 agent 清单（只含当前信任状态下可见的定义）。Agent 默认后台运行（设置 `subagentDefaultBackground`，默认 true），非 git 项目中的可写子 Agent 默认前台。详见 [tools-and-delegation.md](tools-and-delegation.md)。
+
+设置（`saveSettings` / `Snapshot.settings`）中与子 Agent 相关的两项：`subagentDefaultBackground?: boolean`（缺省视为 true）和 `foregroundSubagentTimeoutMs?: number`（前台 Agent 最长等待，0–86400000 毫秒，0 表示一直等待，缺省 300000）。主进程 IPC 与宿主都会校验类型和范围；界面入口在设置弹窗的高级区域。
 
 ## MCP 服务器
 
@@ -184,9 +186,19 @@ await window.pi.tasks.cancel(task.id);
 
 审批事件仍来自 `pi.onEvent`，必须同时保留 `conversationId` 和请求 `id`。错误会话的审批会拒绝。`tasks.snapshot(id)` 不改变当前前台会话，包含该会话自己的 `pendingUI`，供页面重载后恢复审批。
 
+继续一个任务（结束后的下一轮，或给运行中的任务补充说明）：
+
+```ts
+const sent = await window.pi.tasks.send({ taskId: task.id, message: "再补一个边界测试", notifyParent: false });
+// sent.status: "resumed"（已结束的任务带完整历史开始下一轮）| "delivered_to_running_agent"
+await window.pi.tasks.viewing(task.id, true); // 详情打开时上报；关闭时传 false
+```
+
+`tasks.send` 走任务状态机：`turn + 1`、重新排队、用量按轮统计。模型委派的子 Agent 默认不把用户这一轮的结果交给父会话，`notifyParent: true` 才交付。在已结束子 Agent 自己的会话里直接发送消息也会转为 `tasks.send`。已结束且无人查看的子 Agent 进程会在空闲 60 秒后被回收，下次发送时透明重启；`tasks.viewing` 上报的会话不回收。
+
 `tasks.command` 采用现有桌面 RPC 白名单，支持提示、引导、follow-up、停止、模型／思考选择和查询等；不会开放任意切换会话路径或原始 RPC 会话替换。文件、Git 状态和差异接口均以该任务执行目录为边界。
 
-取消是停止请求，正在结束的任务可能还在完成工具清理与检查点封存。恢复文件前，应等会话不再执行；后端会再次检查。应用重启后未完成任务标记为 `interrupted`，不会自动重复发送提示或消耗模型额度。前端重新调用 `tasks.list()` 恢复列表。
+取消是停止请求，正在结束的任务可能还在完成工具清理与检查点封存。恢复文件前，应等会话不再执行；后端会再次检查。应用重启后未完成任务标记为 `interrupted`，不会自动重复发送提示或消耗模型额度；之后可用 `tasks.send`（模型侧为 SendMessage）显式继续。前端重新调用 `tasks.list()` 恢复列表。
 
 ## 评审、浏览器验证和代码分析
 
@@ -307,4 +319,4 @@ Pi 引擎来自精确锁定的 `@earendil-works/pi-coding-agent@1.5.2` 与 `@ear
 
 新增 `window.pi.tools`、`window.pi.permissions` 和 `window.pi.tasks.result`；真实模型工具 Agent、TaskOutput/Stop/List 及 Worktree 工具已接入。完整参数、权限规则、热更新语义、父子事件路由和前端卡片约定见 [tools-and-delegation.md](tools-and-delegation.md)。前端页面没有随本次后端接入修改。
 
-本机外部执行器另见 [local-external-agents.md](local-external-agents.md)。外部 Agent 的审批和事件使用独立命名空间，不能用 Pi tasks.respond/snapshot 代替；主模型使用 Agent 的 executor 和 AgentSend 持续协作。`pi.terminals.ssh(conversationId, host, startPi)` 启动 SSH 终端，使用系统 OpenSSH 配置和远端安装的 Pi。SSH 终端拥有独立的回放与生命周期。
+本机外部执行器另见 [local-external-agents.md](local-external-agents.md)。外部 Agent 的审批和事件使用独立命名空间，不能用 Pi tasks.respond/snapshot 代替；主模型使用 Agent 的 executor 和 SendMessage（兼容别名 AgentSend）持续协作。`pi.terminals.ssh(conversationId, host, startPi)` 启动 SSH 终端，使用系统 OpenSSH 配置和远端安装的 Pi。SSH 终端拥有独立的回放与生命周期。
