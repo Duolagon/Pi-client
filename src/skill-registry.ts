@@ -4,13 +4,14 @@ import { homedir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
 
 export type SkillScope = "user" | "project";
+export type SkillEntryScope = SkillScope | "bundled";
 
 export interface SkillDefinitionEntry {
 	id: string;
 	name: string;
 	description: string;
 	body: string;
-	scope: SkillScope;
+	scope: SkillEntryScope;
 	kind: "skill" | "command";
 	sourceDir: string;
 	filePath: string;
@@ -35,6 +36,29 @@ export interface SkillRemoveInput {
 }
 
 const namePattern = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+export const BUNDLED_SKILLS: readonly SkillDefinitionEntry[] = [
+	{
+		id: "bundled:skill:batch",
+		name: "batch",
+		description: "Orchestrate large-scale parallel repository changes across 5-30 independent work units using isolated worktrees or WorkflowRun",
+		body: [
+			"# /batch — Parallel Change Orchestration",
+			"",
+			"When invoked for a batch refactoring, migration, or multi-target update:",
+			"1. Research the repository and decompose the requested change into 5-30 cleanly independent, non-overlapping units.",
+			"2. Record the decomposed work items using `TodoCreate` so progress stays visible in the shared root checklist.",
+			"3. Execute independent units in parallel using `Agent(isolation=\"worktree\", run_in_background=true)` or a deterministic `WorkflowRun` script (`parallel`, `phase`, `budget`).",
+			"4. Collect worker outputs, review diffs/tests, and summarize which worktrees are ready to merge.",
+		].join("\n"),
+		scope: "bundled",
+		kind: "skill",
+		sourceDir: "builtin:skills",
+		filePath: "builtin:skills/batch/SKILL.md",
+		editable: false,
+		estimatedTokens: 140,
+	},
+];
 
 function parseFrontmatter(raw: string): { data: Record<string, string>; body: string } {
 	const norm = raw.replace(/\r\n/g, "\n");
@@ -155,6 +179,9 @@ export class SkillRegistry {
 				...(await scanSkillDirectory(join(project, ".claude", "skills"), "project", false)),
 				...(await scanCommandsDirectory(join(project, ".claude", "commands"), "project")),
 			);
+		}
+		for (const bundled of BUNDLED_SKILLS) {
+			if (!out.some((entry) => entry.name === bundled.name)) out.push(bundled);
 		}
 		return out;
 	}

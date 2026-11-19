@@ -116,7 +116,7 @@ test("model Agent delegates to real read-only Pi child and returns its result to
 		assert.ok(child.parentToolCallId);
 		assert.ok(assistant(snapshot, "CHILD_EXPLORE_COMPLETE read:ok,write:error,bash:error,Agent:error"));
 		const tools = await data.service.listTools(child.conversationId);
-		assert.ok(tools.filter((tool) => tool.modelVisible).every((tool) => ["read", "grep", "find", "ls", "TaskOutput", "TaskStop", "TaskList", "WorktreeList"].includes(tool.name)));
+		assert.ok(tools.filter((tool) => tool.modelVisible).every((tool) => ["read", "grep", "find", "ls", "TaskOutput", "TaskStop", "TaskList", "WorktreeList", "TodoGet", "TodoList"].includes(tool.name)));
 		assert.ok(!tools.find((tool) => tool.name === "Agent")?.enabled);
 		assert.ok(!tools.find((tool) => tool.name === "bash")?.enabled);
 		await assert.rejects(access(join(data.project, "child-forbidden.txt")));

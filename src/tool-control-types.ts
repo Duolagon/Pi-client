@@ -1,6 +1,8 @@
 import type { ToolExposure } from "@earendil-works/pi-coding-agent";
 import { AGENT_CALL_NAME_PATTERN, MAX_AGENT_PROMPT, MAX_SEND_MESSAGE, MAX_SEND_SUMMARY, MAX_SEND_TARGET, exceedsLength } from "./delegation-limits.ts";
 import type { ModelToolResult, ToolUsage } from "./delegation-types.ts";
+import { todoStatuses } from "./todo-types.ts";
+import { teamMessageTypes } from "./team-types.ts";
 
 /** Values accepted by the Agent tool's `model` parameter. */
 export const agentModelValues = ["sonnet", "opus", "haiku", "fable", "inherit"] as const;
@@ -10,6 +12,11 @@ export const agentIsolationValues = ["worktree", "shared", "remote"] as const;
 export const desktopModelToolNames = [
 	"Agent", "SendMessage", "AgentSend", "AgentExecutors", "TaskOutput", "TaskStop", "TaskList",
 	"WorktreeCreate", "WorktreeList", "WorktreeMerge", "WorktreeRemove",
+	"TodoCreate", "TodoGet", "TodoUpdate", "TodoList",
+	"Monitor",
+	"ScheduleWakeup", "CronCreate", "CronList", "CronDelete",
+	"TeamCreate", "TeamDelete",
+	"WorkflowRun", "StructuredOutput",
 ] as const;
 export type DesktopModelToolName = (typeof desktopModelToolNames)[number];
 /** Tools that start or continue a child; a child process never gets them. */
@@ -39,6 +46,15 @@ export interface ToolOverrides { overrides: Record<string, boolean> }
  * `triggerTurn: false` queues a result for the parent's next run without waking it.
  */
 export type NotificationDelivery = "followUp" | "nextTurn";
+/** Allowlisted custom message types accepted by the generalized delivery control channel. */
+export const DELIVER_CUSTOM_TYPES = [
+	"desktop_task_notification",
+	"desktop_monitor_event",
+	"desktop_cron_wakeup",
+	"desktop_team_message",
+	"desktop_workflow_event",
+] as const;
+export type DeliverCustomType = (typeof DELIVER_CUSTOM_TYPES)[number];
 /** A background child's run usage and the model it ran on. */
 export interface NotificationUsage { provider: string; model: string; usage: ToolUsage }
 export type ToolControlRequest =
@@ -53,6 +69,19 @@ export type ToolControlRequest =
 		deliverAs: NotificationDelivery;
 		triggerTurn: boolean;
 		/** The finished run's usage, counted into the parent session once it receives the result. */
+		usage?: NotificationUsage;
+	}
+	| {
+		requestId: string;
+		operation: "deliver";
+		customType: DeliverCustomType;
+		/** Optional idempotency key (`<id>:<seq>`); required if `usage` is attached. */
+		key?: string;
+		content: string;
+		details: Record<string, unknown>;
+		deliverAs: NotificationDelivery;
+		triggerTurn: boolean;
+		display?: boolean;
 		usage?: NotificationUsage;
 	}
 	/** Start a parent run that consumes results already queued for its next turn. */
@@ -83,26 +112,57 @@ export function validateControlRequest(value: unknown, requestId: string, maxByt
 		if (!Number.isSafeInteger(request.count) || (request.count as number) < 1 || (request.count as number) > 10000) throw new Error("Invalid tool control request");
 		return { requestId, operation: "wake", count: request.count as number };
 	}
-	if (request.operation !== "notify") throw new Error("Invalid tool control request");
-	only(["requestId", "operation", "key", "content", "details", "deliverAs", "triggerTurn", "usage"]);
-	if (typeof request.key !== "string" || !NOTIFICATION_KEY_PATTERN.test(request.key)) throw new Error("Invalid background task result");
+	if (request.operation !== "notify" && request.operation !== "deliver") throw new Error("Invalid tool control request");
+	const isDeliver = request.operation === "deliver";
+	only(
+		isDeliver
+			? ["requestId", "operation", "customType", "key", "content", "details", "deliverAs", "triggerTurn", "display", "usage"]
+			: ["requestId", "operation", "key", "content", "details", "deliverAs", "triggerTurn", "usage"],
+	);
+	let customType: DeliverCustomType = "desktop_task_notification";
+	if (isDeliver) {
+		if (typeof request.customType !== "string" || !DELIVER_CUSTOM_TYPES.includes(request.customType as DeliverCustomType))
+			throw new Error("Invalid delivery customType");
+		customType = request.customType as DeliverCustomType;
+	}
+	let key: string | undefined;
+	if (!isDeliver || request.key !== undefined) {
+		if (typeof request.key !== "string" || !NOTIFICATION_KEY_PATTERN.test(request.key)) throw new Error("Invalid background task result");
+		key = request.key;
+	}
 	if (typeof request.content !== "string" || !request.content.trim() || request.content.includes("\0") ||
 		Buffer.byteLength(request.content, "utf8") > maxBytes) throw new Error("Invalid background task result");
 	const details = object(request.details);
 	if (Buffer.byteLength(JSON.stringify(details), "utf8") > maxBytes) throw new Error("Invalid background task result");
 	if (request.deliverAs !== "followUp" && request.deliverAs !== "nextTurn") throw new Error("Invalid background task result");
 	if (typeof request.triggerTurn !== "boolean" || (request.deliverAs === "nextTurn" && request.triggerTurn)) throw new Error("Invalid background task result");
+	if (isDeliver && request.display !== undefined && typeof request.display !== "boolean") throw new Error("Invalid delivery display flag");
 	let usage: NotificationUsage | undefined;
 	if (request.usage !== undefined) {
+		if (!key) throw new Error("Delivery with usage requires a key");
 		const value = object(request.usage);
 		const label = (item: unknown) => typeof item === "string" && item.length > 0 && item.length <= 200 && !/[\0\r\n]/.test(item);
 		const counted = validToolUsage(value.usage);
-		if (Object.keys(value).some((key) => !["provider", "model", "usage"].includes(key)) || !label(value.provider) || !label(value.model) || !counted)
+		if (Object.keys(value).some((k) => !["provider", "model", "usage"].includes(k)) || !label(value.provider) || !label(value.model) || !counted)
 			throw new Error("Invalid background task result");
 		usage = { provider: value.provider as string, model: value.model as string, usage: counted };
 	}
+	if (isDeliver) {
+		return {
+			requestId,
+			operation: "deliver",
+			customType,
+			...(key ? { key } : {}),
+			content: request.content,
+			details,
+			deliverAs: request.deliverAs,
+			triggerTurn: request.triggerTurn,
+			...(typeof request.display === "boolean" ? { display: request.display } : {}),
+			...(usage ? { usage } : {}),
+		};
+	}
 	return {
-		requestId, operation: "notify", key: request.key, content: request.content, details, deliverAs: request.deliverAs, triggerTurn: request.triggerTurn,
+		requestId, operation: "notify", key: key!, content: request.content, details, deliverAs: request.deliverAs, triggerTurn: request.triggerTurn,
 		...(usage ? { usage } : {}),
 	};
 }
@@ -171,10 +231,23 @@ export function validateDesktopToolInput(tool: DesktopModelToolName, value: unkn
 	const allowed: Record<DesktopModelToolName, string[]> = {
 		// `mode` and `team_name` are the only leniently accepted fields; they are ignored.
 		Agent: ["description", "prompt", "subagent_type", "model", "run_in_background", "name", "isolation", "worktree_id", "executor", "fork", "mode", "team_name"],
-		SendMessage: ["to", "message", "summary", "run_in_background"],
+		SendMessage: ["to", "message", "summary", "run_in_background", "message_type", "request_id", "approve"],
 		AgentSend: ["task_id", "message", "run_in_background"], AgentExecutors: [],
 		TaskOutput: ["task_id", "block", "timeout"], TaskStop: ["task_id"], TaskList: [],
 		WorktreeCreate: ["base_ref"], WorktreeList: [], WorktreeMerge: ["worktree_id"], WorktreeRemove: ["worktree_id"],
+		TodoCreate: ["subject", "description", "activeForm", "owner", "blocks", "blockedBy", "metadata"],
+		TodoGet: ["id"],
+		TodoUpdate: ["id", "subject", "description", "status", "activeForm", "owner", "addBlocks", "addBlockedBy", "metadata"],
+		TodoList: ["include_completed"],
+		Monitor: ["description", "command", "url", "timeout_ms", "persistent"],
+		ScheduleWakeup: ["delay_seconds", "reason", "prompt"],
+		CronCreate: ["prompt", "cron", "interval_seconds", "recurring", "durable"],
+		CronList: [],
+		CronDelete: ["id"],
+		TeamCreate: ["team_name", "description"],
+		TeamDelete: ["team_name"],
+		WorkflowRun: ["title", "script", "budget", "run_in_background"],
+		StructuredOutput: ["data"],
 	};
 	if (Object.keys(input).some((key) => !allowed[tool].includes(key))) throw new Error("Unknown tool input field");
 	if (tool === "Agent") {
@@ -196,6 +269,11 @@ export function validateDesktopToolInput(tool: DesktopModelToolName, value: unkn
 		text(input.to, "to", MAX_SEND_TARGET); text(input.message, "message", MAX_SEND_MESSAGE);
 		if (input.summary !== undefined) text(input.summary, "summary", MAX_SEND_SUMMARY);
 		optionalBoolean(input.run_in_background, "run_in_background");
+		if (input.message_type !== undefined && (typeof input.message_type !== "string" || !teamMessageTypes.includes(input.message_type as never))) {
+			throw new Error("Invalid message_type");
+		}
+		if (input.request_id !== undefined) text(input.request_id, "request_id", 128);
+		optionalBoolean(input.approve, "approve");
 	} else if (tool === "AgentSend") {
 		text(input.task_id, "task_id", 200); text(input.message, "message", MAX_SEND_MESSAGE); optionalBoolean(input.run_in_background, "run_in_background");
 	} else if (tool === "TaskOutput" || tool === "TaskStop") {
@@ -209,6 +287,86 @@ export function validateDesktopToolInput(tool: DesktopModelToolName, value: unkn
 		if (input.base_ref !== undefined) text(input.base_ref, "base_ref", 1000);
 	} else if (tool === "WorktreeMerge" || tool === "WorktreeRemove") {
 		text(input.worktree_id, "worktree_id", 200);
+	} else if (tool === "TodoCreate") {
+		text(input.subject, "subject", 500);
+		text(input.description, "description", 16000);
+		if (input.activeForm !== undefined) text(input.activeForm, "activeForm", 500);
+		if (input.owner !== undefined) text(input.owner, "owner", 128);
+		for (const field of ["blocks", "blockedBy"] as const) {
+			if (input[field] !== undefined) {
+				if (!Array.isArray(input[field]) || (input[field] as unknown[]).length > 100 ||
+					(input[field] as unknown[]).some((item) => typeof item !== "string" || !item.trim() || item.length > 64))
+					throw new Error(`Invalid ${field}`);
+			}
+		}
+		if (input.metadata !== undefined) object(input.metadata);
+	} else if (tool === "TodoGet") {
+		text(input.id, "id", 64);
+	} else if (tool === "TodoUpdate") {
+		text(input.id, "id", 64);
+		if (input.subject !== undefined) text(input.subject, "subject", 500);
+		if (input.description !== undefined) text(input.description, "description", 16000);
+		if (input.status !== undefined && (typeof input.status !== "string" || !todoStatuses.includes(input.status as never)))
+			throw new Error("Invalid todo status");
+		if (input.activeForm !== undefined) text(input.activeForm, "activeForm", 500);
+		if (input.owner !== undefined) text(input.owner, "owner", 128);
+		for (const field of ["addBlocks", "addBlockedBy"] as const) {
+			if (input[field] !== undefined) {
+				if (!Array.isArray(input[field]) || (input[field] as unknown[]).length > 100 ||
+					(input[field] as unknown[]).some((item) => typeof item !== "string" || !item.trim() || item.length > 64))
+					throw new Error(`Invalid ${field}`);
+			}
+		}
+		if (input.metadata !== undefined) object(input.metadata);
+	} else if (tool === "TodoList") {
+		optionalBoolean(input.include_completed, "include_completed");
+	} else if (tool === "Monitor") {
+		if (input.description !== undefined) text(input.description, "description", 160);
+		if (input.command !== undefined) text(input.command, "command", 16384);
+		if (input.url !== undefined) text(input.url, "url", 2048);
+		if ((input.command !== undefined) === (input.url !== undefined)) {
+			throw new Error("Monitor requires exactly one of 'command' or 'url'");
+		}
+		if (input.timeout_ms !== undefined && (!Number.isSafeInteger(input.timeout_ms) || Number(input.timeout_ms) < 1000 || Number(input.timeout_ms) > 86_400_000)) {
+			throw new Error("Invalid timeout_ms (expected 1000–86400000 ms)");
+		}
+		optionalBoolean(input.persistent, "persistent");
+	} else if (tool === "ScheduleWakeup") {
+		if (typeof input.delay_seconds !== "number" || !Number.isSafeInteger(input.delay_seconds) || input.delay_seconds < 1 || input.delay_seconds > 604800) {
+			throw new Error("Invalid delay_seconds (expected 1–604800)");
+		}
+		text(input.reason, "reason", 2000);
+		if (input.prompt !== undefined) text(input.prompt, "prompt", 16000);
+	} else if (tool === "CronCreate") {
+		text(input.prompt, "prompt", 16000);
+		if (input.cron !== undefined) text(input.cron, "cron", 200);
+		if (input.interval_seconds !== undefined && (typeof input.interval_seconds !== "number" || !Number.isSafeInteger(input.interval_seconds) || input.interval_seconds < 10 || input.interval_seconds > 604800)) {
+			throw new Error("Invalid interval_seconds (expected 10–604800)");
+		}
+		if ((input.cron !== undefined) === (input.interval_seconds !== undefined)) {
+			throw new Error("CronCreate requires exactly one of 'cron' or 'interval_seconds'");
+		}
+		optionalBoolean(input.recurring, "recurring");
+		optionalBoolean(input.durable, "durable");
+	} else if (tool === "CronDelete") {
+		text(input.id, "id", 80);
+	} else if (tool === "TeamCreate") {
+		text(input.team_name, "team_name", 64);
+		if (input.description !== undefined) text(input.description, "description", 500);
+	} else if (tool === "TeamDelete") {
+		if (input.team_name !== undefined) text(input.team_name, "team_name", 64);
+	} else if (tool === "WorkflowRun") {
+		if (input.title !== undefined) text(input.title, "title", 160);
+		text(input.script, "script", 256 * 1024);
+		optionalBoolean(input.run_in_background, "run_in_background");
+		if (input.budget !== undefined) {
+			const b = object(input.budget);
+			if (Object.keys(b).some((k) => !["maxCost", "maxTokens", "maxAgents"].includes(k))) {
+				throw new Error("Invalid workflow budget field");
+			}
+		}
+	} else if (tool === "StructuredOutput") {
+		if (!("data" in input)) throw new Error("StructuredOutput requires 'data'");
 	}
 	return { ...input };
 }

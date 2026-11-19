@@ -27,7 +27,7 @@ const permissionModes = new Set<AgentPermissionMode>(["default", "acceptEdits", 
 const memoryScopes = new Set<AgentMemoryScope>(["user", "project", "local"]);
 /** Tools a `memory` definition always gets; a read-only agent may not declare memory. */
 const memoryTools = ["read", "write", "edit"] as const;
-const readOnlyTools = new Set(["read", "grep", "find", "ls", "WebFetch", "TodoWrite", "AskUserQuestion", "ExitPlanMode", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "AgentExecutors"]);
+const readOnlyTools = new Set(["read", "grep", "find", "ls", "WebFetch", "TodoWrite", "TodoGet", "TodoList", "AskUserQuestion", "ExitPlanMode", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "AgentExecutors"]);
 const denylistReadOnlyRequirements = ["edit", "write", "bash"] as const;
 const toolAliases: Record<string, string> = {
 	Read: "read",
@@ -43,6 +43,10 @@ const toolAliases: Record<string, string> = {
 	WebFetch: "WebFetch",
 	WebSearch: "WebSearch",
 	TodoWrite: "TodoWrite",
+	TodoCreate: "TodoCreate",
+	TodoGet: "TodoGet",
+	TodoUpdate: "TodoUpdate",
+	TodoList: "TodoList",
 	AskUserQuestion: "AskUserQuestion",
 	ExitPlanMode: "ExitPlanMode",
 	TaskOutput: "TaskOutput",

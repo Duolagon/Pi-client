@@ -6,6 +6,7 @@ import { installWorkspaceHandlers } from "./workspace-ipc.ts";
 import { installSessionHandlers } from "./session-ipc.ts";
 import { installControlHandlers } from "./control-ipc.ts";
 import { installExternalHandlers } from "./external-ipc.ts";
+import { installP8Handlers } from "./p8-ipc.ts";
 import type { Command, ConnectionInput, DesktopAPI } from "./shared.ts";
 import { checkPreview } from "./preview-check.ts";
 import { captureToolPath } from "./tool-path.ts";
@@ -218,6 +219,10 @@ function installHandlers() {
 			throw new Error("子 Agent fork 开关设置格式错误。");
 		if (settings.confineSubagentBash !== undefined && typeof settings.confineSubagentBash !== "boolean")
 			throw new Error("子 Agent 沙箱隔离设置格式错误。");
+		if (settings.cronEnabled !== undefined && typeof settings.cronEnabled !== "boolean")
+			throw new Error("定时唤醒设置格式错误。");
+		if (settings.agentTeams !== undefined && typeof settings.agentTeams !== "boolean")
+			throw new Error("实验性 Agent Teams 设置格式错误。");
 		if (
 			settings.maxSubagentDepth !== undefined &&
 			(!Number.isSafeInteger(settings.maxSubagentDepth) ||
@@ -256,6 +261,7 @@ function installHandlers() {
 	installSessionHandlers(handle, service);
 	installControlHandlers(handle, service);
 	installExternalHandlers(handle, service);
+	installP8Handlers(handle, service);
 }
 
 void app.whenReady().then(() => {
@@ -325,6 +331,21 @@ void app.whenReady().then(() => {
 	});
 	service.subscribeExternal((event) => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:external:event", event);
+	});
+	service.subscribeTodos((event) => {
+		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:todos:event", event);
+	});
+	service.subscribeMonitors((event) => {
+		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:monitor:event", event);
+	});
+	service.subscribeCron((event) => {
+		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:cron:event", event);
+	});
+	service.subscribeTeams((event) => {
+		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:teams:event", event);
+	});
+	service.subscribeWorkflows((event) => {
+		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:workflow:event", event);
 	});
 	installHandlers();
 	Menu.setApplicationMenu(

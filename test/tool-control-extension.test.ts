@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition, ToolInfo } from "@earendil-works/pi-coding-agent";
 import toolControl from "../src/tool-control-extension.ts";
-import type { ToolControlResponse } from "../src/tool-control-types.ts";
+import { desktopModelToolNames, type ToolControlResponse } from "../src/tool-control-types.ts";
 import { ToolHostServer } from "../src/tool-host-server.ts";
 import { createCoreFixture } from "./fixtures/core-fixture.ts";
 import { RpcHarness } from "./fixtures/rpc-harness.ts";
@@ -51,7 +51,7 @@ async function fixture(extra: Record<string, string> = {}) {
 	} finally {
 		for (const [key, value] of Object.entries(previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
 	}
-	const request = async (operation: "list" | "apply" | "notify" | "wake", fields: Record<string, unknown> = {}) => {
+	const request = async (operation: "list" | "apply" | "notify" | "deliver" | "wake", fields: Record<string, unknown> = {}) => {
 		const requestId = randomUUID();
 		await writeFile(join(directory, "request.json"), JSON.stringify({ requestId, operation, ...fields }));
 		await handlers.get("command")!(`${token} ${requestId}`, { mode: "rpc", sessionManager, isIdle: () => session.idle });
@@ -198,7 +198,8 @@ test("model tools validate inputs, use authenticated host calls, and clamp child
 	const item = await fixture({ PI_DESKTOP_HOST_URL: registration.url, PI_DESKTOP_HOST_TOKEN: registration.token });
 	try {
 		// SendMessage is the declared continuation tool; AgentSend stays callable but hides its declaration.
-		assert.equal(item.definitions.size, 11);
+		assert.equal(item.definitions.size, desktopModelToolNames.length);
+		assert.ok(item.definitions.has("TodoCreate") && item.definitions.has("TodoGet") && item.definitions.has("TodoUpdate") && item.definitions.has("TodoList"));
 		assert.ok(item.definitions.has("SendMessage") && item.definitions.has("AgentSend") && item.definitions.has("AgentExecutors"));
 		assert.deepEqual((item.definitions.get("AgentSend") as { prepareLoadout?: () => unknown }).prepareLoadout?.(), { hiddenDeclarations: ["AgentSend"] });
 		assert.equal((item.definitions.get("SendMessage") as { prepareLoadout?: unknown }).prepareLoadout, undefined);
@@ -243,10 +244,110 @@ test("model tools validate inputs, use authenticated host calls, and clamp child
 		assert.equal((await child.handlers.get("tool_call")!({ toolName: "custom" })).block, true);
 		assert.equal((await child.handlers.get("tool_call")!({ toolName: "Agent" })).block, true);
 		assert.equal((await child.handlers.get("tool_call")!({ toolName: "SendMessage" })).block, true);
+		assert.equal((await child.handlers.get("tool_call")!({ toolName: "CronCreate" })).block, true);
+		assert.equal((await child.handlers.get("tool_call")!({ toolName: "ScheduleWakeup" })).block, true);
 		assert.ok(!child.active().includes("SendMessage") && !child.active().includes("AgentSend"));
+		assert.ok(!child.active().includes("CronCreate") && !child.active().includes("ScheduleWakeup"));
+		assert.ok(!child.active().includes("TeamCreate") && !child.active().includes("TeamDelete"));
+		await assert.rejects(child.definitions.get("CronCreate")!.execute("tool-call", { prompt: "hi", interval_seconds: 60 }, undefined, undefined, {} as never), /disabled for subagents/);
+		await assert.rejects(child.definitions.get("TeamCreate")!.execute("tool-call", { team_name: "t" }, undefined, undefined, {} as never), /agentTeams/);
 		await assert.rejects(child.definitions.get("SendMessage")!.execute("tool-call", { to: "x", message: "y" }, undefined, undefined, {} as never), /cannot delegate/);
 		await assert.rejects(child.definitions.get("Agent")!.execute("tool-call", { description: "research", prompt: "read", subagent_type: "Explore" }, undefined, undefined, {} as never), /cannot delegate/);
-	} finally { await child.cleanup(); await host.close(); }
+	} finally { await child.cleanup(); }
+
+	// Team member child with PI_DESKTOP_AGENT_TEAMS=1 + PI_DESKTOP_TEAM_MEMBER=1 keeps SendMessage enabled
+	const teammate = await fixture({
+		PI_DESKTOP_HOST_URL: registration.url,
+		PI_DESKTOP_HOST_TOKEN: registration.token,
+		PI_DESKTOP_CHILD: "1",
+		PI_DESKTOP_AGENT_TEAMS: "1",
+		PI_DESKTOP_TEAM_MEMBER: "1",
+	});
+	try {
+		await teammate.request("apply");
+		assert.ok(teammate.active().includes("SendMessage"));
+		assert.ok(!teammate.active().includes("Agent"));
+		assert.ok(!teammate.active().includes("TeamCreate"));
+	} finally { await teammate.cleanup(); await host.close(); }
+});
+
+test("generalized deliver channel validates allowlisted customType, optional key, usage rule, and busy deferral", async () => {
+	const item = await fixture();
+	try {
+		// Without key: delivered every time without writing ack entry
+		const monitor = {
+			customType: "desktop_monitor_event",
+			content: "[monitor] build completed",
+			details: { monitor_id: "m1" },
+			deliverAs: "followUp",
+			triggerTurn: false,
+			display: false,
+		};
+		const first = await item.request("deliver", monitor);
+		assert.ok(first.ok && first.delivery === "sent");
+		const second = await item.request("deliver", monitor);
+		assert.ok(second.ok && second.delivery === "sent");
+		assert.equal(item.sent.length, 2);
+		assert.deepEqual(item.entries, []);
+		assert.deepEqual(item.sent[0], {
+			message: { customType: "desktop_monitor_event", content: monitor.content, display: false, details: monitor.details },
+			options: { deliverAs: "followUp", triggerTurn: false },
+		});
+
+		// With key: deduplicates across replays and allows cron/team/workflow types
+		const cron = await item.request("deliver", {
+			customType: "desktop_cron_wakeup",
+			key: "cron_1:1",
+			content: "[cron] run checks",
+			details: { job_id: "cron_1" },
+			deliverAs: "followUp",
+			triggerTurn: true,
+		});
+		assert.ok(cron.ok && cron.delivery === "sent");
+		const cronDup = await item.request("deliver", {
+			customType: "desktop_cron_wakeup",
+			key: "cron_1:1",
+			content: "[cron] run checks",
+			details: { job_id: "cron_1" },
+			deliverAs: "followUp",
+			triggerTurn: true,
+		});
+		assert.ok(cronDup.ok && cronDup.delivery === "duplicate");
+
+		// NextTurn queued without key works
+		const queuedTeam = await item.request("deliver", {
+			customType: "desktop_team_message",
+			content: "team message",
+			details: { team: "alpha" },
+			deliverAs: "nextTurn",
+			triggerTurn: false,
+		});
+		assert.ok(queuedTeam.ok && queuedTeam.delivery === "queued");
+
+		// Busy session defers followUp delivery without acknowledging
+		item.session.idle = false;
+		const deferred = await item.request("deliver", {
+			customType: "desktop_workflow_event",
+			key: "wf_1:1",
+			content: "workflow event",
+			details: { workflow_id: "wf_1" },
+			deliverAs: "followUp",
+			triggerTurn: true,
+		});
+		assert.ok(deferred.ok && deferred.delivery === "deferred");
+		item.session.idle = true;
+
+		// Reject unallowlisted customType, unknown fields, display non-boolean, and usage without key
+		const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+		for (const invalid of [
+			{ ...monitor, customType: "arbitrary_custom_type" },
+			{ ...monitor, display: "yes" },
+			{ ...monitor, usage: { provider: "fixture", model: "m", usage } },
+			{ ...monitor, extra: true },
+		]) {
+			assert.equal((await item.request("deliver", invalid)).ok, false);
+		}
+	} finally { await item.cleanup(); }
 });
 
 test("real Pi exposes desktop tools and applies a host command without requesting a model", { timeout: 30000 }, async () => {

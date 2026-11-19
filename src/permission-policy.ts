@@ -14,7 +14,7 @@ import type {
 
 const readingTools = new Set(["read", "grep", "find", "ls"]);
 const editTools = new Set(["edit", "write", "NotebookEdit"]);
-const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite", "AskUserQuestion", "ExitPlanMode"]);
+const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite", "TodoCreate", "TodoGet", "TodoUpdate", "TodoList", "CronList", "StructuredOutput", "AskUserQuestion", "ExitPlanMode"]);
 const pathTools = new Set([...readingTools, "edit", "write", "NotebookEdit"]);
 const wrappers = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", ".", "env", "sudo", "doas", "exec", "command", "xargs"]);
 /** Pass-through process wrappers that Claude Code strips before matching command rules. */
@@ -504,6 +504,27 @@ export async function evaluatePermission(
 			return { action: "deny", reason: "Plan 模式下此工具不可执行，仅允许只读调研或编写计划文件（.pi/plans/）。", ...(targets.length ? { targets } : {}) };
 		}
 	}
+	if (call.toolName === "Monitor") {
+		if (typeof input.command === "string" && input.command.trim()) {
+			if (policy.disabledTools.includes("bash")) {
+				return { action: "deny", reason: "Bash 工具已停用，无法启动命令监听。" };
+			}
+			return evaluatePermission(policy, { toolName: "bash", input: { command: input.command } });
+		}
+		if (typeof input.url === "string" && input.url.trim()) {
+			let parsed: URL;
+			try {
+				parsed = new URL(input.url.trim());
+			} catch {
+				return { action: "deny", reason: "Monitor WebSocket URL 格式无效。" };
+			}
+			const cleanHost = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+			const isLoopback = cleanHost === "127.0.0.1" || cleanHost === "localhost" || cleanHost === "::1";
+			if (parsed.protocol !== "wss:" && !(parsed.protocol === "ws:" && isLoopback)) {
+				return { action: "deny", reason: "Monitor 仅允许 wss:// 或本机 loopback (127.0.0.1 / localhost / [::1]) 的 ws:// 地址。" };
+			}
+		}
+	}
 	const shell = call.toolName === "bash" && typeof input.command === "string" ? parseShell(input.command) : undefined;
 	const agentType = call.toolName === "Agent"
 		? input.fork === true
@@ -577,5 +598,14 @@ export async function evaluatePermission(
 	if (readingTools.has(call.toolName) && targets.every((target) => contained(project, target)))
 		return result("allow", "项目目录内的读取工具。");
 	if (harmlessDesktopTools.has(call.toolName)) return result("allow", "只读任务状态或任务取消操作。");
+	if (call.toolName === "CronCreate" || call.toolName === "CronDelete" || call.toolName === "ScheduleWakeup") {
+		return result("allow", "定时唤醒日程管理。");
+	}
+	if (call.toolName === "TeamCreate" || call.toolName === "TeamDelete") {
+		return result("allow", "Agent Team 团队管理。");
+	}
+	if (call.toolName === "WorkflowRun") {
+		return result("allow", "工作流引擎执行（受工作流审批卡片与沙箱控制）。");
+	}
 	return result("ask", targets.some((target) => !contained(project, target)) ? "访问项目目录外的路径需要确认。" : "此工具操作需要确认。");
 }

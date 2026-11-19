@@ -240,7 +240,15 @@ export function TranscriptView({
 					if (message.role === "custom" && message.customType === "desktop_task_notification") {
 						return <TaskNotificationCard key={`tasknote-${message.timestamp}-${index}`} details={message.details} onOpenTask={onOpenTask} />;
 					}
-					if (message.role === "custom" && message.customType === "desktop_task_result") {
+					const customCardMeta: Record<string, { verb: string; label: string }> = {
+						desktop_task_result: { verb: "Subagent", label: "(后台任务结果回传)" },
+						desktop_monitor_event: { verb: "Monitor", label: "(后台监听事件)" },
+						desktop_cron_wakeup: { verb: "Schedule", label: "(定时唤醒提醒)" },
+						desktop_team_message: { verb: "Team", label: "(团队协作消息)" },
+						desktop_workflow_event: { verb: "Workflow", label: "(工作流事件)" },
+					};
+					const cardMeta = message.role === "custom" ? customCardMeta[message.customType] : undefined;
+					if (message.role === "custom" && cardMeta) {
 						const text =
 							typeof message.content === "string"
 								? message.content
@@ -249,12 +257,12 @@ export function TranscriptView({
 										.map((b) => b.text)
 										.join("\n");
 						return (
-							<details className="cl-tool done" key={`taskres-${message.timestamp}-${index}`}>
+							<details className="cl-tool done" key={`custom-${message.customType}-${message.timestamp}-${index}`}>
 								<summary>
 									<span className="cc-dot ok" />
 									<span className="cc-tool-head">
-										<span className="cc-tool-verb">Subagent</span>
-										<span className="cl-tool-name">(后台任务结果回传)</span>
+										<span className="cc-tool-verb">{cardMeta.verb}</span>
+										<span className="cl-tool-name">{cardMeta.label}</span>
 									</span>
 									<ChevronRight size={13} className="cl-tool-chevron" />
 								</summary>

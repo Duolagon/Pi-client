@@ -113,6 +113,17 @@ import { HooksService } from "./hooks-service.ts";
 import type { HookEntry, HookRemoveInput, HookRunResult, HookSaveInput, HookTestInput } from "./hook-types.ts";
 import { SkillRegistry } from "./skill-registry.ts";
 import type { SkillDefinitionEntry, SkillRemoveInput, SkillSaveInput } from "./skill-registry.ts";
+import { TodoService } from "./todo-service.ts";
+import type { TodoCreateInput, TodoEvent, TodoGetInput, TodoListInput, TodoRecord, TodoUpdateInput } from "./todo-types.ts";
+import { MonitorService } from "./monitor-service.ts";
+import type { MonitorEvent, MonitorRecord, MonitorStartInput } from "./monitor-types.ts";
+import { CronService, parseLoopCommandArgs } from "./cron-service.ts";
+import { cronToolNames, type CronCreateInput, type CronEvent, type CronJobRecord, type ScheduleWakeupInput } from "./cron-types.ts";
+import { TeamsService } from "./teams-service.ts";
+import type { TeamEvent, TeamMessageType, TeamRecord } from "./team-types.ts";
+import { WorkflowService } from "./workflow-service.ts";
+import { validateJsonSchema } from "./workflow-schema.ts";
+import type { WorkflowApprovalDecision, WorkflowEvent, WorkflowRecord, WorkflowRunInput } from "./workflow-types.ts";
 import { buildContextReport, deleteProjectMemoryRule, writeProjectMemoryFile, type ContextBreakdown, type ContextMemorySource } from "./context-inspector.ts";
 import { buildSeatbeltProfile, probeSeatbeltSupport } from "./sandbox.ts";
 import { readClaudeProjectPermissionsDetailed, writeClaudeProjectPermissions } from "./claude-settings-sync.ts";
@@ -123,8 +134,8 @@ import { CodexAdapter } from "./external-codex.ts";
 import { ClaudeAdapter } from "./external-claude.ts";
 import { KimiAdapter } from "./external-kimi.ts";
 import type { ExternalAdapter, ExternalApprovalResponse, ExternalEvent, ExternalExecutorInput, ExternalProvider, ExternalTask, ExternalTaskSendInput, ExternalTaskStartInput } from "./external-types.ts";
-import type { DesktopToolInvocation, NotificationDelivery, NotificationDisposition, NotificationUsage, ToolHostContext } from "./tool-control-types.ts";
-import { formatTaskNotification, notificationStatus, type TaskNotificationDetails } from "./delegation-format.ts";
+import type { DeliverCustomType, DesktopToolInvocation, NotificationDelivery, NotificationDisposition, NotificationUsage, ToolHostContext } from "./tool-control-types.ts";
+import { formatTaskNotification, notificationStatus, TASK_NOTIFICATION_TYPE, type TaskNotificationDetails } from "./delegation-format.ts";
 import { TaskWaiters } from "./task-waiters.ts";
 import type { ExternalNotification } from "./external-agents.ts";
 import type { RpcExtensionUIResponse, SessionStats } from "@earendil-works/pi-coding-agent";
@@ -270,6 +281,7 @@ export interface ServiceOptions {
 	historyEntry?: string;
 	navigationExtension?: string;
 	toolControlExtension?: string;
+	workflowWorker?: string;
 	externalAdapters?: Record<ExternalProvider, ExternalAdapter>;
 	claudeHelperPath?: string;
 	maxConcurrentTasks?: number;
@@ -321,6 +333,11 @@ export class DesktopService {
 	private mcp: McpRegistry;
 	private hooks: HooksService;
 	private skills: SkillRegistry;
+	private todos: TodoService;
+	private monitors: MonitorService;
+	private cron: CronService;
+	private teams: TeamsService;
+	private workflows: WorkflowService;
 	/** Last global value sent through set_auto_retry (Pi may still be writing it); project settings override it. */
 	private autoRetryGlobal?: { agentDir: string; enabled: boolean };
 	private controlListeners = new Set<(event: ControlEvent) => void>();
@@ -343,6 +360,19 @@ export class DesktopService {
 		this.mcp = new McpRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
 		this.hooks = new HooksService({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
 		this.skills = new SkillRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
+		this.todos = new TodoService({ dataDir: () => this.options.dataDir });
+		this.monitors = new MonitorService({ deliver: (id, params) => this.deliverToConversation(id, params) });
+		this.cron = new CronService({
+			dataDir: () => this.options.dataDir,
+			deliver: (id, params) => this.deliverToConversation(id, params),
+			isEnabled: () => this.store.settings.cronEnabled !== false,
+			isProjectTrusted: (project) => this.isProjectTrusted(project),
+		});
+		this.teams = new TeamsService({
+			dataDir: () => this.options.dataDir,
+			deliver: (id, params) => this.deliverToConversation(id, params),
+			isEnabled: () => this.store.settings.agentTeams === true,
+		});
 		this.toolHost = new ToolHostServer({
 			handle: async (request, context) => {
 				const decision = await evaluatePermission(this.permissionPolicy(context.conversationId), { toolName: request.tool, input: request.input });
@@ -441,6 +471,7 @@ export class DesktopService {
 			seatbeltSupport: () => probeSeatbeltSupport(),
 			maxSubagentDepth: () => this.store.settings.maxSubagentDepth ?? DEFAULT_MAX_SUBAGENT_DEPTH,
 			maxConcurrentSubagents: () => this.store.settings.maxConcurrentSubagents ?? DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+			teamsEnabled: () => this.store.settings.agentTeams === true,
 			prepareAgentContext: (project, definition) => this.prepareCustomAgentContext(this.trustProjectFor(project), definition),
 			listTasks: () => this.listTasks(),
 			startTask: (input, metadata) => this.startTask(input, metadata),
@@ -476,6 +507,114 @@ export class DesktopService {
 		this.git = new GitSnapshots(join(options.dataDir, "checkpoints"));
 		const runtimeDir =
 			options.runtimeDir ?? (options.entry ? dirname(dirname(dirname(options.entry))) : options.dataDir);
+		this.workflows = new WorkflowService({
+			dataDir: () => this.options.dataDir,
+			callbacks: {
+				workerPath: () => this.options.workflowWorker ?? join(runtimeDir, "workflow-worker-entry.mjs"),
+				permissionMode: (conversationId) => this.permissionPolicy(conversationId).mode,
+				deliver: (id, params) => this.deliverToConversation(id, params),
+				cancelWorkflowTasks: async (workflowId) => {
+					const matching = this.store.tasks.filter(
+						(item) => item.workflowId === workflowId && ["queued", "running", "waiting_for_input"].includes(item.status),
+					);
+					await Promise.all(matching.map((t) => this.cancelTask(t.id, "parent_abort").catch(() => {})));
+				},
+				runAgentStep: async (req, signal) => {
+					const conv = this.conversation(req.conversationId);
+					const maxConcurrent = this.store.settings.maxConcurrentSubagents ?? DEFAULT_MAX_CONCURRENT_SUBAGENTS;
+					const activeCount = this.store.tasks.filter(
+						(item) => item.parentConversationId === conv.id && ["queued", "running", "waiting_for_input"].includes(item.status),
+					).length;
+					if (activeCount >= maxConcurrent) {
+						throw new Error(`Concurrent subagent limit reached (${activeCount}/${maxConcurrent})`);
+					}
+					const trustProj = this.trustProjectFor(conv.project);
+					const definition = req.subagentType
+						? await this.agents.resolve(trustProj, req.subagentType, this.projectTrusted(trustProj)).catch(() => undefined)
+						: undefined;
+					const readOnly = definition?.readOnly ?? (req.subagentType !== undefined && req.subagentType !== "general-purpose");
+					let isGitRepo = false;
+					try {
+						await exec("git", ["rev-parse", "--show-toplevel"], { cwd: conv.project });
+						isGitRepo = true;
+					} catch {}
+					const isolation = readOnly ? "shared" : (req.isolation ?? (isGitRepo ? "worktree" : "shared"));
+					const model = req.model && ["sonnet", "opus", "haiku", "fable", "inherit"].includes(req.model)
+						? await this.resolveAgentModelAlias(conv.id, req.model as AgentModelAlias, true)
+						: undefined;
+					const schemaHint = req.schema !== undefined
+						? `You MUST return valid JSON conforming to this schema by calling the StructuredOutput tool with {"data": <JSON>}:\n${JSON.stringify(req.schema)}`
+						: undefined;
+					const combinedSystem = [definition?.prompt?.trim(), schemaHint].filter(Boolean).join("\n\n---\n\n");
+					const task = await this.startTask(
+						{
+							project: conv.project,
+							message: req.prompt,
+							title: req.description,
+							isolation,
+							...(model ? { model } : {}),
+							...(definition?.tools ? { allowedTools: definition.tools } : {}),
+							...(definition?.disallowedTools?.length ? { disallowedTools: definition.disallowedTools } : {}),
+							...(definition?.permissionMode ? { permissionMode: definition.permissionMode } : {}),
+							...(combinedSystem ? { systemPrompt: combinedSystem } : {}),
+							...(req.schema !== undefined ? { structuredOutputSchema: req.schema } : {}),
+						},
+						{
+							parentConversationId: conv.id,
+							parentToolCallId: `wf_${req.workflowId}_${req.stepKey}`,
+							subagentType: definition?.name ?? req.subagentType ?? "general-purpose",
+							delegationDepth: 1,
+							readOnly,
+							runInBackground: true,
+							notifySuppressed: true,
+							workflowId: req.workflowId,
+						},
+					);
+					const finished = await this.waiters.wait(
+						task.id,
+						() => {
+							const item = this.store.tasks.find((t) => t.id === task.id);
+							return item && structuredClone(item);
+						},
+						(t) => !["queued", "running", "waiting_for_input"].includes(t.status),
+						signal,
+					);
+					if (!finished) throw new Error(`Workflow task ${task.id} disappeared`);
+					if (finished.status === "failed" || finished.status === "cancelled" || finished.status === "interrupted") {
+						throw new Error(finished.error || `Workflow child task ended with status ${finished.status}`);
+					}
+					const output = finished.result?.text ?? "";
+					return {
+						taskId: finished.id,
+						output,
+						...(finished.structuredOutput !== undefined ? { structuredOutput: finished.structuredOutput } : {}),
+						...(finished.stats ? { usage: { totalTokens: finished.stats.tokens.total, cost: finished.stats.cost } } : {}),
+					};
+				},
+				resumeStructuredStep: async (taskId, feedback, signal) => {
+					const existing = this.task(taskId);
+					delete existing.structuredOutput;
+					const expectedTurn = (existing.turn ?? 1) + 1;
+					await this.resumeTask(taskId, feedback, { source: "model", background: true });
+					const finished = await this.waiters.wait(
+						taskId,
+						() => {
+							const item = this.store.tasks.find((t) => t.id === taskId);
+							return item && structuredClone(item);
+						},
+						(t) => (t.turn ?? 1) >= expectedTurn && !["queued", "running", "waiting_for_input"].includes(t.status),
+						signal,
+					);
+					if (!finished) throw new Error(`Workflow task ${taskId} disappeared`);
+					return {
+						taskId: finished.id,
+						output: finished.result?.text ?? "",
+						...(finished.structuredOutput !== undefined ? { structuredOutput: finished.structuredOutput } : {}),
+						...(finished.stats ? { usage: { totalTokens: finished.stats.tokens.total, cost: finished.stats.cost } } : {}),
+					};
+				},
+			},
+		});
 		this.history = new SessionHistoryService({
 			dataDir: options.dataDir,
 			executable: options.executable,
@@ -557,6 +696,8 @@ export class DesktopService {
 				task.result = { text: truncateText(text, MAX_AGENT_OUTPUT), truncated: text.length > MAX_AGENT_OUTPUT, partial: true };
 		}
 		await this.worktrees.initialize();
+		await this.cron.loadGlobal();
+		await this.workflows.initialize();
 		await this.persist();
 		const reapInterval = this.options.childRuntimeReapIntervalMs ?? CHILD_RUNTIME_REAP_INTERVAL_MS;
 		if (reapInterval > 0 && !this.reapTimer) {
@@ -589,6 +730,7 @@ export class DesktopService {
 				.filter((conversation) => conversation.project === projectPath)
 				.sort((a, b) => b.updatedAt - a.updatedAt)[0];
 			const conversation = recent ?? this.createConversation(projectPath);
+			await this.cron.loadProject(projectPath);
 			await this.activate(conversation);
 			return this.buildSnapshot();
 		});
@@ -611,6 +753,7 @@ export class DesktopService {
 			const changed = (this.store.projectTrust?.[project] ?? undefined) !== input.decision;
 			this.store.projectTrust = { ...(this.store.projectTrust ?? {}), [project]: input.decision };
 			await this.persist();
+			if (input.decision === "trusted") await this.cron.loadProject(project);
 			if (changed) {
 				// Pi reads project resources once at startup, so an explicit decision
 				// only takes effect after the affected runtimes are recreated.
@@ -1416,9 +1559,239 @@ export class DesktopService {
 		else conversation.sessionLeafId = result.leafId;
 	}
 
+	private isDelegatedChild(conversationId: string): boolean {
+		return Boolean(
+			this.store.tasks.find((item) => item.conversationId === conversationId && item.parentConversationId) ||
+			this.store.conversations.find((item) => item.id === conversationId && item.parentConversationId),
+		);
+	}
+
+	subscribeCron(listener: (event: CronEvent) => void): () => void { return this.cron.subscribe(listener); }
+	async listCron(conversationId?: string): Promise<CronJobRecord[]> {
+		await this.operation;
+		const conv = conversationId ? this.conversation(conversationId) : this.active();
+		return this.cron.list(conversationId ? conv?.id : undefined, conv?.project);
+	}
+	async createCron(conversationId: string, input: CronCreateInput): Promise<CronJobRecord> {
+		await this.operation;
+		const conv = this.conversation(conversationId);
+		return this.cron.create({ conversationId: conv.id, project: conv.project, source: "tool", input });
+	}
+	async runLoopCommand(conversationId: string, rawArgs: string): Promise<CronJobRecord> {
+		await this.operation;
+		const conv = this.conversation(conversationId);
+		const parsed = parseLoopCommandArgs(rawArgs);
+		return this.cron.create({
+			conversationId: conv.id,
+			project: conv.project,
+			source: "loop",
+			input: { ...parsed, recurring: true, durable: this.isProjectTrusted(conv.project) },
+		});
+	}
+	async deleteCron(id: string, conversationId?: string): Promise<boolean> {
+		await this.operation;
+		return this.cron.delete(id, conversationId ? this.conversation(conversationId).id : undefined);
+	}
+
+	subscribeTeams(listener: (event: TeamEvent) => void): () => void { return this.teams.subscribe(listener); }
+	async getTeam(conversationId?: string): Promise<TeamRecord | null> {
+		await this.operation;
+		const id = conversationId ?? this.store.activeId;
+		if (!id) return null;
+		return this.teams.get(this.rootConversationId(this.conversation(id).id));
+	}
+	async deleteTeam(conversationId: string, teamName?: string): Promise<{ deleted: boolean; name?: string }> {
+		await this.operation;
+		const conv = this.conversation(conversationId);
+		return this.teams.deleteTeam(this.rootConversationId(conv.id), teamName);
+	}
+
+	subscribeWorkflows(listener: (event: WorkflowEvent) => void): () => void { return this.workflows.subscribe(listener); }
+	async listWorkflows(conversationId?: string): Promise<WorkflowRecord[]> {
+		await this.operation;
+		return this.workflows.list(conversationId ? this.conversation(conversationId).id : undefined);
+	}
+	async startWorkflow(conversationId: string, input: WorkflowRunInput): Promise<WorkflowRecord> {
+		await this.operation;
+		const conv = this.conversation(conversationId);
+		return this.workflows.start({
+			conversationId: conv.id,
+			rootConversationId: this.rootConversationId(conv.id),
+			project: conv.project,
+			input,
+		});
+	}
+	async resumeWorkflow(id: string): Promise<WorkflowRecord> {
+		await this.operation;
+		return this.workflows.resume(id);
+	}
+	async stopWorkflow(id: string): Promise<WorkflowRecord> {
+		await this.operation;
+		return this.workflows.stop(id);
+	}
+	async respondWorkflowApproval(
+		workflowId: string,
+		requestId: string,
+		decision: WorkflowApprovalDecision,
+	): Promise<WorkflowRecord> {
+		await this.operation;
+		return this.workflows.respondApproval(workflowId, requestId, decision);
+	}
+
+	private rootConversationId(conversationId: string): string {
+		let cursor = conversationId;
+		const visited = new Set<string>();
+		while (cursor && !visited.has(cursor)) {
+			visited.add(cursor);
+			const parent =
+				this.store.conversations.find((item) => item.id === cursor)?.parentConversationId ??
+				this.store.tasks.find((item) => item.conversationId === cursor && item.parentConversationId)?.parentConversationId;
+			if (!parent) break;
+			cursor = parent;
+		}
+		return cursor;
+	}
+
+	subscribeTodos(listener: (event: TodoEvent) => void): () => void {
+		return this.todos.subscribe(listener);
+	}
+
+	async listTodos(conversationId?: string): Promise<TodoRecord[]> {
+		await this.operation;
+		const id = conversationId ?? this.store.activeId;
+		if (!id) return [];
+		const conv = this.conversation(id);
+		return this.todos.list(this.rootConversationId(conv.id));
+	}
+
+	async createTodo(conversationId: string, input: TodoCreateInput): Promise<TodoRecord> {
+		await this.operation;
+		const conv = this.conversation(conversationId);
+		return this.todos.create(this.rootConversationId(conv.id), input);
+	}
+
+	async updateTodo(conversationId: string, input: TodoUpdateInput): Promise<TodoRecord> {
+		await this.operation;
+		const conv = this.conversation(conversationId);
+		return this.todos.update(this.rootConversationId(conv.id), input);
+	}
+
 	private async modelTool(request: DesktopToolInvocation, context: ToolHostContext): Promise<unknown> {
 		if (this.closed) throw new Error("桌面服务已关闭。");
 		const input = request.input;
+		if (request.tool === "TodoCreate") {
+			this.conversation(context.conversationId);
+			const rootId = this.rootConversationId(context.conversationId);
+			const todo = await this.todos.create(rootId, input as unknown as TodoCreateInput);
+			return { todo };
+		}
+		if (request.tool === "TodoGet") {
+			this.conversation(context.conversationId);
+			const rootId = this.rootConversationId(context.conversationId);
+			const todo = await this.todos.get(rootId, input as unknown as TodoGetInput);
+			return todo ? { found: true, todo } : { found: false, id: String(input.id ?? "") };
+		}
+		if (request.tool === "TodoUpdate") {
+			this.conversation(context.conversationId);
+			const rootId = this.rootConversationId(context.conversationId);
+			const todo = await this.todos.update(rootId, input as unknown as TodoUpdateInput);
+			return { todo };
+		}
+		if (request.tool === "TodoList") {
+			this.conversation(context.conversationId);
+			const rootId = this.rootConversationId(context.conversationId);
+			const todos = await this.todos.list(rootId, input as unknown as TodoListInput);
+			return { todos, total: todos.length };
+		}
+		if ((cronToolNames as readonly string[]).includes(request.tool)) {
+			const conv = this.conversation(context.conversationId);
+			if (this.isDelegatedChild(conv.id)) {
+				throw new Error("Cron and ScheduleWakeup tools are disabled for subagents");
+			}
+			if (request.tool === "ScheduleWakeup") {
+				const job = await this.cron.scheduleWakeup({
+					conversationId: conv.id,
+					project: conv.project,
+					input: input as unknown as ScheduleWakeupInput,
+				});
+				return { job_id: job.id, next_run_at: job.nextRunAt, expires_at: job.expiresAt, notice: "已安排定时唤醒，会在会话空闲时自动触发并消耗模型额度。" };
+			}
+			if (request.tool === "CronCreate") {
+				const job = await this.cron.create({
+					conversationId: conv.id,
+					project: conv.project,
+					source: "tool",
+					input: input as unknown as CronCreateInput,
+				});
+				return { job_id: job.id, next_run_at: job.nextRunAt, expires_at: job.expiresAt, durable: job.durable, notice: "已创建定时任务，会在会话空闲时自动执行并消耗模型额度。" };
+			}
+			if (request.tool === "CronList") {
+				const jobs = await this.cron.list(conv.id, conv.project);
+				return { jobs, cron_enabled: this.store.settings.cronEnabled !== false };
+			}
+			if (request.tool === "CronDelete") {
+				const deleted = await this.cron.delete(String(input.id), conv.id);
+				return { deleted, id: String(input.id) };
+			}
+		}
+		if (request.tool === "TeamCreate") {
+			const conv = this.conversation(context.conversationId);
+			if (this.isDelegatedChild(conv.id)) throw new Error("Subagents cannot create teams");
+			const team = await this.teams.createTeam({
+				rootConversationId: this.rootConversationId(conv.id),
+				leaderConversationId: conv.id,
+				team_name: String(input.team_name),
+				description: typeof input.description === "string" ? input.description : undefined,
+			});
+			return { team };
+		}
+		if (request.tool === "TeamDelete") {
+			const conv = this.conversation(context.conversationId);
+			if (this.isDelegatedChild(conv.id)) throw new Error("Subagents cannot delete teams");
+			return this.teams.deleteTeam(
+				this.rootConversationId(conv.id),
+				typeof input.team_name === "string" ? input.team_name : undefined,
+			);
+		}
+		if (request.tool === "StructuredOutput") {
+			const task = this.store.tasks.find(
+				(item) => item.conversationId === context.conversationId && item.structuredOutputSchema !== undefined,
+			);
+			if (!task) throw new Error("StructuredOutput is only enabled on workflow steps with a schema");
+			const check = validateJsonSchema(task.structuredOutputSchema, input.data);
+			if (!check.valid) {
+				throw new Error(`StructuredOutput validation failed: ${check.errors.join("; ")}`);
+			}
+			task.structuredOutput = input.data;
+			await this.persist();
+			return { accepted: true, data: input.data };
+		}
+		if (request.tool === "WorkflowRun") {
+			const conv = this.conversation(context.conversationId);
+			if (this.isDelegatedChild(conv.id)) throw new Error("Subagents cannot start workflows");
+			const wf = await this.workflows.start({
+				conversationId: conv.id,
+				rootConversationId: this.rootConversationId(conv.id),
+				project: conv.project,
+				input: {
+					title: typeof input.title === "string" ? input.title : undefined,
+					script: String(input.script),
+					budget: input.budget as WorkflowRunInput["budget"],
+				},
+			});
+			if (input.run_in_background === true) {
+				return { workflow_id: wf.id, status: wf.status };
+			}
+			const done = await this.workflows.wait(wf.id, context.signal);
+			if (done.status === "failed") throw new Error(done.error || "Workflow execution failed");
+			return {
+				workflow_id: done.id,
+				status: done.status,
+				result: done.result ?? null,
+				phases: done.phases,
+				budget: done.budget,
+			};
+		}
 		if (request.tool === "AgentExecutors") return { executors: await this.external.executors() };
 		if (request.tool === "Agent" && input.executor && input.executor !== "pi") {
 			if (input.isolation === "remote") throw new Error("isolation 'remote' is not supported by this client; use worktree or shared");
@@ -1450,22 +1823,133 @@ export class DesktopService {
 				await this.external.send({ taskId: to, message: input.message as string, runInBackground: background }, context.conversationId);
 				return this.external.awaitModelResult(to, context.conversationId, background, context.signal);
 			}
+			if (
+				request.tool === "SendMessage" &&
+				this.store.settings.agentTeams === true &&
+				(to === "*" || to === "team-lead" || input.message_type !== undefined || this.isDelegatedChild(context.conversationId))
+			) {
+				const rootId = this.rootConversationId(context.conversationId);
+				const team = await this.teams.get(rootId);
+				if (team) {
+					const delivered = await this.teams.sendStructuredMessage({
+						rootConversationId: rootId,
+						senderConversationId: context.conversationId,
+						to,
+						message: String(input.message),
+						summary: typeof input.summary === "string" ? input.summary : undefined,
+						messageType: input.message_type as TeamMessageType | undefined,
+						requestId: typeof input.request_id === "string" ? input.request_id : undefined,
+						approve: typeof input.approve === "boolean" ? input.approve : undefined,
+					});
+					if (input.message_type === "shutdown_response" && input.approve === true) {
+						const selfTask = this.store.tasks.find((item) => item.conversationId === context.conversationId);
+						if (selfTask && ["running", "waiting_for_input", "queued"].includes(selfTask.status)) {
+							void this.cancelTask(selfTask.id, "model_stop").catch(() => {});
+						}
+					}
+					return delivered;
+				}
+			}
 			return this.delegation.handle(context, request.tool, input);
+		}
+		if (request.tool === "Monitor") {
+			const conv = this.conversation(context.conversationId);
+			const task = this.store.tasks.find((item) => item.conversationId === conv.id);
+			const workingDirectory = task?.workingDirectory ?? conv.project;
+			const record = await this.monitors.start({
+				conversationId: conv.id,
+				rootConversationId: this.rootConversationId(conv.id),
+				workingDirectory,
+				env: this.options.env,
+				sandboxProfileFile: this.runtimes.get(conv.id)?.sandboxProfileFile,
+				input: input as unknown as MonitorStartInput,
+			});
+			return {
+				monitor_id: record.id,
+				kind: record.kind,
+				status: record.status,
+				description: record.description,
+				timeout_ms: record.timeoutMs,
+			};
 		}
 		if (request.tool === "TaskOutput" && this.external.has(input.task_id as string))
 			return this.external.result(input.task_id as string, { block: input.block as boolean | undefined, timeout: input.timeout as number | undefined }, context.conversationId, context.signal);
-		if (request.tool === "TaskStop" && this.external.has(input.task_id as string)) {
-			await this.external.cancel(input.task_id as string, context.conversationId, "model_stop");
-			return this.external.result(input.task_id as string, {}, context.conversationId);
+		if (request.tool === "TaskStop") {
+			const targetId = input.task_id as string;
+			if (this.workflows.get(targetId)) {
+				const stopped = await this.workflows.stop(targetId);
+				return { task_id: stopped.id, status: stopped.status };
+			}
+			if (this.monitors.has(targetId)) {
+				const stopped = await this.monitors.stop(targetId, context.conversationId, "model_stop");
+				return { task_id: stopped.id, status: stopped.status, stop_reason: stopped.stopReason };
+			}
+			if (this.external.has(targetId)) {
+				await this.external.cancel(targetId, context.conversationId, "model_stop");
+				return this.external.result(targetId, {}, context.conversationId);
+			}
+			return this.delegation.handle(context, request.tool, input);
 		}
 		if (request.tool === "TaskList") {
 			const pi = await this.delegation.handle(context, request.tool, input) as { tasks: unknown[]; truncated: boolean };
 			const external = this.external.list(context.conversationId);
-			return { tasks: [...pi.tasks, ...external.slice(0, 128).map((task) => ({ task_id: task.id, executor: task.executor,
-				description: task.title, status: task.status, turn: task.turn, worktree_id: task.worktreeId, pending_approvals: task.pendingApprovals.length }))], truncated: pi.truncated || external.length > 128 };
+			const monitors = this.monitors.list(context.conversationId).map((m) => ({
+				monitor_id: m.id,
+				kind: m.kind,
+				description: m.description,
+				status: m.status,
+				event_count: m.eventCount,
+			}));
+			return {
+				tasks: [
+					...pi.tasks,
+					...external.slice(0, 128).map((task) => ({
+						task_id: task.id, executor: task.executor,
+						description: task.title, status: task.status, turn: task.turn, worktree_id: task.worktreeId, pending_approvals: task.pendingApprovals.length,
+					})),
+				],
+				truncated: pi.truncated || external.length > 128,
+				...(monitors.length ? { monitors } : {}),
+			};
 		}
-		if (request.tool === "Agent" && input.executor === "pi") { const { executor: _executor, ...args } = input; return this.delegation.handle(context, request.tool, args); }
+		if (request.tool === "Agent") {
+			const cleanInput = input.executor === "pi" ? (({ executor: _executor, ...args }) => args)(input) : input;
+			if (this.store.settings.agentTeams === true && typeof cleanInput.team_name === "string") {
+				const rootId = this.rootConversationId(context.conversationId);
+				const team = await this.teams.get(rootId);
+				if (!team || team.name !== cleanInput.team_name) {
+					throw new Error(`未找到团队 "${String(cleanInput.team_name)}"，请先调用 TeamCreate 创建。`);
+				}
+				const memberName =
+					typeof cleanInput.name === "string" ? cleanInput.name : `member-${randomBytes(3).toString("hex")}`;
+				const result = await this.delegation.handle(context, request.tool, { ...cleanInput, name: memberName });
+				const details = (result as { details?: { task_id?: string; conversation_id?: string; subagent_type?: string } })?.details;
+				if (details?.task_id && details.conversation_id) {
+					await this.teams.registerMember({
+						rootConversationId: rootId,
+						teamName: cleanInput.team_name,
+						memberName,
+						agentId: details.task_id,
+						conversationId: details.conversation_id,
+						subagentType: details.subagent_type,
+					});
+				}
+				return result;
+			}
+			return this.delegation.handle(context, request.tool, cleanInput);
+		}
 		return this.delegation.handle(context, request.tool, input);
+	}
+
+	subscribeMonitors(listener: (event: MonitorEvent) => void): () => void { return this.monitors.subscribe(listener); }
+	async listMonitors(conversationId?: string): Promise<MonitorRecord[]> {
+		await this.operation;
+		const id = conversationId ? this.conversation(conversationId).id : undefined;
+		return this.monitors.list(id);
+	}
+	async stopMonitor(id: string): Promise<MonitorRecord> {
+		await this.operation;
+		return this.monitors.stop(id, undefined, "user_stop");
 	}
 
 	subscribeExternal(listener: (event: ExternalEvent) => void): () => void { return this.external.subscribe(listener); }
@@ -1929,6 +2413,8 @@ export class DesktopService {
 		confineSubagentBash?: boolean;
 		maxSubagentDepth?: number;
 		maxConcurrentSubagents?: number;
+		cronEnabled?: boolean;
+		agentTeams?: boolean;
 		provider?: Provider;
 		apiKey?: string;
 		baseUrl?: string;
@@ -1977,6 +2463,14 @@ export class DesktopService {
 				if (!Number.isSafeInteger(value) || value < 1 || value > MAX_CONCURRENT_SUBAGENTS_LIMIT)
 					throw new Error("最大并发子 Agent 数量无效。");
 				next.settings.maxConcurrentSubagents = value;
+			}
+			if (settings.cronEnabled !== undefined) {
+				if (typeof settings.cronEnabled !== "boolean") throw new Error("定时唤醒开关设置无效。");
+				next.settings.cronEnabled = settings.cronEnabled;
+			}
+			if (settings.agentTeams !== undefined) {
+				if (typeof settings.agentTeams !== "boolean") throw new Error("实验性 Agent Teams 开关设置无效。");
+				next.settings.agentTeams = settings.agentTeams;
 			}
 			if (settings.agentDir !== undefined) {
 				const value = settings.agentDir.trim();
@@ -2028,10 +2522,12 @@ export class DesktopService {
 				next.settings.permission !== this.store.settings.permission ||
 				Boolean(next.settings.sandbox) !== Boolean(this.store.settings.sandbox) ||
 				Boolean(next.settings.sandboxOffline) !== Boolean(this.store.settings.sandboxOffline) ||
+				Boolean(next.settings.agentTeams) !== Boolean(this.store.settings.agentTeams) ||
 				next.settings.agentDir !== this.store.settings.agentDir ||
 				Boolean(settings.provider);
 			this.store = next;
 			await this.persist();
+			if (settings.cronEnabled !== undefined) this.cron.onEnabledChanged();
 			if (needsRestart) {
 				for (const runtime of [...this.runtimes.values()]) await this.stopRuntime(runtime);
 				if (next.settings.permission === "read" || next.settings.permission === "plan") {
@@ -2541,6 +3037,70 @@ export class DesktopService {
 		return action;
 	}
 
+	private async deliverOnRuntime(
+		runtime: SessionRuntime,
+		params: {
+			customType: DeliverCustomType;
+			key?: string;
+			content: string;
+			details: Record<string, unknown>;
+			deliverAs: NotificationDelivery;
+			triggerTurn: boolean;
+			display?: boolean;
+			usage?: NotificationUsage;
+		},
+	): Promise<NotificationDisposition | undefined> {
+		const data = await this.controlCall(runtime, {
+			operation: "deliver",
+			customType: params.customType,
+			...(params.key ? { key: params.key } : {}),
+			content: params.content,
+			details: params.details,
+			deliverAs: params.deliverAs,
+			triggerTurn: params.triggerTurn,
+			...(params.display !== undefined ? { display: params.display } : {}),
+			...(params.usage ? { usage: params.usage } : {}),
+		});
+		return data.delivery as NotificationDisposition | undefined;
+	}
+
+	async deliverToConversation(
+		conversationId: string,
+		params: {
+			customType: DeliverCustomType;
+			key?: string;
+			content: string;
+			details: Record<string, unknown>;
+			deliverAs?: NotificationDelivery;
+			triggerTurn?: boolean;
+			display?: boolean;
+			usage?: NotificationUsage;
+			idleOnly?: boolean;
+		},
+	): Promise<NotificationDisposition | "unavailable"> {
+		if (this.closed) return "unavailable";
+		let runtime = this.runtimes.get(conversationId);
+		if (runtime?.settling) await runtime.settling.catch(() => {});
+		runtime = this.runtimes.get(conversationId);
+		if (this.closed || !runtime?.agent || !runtime.controls || runtime.engineStatus !== "ready" || runtime.stopping) {
+			return "unavailable";
+		}
+		if (params.idleOnly && (runtime.busy || runtime.state?.isStreaming)) return "deferred";
+		const deliverAs = params.deliverAs ?? "followUp";
+		const triggerTurn = params.triggerTurn ?? (deliverAs === "followUp");
+		const disposition = await this.deliverOnRuntime(runtime, {
+			customType: params.customType,
+			key: params.key,
+			content: params.content,
+			details: params.details,
+			deliverAs,
+			triggerTurn,
+			display: params.display,
+			usage: params.usage,
+		});
+		return disposition ?? "sent";
+	}
+
 	subscribeTerminals(listener: (event: TerminalEvent) => void): () => void {
 		return this.terminals.subscribe(listener);
 	}
@@ -2698,6 +3258,7 @@ export class DesktopService {
 				...(input.omitClaudeMd ? { omitClaudeMd: true } : {}),
 				...(input.mcpServers ? { mcpServers: input.mcpServers } : {}),
 				...delegation,
+				...(input.structuredOutputSchema !== undefined ? { structuredOutputSchema: input.structuredOutputSchema } : {}),
 				...(systemPromptFile ? { systemPromptFile } : {}),
 			};
 			if (delegation) {
@@ -2925,11 +3486,15 @@ export class DesktopService {
 			if (mode === "auto" && (this.notifyAttempts.get(item.key) ?? 0) >= MAX_NOTIFY_ATTEMPTS) continue;
 			const deliverAs: NotificationDelivery = mode === "startup" ? "nextTurn" : "followUp";
 			try {
-				const data = await this.controlCall(runtime, {
-					operation: "notify", key: item.key, content: item.content, details: item.details as unknown as Record<string, unknown>,
-					deliverAs, triggerTurn: deliverAs === "followUp", ...(item.usage ? { usage: item.usage } : {}),
+				const delivery = await this.deliverOnRuntime(runtime, {
+					customType: TASK_NOTIFICATION_TYPE,
+					key: item.key,
+					content: item.content,
+					details: item.details as unknown as Record<string, unknown>,
+					deliverAs,
+					triggerTurn: deliverAs === "followUp",
+					...(item.usage ? { usage: item.usage } : {}),
 				});
-				const delivery = data.delivery as NotificationDisposition | undefined;
 				if (delivery === "queued") {
 					queued.set(item.key, item);
 					this.notifyAttempts.delete(item.key);
@@ -3049,7 +3614,8 @@ export class DesktopService {
 		const owner = this.conversation(conversationId).id;
 		const pi = await this.delegation.cancelChildren(owner, { backgroundOnly: true, reason: "user_stop" });
 		const external = await this.external.cancelChildren(owner, { backgroundOnly: true, reason: "user_stop" });
-		return { stopped: pi.length + external.length };
+		const monitors = await this.monitors.stopForConversation([owner], "user_stop", { includeRoot: true });
+		return { stopped: pi.length + external.length + monitors };
 	}
 
 	/**
@@ -3104,7 +3670,7 @@ export class DesktopService {
 				// The model chooses whether it waits; a user's message never blocks the parent,
 				// and reaches the parent only when the user asked for it.
 				task.runInBackground = fromModel ? options.background ?? true : true;
-				if (fromModel || options.notifyParent) delete task.notifySuppressed;
+				if ((fromModel || options.notifyParent) && !task.workflowId) delete task.notifySuppressed;
 				else task.notifySuppressed = true;
 			}
 			remember();
@@ -3196,6 +3762,7 @@ export class DesktopService {
 	async cancelTask(id: string, reason: TaskStopReason = "user_stop"): Promise<DesktopTask> {
 		await this.operation;
 		const task = this.task(id);
+		await this.monitors.stopForConversation([task.conversationId], reason);
 		await this.delegation.cancelChildren(task.conversationId);
 		await this.external.cancelChildren(task.conversationId);
 		if (!["queued", "running", "waiting_for_input"].includes(task.status)) return structuredClone(task);
@@ -3413,6 +3980,9 @@ export class DesktopService {
 		this.connectionCheck?.cancel(new Error("桌面服务已关闭，连接测试已取消。"));
 		await this.operation;
 		await this.external.close();
+		await this.monitors.close();
+		await this.cron.close();
+		await this.workflows.close();
 		await this.terminals.dispose();
 		for (const task of this.store.tasks) {
 			if (["queued", "running", "waiting_for_input"].includes(task.status))
@@ -3619,6 +4189,13 @@ export class DesktopService {
 			runtime.settling = undefined;
 			// A stopped child's partial output is recorded now; its parent may receive it.
 			const task = this.store.tasks.find((item) => item.conversationId === runtime.conversationId);
+			if (task?.parentConversationId && !["queued", "running", "waiting_for_input"].includes(task.status)) {
+				void this.monitors.stopForConversation([runtime.conversationId], "child_finished");
+				if (task.teamName) {
+					const teamStatus = task.status === "cancelled" || task.status === "failed" || task.status === "interrupted" ? "shutdown" : "idle";
+					void this.teams.setMemberStatus(this.rootConversationId(runtime.conversationId), runtime.conversationId, teamStatus);
+				}
+			}
 			if (task?.parentConversationId && task.runInBackground && !["queued", "running", "waiting_for_input"].includes(task.status))
 				void this.flushNotifications(task.parentConversationId, "auto");
 			void this.scheduleTasks();
@@ -3911,6 +4488,9 @@ export class DesktopService {
 			env.PI_DESKTOP_FORK_CHILD = delegated?.isFork ? "1" : "0";
 			env.PI_DESKTOP_DELEGATION_DEPTH = String(delegated ? (delegated.delegationDepth ?? 1) : 0);
 			env.PI_DESKTOP_MAX_DEPTH = String(this.store.settings.maxSubagentDepth ?? DEFAULT_MAX_SUBAGENT_DEPTH);
+			env.PI_DESKTOP_AGENT_TEAMS = this.store.settings.agentTeams === true ? "1" : "0";
+			env.PI_DESKTOP_TEAM_MEMBER = delegated?.teamName ? "1" : "0";
+			env.PI_DESKTOP_STRUCTURED_OUTPUT = delegated?.structuredOutputSchema !== undefined ? "1" : "0";
 			if (delegated?.maxTurns) env.PI_DESKTOP_MAX_TURNS = String(delegated.maxTurns);
 			else delete env.PI_DESKTOP_MAX_TURNS;
 			const toolExtension = this.options.toolControlExtension ?? join(runtimeDir, "tool-control-extension.mjs");
@@ -4315,6 +4895,8 @@ export class DesktopService {
 				// A live parent receives results that could not be delivered during its run,
 				// including results whose automatic retries were exhausted.
 				void this.flushNotifications(conversationId, "settled");
+				this.monitors.onConversationSettled(conversationId);
+				this.cron.onConversationSettled(conversationId);
 			});
 			return;
 		}
@@ -4630,6 +5212,8 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 				(value.settings.maxConcurrentSubagents as number) <= MAX_CONCURRENT_SUBAGENTS_LIMIT
 					? value.settings.maxConcurrentSubagents
 					: undefined,
+			cronEnabled: typeof value.settings.cronEnabled === "boolean" ? value.settings.cronEnabled : undefined,
+			agentTeams: typeof value.settings.agentTeams === "boolean" ? value.settings.agentTeams : undefined,
 			defaultModel: value.settings.defaultModel,
 			connections: value.settings.connections ?? {},
 			agentDir: value.settings.agentDir,

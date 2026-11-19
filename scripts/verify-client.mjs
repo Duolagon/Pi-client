@@ -701,6 +701,45 @@ try {
 	await page.evaluate(() => window.pi.permissions.remove("e2e-allow-agent"));
 	checks.push("SubagentPanel, sidebar (+N) folding, SubagentTranscriptView and SubagentApprovals E2E UI");
 
+	// P8 UI & Electron utilityProcess Workflow E2E check
+	await page.getByRole("button", { name: "设置", exact: true }).click();
+	await page.getByText("权限与外观", { exact: true }).click();
+	assert.equal(await page.getByRole("checkbox", { name: "启用定时唤醒与 /loop 自动任务", exact: true }).isChecked(), true);
+	await page.getByText(/会自动消耗额度/).waitFor();
+	assert.equal(await page.getByRole("checkbox", { name: "实验性 Agent Teams 多成员协作", exact: true }).isChecked(), false);
+	await page.getByRole("checkbox", { name: "实验性 Agent Teams 多成员协作", exact: true }).check();
+	await page.getByRole("button", { name: "保存设置", exact: true }).click();
+	await until(async () => (await snapshot()).settings.agentTeams === true, "agentTeams setting persisted");
+
+	const skillsList = await page.evaluate((proj) => window.pi.skills.list(proj), originalSession.project);
+	assert.ok(skillsList.some((s) => s.name === "batch" && s.scope === "bundled"));
+
+	await page.getByRole("button", { name: /任务/ }).first().click();
+	await page.getByRole("tab", { name: /任务清单/ }).waitFor();
+	await page.getByRole("tab", { name: /定时唤醒/ }).waitFor();
+	await page.getByRole("tab", { name: /工作流/ }).waitFor();
+	await page.getByRole("tab", { name: /团队/ }).waitFor();
+	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
+
+	const activeConvId = (await snapshot()).active.id;
+	await page.evaluate((cid) => window.pi.todos.create(cid, { subject: "E2E P8 Checklist", description: "Verify root todo strip" }), activeConvId);
+	await page.locator(".cc-pinned-todos").waitFor();
+	await page.locator(".cc-pinned-todos-head").click();
+	await page.locator(".cc-pinned-todos").filter({ hasText: "E2E P8 Checklist" }).waitFor();
+
+	const wf = await page.evaluate(
+		(cid) => window.pi.workflow.start(cid, { title: "E2E Electron Workflow", script: `return await phase("calc", async () => { log("electron utilityProcess ok"); return 42; });` }),
+		activeConvId,
+	);
+	await page.getByRole("region", { name: "工作流执行审批", exact: true }).waitFor();
+	await page.getByRole("button", { name: "允许一次 (Once)", exact: true }).click();
+	await until(async () => {
+		const list = await page.evaluate((cid) => window.pi.workflow.list(cid), activeConvId);
+		const item = list.find((w) => w.id === wf.id);
+		return item && item.status === "completed" && item.result === 42;
+	}, "Electron utilityProcess workflow completed via Once approval");
+	checks.push("P8 settings notices, bundled /batch skill, TasksDrawer tabs, pinned Todo*, and Electron utilityProcess workflow approval E2E UI");
+
 
 	assert.deepEqual(pageErrors, []);
 	if (capture)

@@ -24,8 +24,18 @@ import type { SkillDefinitionEntry, SkillRemoveInput, SkillSaveInput } from "./s
 import type { DraftPullRequest } from "./review-service.ts";
 import type { CodeIntelligence, CodePosition } from "./language-service.ts";
 import type { PreviewCheck } from "./preview-check.ts";
+import type { TodoCreateInput, TodoEvent, TodoRecord, TodoUpdateInput } from "./todo-types.ts";
+import type { MonitorEvent, MonitorRecord } from "./monitor-types.ts";
+import type { CronCreateInput, CronEvent, CronJobRecord } from "./cron-types.ts";
+import type { TeamEvent, TeamRecord } from "./team-types.ts";
+import type { WorkflowApprovalDecision, WorkflowEvent, WorkflowRecord, WorkflowRunInput } from "./workflow-types.ts";
 export type { CodeIntelligence, CodePosition } from "./language-service.ts";
 export type { PreviewCheck } from "./preview-check.ts";
+export type * from "./todo-types.ts";
+export type * from "./monitor-types.ts";
+export type * from "./cron-types.ts";
+export type * from "./team-types.ts";
+export type * from "./workflow-types.ts";
 export type * from "./external-types.ts";
 export type * from "./agent-types.ts";
 export type * from "./mcp-types.ts";
@@ -209,6 +219,10 @@ export interface Settings {
 	maxSubagentDepth?: number;
 	/** Maximum concurrent active subagents per parent conversation (1–20); absent means 8. */
 	maxConcurrentSubagents?: number;
+	/** Enable scheduled wakeups / Cron / /loop (consumes quota when idle); absent means true. */
+	cronEnabled?: boolean;
+	/** Experimental multi-agent Teams collaboration (TeamCreate / TeamDelete); absent means false. */
+	agentTeams?: boolean;
 	configuredProviders: Provider[];
 	connections: Partial<
 		Record<Provider, { baseUrl?: string; modelId?: string; api?: ConnectionProtocol; mode?: ConnectionMode }>
@@ -325,6 +339,37 @@ export type DesktopEvent = {
 		| { type: "extension_error"; extensionPath: string; event: string; error: string };
 };
 export type Command = RpcCommand;
+export interface DesktopTodosAPI {
+	list(conversationId?: string): Promise<TodoRecord[]>;
+	create(conversationId: string, input: TodoCreateInput): Promise<TodoRecord>;
+	update(conversationId: string, input: TodoUpdateInput): Promise<TodoRecord>;
+	onEvent(listener: (event: TodoEvent) => void): () => void;
+}
+export interface DesktopMonitorsAPI {
+	list(conversationId?: string): Promise<MonitorRecord[]>;
+	stop(id: string): Promise<MonitorRecord>;
+	onEvent(listener: (event: MonitorEvent) => void): () => void;
+}
+export interface DesktopCronAPI {
+	list(conversationId?: string): Promise<CronJobRecord[]>;
+	create(conversationId: string, input: CronCreateInput): Promise<CronJobRecord>;
+	loop(conversationId: string, args: string): Promise<CronJobRecord>;
+	delete(id: string, conversationId?: string): Promise<boolean>;
+	onEvent(listener: (event: CronEvent) => void): () => void;
+}
+export interface DesktopTeamsAPI {
+	get(conversationId?: string): Promise<TeamRecord | null>;
+	delete(conversationId: string, teamName?: string): Promise<{ deleted: boolean; name?: string }>;
+	onEvent(listener: (event: TeamEvent) => void): () => void;
+}
+export interface DesktopWorkflowAPI {
+	list(conversationId?: string): Promise<WorkflowRecord[]>;
+	start(conversationId: string, input: WorkflowRunInput): Promise<WorkflowRecord>;
+	resume(id: string): Promise<WorkflowRecord>;
+	stop(id: string): Promise<WorkflowRecord>;
+	respond(workflowId: string, requestId: string, decision: WorkflowApprovalDecision): Promise<WorkflowRecord>;
+	onEvent(listener: (event: WorkflowEvent) => void): () => void;
+}
 export interface DesktopAPI {
 	externalAgents: DesktopExternalAgentsAPI;
 	agents: DesktopAgentsAPI;
@@ -338,6 +383,11 @@ export interface DesktopAPI {
 	terminals: DesktopTerminalAPI;
 	tasks: DesktopTaskAPI;
 	worktrees: DesktopWorktreeAPI;
+	todos: DesktopTodosAPI;
+	monitors: DesktopMonitorsAPI;
+	cron: DesktopCronAPI;
+	teams: DesktopTeamsAPI;
+	workflow: DesktopWorkflowAPI;
 	snapshot(): Promise<Snapshot>;
 	openProject(): Promise<Snapshot | null>;
 	selectProject(path: string): Promise<Snapshot>;
@@ -383,6 +433,8 @@ export interface DesktopAPI {
 		confineSubagentBash?: boolean;
 		maxSubagentDepth?: number;
 		maxConcurrentSubagents?: number;
+		cronEnabled?: boolean;
+		agentTeams?: boolean;
 		provider?: Provider;
 		mode?: ConnectionMode;
 		apiKey?: string;

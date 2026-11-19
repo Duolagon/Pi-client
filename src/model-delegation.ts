@@ -194,7 +194,10 @@ export class ModelDelegation {
 	}
 
 	private async agent(context: DelegationContext, input: AgentToolInput): Promise<ModelToolResult<DelegatedTaskResult>> {
-		const warnings = (input.ignored ?? []).map((name) => `Parameter '${name}' is not supported by this client and was ignored.`);
+		const teamsEnabled = (await this.callbacks.teamsEnabled?.()) === true;
+		const effectiveIgnored = (input.ignored ?? []).filter((name) => !(name === "team_name" && teamsEnabled));
+		const warnings = effectiveIgnored.map((name) => `Parameter '${name}' is not supported by this client and was ignored.`);
+		const teamName = teamsEnabled ? input.team_name : undefined;
 		// "fork" (or the legacy fork flag) forks this conversation into a general-purpose child.
 		const fork = input.fork === true || input.subagent_type === "fork";
 		const isNativeFork = input.subagent_type === "fork";
@@ -304,6 +307,7 @@ export class ModelDelegation {
 					readOnly,
 					runInBackground,
 					...(input.name ? { name: input.name } : {}),
+					...(teamName ? { teamName } : {}),
 				},
 			);
 			return { task, sharedWriter };
@@ -593,6 +597,7 @@ function parseAgent(value: Record<string, unknown>): AgentToolInput {
 		fork: optionalBoolean(value.fork, "fork"),
 		...(value.model !== undefined ? { model: value.model as AgentCallModel } : {}),
 		...(value.name !== undefined ? { name: value.name as string } : {}),
+		...(value.team_name !== undefined ? { team_name: value.team_name as string } : {}),
 		...(ignored.length ? { ignored } : {}),
 	};
 }

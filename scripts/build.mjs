@@ -67,6 +67,14 @@ await Promise.all([
 	}),
 	build({
 		...common,
+		entryPoints: ["src/workflow-worker-entry.ts"],
+		outfile: "dist/workflow-worker-entry.mjs",
+		platform: "node",
+		format: "esm",
+		target: "node22",
+	}),
+	build({
+		...common,
 		entryPoints: ["src/external-claude-helper.ts"],
 		outfile: "dist/external-claude-helper.mjs",
 		platform: "node",
@@ -136,6 +144,7 @@ await cp(resolve(app, "LICENSE"), resolve(runtime, "LICENSE"));
 await cp(resolve(app, "NOTICE.md"), resolve(runtime, "NOTICE.md"));
 await cp(resolve(app, "dist/permission-extension.mjs"), resolve(runtime, "permission-extension.mjs"));
 await cp(resolve(app, "dist/tool-control-extension.mjs"), resolve(runtime, "tool-control-extension.mjs"));
+await cp(resolve(app, "dist/workflow-worker-entry.mjs"), resolve(runtime, "workflow-worker-entry.mjs"));
 await cp(resolve(app, "dist/external-claude-helper.mjs"), resolve(runtime, "external-claude-helper.mjs"));
 await mkdir(resolve(runtime, "licenses"), { recursive: true });
 await cp(resolve(app, "node_modules/@anthropic-ai/claude-agent-sdk/LICENSE.md"), resolve(runtime, "licenses/claude-agent-sdk-LICENSE.md"));

@@ -180,6 +180,12 @@ export function validateTask(value: unknown, conversationIds: ReadonlySet<string
 			if (typeof input.name !== "string" || !AGENT_CALL_NAME_PATTERN.test(input.name)) fail("name");
 			task.name = input.name;
 		}
+		if (input.teamName !== undefined) {
+			task.teamName = text(input.teamName, "teamName", 64);
+		}
+		if (input.workflowId !== undefined) {
+			task.workflowId = id(input.workflowId, "workflowId");
+		}
 		if (input.isFork !== undefined) task.isFork = bool(input.isFork, "isFork");
 		if (input.systemPromptFile !== undefined) {
 			// The file is passed to the child's command line; only the host's own path is accepted.

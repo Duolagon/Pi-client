@@ -69,6 +69,8 @@ export function SettingsDialog({
 	const [confineSubagentBash, setConfineSubagentBash] = useState<boolean>(settings.confineSubagentBash !== false);
 	const [maxSubagentDepthText, setMaxSubagentDepthText] = useState(String(settings.maxSubagentDepth ?? 1));
 	const [maxConcurrentText, setMaxConcurrentText] = useState(String(settings.maxConcurrentSubagents ?? 8));
+	const [cronEnabled, setCronEnabled] = useState<boolean>(settings.cronEnabled !== false);
+	const [agentTeams, setAgentTeams] = useState<boolean>(settings.agentTeams === true);
 	const [sandboxOffline, setSandboxOffline] = useState(Boolean(settings.sandboxOffline));
 	const [sandboxInfo, setSandboxInfo] = useState<SandboxStatus | null>(null);
 	const [provider, setProvider] = useState<Provider>(initialProvider);
@@ -107,6 +109,8 @@ export function SettingsDialog({
 		confineSubagentBash !== (settings.confineSubagentBash !== false) ||
 		maxSubagentDepthText.trim() !== String(settings.maxSubagentDepth ?? 1) ||
 		maxConcurrentText.trim() !== String(settings.maxConcurrentSubagents ?? 8) ||
+		cronEnabled !== (settings.cronEnabled !== false) ||
+		agentTeams !== (settings.agentTeams === true) ||
 		agentDir.trim() !== (settings.agentDir ?? "");
 	const connectionChanged =
 		Boolean(apiKey.trim()) ||
@@ -183,6 +187,8 @@ export function SettingsDialog({
 				confineSubagentBash,
 				...(maxSubagentDepthText.trim() !== String(settings.maxSubagentDepth ?? 1) ? { maxSubagentDepth: depthNum } : {}),
 				...(maxConcurrentText.trim() !== String(settings.maxConcurrentSubagents ?? 8) ? { maxConcurrentSubagents: concurrentNum } : {}),
+				cronEnabled,
+				agentTeams,
 			};
 			if (agentDir.trim() !== (settings.agentDir ?? "")) update.agentDir = agentDir.trim();
 			if (connectionChanged) Object.assign(update, connectionInput);
@@ -536,6 +542,29 @@ export function SettingsDialog({
 								onChange={(event) => setMaxConcurrentText(event.target.value)}
 							/>
 							<small>默认为 8；超过限制后模型需等待已有子 Agent 完成。</small>
+						</label>
+						<label className="live-setting-toggle">
+							<input
+								type="checkbox"
+								aria-label="启用定时唤醒与 /loop 自动任务"
+								checked={cronEnabled}
+								disabled={pending}
+								onChange={(event) => setCronEnabled(event.target.checked)}
+							/>
+							启用定时唤醒与 /loop 自动任务（Cron / ScheduleWakeup）
+						</label>
+						<p className="subtle-note" role="note">
+							注意：开启定时唤醒后，到点且会话空闲时会自动触发模型回合，<strong>会自动消耗额度</strong>；任务默认 7 天后自动过期，对子 Agent 禁用。
+						</p>
+						<label className="live-setting-toggle">
+							<input
+								type="checkbox"
+								aria-label="实验性 Agent Teams 多成员协作"
+								checked={agentTeams}
+								disabled={pending || busy}
+								onChange={(event) => setAgentTeams(event.target.checked)}
+							/>
+							启用实验性 Agent Teams 多成员协作（TeamCreate / TeamDelete 与结构化团队消息）
 						</label>
 					</div>
 				</details>

@@ -9,6 +9,9 @@ import {
 	type ToolControlResponse, type ToolOverrides,
 } from "./tool-control-types.ts";
 import { MAX_AGENT_PROMPT, MAX_NOTIFICATION, MAX_SEND_MESSAGE, MAX_SEND_SUMMARY, MAX_SEND_TARGET } from "./delegation-limits.ts";
+import { todoStatuses } from "./todo-types.ts";
+import { cronToolNames } from "./cron-types.ts";
+import { teamMessageTypes, teamToolNames } from "./team-types.ts";
 import { formatAgentListing, parseAgentListing } from "./agent-listing.ts";
 import { TASK_NOTIFICATION_TYPE, formatTaskProgressSummary } from "./delegation-format.ts";
 import { postLoopbackJson, postLoopbackNdjson } from "./loopback-request.ts";
@@ -19,8 +22,10 @@ const NOTIFICATION_WAKE = "desktop_task_notification_wake";
 /** Name of the structured system prompt section that lists agent types (see Pi's section names). */
 export const AGENT_LISTING_SECTION = "agent_types";
 const nativeTools = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"]);
-const safeChildTools = new Set(["read", "grep", "find", "ls", "AgentExecutors", "TaskOutput", "TaskStop", "TaskList", "WorktreeList"]);
+const safeChildTools = new Set(["read", "grep", "find", "ls", "AgentExecutors", "TaskOutput", "TaskStop", "TaskList", "WorktreeList", "TodoGet", "TodoList"]);
 const worktreeMutationTools = new Set(["WorktreeCreate", "WorktreeMerge", "WorktreeRemove"]);
+const cronChildBlockedTools = new Set<string>(cronToolNames);
+const teamTools = new Set<string>(teamToolNames);
 /**
  * Calls that never change the parent's working directory. Other Agent calls are checked by
  * the host itself (a second shared writer finds the directory busy; external agents and
@@ -52,10 +57,13 @@ export const toolSchemas: Record<DesktopModelToolName, JsonSchema> = {
 		team_name: { ...boundedText(200), description: "Accepted for compatibility and ignored" },
 	}, ["description", "prompt"]),
 	SendMessage: schema({
-		to: { ...boundedText(MAX_SEND_TARGET), description: "The agentId returned by Agent, or the name you gave the agent" },
-		message: { ...boundedText(MAX_SEND_MESSAGE), description: "The message for the agent; it keeps its whole previous conversation" },
+		to: { ...boundedText(MAX_SEND_TARGET), description: 'The agentId, agent name, teammate name, "team-lead", or "*" for broadcast' },
+		message: { ...boundedText(MAX_SEND_MESSAGE), description: "The message for the agent or teammate; it keeps its whole previous conversation" },
 		summary: { ...boundedText(MAX_SEND_SUMMARY), description: "Optional 5-10 word preview of the message" },
 		run_in_background: { type: "boolean", description: "Resume a finished agent in the background (default true). Set false to wait for its reply." },
+		message_type: { type: "string", enum: [...teamMessageTypes], description: "Optional structured team message type" },
+		request_id: { ...boundedText(128), description: "Optional request ID for shutdown or plan approval handshake" },
+		approve: { type: "boolean", description: "Approval decision for shutdown_response or plan_approval_response" },
 	}, ["to", "message"]),
 	AgentSend: schema({ task_id: taskId, message: boundedText(MAX_SEND_MESSAGE), run_in_background: { type: "boolean" } }, ["task_id", "message"]),
 	AgentExecutors: schema({}),
@@ -64,6 +72,75 @@ export const toolSchemas: Record<DesktopModelToolName, JsonSchema> = {
 	WorktreeCreate: schema({ base_ref: boundedText(1000) }), WorktreeList: schema({}),
 	WorktreeMerge: schema({ worktree_id: taskId }, ["worktree_id"]),
 	WorktreeRemove: schema({ worktree_id: taskId }, ["worktree_id"]),
+	TodoCreate: schema({
+		subject: { ...boundedText(500), description: "Short imperative title for the checklist item" },
+		description: { ...boundedText(16000), description: "Detailed acceptance criteria and context for the task" },
+		activeForm: { ...boundedText(500), description: "Optional present-continuous spinner text while in_progress" },
+		owner: { ...boundedText(128), description: "Optional agent name or teammate owner" },
+		blocks: { type: "array", items: boundedText(64), maxItems: 100 },
+		blockedBy: { type: "array", items: boundedText(64), maxItems: 100 },
+		metadata: { type: "object" },
+	}, ["subject", "description"]),
+	TodoGet: schema({ id: { ...boundedText(64), description: "Checklist task ID returned by TodoCreate or TodoList" } }, ["id"]),
+	TodoUpdate: schema({
+		id: { ...boundedText(64), description: "Checklist task ID to update" },
+		subject: boundedText(500),
+		description: boundedText(16000),
+		status: { type: "string", enum: [...todoStatuses] },
+		activeForm: boundedText(500),
+		owner: boundedText(128),
+		addBlocks: { type: "array", items: boundedText(64), maxItems: 100 },
+		addBlockedBy: { type: "array", items: boundedText(64), maxItems: 100 },
+		metadata: { type: "object" },
+	}, ["id"]),
+	TodoList: schema({
+		include_completed: { type: "boolean", description: "Whether to include completed items (default true)" },
+	}),
+	Monitor: schema({
+		description: { ...boundedText(160), description: "Short label describing what is being monitored" },
+		command: { ...boundedText(16384), description: "Long-lived shell command whose stdout/stderr lines are streamed back as events" },
+		url: { ...boundedText(2048), description: "WebSocket URL (wss:// or loopback ws://127.0.0.1|localhost|[::1]) to monitor" },
+		timeout_ms: { type: "integer", minimum: 1000, maximum: 86_400_000, description: "Optional timeout in ms (default 300000)" },
+		persistent: { type: "boolean", description: "Allow longer timeouts up to 24 hours" },
+	}),
+	ScheduleWakeup: schema({
+		delay_seconds: { type: "integer", minimum: 1, maximum: 604800, description: "Delay before wakeup in seconds (1–604800)" },
+		reason: { ...boundedText(2000), description: "Short explanation of why the wakeup is needed" },
+		prompt: { ...boundedText(16000), description: "Optional follow-up prompt injected when the wakeup fires (defaults to reason)" },
+	}, ["delay_seconds", "reason"]),
+	CronCreate: schema({
+		prompt: { ...boundedText(16000), description: "Prompt delivered automatically when the schedule fires" },
+		cron: { ...boundedText(200), description: "Standard 5-field cron expression (min hour dom month dow)" },
+		interval_seconds: { type: "integer", minimum: 10, maximum: 604800, description: "Fixed interval in seconds (10–604800)" },
+		recurring: { type: "boolean", description: "Repeat automatically until 7-day expiry (default true)" },
+		durable: { type: "boolean", description: "Persist to trusted project .pi/scheduled_tasks.json (default true)" },
+	}, ["prompt"]),
+	CronList: schema({}),
+	CronDelete: schema({ id: { ...boundedText(80), description: "Scheduled task ID to delete" } }, ["id"]),
+	TeamCreate: schema({
+		team_name: { ...boundedText(64), description: "Unique team name for coordinating multiple agents and shared checklist" },
+		description: { ...boundedText(500), description: "Optional description of team mission" },
+	}, ["team_name"]),
+	TeamDelete: schema({
+		team_name: { ...boundedText(64), description: "Optional active team name to shut down and clean up" },
+	}),
+	WorkflowRun: schema({
+		title: { ...boundedText(160), description: "Short human-readable workflow title" },
+		script: { ...boundedText(256 * 1024), description: "Async JS workflow body using allowlisted APIs: agent(), parallel(), pipeline(), phase(), log(), budget()" },
+		budget: {
+			type: "object",
+			properties: {
+				maxCost: { type: "number", minimum: 0 },
+				maxTokens: { type: "integer", minimum: 1 },
+				maxAgents: { type: "integer", minimum: 1, maximum: 100 },
+			},
+			additionalProperties: false,
+		},
+		run_in_background: { type: "boolean", description: "Return immediately with workflow_id instead of awaiting completion (default false)" },
+	}, ["script"]),
+	StructuredOutput: schema({
+		data: { description: "JSON value matching the required StructuredOutput JSON Schema" },
+	}, ["data"]),
 };
 const descriptions: Record<DesktopModelToolName, string> = {
 	Agent: [
@@ -87,6 +164,19 @@ const descriptions: Record<DesktopModelToolName, string> = {
 	WorktreeList: "List application-managed worktrees for this conversation's repository. Inspect identifiers and status before delegating, merging, or removing a worktree.",
 	WorktreeMerge: "Fast-forward merge an owned, idle worktree into its original repository. Never force merges or discards dirty files. Review its changes first; returns a blocked reason when a safe fast-forward is unavailable.",
 	WorktreeRemove: "Remove an owned, idle, clean worktree using the host's safety checks. Never force-removes dirty files. Branch retention is reported in the result.",
+	TodoCreate: "Create a persistent task item on the shared checklist for this root conversation (shared with subagents and teams). Supports dependencies (blocks/blockedBy), owner, activeForm and metadata.",
+	TodoGet: "Fetch the full details, description, owner, dependencies, and status of a specific task item by ID from the shared checklist.",
+	TodoUpdate: "Update a task item on the shared checklist (status: pending | in_progress | completed | deleted, owner, activeForm, dependency edges, or merged metadata).",
+	TodoList: "List persistent tasks on the shared checklist for this root conversation, showing statuses, owners, and dependency blockers.",
+	Monitor: "Start a background command or WebSocket (wss:// or loopback ws://) monitor. Output is coalesced and delivered asynchronously via <monitor-event> follow-ups; stop it anytime with TaskStop.",
+	ScheduleWakeup: "Schedule a one-shot reminder wakeup after delay_seconds (only fires when parent session is idle, consumes quota, max 7 days, unavailable to subagents).",
+	CronCreate: "Create a recurring or one-shot scheduled task with jitter and 7-day lifetime (fires only when session is idle, consumes quota, unavailable to subagents).",
+	CronList: "List active scheduled Cron / /loop / ScheduleWakeup jobs for the current session.",
+	CronDelete: "Delete a scheduled Cron / /loop / ScheduleWakeup job by ID.",
+	TeamCreate: "Create a coordinated Agent Team for this root conversation (requires experimental agentTeams setting). Teammates share the Todo* checklist and exchange structured messages via SendMessage.",
+	TeamDelete: "Delete the active Agent Team directory after active teammates have stopped or shut down.",
+	WorkflowRun: "Execute a deterministic multi-step workflow script in an isolated utilityProcess/VM sandbox using allowlisted agent(), parallel(), pipeline(), phase(), log(), and budget() primitives with durable journal recovery.",
+	StructuredOutput: "Submit the structured JSON result matching the workflow step's schema.",
 };
 
 function hostConfig(): { url: string; token: string } | undefined {
@@ -115,6 +205,9 @@ export default function toolControl(pi: ExtensionAPI): void {
 	const delegationDepth = Number.isFinite(rawDepth) && rawDepth >= 0 ? Math.floor(rawDepth) : 1;
 	const maxDepth = Number.isFinite(rawMaxDepth) && rawMaxDepth >= 1 ? Math.floor(rawMaxDepth) : 1;
 	const child = process.env.PI_DESKTOP_CHILD === "1" || readOnlyChild || forkChild || delegationDepth > 0;
+	const agentTeams = process.env.PI_DESKTOP_AGENT_TEAMS === "1";
+	const teamMember = process.env.PI_DESKTOP_TEAM_MEMBER === "1";
+	const structuredOutputEnabled = process.env.PI_DESKTOP_STRUCTURED_OUTPUT === "1";
 	const canDelegate = !forkChild && delegationDepth < maxDepth;
 	const host = hostConfig();
 	if (!directory && !token && !command && !toolsFile && !host) return;
@@ -148,17 +241,38 @@ export default function toolControl(pi: ExtensionAPI): void {
 			pi.registerTool({
 				name, label: name, description: descriptions[name], promptSnippet: descriptions[name].split(". ")[0],
 				promptGuidelines: name === "Agent" ? ["Delegate independent focused research or implementation when it can progress separately; collect the child's result and review worktree changes before merging."] : undefined,
-				parameters: toolSchemas[name], exposure: "model-only", defaultActive: forkChild || (delegating(name) ? canDelegate : !(child && worktreeMutationTools.has(name))),
+				parameters: toolSchemas[name], exposure: "model-only", defaultActive: forkChild ? (
+					name === "StructuredOutput"
+						? structuredOutputEnabled
+						: teamTools.has(name)
+							? agentTeams
+							: true
+				) : (
+					name === "StructuredOutput"
+						? structuredOutputEnabled
+						: name === "WorkflowRun"
+							? !child
+							: teamTools.has(name)
+								? (agentTeams && !child)
+								: delegating(name)
+									? (canDelegate || (name === "SendMessage" && teamMember && agentTeams))
+									: !(child && (worktreeMutationTools.has(name) || cronChildBlockedTools.has(name)))
+				),
 				executionMode: [...delegatingToolNames, "TaskOutput"].includes(name) ? "parallel" : "sequential",
 				// AgentSend stays callable for older prompts, but SendMessage is the declared tool.
 				...(name === "AgentSend" ? { prepareLoadout: () => ({ hiddenDeclarations: ["AgentSend"] }) } : {}),
 				prepareArguments: (input) => validateDesktopToolInput(name, input),
 				async execute(toolCallId, input, signal, onUpdate) {
 					const params = validateDesktopToolInput(name, input);
+					const canTeamMessage = name === "SendMessage" && teamMember && agentTeams && !forkChild;
 					if (forkChild && delegating(name)) throw new Error("Forked agents cannot fork or spawn agents");
-					if (!canDelegate && delegating(name)) throw new Error(`Subagent nesting limit reached (depth ${delegationDepth}). Complete this task directly; subagents cannot delegate, and cannot spawn nested agents.`);
+					if (!canDelegate && delegating(name) && !canTeamMessage) throw new Error(`Subagent nesting limit reached (depth ${delegationDepth}). Complete this task directly; subagents cannot delegate, and cannot spawn nested agents.`);
+					if (name === "WorkflowRun" && child) throw new Error("WorkflowRun is disabled for subagents");
+					if (name === "StructuredOutput" && !structuredOutputEnabled) throw new Error("StructuredOutput is only enabled inside structured workflow steps");
+					if (teamTools.has(name) && (!agentTeams || child)) throw new Error("Team management tools require experimental agentTeams setting in root conversation");
+					if (child && cronChildBlockedTools.has(name)) throw new Error("Cron and ScheduleWakeup tools are disabled for subagents");
 					if (child && worktreeMutationTools.has(name)) throw new Error("Subagents cannot spawn nested agents or manage additional worktrees");
-					if (readOnlyChild && !safeChildTools.has(name) && !(canDelegate && delegating(name))) throw new Error("This subagent is read-only");
+					if (readOnlyChild && !safeChildTools.has(name) && !(canDelegate && delegating(name)) && !(name === "StructuredOutput" && structuredOutputEnabled)) throw new Error("This subagent is read-only");
 					signal?.throwIfAborted();
 					onUpdate?.({ content: [{ type: "text", text: name === "Agent" ? "Delegating task…" : `Running ${name}…` }], details: { tool: name, toolCallId } });
 					const payload = {
@@ -232,9 +346,20 @@ export default function toolControl(pi: ExtensionAPI): void {
 			if (!(name in previousOverrides) && !baseline.has(name)) baseline.set(name, active.has(name));
 			if (enabled) active.add(name); else active.delete(name);
 		}
-		if (!canDelegate && !forkChild) for (const name of delegatingToolNames) active.delete(name);
+		if (!canDelegate && !forkChild) {
+			for (const name of delegatingToolNames) {
+				if (name === "SendMessage" && teamMember && agentTeams) continue;
+				active.delete(name);
+			}
+		}
+		if (!agentTeams || (child && !forkChild)) for (const name of teamTools) active.delete(name);
+		if (child && !forkChild) {
+			active.delete("WorkflowRun");
+			for (const name of cronChildBlockedTools) active.delete(name);
+		}
+		if (!structuredOutputEnabled) active.delete("StructuredOutput");
 		if (child && !forkChild) for (const name of worktreeMutationTools) active.delete(name);
-		if (readOnlyChild) for (const name of active) if (!safeChildTools.has(name) && !(canDelegate && delegating(name))) active.delete(name);
+		if (readOnlyChild) for (const name of active) if (!safeChildTools.has(name) && !(canDelegate && delegating(name)) && !(name === "StructuredOutput" && structuredOutputEnabled)) active.delete(name);
 		previousOverrides = settings.overrides;
 		pi.setActiveTools([...active]);
 		if (baselineFile) {
@@ -245,7 +370,7 @@ export default function toolControl(pi: ExtensionAPI): void {
 	}
 	function inventory(settings: ToolOverrides): DesktopToolInfo[] {
 		const active = new Set(pi.getActiveTools());
-		return pi.getAllTools().map((tool) => describeTool(tool, active, settings.overrides, child, canDelegate, readOnlyChild));
+		return pi.getAllTools().map((tool) => describeTool(tool, active, settings.overrides, child, canDelegate, readOnlyChild, agentTeams, teamMember, structuredOutputEnabled));
 	}
 	// Results queued as `nextTurn` in this process; Pi consumes them when the next run starts.
 	const queuedNotifications = new Map<string, NotificationUsage | undefined>();
@@ -279,15 +404,28 @@ export default function toolControl(pi: ExtensionAPI): void {
 	// The active set changes what is declared to the model. A fresh guard also denies stale or nested calls.
 	pi.on("tool_call", async (event) => {
 		try {
+			const canTeamMessage = event.toolName === "SendMessage" && teamMember && agentTeams && !forkChild;
 			if (forkChild && delegating(event.toolName)) return { block: true, reason: "Forked agents cannot fork or spawn agents" };
-			if (!canDelegate && delegating(event.toolName)) {
+			if (!canDelegate && delegating(event.toolName) && !canTeamMessage) {
 				return { block: true, reason: `Subagent nesting limit reached (depth ${delegationDepth}). Complete this task directly; subagents cannot delegate, and cannot spawn nested agents.` };
+			}
+			if (event.toolName === "WorkflowRun" && child) {
+				return { block: true, reason: "WorkflowRun is disabled for subagents" };
+			}
+			if (event.toolName === "StructuredOutput" && !structuredOutputEnabled) {
+				return { block: true, reason: "StructuredOutput is only enabled inside structured workflow steps" };
+			}
+			if (teamTools.has(event.toolName) && (!agentTeams || child)) {
+				return { block: true, reason: "Team management tools require experimental agentTeams setting in root conversation" };
+			}
+			if (child && cronChildBlockedTools.has(event.toolName)) {
+				return { block: true, reason: "Cron and ScheduleWakeup tools are disabled for subagents" };
 			}
 			if (child && worktreeMutationTools.has(event.toolName)) {
 				return { block: true, reason: "Subagents cannot spawn nested agents or manage additional worktrees" };
 			}
 			const settings = await config();
-			if (settings.overrides[event.toolName] === false || (readOnlyChild && !safeChildTools.has(event.toolName) && !(canDelegate && delegating(event.toolName)))) {
+			if (settings.overrides[event.toolName] === false || (readOnlyChild && !safeChildTools.has(event.toolName) && !(canDelegate && delegating(event.toolName)) && !(event.toolName === "StructuredOutput" && structuredOutputEnabled))) {
 				return { block: true, reason: "此工具已被客户端禁用。" };
 			}
 		} catch { return { block: true, reason: "无法读取工具启停设置，已阻止执行。" }; }
@@ -303,19 +441,24 @@ export default function toolControl(pi: ExtensionAPI): void {
 			try {
 				if (ctx.mode !== "rpc") throw new Error("Invalid tool control request");
 				const request: ToolControlRequest = validateControlRequest(JSON.parse(await readFile(join(directory, "request.json"), "utf8")), requestId, MAX_NOTIFICATION);
-				if (request.operation === "notify") {
-					// Exactly-once across host crashes: a key acknowledged in this session was delivered.
-					const delivered = (ctx.sessionManager?.getEntries() ?? []).some((entry) =>
-						entry.type === "custom" && entry.customType === NOTIFICATION_ACK &&
-						(entry.data as { key?: unknown } | undefined)?.key === request.key);
-					if (delivered) {
-						await respond({ requestId, ok: true, tools: [], delivery: "duplicate" });
-						return;
+				if (request.operation === "notify" || request.operation === "deliver") {
+					const customType = request.operation === "deliver" ? request.customType : TASK_NOTIFICATION_TYPE;
+					const display = request.operation === "deliver" ? (request.display ?? true) : true;
+					const key = request.key;
+					if (key) {
+						// Exactly-once across host crashes: a key acknowledged in this session was delivered.
+						const delivered = (ctx.sessionManager?.getEntries() ?? []).some((entry) =>
+							entry.type === "custom" && entry.customType === NOTIFICATION_ACK &&
+							(entry.data as { key?: unknown } | undefined)?.key === key);
+						if (delivered) {
+							await respond({ requestId, ok: true, tools: [], delivery: "duplicate" });
+							return;
+						}
 					}
-					const message = { customType: TASK_NOTIFICATION_TYPE, content: request.content, display: true, details: request.details };
+					const message = { customType, content: request.content, display, details: request.details };
 					if (request.deliverAs === "nextTurn") {
-						if (!queuedNotifications.has(request.key)) {
-							queuedNotifications.set(request.key, request.usage);
+						if (!key || !queuedNotifications.has(key)) {
+							if (key) queuedNotifications.set(key, request.usage);
 							pi.sendMessage(message, { deliverAs: "nextTurn", triggerTurn: false });
 						}
 						await respond({ requestId, ok: true, tools: [], delivery: "queued" });
@@ -327,7 +470,7 @@ export default function toolControl(pi: ExtensionAPI): void {
 						await respond({ requestId, ok: true, tools: [], delivery: "deferred" });
 						return;
 					}
-					acknowledge(request.key, request.usage, ctx);
+					if (key) acknowledge(key, request.usage, ctx);
 					pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: request.triggerTurn });
 					await respond({ requestId, ok: true, tools: [], delivery: "sent" });
 					return;
@@ -366,16 +509,21 @@ function recordUsage(ctx: unknown, usage: NotificationUsage, key: string): void 
 	} catch {}
 }
 
-function describeTool(tool: ToolInfo, active: Set<string>, overrides: Record<string, boolean>, child: boolean, canDelegate: boolean, readOnlyChild: boolean): DesktopToolInfo {
+function describeTool(tool: ToolInfo, active: Set<string>, overrides: Record<string, boolean>, child: boolean, canDelegate: boolean, readOnlyChild: boolean, agentTeams: boolean, teamMember: boolean, structuredOutputEnabled: boolean): DesktopToolInfo {
 	const sourcePath = tool.sourceInfo?.path;
 	const source: DesktopToolInfo["source"] = tool.name.startsWith("mcp__") ? "mcp" :
 		desktopModelToolNames.includes(tool.name as DesktopModelToolName) && sourcePath?.includes("tool-control-extension") ? "desktop" :
 		nativeTools.has(tool.name) && sourcePath?.startsWith("builtin:") || sourcePath?.startsWith("builtin:") ? "builtin" : "extension";
+	const canTeamMessage = tool.name === "SendMessage" && teamMember && agentTeams;
 	const blocked =
 		overrides[tool.name] === false ||
-		(!canDelegate && delegating(tool.name)) ||
+		(!canDelegate && delegating(tool.name) && !canTeamMessage) ||
+		(tool.name === "WorkflowRun" && child) ||
+		(tool.name === "StructuredOutput" && !structuredOutputEnabled) ||
+		(teamTools.has(tool.name) && (!agentTeams || child)) ||
 		(child && worktreeMutationTools.has(tool.name)) ||
-		(readOnlyChild && !safeChildTools.has(tool.name) && !(canDelegate && delegating(tool.name)));
+		(child && cronChildBlockedTools.has(tool.name)) ||
+		(readOnlyChild && !safeChildTools.has(tool.name) && !(canDelegate && delegating(tool.name)) && !(tool.name === "StructuredOutput" && structuredOutputEnabled));
 	// AgentSend is an active, callable alias whose declaration requests leave out.
 	const modelVisible = active.has(tool.name) && tool.exposure !== "hidden" && tool.name !== "AgentSend";
 	return {

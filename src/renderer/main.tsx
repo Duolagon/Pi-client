@@ -40,6 +40,8 @@ import type {
 	ProjectTrustDecision,
 	Snapshot,
 	TaskProgress,
+	TodoRecord,
+	WorkflowRecord,
 } from "../shared.ts";
 import { IconButton, Modal, PiMark } from "../prototype/ui.tsx";
 import { useDesktop } from "./useDesktop.ts";
@@ -107,6 +109,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [agentsOpen, setAgentsOpen] = useState(false);
 	const [mcpOpen, setMcpOpen] = useState(false);
 	const [todoExpanded, setTodoExpanded] = useState(false);
+	const [sharedTodos, setSharedTodos] = useState<TodoRecord[]>([]);
+	const [workflows, setWorkflows] = useState<WorkflowRecord[]>([]);
 	const [tasksMap, setTasksMap] = useState<Record<string, DesktopTask>>({});
 	const [taskProgressMap, setTaskProgressMap] = useState<Record<string, TaskProgress>>({});
 	const [focusedSubagentTaskId, setFocusedSubagentTaskId] = useState<string | null>(null);
@@ -189,6 +193,54 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			unsubExt();
 		};
 	}, [api]);
+	useEffect(() => {
+		const activeId = snapshot?.active?.id;
+		if (!activeId || !api.todos?.list) {
+			setSharedTodos([]);
+			return;
+		}
+		let mounted = true;
+		const loadTodos = () => {
+			void api.todos
+				.list(activeId)
+				.then((list) => {
+					if (mounted) setSharedTodos(list);
+				})
+				.catch(() => {});
+		};
+		loadTodos();
+		const unsubTodos = api.todos?.onEvent?.(() => {
+			loadTodos();
+		});
+		return () => {
+			mounted = false;
+			unsubTodos?.();
+		};
+	}, [api, snapshot?.active?.id]);
+	useEffect(() => {
+		const activeId = snapshot?.active?.id;
+		if (!activeId || !api.workflow?.list) {
+			setWorkflows([]);
+			return;
+		}
+		let mounted = true;
+		const loadWorkflows = () => {
+			void api.workflow
+				.list(activeId)
+				.then((list) => {
+					if (mounted) setWorkflows(list);
+				})
+				.catch(() => {});
+		};
+		loadWorkflows();
+		const unsubWf = api.workflow?.onEvent?.(() => {
+			loadWorkflows();
+		});
+		return () => {
+			mounted = false;
+			unsubWf?.();
+		};
+	}, [api, snapshot?.active?.id]);
 	useEffect(() => {
 		if (!snapshot?.active?.project) {
 			setGitSummary(null);
@@ -349,6 +401,17 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			setBtwState({ loading: false, question: q, error: error instanceof Error ? error.message : String(error) });
 		}
 	};
+	const runLoop = async (args: string) => {
+		const activeId = snapshot?.active?.id;
+		if (!activeId) return;
+		try {
+			const job = await api.cron.loop(activeId, args);
+			const nextStr = new Date(job.nextRunAt).toLocaleTimeString();
+			app.setNotice(`已创建定时任务 ${job.id}（下次触发 ${nextStr}，注意：空闲时会自动运行并消耗额度）。`);
+		} catch (error) {
+			app.fail(error);
+		}
+	};
 	const handleBuiltinSlash = (action: BuiltinSlashAction) => {
 		if (action === "compact") {
 			if (!blocked && history.messages.length) void app.command({ type: "compact" });
@@ -360,6 +423,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			setControlsTab("skills");
 		} else if (action === "btw") {
 			app.setDraft("/btw ");
+		} else if (action === "loop") {
+			app.setDraft("/loop 5m ");
+		} else if (action === "batch") {
+			app.setDraft("/batch ");
 		} else if (action === "new") {
 			if (!changing && snapshot?.active) switchTo(() => api.newConversation());
 		} else if (action === "permissions") {
@@ -492,20 +559,28 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const focusedSubagentTask = focusedSubagentTaskId ? tasksMap[focusedSubagentTaskId] : undefined;
 	const liveChildApprovals = collectDescendantApprovals(Object.values(tasksMap), snapshot.active?.id);
 	const childApprovals = liveChildApprovals.length > 0 ? liveChildApprovals : (snapshot.childApprovals ?? []);
-	const latestTodos: TodoItem[] = (() => {
-		for (let i = history.messages.length - 1; i >= 0; i--) {
-			const msg = history.messages[i];
-			if (msg.role !== "assistant") continue;
-			for (let j = msg.content.length - 1; j >= 0; j--) {
-				const block = msg.content[j];
-				if (block.type === "toolCall" && block.name === "TodoWrite" && block.arguments && typeof block.arguments === "object") {
-					const todos = (block.arguments as { todos?: TodoItem[] }).todos;
-					if (Array.isArray(todos)) return todos;
+	const latestTodos: TodoItem[] = sharedTodos.length > 0
+		? sharedTodos.map((item) => ({
+			id: item.id,
+			content: (item.status === "in_progress" && item.activeForm ? item.activeForm : item.subject) +
+				(item.owner ? ` (@${item.owner})` : "") +
+				(item.blockedBy.length ? ` [阻塞于 #${item.blockedBy.join(", #")}]` : ""),
+			status: item.status === "completed" ? "completed" : item.status === "in_progress" ? "in_progress" : "pending",
+		}))
+		: (() => {
+			for (let i = history.messages.length - 1; i >= 0; i--) {
+				const msg = history.messages[i];
+				if (msg.role !== "assistant") continue;
+				for (let j = msg.content.length - 1; j >= 0; j--) {
+					const block = msg.content[j];
+					if (block.type === "toolCall" && block.name === "TodoWrite" && block.arguments && typeof block.arguments === "object") {
+						const todos = (block.arguments as { todos?: TodoItem[] }).todos;
+						if (Array.isArray(todos)) return todos;
+					}
 				}
 			}
-		}
-		return [];
-	})();
+			return [];
+		})();
 	const lastMessage = history.messages[history.messages.length - 1];
 	const inPlanMode = planMode || snapshot.settings.permission === "plan";
 	const showPlanApproval =
@@ -1059,6 +1134,43 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								</div>
 							</div>
 						)}
+						{workflows
+							.filter((wf) => wf.pendingApproval)
+							.map((wf) => {
+								const req = wf.pendingApproval!;
+								return (
+									<div key={req.id} className="cc-plan-bar" role="region" aria-label="工作流执行审批">
+										<div className="cc-plan-bar-row">
+											<span>
+												<strong>{req.title}</strong> · {req.detail.slice(0, 140)}
+											</span>
+											<div className="cc-plan-bar-actions">
+												<button
+													type="button"
+													className="primary-button"
+													onClick={() => void api.workflow.respond(wf.id, req.id, "once").catch(app.fail)}
+												>
+													允许一次 (Once)
+												</button>
+												<button
+													type="button"
+													className="secondary-button"
+													onClick={() => void api.workflow.respond(wf.id, req.id, "always").catch(app.fail)}
+												>
+													始终允许 (Always)
+												</button>
+												<button
+													type="button"
+													className="cc-mini-btn danger"
+													onClick={() => void api.workflow.respond(wf.id, req.id, "deny").catch(app.fail)}
+												>
+													拒绝 (Deny)
+												</button>
+											</div>
+										</div>
+									</div>
+								);
+							})}
 						<SubagentPanel
 							ref={subagentPanelRef}
 							parentConversationId={snapshot.active?.id}
@@ -1097,6 +1209,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							onBuiltinSlash={handleBuiltinSlash}
 							onCompactInstructions={(customInstructions) => void app.command({ type: "compact", customInstructions })}
 							onBtw={(q) => void runBtw(q)}
+							onLoop={(args) => void runLoop(args)}
 							onFocusSubagentPanel={() => subagentPanelRef.current?.focusFirst() ?? false}
 							inputRef={composerInputRef}
 							fail={app.fail}
@@ -1313,6 +1426,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				<TasksDrawer
 					project={snapshot.active?.project}
 					conversationId={snapshot.active?.id}
+					agentTeams={snapshot.settings.agentTeams === true}
 					initialTaskId={taskInitialId}
 					close={() => setTasksOpen(false)}
 					onNotice={(msg) => app.setNotice(msg)}

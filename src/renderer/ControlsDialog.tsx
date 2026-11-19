@@ -287,6 +287,7 @@ export function ControlsDialog({
 	};
 
 	const deleteSkill = async (item: SkillDefinitionEntry) => {
+		if (item.scope === "bundled" || !item.editable) return;
 		try {
 			setSkills(await window.pi.skills.remove({ name: item.name, scope: item.scope, project }));
 		} catch (error) {

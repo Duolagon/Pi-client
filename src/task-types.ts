@@ -60,6 +60,14 @@ export interface DesktopTask {
 	subagentType?: SubagentType;
 	/** Call-level Agent `name`; SendMessage can address the child by it. */
 	name?: string;
+	/** Optional active Agent Team name when experimental agentTeams is enabled. */
+	teamName?: string;
+	/** Owning workflow ID when spawned by WorkflowService. */
+	workflowId?: string;
+	/** JSON Schema enforced via StructuredOutput for workflow agent steps. */
+	structuredOutputSchema?: unknown;
+	/** Validated StructuredOutput payload captured from this child task. */
+	structuredOutput?: unknown;
 	/** 1 for a direct child of a user conversation; validated against MAX_DELEGATION_DEPTH. */
 	delegationDepth?: number;
 	readOnly?: boolean;
@@ -128,6 +136,8 @@ export interface TaskStartInput {
 	mcpServers?: string[];
 	/** Appended to the child's system prompt (definition body, skills, memory). */
 	systemPrompt?: string;
+	/** JSON Schema for StructuredOutput injection on workflow steps. */
+	structuredOutputSchema?: unknown;
 }
 
 export interface TaskProgressActivity {

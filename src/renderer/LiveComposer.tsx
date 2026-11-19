@@ -51,12 +51,16 @@ export type BuiltinSlashAction =
 	| "memory"
 	| "status"
 	| "init"
-	| "preview";
+	| "preview"
+	| "loop"
+	| "batch";
 
 const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[] = [
 	{ name: "compact", description: "压缩上下文（支持 /compact <聚焦指令>）" },
 	{ name: "context", description: "查看上下文占用构成与自动压缩设置" },
 	{ name: "btw", description: "不污染主会话的侧边快问（/btw <问题>）" },
+	{ name: "loop", description: "定时自动循环执行提示词（/loop 5m <任务>，会自动消耗额度）" },
+	{ name: "batch", description: "并行分解并批量执行仓库改动（bundled skill）" },
 	{ name: "new", description: "新建会话" },
 	{ name: "plan", description: "进入/退出引擎级计划模式（只读调研+输出方案）" },
 	{ name: "rewind", description: "打开 Git 检查点与代码回滚" },
@@ -80,9 +84,9 @@ const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[
  * stops them instead. Pi commands, skills and templates with the same name win.
  */
 const CLAUDE_ONLY_COMMANDS = new Set([
-	"add-dir", "advisor", "agents-view", "autocompact", "background", "batch", "branch", "bug", "chrome", "copy",
+	"add-dir", "advisor", "agents-view", "autocompact", "background", "branch", "bug", "chrome", "copy",
 	"desktop", "diff", "doctor", "effort", "exit", "export", "fast", "feedback", "fork", "goal", "help", "ide",
-	"insights", "install-github-app", "keybindings", "login", "logout", "loop", "mobile", "model", "output-style",
+	"insights", "install-github-app", "keybindings", "login", "logout", "mobile", "model", "output-style",
 	"plugin", "pr-comments", "privacy-settings", "quit", "recap", "release-notes", "remote-control", "rename",
 	"resume", "review", "run", "sandbox", "schedule", "security-review", "simplify", "stats", "statusline",
 	"subtask", "teleport", "terminal-setup", "theme", "upgrade", "usage", "verify", "vim", "voice", "workflows",
@@ -105,6 +109,7 @@ export function LiveComposer({
 	onBuiltinSlash,
 	onCompactInstructions,
 	onBtw,
+	onLoop,
 	onFocusSubagentPanel,
 	inputRef,
 	fail,
@@ -124,6 +129,7 @@ export function LiveComposer({
 	onBuiltinSlash: (action: BuiltinSlashAction) => void;
 	onCompactInstructions?: (instructions: string) => void;
 	onBtw?: (question: string) => void;
+	onLoop?: (args: string) => void;
 	/** Focus the sub-agent panel above the composer when ArrowUp is pressed on an empty input. */
 	onFocusSubagentPanel?: () => boolean;
 	inputRef?: React.MutableRefObject<HTMLTextAreaElement | null>;
@@ -236,6 +242,28 @@ export function LiveComposer({
 			if (cmdName === "btw" && argText && onBtw) {
 				setDraft("");
 				onBtw(argText);
+				return;
+			}
+			if (cmdName === "loop" && argText && onLoop) {
+				setDraft("");
+				onLoop(argText);
+				return;
+			}
+			if (cmdName === "batch" && argText && !snapshot.commands.some((c) => c.name.toLowerCase() === "skill:batch")) {
+				if (disabled) return;
+				setDraft("");
+				setSending(true);
+				try {
+					await send(
+						promptInput(
+							`[Bundled /batch Skill]\n请先分析需求与仓库结构，将下述批量任务拆解为 5–30 个互不重叠的独立子单元，先使用 TodoCreate 写入共享任务清单，再使用并行 Agent(isolation="worktree") 或 WorkflowRun(parallel, phase, budget) 隔离执行并在最后汇总结果：\n\n${argText}`,
+							[],
+						),
+					);
+				} catch {
+				} finally {
+					setSending(false);
+				}
 				return;
 			}
 			const builtin = BUILTIN_SLASH_COMMANDS.find((c) => c.name === cmdName);

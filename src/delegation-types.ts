@@ -19,6 +19,12 @@ export interface DelegationMetadata {
 	runInBackground: boolean;
 	/** Call-level Agent `name`. */
 	name?: string;
+	/** Team name when experimental agentTeams is enabled. */
+	teamName?: string;
+	/** Suppress parent outbox notification (used by WorkflowService). */
+	notifySuppressed?: boolean;
+	/** Owning workflow ID when spawned by WorkflowService. */
+	workflowId?: string;
 }
 export interface DelegationContext {
 	conversationId: string;
@@ -67,6 +73,7 @@ export interface AgentToolInput {
 	fork?: boolean;
 	model?: AgentCallModel;
 	name?: string;
+	team_name?: string;
 	/** Accepted for compatibility with Claude Code and ignored (`mode`, `team_name`). */
 	ignored?: string[];
 }
@@ -143,6 +150,8 @@ export interface DelegationCallbacks {
 	maxSubagentDepth?(): number | Promise<number>;
 	/** `settings.maxConcurrentSubagents`; 8 when absent. */
 	maxConcurrentSubagents?(): number | Promise<number>;
+	/** `settings.agentTeams`; false when absent. */
+	teamsEnabled?(): boolean | Promise<boolean>;
 	/** Load preloaded skills and persistent agent memory block for a custom agent. */
 	prepareAgentContext?(project: string, definition: AgentDefinition): Promise<string | undefined>;
 	/** Persist metadata and apply inherited permissions before the task is scheduled. */

@@ -1,14 +1,15 @@
 import { useEffect, useState } from "react";
-import { ArrowDownToLine, Eye, GitBranch, GitMerge, Play, Send, Square, Trash2 } from "lucide-react";
+import { ArrowDownToLine, Check, Circle, Clock, Eye, GitBranch, GitMerge, ListTodo, LoaderCircle, Play, Send, Square, Trash2, Users, Workflow } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
 import { TranscriptView } from "./TranscriptView.tsx";
 import { applyEvent, transcript, type Transcript } from "./messages.ts";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
-import type { DesktopTask, ExternalTask, RpcExtensionUIRequest, TaskProgress, WorktreeInfo } from "../shared.ts";
+import type { CronJobRecord, DesktopTask, ExternalTask, MonitorRecord, RpcExtensionUIRequest, TaskProgress, TeamRecord, TodoRecord, WorkflowRecord, WorktreeInfo } from "../shared.ts";
 
 export function TasksDrawer({
 	project,
 	conversationId,
+	agentTeams = false,
 	initialTaskId,
 	close,
 	onNotice,
@@ -17,14 +18,20 @@ export function TasksDrawer({
 	project?: string;
 	/** Active conversation; "停止全部后台子 Agent" acts only on its own children. */
 	conversationId?: string;
+	agentTeams?: boolean;
 	initialTaskId?: string;
 	close: () => void;
 	onNotice: (msg: string) => void;
 	fail: (error: unknown) => void;
 }) {
-	const [tab, setTab] = useState<"tasks" | "worktrees">("tasks");
+	const [tab, setTab] = useState<"tasks" | "todos" | "cron" | "workflows" | "teams" | "worktrees">("tasks");
 	const [tasks, setTasks] = useState<DesktopTask[]>([]);
 	const [externalTasks, setExternalTasks] = useState<ExternalTask[]>([]);
+	const [monitors, setMonitors] = useState<MonitorRecord[]>([]);
+	const [todos, setTodos] = useState<TodoRecord[]>([]);
+	const [cronJobs, setCronJobs] = useState<CronJobRecord[]>([]);
+	const [workflows, setWorkflows] = useState<WorkflowRecord[]>([]);
+	const [team, setTeam] = useState<TeamRecord | null>(null);
 	const [progressMap, setProgressMap] = useState<Record<string, TaskProgress>>({});
 	const [worktrees, setWorktrees] = useState<WorktreeInfo[]>([]);
 	const [detailTranscript, setDetailTranscript] = useState<Transcript | null>(null);
@@ -42,16 +49,26 @@ export function TasksDrawer({
 
 	const refresh = async () => {
 		try {
-			const [taskList, extList, wtList] = await Promise.all([
+			const [taskList, extList, wtList, todoList, monList, cronList, wfList, teamData] = await Promise.all([
 				window.pi.tasks.list(),
 				window.pi.externalAgents.list(),
 				window.pi.worktrees.list(project),
+				conversationId && window.pi.todos?.list ? window.pi.todos.list(conversationId) : Promise.resolve([]),
+				window.pi.monitors?.list ? window.pi.monitors.list(conversationId) : Promise.resolve([]),
+				window.pi.cron?.list ? window.pi.cron.list(conversationId) : Promise.resolve([]),
+				window.pi.workflow?.list ? window.pi.workflow.list(conversationId) : Promise.resolve([]),
+				agentTeams && conversationId && window.pi.teams?.get ? window.pi.teams.get(conversationId) : Promise.resolve(null),
 			]);
 			const sortedTasks = [...taskList].sort((a, b) => b.updatedAt - a.updatedAt);
 			const sortedExt = [...extList].sort((a, b) => b.updatedAt - a.updatedAt);
 			setTasks(sortedTasks);
 			setExternalTasks(sortedExt);
 			setWorktrees(wtList);
+			setTodos(todoList);
+			setMonitors(monList);
+			setCronJobs(cronList);
+			setWorkflows(wfList);
+			setTeam(teamData);
 			if (initialTaskId && !detailTask && !extDetail) {
 				const piMatch = sortedTasks.find((t) => t.id === initialTaskId);
 				if (piMatch) void openDetail(piMatch);
@@ -98,11 +115,41 @@ export function TasksDrawer({
 				setExtDetail((prev) => (prev?.id === updated.id ? updated : prev));
 			}
 		});
+		const unsubTodos = window.pi.todos?.onEvent?.(() => {
+			if (conversationId && window.pi.todos?.list) {
+				void window.pi.todos.list(conversationId).then(setTodos).catch(() => {});
+			}
+		});
+		const unsubMonitors = window.pi.monitors?.onEvent?.(() => {
+			if (window.pi.monitors?.list) {
+				void window.pi.monitors.list(conversationId).then(setMonitors).catch(() => {});
+			}
+		});
+		const unsubCron = window.pi.cron?.onEvent?.(() => {
+			if (window.pi.cron?.list) {
+				void window.pi.cron.list(conversationId).then(setCronJobs).catch(() => {});
+			}
+		});
+		const unsubWorkflows = window.pi.workflow?.onEvent?.(() => {
+			if (window.pi.workflow?.list) {
+				void window.pi.workflow.list(conversationId).then(setWorkflows).catch(() => {});
+			}
+		});
+		const unsubTeams = window.pi.teams?.onEvent?.(() => {
+			if (agentTeams && conversationId && window.pi.teams?.get) {
+				void window.pi.teams.get(conversationId).then(setTeam).catch(() => {});
+			}
+		});
 		return () => {
 			unsubTasks();
 			unsubExternal();
+			unsubTodos?.();
+			unsubMonitors?.();
+			unsubCron?.();
+			unsubWorkflows?.();
+			unsubTeams?.();
 		};
-	}, [project]);
+	}, [project, conversationId, agentTeams]);
 
 	// A shown child conversation keeps its process; the host may stop idle finished ones otherwise.
 	const viewedConversationId = detailTask?.conversationId;
@@ -284,6 +331,20 @@ export function TasksDrawer({
 					<button type="button" role="tab" aria-selected={tab === "tasks"} onClick={() => setTab("tasks")}>
 						任务与子 Agent ({totalTasks})
 					</button>
+					<button type="button" role="tab" aria-selected={tab === "todos"} onClick={() => setTab("todos")}>
+						<ListTodo size={13} /> 任务清单 ({todos.length})
+					</button>
+					<button type="button" role="tab" aria-selected={tab === "cron"} onClick={() => setTab("cron")}>
+						<Clock size={13} /> 定时唤醒 ({cronJobs.length})
+					</button>
+					<button type="button" role="tab" aria-selected={tab === "workflows"} onClick={() => setTab("workflows")}>
+						<Workflow size={13} /> 工作流 ({workflows.length})
+					</button>
+					{agentTeams && (
+						<button type="button" role="tab" aria-selected={tab === "teams"} onClick={() => setTab("teams")}>
+							<Users size={13} /> 团队 ({team ? team.members.length : 0})
+						</button>
+					)}
 					<button type="button" role="tab" aria-selected={tab === "worktrees"} onClick={() => setTab("worktrees")}>
 						<GitBranch size={13} /> Worktrees ({worktrees.length})
 					</button>
@@ -643,8 +704,218 @@ export function TasksDrawer({
 										</div>
 									);
 								})}
-								{!totalTasks && <p className="subtle-note">暂无后台任务或模型子 Agent。</p>}
+								{monitors.map((mon) => (
+									<div key={mon.id} className="cc-tool-ctrl-row">
+										<div className="cc-tool-ctrl-info">
+											<div className="cc-tool-ctrl-name">
+												<strong>[Monitor:{mon.kind}] {mon.description}</strong>
+												<span className={`cc-action-badge ${mon.status === "running" ? "ask" : mon.status === "exited" || mon.status === "stopped" ? "allow" : "deny"}`}>
+													{mon.status}
+												</span>
+											</div>
+											<p className="cc-tool-ctrl-desc">
+												id={mon.id} · 事件数={mon.eventCount} · {mon.target}
+											</p>
+										</div>
+										<div className="cc-tool-ctrl-actions">
+											{mon.status === "running" && (
+												<button
+													type="button"
+													className="cc-mini-btn danger"
+													onClick={() => void window.pi.monitors.stop(mon.id).then(refresh).catch(fail)}
+												>
+													<Square size={12} /> 停止监听
+												</button>
+											)}
+										</div>
+									</div>
+								))}
+								{!totalTasks && !monitors.length && <p className="subtle-note">暂无后台任务、Monitor 或模型子 Agent。</p>}
 							</div>
+						)}
+					</div>
+				)}
+
+				{tab === "todos" && (
+					<div className="cc-controls-body">
+						<div className="cc-list-scroll">
+							{todos.map((item) => (
+								<div key={item.id} className="cc-tool-ctrl-row">
+									<div className="cc-tool-ctrl-info">
+										<div className="cc-tool-ctrl-name">
+											{item.status === "completed" ? (
+												<Check size={13} className="ok" />
+											) : item.status === "in_progress" ? (
+												<LoaderCircle size={13} className="spin run" />
+											) : (
+												<Circle size={12} className="pending" />
+											)}
+											<strong>#{item.id} {item.subject}</strong>
+											<span className={`cc-action-badge ${item.status === "completed" ? "allow" : item.status === "in_progress" ? "ask" : ""}`}>
+												{item.status}
+											</span>
+											{item.owner && <span className="cc-source-tag">@{item.owner}</span>}
+										</div>
+										<p className="cc-tool-ctrl-desc">
+											{item.status === "in_progress" && item.activeForm ? `${item.activeForm} · ` : ""}
+											{item.description}
+											{item.blockedBy.length > 0 ? ` · 阻塞于: #${item.blockedBy.join(", #")}` : ""}
+											{item.blocks.length > 0 ? ` · 阻塞: #${item.blocks.join(", #")}` : ""}
+										</p>
+									</div>
+									{conversationId && (
+										<div className="cc-tool-ctrl-actions">
+											<button
+												type="button"
+												className="cc-mini-btn"
+												disabled={busy}
+												onClick={() =>
+													void window.pi.todos
+														.update(conversationId, {
+															id: item.id,
+															status: item.status === "completed" ? "pending" : "completed",
+														})
+														.then(refresh)
+														.catch(fail)
+												}
+											>
+												{item.status === "completed" ? "重开" : "完成"}
+											</button>
+										</div>
+									)}
+								</div>
+							))}
+							{!todos.length && <p className="subtle-note">当前会话暂无持久化任务条目（模型可使用 TodoCreate / TodoUpdate 创建与更新）。</p>}
+						</div>
+					</div>
+				)}
+
+				{tab === "cron" && (
+					<div className="cc-controls-body">
+						<p className="subtle-note" role="note">
+							注意：定时唤醒与 `/loop` 仅在父会话空闲时触发，<strong>会自动消耗额度</strong>；任务 7 天后自动失效，可在设置中全局关闭。
+						</p>
+						<div className="cc-list-scroll">
+							{cronJobs.map((job) => (
+								<div key={job.id} className="cc-tool-ctrl-row">
+									<div className="cc-tool-ctrl-info">
+										<div className="cc-tool-ctrl-name">
+											<strong>[{job.source}] {job.cron ? `cron: ${job.cron}` : `every ${Math.round((job.intervalMs ?? 0) / 1000)}s`}</strong>
+											<span className="cc-source-tag">{job.durable ? "持久" : "临时"}</span>
+											<span className="cc-action-badge allow">已触发 {job.runCount} 次</span>
+										</div>
+										<p className="cc-tool-ctrl-desc">
+											{job.prompt} · 下次：{new Date(job.nextRunAt).toLocaleString()} · 过期：{new Date(job.expiresAt).toLocaleDateString()}
+										</p>
+									</div>
+									<div className="cc-tool-ctrl-actions">
+										<button
+											type="button"
+											className="cc-mini-btn danger"
+											disabled={busy}
+											onClick={() => void window.pi.cron.delete(job.id, conversationId).then(refresh).catch(fail)}
+										>
+											<Trash2 size={12} /> 删除
+										</button>
+									</div>
+								</div>
+							))}
+							{!cronJobs.length && <p className="subtle-note">当前会话暂无活跃的定时唤醒任务（可通过 `/loop 5m 检查状态` 创建）。</p>}
+						</div>
+					</div>
+				)}
+
+				{tab === "workflows" && (
+					<div className="cc-controls-body">
+						<div className="cc-list-scroll">
+							{workflows.map((wf) => (
+								<div key={wf.id} className="cc-tool-ctrl-row">
+									<div className="cc-tool-ctrl-info">
+										<div className="cc-tool-ctrl-name">
+											<strong>{wf.title}</strong>
+											<span className="cc-source-tag">{wf.id}</span>
+											<span className={`cc-action-badge ${wf.status === "completed" ? "allow" : wf.status === "failed" || wf.status === "cancelled" ? "deny" : "ask"}`}>
+												{wf.status}
+											</span>
+										</div>
+										<p className="cc-tool-ctrl-desc">
+											阶段 {wf.phases.length} · Journal 步骤 {Object.keys(wf.journal).length} · 费用 ${wf.budget.spentCost.toFixed(4)}
+											{wf.error ? ` · ${wf.error}` : ""}
+										</p>
+									</div>
+									<div className="cc-tool-ctrl-actions">
+										{(wf.status === "running" || wf.status === "waiting_for_approval") && (
+											<button
+												type="button"
+												className="cc-mini-btn danger"
+												disabled={busy}
+												onClick={() => void window.pi.workflow.stop(wf.id).then(refresh).catch(fail)}
+											>
+												<Square size={12} /> 停止
+											</button>
+										)}
+										{(wf.status === "failed" || wf.status === "cancelled") && (
+											<button
+												type="button"
+												className="cc-mini-btn"
+												disabled={busy}
+												onClick={() => void window.pi.workflow.resume(wf.id).then(refresh).catch(fail)}
+											>
+												<Play size={12} /> 恢复运行
+											</button>
+										)}
+									</div>
+								</div>
+							))}
+							{!workflows.length && <p className="subtle-note">当前会话暂无 Workflow 运行记录。</p>}
+						</div>
+					</div>
+				)}
+
+				{agentTeams && tab === "teams" && (
+					<div className="cc-controls-body">
+						{team ? (
+							<div className="cc-list-scroll">
+								<div className="cc-tool-ctrl-row">
+									<div className="cc-tool-ctrl-info">
+										<div className="cc-tool-ctrl-name">
+											<strong>团队：{team.name}</strong>
+											<span className="cc-source-tag">{team.members.length} 名成员</span>
+										</div>
+										{team.description && <p className="cc-tool-ctrl-desc">{team.description}</p>}
+									</div>
+									{conversationId && (
+										<div className="cc-tool-ctrl-actions">
+											<button
+												type="button"
+												className="cc-mini-btn danger"
+												disabled={busy}
+												onClick={() => void window.pi.teams.delete(conversationId, team.name).then(refresh).catch(fail)}
+											>
+												<Trash2 size={12} /> 解散团队
+											</button>
+										</div>
+									)}
+								</div>
+								{team.members.map((member) => (
+									<div key={member.name} className="cc-tool-ctrl-row">
+										<div className="cc-tool-ctrl-info">
+											<div className="cc-tool-ctrl-name">
+												<strong>@{member.name}</strong>
+												{member.subagentType && <span className="cc-source-tag">{member.subagentType}</span>}
+												<span className={`cc-action-badge ${member.status === "active" ? "ask" : member.status === "idle" ? "allow" : "deny"}`}>
+													{member.status}
+												</span>
+											</div>
+											<p className="cc-tool-ctrl-desc">
+												{member.agentId ? `task=${member.agentId}` : "team leader"}
+											</p>
+										</div>
+									</div>
+								))}
+							</div>
+						) : (
+							<p className="subtle-note">当前会话尚未创建 Team（模型可使用 TeamCreate 建立团队并分配 Todo* 清单）。</p>
 						)}
 					</div>
 				)}
