@@ -125,7 +125,7 @@ import { WorkflowService } from "./workflow-service.ts";
 import { validateJsonSchema } from "./workflow-schema.ts";
 import type { WorkflowApprovalDecision, WorkflowEvent, WorkflowRecord, WorkflowRunInput } from "./workflow-types.ts";
 import { buildContextReport, deleteProjectMemoryRule, writeProjectMemoryFile, type ContextBreakdown, type ContextMemorySource } from "./context-inspector.ts";
-import { buildSeatbeltProfile, probeSeatbeltSupport } from "./sandbox.ts";
+import { buildSeatbeltProfile, probeSeatbeltSupport, resolveGitWorktreeWritablePaths } from "./sandbox.ts";
 import { readClaudeProjectPermissionsDetailed, writeClaudeProjectPermissions } from "./claude-settings-sync.ts";
 import { createForkedSessionSnapshot, findSessionFileById } from "./session-fork.ts";
 import type { BtwResult, ClaudePermissionsSyncResult, PlanFileState, SandboxStatus } from "./shared.ts";
@@ -698,6 +698,10 @@ export class DesktopService {
 		await this.worktrees.initialize();
 		await this.cron.loadGlobal();
 		await this.workflows.initialize();
+		if (this.store.settings.sandbox === undefined && process.env.PI_DESKTOP_NO_AUTO_SANDBOX !== "1") {
+			const seatbelt = await probeSeatbeltSupport();
+			if (seatbelt.supported) this.store.settings.sandbox = true;
+		}
 		await this.persist();
 		const reapInterval = this.options.childRuntimeReapIntervalMs ?? CHILD_RUNTIME_REAP_INTERVAL_MS;
 		if (reapInterval > 0 && !this.reapTimer) {
@@ -4474,12 +4478,14 @@ export class DesktopService {
 			);
 			if (this.store.settings.sandbox) {
 				if (!(await probeSeatbeltSupport()).supported) throw new Error("无法启动命令沙箱。请在支持的环境中运行，或在设置中关闭沙箱。");
+				const extraWritable = await resolveGitWorktreeWritablePaths(conversation.project);
 				runtime.sandboxProfileFile = join(this.options.dataDir, `sandbox-${conversation.id}-${randomBytes(8).toString("hex")}.sb`);
-				await writeFile(runtime.sandboxProfileFile, buildSeatbeltProfile(conversation.project, [], this.store.settings.sandboxOffline), { mode: 0o600 });
+				await writeFile(runtime.sandboxProfileFile, buildSeatbeltProfile(conversation.project, extraWritable, this.store.settings.sandboxOffline), { mode: 0o600 });
 				env.PI_DESKTOP_SANDBOX_PROFILE = runtime.sandboxProfileFile;
 			} else if (shouldConfineWorktreeChild && (await probeSeatbeltSupport()).supported) {
+				const extraWritable = await resolveGitWorktreeWritablePaths(conversation.project);
 				runtime.sandboxProfileFile = join(this.options.dataDir, `sandbox-${conversation.id}-${randomBytes(8).toString("hex")}.sb`);
-				await writeFile(runtime.sandboxProfileFile, buildSeatbeltProfile(conversation.project, [], this.store.settings.sandboxOffline), { mode: 0o600 });
+				await writeFile(runtime.sandboxProfileFile, buildSeatbeltProfile(conversation.project, extraWritable, this.store.settings.sandboxOffline), { mode: 0o600 });
 				env.PI_DESKTOP_SANDBOX_PROFILE = runtime.sandboxProfileFile;
 			}
 			// Set these explicitly so an inherited shell environment cannot change a session's role.

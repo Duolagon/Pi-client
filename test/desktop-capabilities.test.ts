@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { test } from "node:test";
+import { promisify } from "node:util";
 import { readClaudeProjectPermissions, writeClaudeProjectPermissions } from "../src/claude-settings-sync.ts";
 import { HooksService } from "../src/hooks-service.ts";
 import { codeIntelligence } from "../src/language-service.ts";
 import { McpRegistry } from "../src/mcp-registry.ts";
 import { projectMemoryContext } from "../src/project-memory.ts";
 import { createDraftPullRequest, readPullRequest } from "../src/review-service.ts";
-import { buildSeatbeltProfile } from "../src/sandbox.ts";
+import { buildSeatbeltProfile, probeSeatbeltSupport, resolveGitWorktreeWritablePaths } from "../src/sandbox.ts";
+
+const exec = promisify(execFile);
 
 async function fixture(t: { after: (cleanup: () => Promise<void>) => void }) {
 	const root = await realpath(await mkdtemp(join(tmpdir(), "pi-desktop-feature-")));
@@ -71,8 +75,12 @@ test("project memory follows nested imports and path globs within the workspace"
 	assert.doesNotMatch(unscoped, /SCOPED-RULE|SECRET-VALUE|## linked.md/);
 	assert.match(await projectMemoryContext(root, "inspect @src/test.ts"), /SCOPED-RULE[\s\S]*REFERENCE-TEXT/);
 	assert.match(await projectMemoryContext(root, "inspect", undefined, [join(root, "src/test.ts")]), /SCOPED-RULE/);
-	assert.doesNotMatch(buildSeatbeltProfile(root), /deny network/);
-	assert.match(buildSeatbeltProfile(root, [], true), /deny network/);
+	const seatbelt = buildSeatbeltProfile(root, [], false, "/Users/example");
+	assert.doesNotMatch(seatbelt, /deny network/);
+	assert.match(seatbelt, /\(deny file-read\*[\s\S]*\/Users\/example\/\.ssh/);
+	assert.match(seatbelt, /\/Users\/example\/\.aws/);
+	assert.match(seatbelt, /\/Users\/example\/\.netrc/);
+	assert.match(buildSeatbeltProfile(root, [], true, "/Users/example"), /deny network/);
 });
 
 test("GitHub CLI reports checks and creates draft PRs using an explicit head", async (t) => {
@@ -130,4 +138,38 @@ process.stdin.on("data", chunk => {
 	assert.deepEqual(result.symbols, [{ name: "demo", line: 2, column: 3 }]);
 	assert.equal(result.diagnostics[0].message, "Fixture");
 	assert.deepEqual(result.definitions, [{ path: "demo.ts", line: 2, column: 3 }]);
+});
+
+test("resolveGitWorktreeWritablePaths grants minimal git metadata write access for worktrees under Seatbelt", async (t) => {
+	const root = await fixture(t);
+	const mainRepo = join(root, "main");
+	const wtRepo = join(root, "wt");
+	const wtSub = join(wtRepo, "packages", "app");
+	await mkdir(mainRepo);
+	const gitEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
+	await exec("git", ["init", "-b", "main"], { cwd: mainRepo, env: gitEnv });
+	await writeFile(join(mainRepo, "a.txt"), "hello\n");
+	await exec("git", ["add", "a.txt"], { cwd: mainRepo, env: gitEnv });
+	await exec("git", ["-c", "user.name=T", "-c", "user.email=t@t", "commit", "-m", "init"], { cwd: mainRepo, env: gitEnv });
+	await exec("git", ["worktree", "add", "-b", "feat-sb", wtRepo], { cwd: mainRepo, env: gitEnv });
+	await mkdir(wtSub, { recursive: true });
+
+	assert.deepEqual(await resolveGitWorktreeWritablePaths(mainRepo), []);
+	const extras = await resolveGitWorktreeWritablePaths(wtSub);
+	assert.ok(extras.some((p) => p.includes("/.git/worktrees/")));
+	assert.ok(extras.some((p) => p.endsWith("/.git/objects")));
+	assert.ok(extras.some((p) => p.endsWith("/.git/refs")));
+	assert.ok(!extras.includes(join(mainRepo, ".git")), "must not expose main .git root (config/hooks)");
+
+	if ((await probeSeatbeltSupport()).supported) {
+		const profile = buildSeatbeltProfile(wtRepo, extras, false);
+		await writeFile(join(wtRepo, "b.txt"), "world\n");
+		await exec(
+			"/usr/bin/sandbox-exec",
+			["-p", profile, "/bin/sh", "-c", "git add b.txt && git -c user.name=T -c user.email=t@t commit -m wt-commit"],
+			{ cwd: wtRepo, env: gitEnv },
+		);
+		const { stdout } = await exec("git", ["log", "-n", "1", "--oneline"], { cwd: wtRepo, env: gitEnv });
+		assert.match(stdout, /wt-commit/);
+	}
 });

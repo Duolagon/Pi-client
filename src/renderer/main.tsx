@@ -29,6 +29,10 @@ import {
 	Check,
 	Circle,
 	LoaderCircle,
+	MoreHorizontal,
+	Folder,
+	Sparkles,
+	WifiOff,
 } from "lucide-react";
 import type {
 	Conversation,
@@ -38,6 +42,7 @@ import type {
 	PermissionMode,
 	PlanFileState,
 	ProjectTrustDecision,
+	SandboxStatus,
 	Snapshot,
 	TaskProgress,
 	TodoRecord,
@@ -47,6 +52,7 @@ import { IconButton, Modal, PiMark } from "../prototype/ui.tsx";
 import { useDesktop } from "./useDesktop.ts";
 import { TranscriptView, type TodoItem } from "./TranscriptView.tsx";
 import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
+import { WorkspacePicker } from "./WorkspacePicker.tsx";
 import { SubagentPanel, type SubagentPanelHandle } from "./SubagentPanel.tsx";
 import { SubagentTranscriptView } from "./SubagentTranscriptView.tsx";
 import { SubagentApprovals } from "./SubagentApprovals.tsx";
@@ -125,8 +131,36 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [externalTasksMap, setExternalTasksMap] = useState<Record<string, ExternalTask>>({});
 	const [gitSummary, setGitSummary] = useState<{ branch: string; count: number; isGit: boolean } | null>(null);
 	const [rename, setRename] = useState<string | null>(null);
+	const [sandboxStatus, setSandboxStatus] = useState<SandboxStatus | null>(null);
+	const [sandboxOpen, setSandboxOpen] = useState(false);
+	const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+	const moreMenuRef = useRef<HTMLDivElement>(null);
 	const scroll = useRef<HTMLDivElement>(null);
 	const stickToEnd = useRef(true);
+	useEffect(() => {
+		let mounted = true;
+		void api.sandboxStatus().then((status) => {
+			if (mounted) setSandboxStatus(status);
+		}).catch(() => {});
+		return () => {
+			mounted = false;
+		};
+	}, [api, snapshot?.settings.sandbox, snapshot?.settings.sandboxOffline]);
+	useEffect(() => {
+		if (!moreMenuOpen) return;
+		const onMouseDown = (event: MouseEvent) => {
+			if (moreMenuRef.current && !moreMenuRef.current.contains(event.target as Node)) setMoreMenuOpen(false);
+		};
+		const onKeyDown = (event: KeyboardEvent) => {
+			if (event.key === "Escape") setMoreMenuOpen(false);
+		};
+		window.addEventListener("mousedown", onMouseDown);
+		window.addEventListener("keydown", onKeyDown);
+		return () => {
+			window.removeEventListener("mousedown", onMouseDown);
+			window.removeEventListener("keydown", onKeyDown);
+		};
+	}, [moreMenuOpen]);
 	useEffect(() => {
 		stickToEnd.current = true;
 		setDeferredApproval(undefined);
@@ -350,6 +384,34 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		if (permission === "plan" && !planMode) setPlanMode(true);
 		await app.switchTo(() => api.saveSettings({ permission, theme: snapshot.settings.theme }));
 	};
+	const saveSandbox = async (next: { sandbox: boolean; sandboxOffline: boolean }) => {
+		if (!snapshot) return;
+		await app.switchTo(() =>
+			api.saveSettings({
+				permission: snapshot.settings.permission,
+				theme: snapshot.settings.theme,
+				sandbox: next.sandbox,
+				sandboxOffline: next.sandbox && next.sandboxOffline,
+			}),
+		);
+		const status = await api.sandboxStatus().catch(() => null);
+		if (status) setSandboxStatus(status);
+		app.setNotice(
+			next.sandbox
+				? next.sandboxOffline
+					? "已开启 macOS Seatbelt 离线命令沙箱。"
+					: "已开启 macOS Seatbelt 命令沙箱。"
+				: "已关闭 OS 命令沙箱。",
+		);
+	};
+	const selectWorkspace = (path: string) => {
+		setMoreMenuOpen(false);
+		switchTo(() => api.selectProject(path));
+	};
+	const openWorkspace = () => {
+		setMoreMenuOpen(false);
+		void app.switchTo(() => api.openProject());
+	};
 	const decideTrust = async (decision: ProjectTrustDecision) => {
 		if (!snapshot?.trust || trustBusy) return;
 		setTrustBusy(true);
@@ -427,6 +489,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			app.setDraft("/loop 5m ");
 		} else if (action === "batch") {
 			app.setDraft("/batch ");
+		} else if (action === "sandbox") {
+			setSandboxOpen(true);
 		} else if (action === "new") {
 			if (!changing && snapshot?.active) switchTo(() => api.newConversation());
 		} else if (action === "permissions") {
@@ -603,7 +667,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		{ id: "new", label: "新建会话", shortcut: "⌘N", keywords: "new session clear", disabled: changing || !snapshot.active, run: () => switchTo(() => api.newConversation()) },
 		{ id: "search", label: "搜索历史会话", shortcut: "⌘K", keywords: "search find", run: () => { setQuery(""); setSearching(true); } },
 		{ id: "find", label: "会话内关键词搜索", shortcut: "⌘F", keywords: "find in transcript", disabled: !snapshot.active, run: () => setFindOpen(true) },
-		{ id: "open", label: "打开项目文件夹", keywords: "open project folder", disabled: changing, run: () => void app.switchTo(() => api.openProject()) },
+		{ id: "open", label: "打开项目文件夹", keywords: "open project folder", disabled: changing, run: () => openWorkspace() },
+		{ id: "sandbox", label: "命令沙箱设置 (/sandbox)", keywords: "sandbox seatbelt offline isolation", run: () => setSandboxOpen(true) },
 		{ id: "plan", label: inPlanMode ? "退出 Plan 计划模式" : "进入 Plan 计划模式", keywords: "plan mode readonly", disabled: blocked, run: () => void togglePlanMode() },
 		{ id: "rewind", label: "检查点与代码回滚 (/rewind)", keywords: "git checkpoint restore", disabled: !snapshot.active, run: () => { setRewindQuery(undefined); setCheckpointsOpen(true); } },
 		{ id: "tasks", label: "后台任务、子 Agent 与 Worktree (/tasks)", keywords: "subagent external codex claude kimi", run: () => { setTaskInitialId(undefined); setTasksOpen(true); } },
@@ -627,58 +692,79 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	];
 	return (
 		<div className={`desktop-app live-app ${sidebar ? "" : "cl-side-hidden"} ${pane || previewUrl ? "has-inspector" : ""}`}>
-			<nav className="cl-rail" aria-label="主导航">
-				{sidebar ? (
-					<IconButton icon={PanelLeftClose} label="收起侧栏" onClick={() => setSidebar(false)} />
-				) : (
-					<IconButton icon={PanelLeftOpen} label="展开侧栏" onClick={() => setSidebar(true)} />
-				)}
-				<IconButton
-					icon={SquarePen}
-					label="新建会话"
-					disabled={changing || !snapshot.active}
-					onClick={() => switchTo(() => api.newConversation())}
-				/>
-				<IconButton
-					icon={Search}
-					label="搜索会话"
-					onClick={() => {
-						setQuery("");
-						setSearching(true);
-					}}
-				/>
-				<IconButton icon={FolderOpen} label="打开项目" disabled={changing} onClick={() => void app.switchTo(() => api.openProject())} />
-				<span className="cl-rail-spacer" />
-				<IconButton icon={Settings} label="设置" active={settings} onClick={() => setSettings(true)} />
-			</nav>
 			{sidebar && (
 				<aside className="cl-side" aria-label="项目与会话">
 					<div className="cl-side-head">
-						<span className="cl-side-title">会话</span>
+						<span className="cl-side-brand">
+							<PiMark />
+							<span className="cl-side-title">Pi Code</span>
+						</span>
+						<IconButton icon={PanelLeftClose} label="收起侧栏" onClick={() => setSidebar(false)} />
 					</div>
 					<div className="cl-side-actions">
-						<button className="cl-side-action" disabled={changing || !snapshot.active} onClick={() => switchTo(() => api.newConversation())}>
-							<Plus size={16} />
-							<span>新建会话</span>
-							<kbd>⌘N</kbd>
-						</button>
 						<button
-							className="cl-side-action"
-							onClick={() => {
-								setQuery("");
-								setSearching(true);
-							}}
+							type="button"
+							className="cl-side-new"
+							aria-label="新建会话"
+							disabled={changing || !snapshot.active}
+							onClick={() => switchTo(() => api.newConversation())}
 						>
-							<Search size={16} />
-							<span>搜索会话</span>
-							<kbd>⌘K</kbd>
+							<Plus size={15} />
+							<span>新建会话</span>
+							<kbd aria-hidden="true">⌘N</kbd>
 						</button>
-						<button className="cl-side-action" disabled={changing} onClick={() => void app.switchTo(() => api.openProject())}>
-							<FolderOpen size={16} />
-							<span>打开项目</span>
-						</button>
+						<div className="cl-side-action-row">
+							<button
+								type="button"
+								className="cl-side-action"
+								aria-label="搜索会话"
+								onClick={() => {
+									setQuery("");
+									setSearching(true);
+								}}
+							>
+								<Search size={14} />
+								<span>搜索</span>
+								<kbd aria-hidden="true">⌘K</kbd>
+							</button>
+							<button
+								type="button"
+								className="cl-side-action"
+								aria-label="打开项目"
+								disabled={changing}
+								onClick={openWorkspace}
+							>
+								<FolderOpen size={14} />
+								<span>打开目录</span>
+							</button>
+						</div>
 					</div>
 					<div className="cl-side-scroll">
+						{snapshot.projects.length > 0 && (
+							<section className="cl-group cl-side-workspaces" aria-label="工作目录">
+								<div className="cl-group-label">工作目录</div>
+								<div className="cl-ws-chips">
+									{snapshot.projects.map((item) => {
+										const isCurrent = item.path === project?.path;
+										return (
+											<button
+												key={item.path}
+												type="button"
+												className={`cl-ws-chip ${isCurrent ? "active" : ""}`}
+												title={item.path}
+												disabled={changing}
+												onClick={() => {
+													if (!isCurrent) selectWorkspace(item.path);
+												}}
+											>
+												<Folder size={13} />
+												<span>{item.name}</span>
+											</button>
+										);
+									})}
+								</div>
+							</section>
+						)}
 						{groups.map((group) => (
 							<section className="cl-group" key={group.label}>
 								<div className="cl-group-label">{group.label}</div>
@@ -749,32 +835,87 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								})}
 							</section>
 						))}
-						{!snapshot.conversations.length && <p className="cl-side-empty">还没有会话。打开项目，开始第一次编码任务。</p>}
+						{!snapshot.conversations.length && <p className="cl-side-empty">还没有会话。选择一个工作目录开始编码。</p>}
 					</div>
 					<div className="cl-side-foot">
-						<span className={`cl-engine ${ready ? "ok" : ""}`}>
-							<i />
-							{ready ? "Pi 引擎已连接" : "Pi 引擎未就绪"}
-						</span>
-						<span className="cl-foot-project">{project?.name ?? "本地工作区"}</span>
+						<div className="cl-side-foot-status">
+							<span className={`cl-engine ${ready ? "ok" : ""}`}>
+								<i />
+								{ready ? "Pi 引擎就绪" : "引擎未就绪"}
+							</span>
+							<button
+								type="button"
+								className={`cl-foot-sandbox ${snapshot.settings.sandbox ? "on" : "off"}`}
+								onClick={() => setSandboxOpen(true)}
+								title="点击管理命令沙箱"
+							>
+								{snapshot.settings.sandbox ? (
+									snapshot.settings.sandboxOffline ? (
+										<>
+											<WifiOff size={11} />
+											<span>离线沙箱</span>
+										</>
+									) : (
+										<>
+											<ShieldCheck size={11} />
+											<span>沙箱保护</span>
+										</>
+									)
+								) : (
+									<>
+										<ShieldAlert size={11} />
+										<span>无沙箱</span>
+									</>
+								)}
+							</button>
+						</div>
+						<button
+							type="button"
+							className={`cl-foot-settings ${settings ? "active" : ""}`}
+							aria-label="设置"
+							onClick={() => setSettings(true)}
+						>
+							<Settings size={14} />
+							<span>设置</span>
+						</button>
 					</div>
 				</aside>
 			)}
 			<main className="cl-main">
-				<header className="cl-top">
+				<header className={`cl-top ${sidebar ? "" : "cl-top-collapsed"}`}>
 					<div className="cl-top-title">
-						<button
-							className="cl-title-button"
-							disabled={blocked || !snapshot.active}
-							onClick={() => setRename(snapshot.active?.title ?? "")}
-						>
-							{snapshot.active?.title ?? "打开一个项目开始"}
-						</button>
-						{project && (
-							<span className="cc-project-pill" title={project.path}>
-								{project.name}
-								{gitSummary?.isGit && gitSummary.branch ? ` · ${gitSummary.branch}` : ""}
-							</span>
+						{!sidebar && (
+							<>
+								<IconButton icon={PanelLeftOpen} label="展开侧栏" onClick={() => setSidebar(true)} />
+								<IconButton
+									icon={SquarePen}
+									label="新建会话"
+									disabled={changing || !snapshot.active}
+									onClick={() => switchTo(() => api.newConversation())}
+								/>
+							</>
+						)}
+						<WorkspacePicker
+							variant="topbar"
+							projects={snapshot.projects}
+							activeProject={project}
+							gitBranch={gitSummary?.isGit ? gitSummary.branch : undefined}
+							disabled={changing}
+							onSelectProject={selectWorkspace}
+							onOpenProject={openWorkspace}
+						/>
+						{snapshot.active && (
+							<>
+								<span className="cl-top-sep" aria-hidden="true">/</span>
+								<button
+									className="cl-title-button"
+									disabled={blocked}
+									onClick={() => setRename(snapshot.active?.title ?? "")}
+									title="点击重命名会话"
+								>
+									{snapshot.active.title}
+								</button>
+							</>
 						)}
 					</div>
 					<div className="cl-top-tools">
@@ -792,50 +933,240 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								onClick={() => setTrustOpen(true)}
 							/>
 						)}
-						<IconButton icon={Bot} label="Agents 与子 Agent" disabled={!snapshot.active} active={agentsOpen} onClick={() => setAgentsOpen(true)} />
-						<IconButton icon={Plug} label="MCP 服务器" disabled={!snapshot.active} active={mcpOpen} onClick={() => setMcpOpen(true)} />
-						<IconButton icon={History} label="检查点与回滚" disabled={!snapshot.active} onClick={() => { setRewindQuery(undefined); setCheckpointsOpen(true); }} />
-						<span className="cc-tool-btn-wrap">
-							<IconButton icon={ListTodo} label="后台任务与 Worktree" onClick={() => { setTaskInitialId(undefined); setTasksOpen(true); }} />
-							{(activeTaskCount > 0 || waitingTaskCount > 0) && (
-								<span className={`cc-topbar-badge ${waitingTaskCount > 0 ? "warn" : ""}`}>
-									{waitingTaskCount > 0 ? `!${waitingTaskCount}` : activeTaskCount}
-								</span>
+						<div className="cc-top-seg" role="toolbar" aria-label="工作区工具">
+							<button
+								type="button"
+								className={`cc-top-btn ${pane === "changes" ? "active" : ""}`}
+								aria-label="代码修改"
+								title="代码修改与 Git Diff"
+								onClick={() => { setPreviewUrl(null); setPane(pane === "changes" ? null : "changes"); }}
+							>
+								<GitCompareArrows size={14} />
+								<span>差异</span>
+								{gitSummary && gitSummary.count > 0 && <em className="cc-top-count">{gitSummary.count}</em>}
+							</button>
+							<button
+								type="button"
+								className={`cc-top-btn ${pane === "files" ? "active" : ""}`}
+								aria-label="项目文件"
+								title="浏览项目文件"
+								onClick={() => { setPreviewUrl(null); setPane(pane === "files" ? null : "files"); }}
+							>
+								<Files size={14} />
+								<span>文件</span>
+							</button>
+							<button
+								type="button"
+								className={`cc-top-btn ${terminalOpen ? "active" : ""}`}
+								aria-label="终端"
+								title="打开终端 / 交互 PTY"
+								onClick={() => setTerminalOpen(!terminalOpen)}
+							>
+								<TerminalIcon size={14} />
+								<span>终端</span>
+							</button>
+							<button
+								type="button"
+								className={`cc-top-btn ${tasksOpen ? "active" : ""}`}
+								aria-label="后台任务与 Worktree"
+								title="后台任务、子 Agent、工作流与 Worktree"
+								onClick={() => { setTaskInitialId(undefined); setTasksOpen(true); }}
+							>
+								<ListTodo size={14} />
+								<span>任务</span>
+								{(activeTaskCount > 0 || waitingTaskCount > 0) && (
+									<em className={`cc-top-count ${waitingTaskCount > 0 ? "warn" : ""}`}>
+										{waitingTaskCount > 0 ? `!${waitingTaskCount}` : activeTaskCount}
+									</em>
+								)}
+							</button>
+						</div>
+						<div className="cc-more-wrap" ref={moreMenuRef}>
+							<button
+								type="button"
+								className={`cc-top-btn cc-more-btn ${moreMenuOpen ? "active" : ""}`}
+								aria-label="更多工具"
+								aria-haspopup="menu"
+								aria-expanded={moreMenuOpen}
+								title="更多工具与会话操作"
+								onClick={() => setMoreMenuOpen((prev) => !prev)}
+							>
+								<MoreHorizontal size={15} />
+							</button>
+							{moreMenuOpen && (
+								<div className="cc-more-menu" role="menu" aria-label="更多工具菜单">
+									<div className="cc-more-group">
+										<div className="cc-more-label">工作区与会话</div>
+										<button
+											type="button"
+											role="menuitem"
+											className="cc-more-item"
+											onClick={() => {
+												setMoreMenuOpen(false);
+												setPane(null);
+												setPreviewUrl((v) => (v ? null : "http://localhost:3000"));
+											}}
+										>
+											<Globe size={14} />
+											<span>本地网页预览</span>
+										</button>
+										<button
+											type="button"
+											role="menuitem"
+											className="cc-more-item"
+											disabled={!snapshot.active}
+											onClick={() => {
+												setMoreMenuOpen(false);
+												setRewindQuery(undefined);
+												setCheckpointsOpen(true);
+											}}
+										>
+											<History size={14} />
+											<span>检查点与回滚</span>
+										</button>
+										<button
+											type="button"
+											role="menuitem"
+											className="cc-more-item"
+											disabled={!snapshot.active}
+											onClick={() => {
+												setMoreMenuOpen(false);
+												setSessionsOpen(true);
+											}}
+										>
+											<GitFork size={14} />
+											<span>会话分支树</span>
+										</button>
+										<button
+											type="button"
+											role="menuitem"
+											className="cc-more-item"
+											disabled={!snapshot.active}
+											onClick={() => {
+												setMoreMenuOpen(false);
+												setMemoryTab("memory");
+											}}
+										>
+											<BookOpen size={14} />
+											<span>项目记忆与状态</span>
+										</button>
+										<button
+											type="button"
+											role="menuitem"
+											className="cc-more-item"
+											onClick={() => {
+												setMoreMenuOpen(false);
+												setPaletteOpen(true);
+											}}
+										>
+											<CommandIcon size={14} />
+											<span>命令面板</span>
+											<kbd aria-hidden="true">⌘P</kbd>
+										</button>
+									</div>
+									<div className="cc-more-divider" />
+									<div className="cc-more-group">
+										<div className="cc-more-label">能力与控制</div>
+										<button
+											type="button"
+											role="menuitem"
+											className="cc-more-item"
+											disabled={!snapshot.active}
+											onClick={() => {
+												setMoreMenuOpen(false);
+												setAgentsOpen(true);
+											}}
+										>
+											<Bot size={14} />
+											<span>Agents 与子 Agent</span>
+										</button>
+										<button
+											type="button"
+											role="menuitem"
+											className="cc-more-item"
+											disabled={!snapshot.active}
+											onClick={() => {
+												setMoreMenuOpen(false);
+												setMcpOpen(true);
+											}}
+										>
+											<Plug size={14} />
+											<span>MCP 服务器</span>
+										</button>
+										<button
+											type="button"
+											role="menuitem"
+											className="cc-more-item"
+											onClick={() => {
+												setMoreMenuOpen(false);
+												setControlsTab("tools");
+											}}
+										>
+											<SlidersHorizontal size={14} />
+											<span>工具与权限</span>
+										</button>
+										<button
+											type="button"
+											role="menuitem"
+											className="cc-more-item"
+											disabled={blocked}
+											onClick={() => {
+												setMoreMenuOpen(false);
+												void app.refresh();
+											}}
+										>
+											<RefreshCw size={14} />
+											<span>刷新会话</span>
+										</button>
+										<button
+											type="button"
+											role="menuitem"
+											className="cc-more-item"
+											disabled={blocked || !history.messages.length}
+											onClick={() => {
+												setMoreMenuOpen(false);
+												void app.command({ type: "compact" });
+											}}
+										>
+											<Archive size={14} />
+											<span>压缩上下文</span>
+										</button>
+										<button
+											type="button"
+											role="menuitem"
+											className="cc-more-item"
+											disabled={blocked || !snapshot.active}
+											onClick={() => {
+												setMoreMenuOpen(false);
+												void api
+													.exportConversation()
+													.then((path) => {
+														if (path) app.setNotice(`会话已导出：${path}`);
+													})
+													.catch(app.fail);
+											}}
+										>
+											<Download size={14} />
+											<span>导出会话</span>
+										</button>
+										{!sidebar && (
+											<button
+												type="button"
+												role="menuitem"
+												className="cc-more-item"
+												onClick={() => {
+													setMoreMenuOpen(false);
+													setSettings(true);
+												}}
+											>
+												<Settings size={14} />
+												<span>设置</span>
+											</button>
+										)}
+									</div>
+								</div>
 							)}
-						</span>
-						<IconButton icon={SlidersHorizontal} label="工具与权限" onClick={() => setControlsTab("tools")} />
-						<IconButton icon={GitFork} label="会话分支树" disabled={!snapshot.active} onClick={() => setSessionsOpen(true)} />
-						<IconButton icon={BookOpen} label="项目记忆与状态" disabled={!snapshot.active} onClick={() => setMemoryTab("memory")} />
-						<IconButton icon={Globe} label="本地网页预览" onClick={() => { setPane(null); setPreviewUrl((v) => (v ? null : "http://localhost:3000")); }} active={Boolean(previewUrl)} />
-						<IconButton icon={CommandIcon} label="命令面板" onClick={() => setPaletteOpen(true)} />
-						<IconButton icon={RefreshCw} label="刷新会话" disabled={blocked} onClick={() => void app.refresh()} />
-						<IconButton icon={Archive} label="压缩上下文" disabled={blocked || !history.messages.length} onClick={() => void app.command({ type: "compact" })} />
-						<IconButton
-							icon={Download}
-							label="导出会话"
-							disabled={blocked || !snapshot.active}
-							onClick={() => {
-								void api
-									.exportConversation()
-									.then((path) => {
-										if (path) app.setNotice(`会话已导出：${path}`);
-									})
-									.catch(app.fail);
-							}}
-						/>
-						<IconButton icon={TerminalIcon} label="终端" onClick={() => setTerminalOpen(!terminalOpen)} active={terminalOpen} />
-						<IconButton
-							icon={GitCompareArrows}
-							label="代码修改"
-							onClick={() => { setPreviewUrl(null); setPane(pane === "changes" ? null : "changes"); }}
-							active={pane === "changes"}
-						/>
-						<IconButton
-							icon={Files}
-							label="项目文件"
-							onClick={() => { setPreviewUrl(null); setPane(pane === "files" ? null : "files"); }}
-							active={pane === "files"}
-						/>
+						</div>
 					</div>
 				</header>
 				{(app.error || snapshot.engineError) && (
@@ -996,24 +1327,71 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										/>
 									) : (
 										<div className="cl-empty">
-											<PiMark />
-											<h1>{snapshot.active ? "开始一个真实编码任务" : "选择项目文件夹"}</h1>
-											<p>
-												{snapshot.active
-													? "Pi 会读取项目文件、修改代码并执行工具。"
-													: "打开你要工作的目录，Pi 会在该目录中运行。"}
-											</p>
-											{!snapshot.active && (
-												<button className="primary-button" onClick={() => void app.switchTo(() => api.openProject())}>
-													打开项目
-												</button>
+											<div className="cl-empty-emblem">
+												<PiMark />
+											</div>
+											<h1>{snapshot.active ? "今天想一起做什么？" : "选择工作目录开始"}</h1>
+											{snapshot.active ? (
+												<>
+													<div className="cc-empty-workspace">
+														<Folder size={14} />
+														<span className="cc-empty-ws-path" title={snapshot.active.project}>
+															{snapshot.active.project}
+														</span>
+														<button type="button" className="cc-empty-ws-btn" disabled={changing} onClick={openWorkspace}>
+															切换目录
+														</button>
+													</div>
+													<div className="cc-starter-chips">
+														<button
+															type="button"
+															className="cc-starter-chip"
+															onClick={() => {
+																app.setDraft("请先梳理当前项目的目录结构、核心模块与运行方式。");
+																composerInputRef.current?.focus();
+															}}
+														>
+															<Sparkles size={13} />
+															<span>梳理项目结构</span>
+														</button>
+														<button
+															type="button"
+															className="cc-starter-chip"
+															onClick={() => {
+																app.setDraft("请检查当前工作区的 Git 改动并总结潜在风险。");
+																composerInputRef.current?.focus();
+															}}
+														>
+															<GitCompareArrows size={13} />
+															<span>检查代码变更</span>
+														</button>
+														<button
+															type="button"
+															className="cc-starter-chip"
+															onClick={() => {
+																app.setDraft("请运行当前项目的测试或类型检查并汇报结果。");
+																composerInputRef.current?.focus();
+															}}
+														>
+															<TerminalIcon size={13} />
+															<span>运行测试检查</span>
+														</button>
+													</div>
+												</>
+											) : (
+												<>
+													<p>选择一个本地项目文件夹，Pi 会在该目录中读取代码、安全编辑并在沙箱内执行命令。</p>
+													<button className="primary-button cc-empty-cta" onClick={openWorkspace}>
+														<FolderOpen size={15} />
+														<span>打开项目文件夹</span>
+													</button>
+												</>
 											)}
-											{snapshot.active && <p className="cl-empty-path">{snapshot.active.project}</p>}
 											<div className="cc-empty-hints">
 												<span><kbd>⌘N</kbd> 新建会话</span>
 												<span><kbd>⌘K</kbd> 搜索会话</span>
 												<span><kbd>/</kbd> 斜杠命令</span>
-												<span><kbd>Shift+Enter</kbd> 换行</span>
+												<span><kbd>@</kbd> 引用文件</span>
 											</div>
 										</div>
 									)}
@@ -1195,6 +1573,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						<LiveComposer
 							key={snapshot.active?.id ?? "no-conversation"}
 							snapshot={snapshot}
+							activeProject={project}
 							draft={app.draft}
 							setDraft={app.setDraft}
 							running={running}
@@ -1205,6 +1584,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							stop={() => void app.command({ type: "abort" })}
 							command={app.command}
 							setPermission={(permission) => void savePermission(permission)}
+							onSelectProject={selectWorkspace}
+							onOpenProject={openWorkspace}
+							sandboxStatus={sandboxStatus}
+							sandboxOpen={sandboxOpen}
+							setSandboxOpen={setSandboxOpen}
+							onUpdateSandbox={saveSandbox}
 							openSettings={() => setSettings(true)}
 							onBuiltinSlash={handleBuiltinSlash}
 							onCompactInstructions={(customInstructions) => void app.command({ type: "compact", customInstructions })}

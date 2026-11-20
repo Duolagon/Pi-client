@@ -1,6 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ArrowUp, Brain, Paperclip, ShieldCheck, Square, X } from "lucide-react";
-import type { Command, PermissionMode, Snapshot, ThinkingLevel } from "../shared.ts";
+import type { Command, PermissionMode, Project, SandboxStatus, Snapshot, ThinkingLevel } from "../shared.ts";
+import { WorkspacePicker } from "./WorkspacePicker.tsx";
+import { SandboxControl } from "./SandboxControl.tsx";
 
 type Image = NonNullable<Extract<Command, { type: "prompt" }>["images"]>[number];
 interface Attachment {
@@ -53,7 +55,8 @@ export type BuiltinSlashAction =
 	| "init"
 	| "preview"
 	| "loop"
-	| "batch";
+	| "batch"
+	| "sandbox";
 
 const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[] = [
 	{ name: "compact", description: "压缩上下文（支持 /compact <聚焦指令>）" },
@@ -61,6 +64,7 @@ const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[
 	{ name: "btw", description: "不污染主会话的侧边快问（/btw <问题>）" },
 	{ name: "loop", description: "定时自动循环执行提示词（/loop 5m <任务>，会自动消耗额度）" },
 	{ name: "batch", description: "并行分解并批量执行仓库改动（bundled skill）" },
+	{ name: "sandbox", description: "查看或切换 macOS Seatbelt 命令沙箱与离线隔离" },
 	{ name: "new", description: "新建会话" },
 	{ name: "plan", description: "进入/退出引擎级计划模式（只读调研+输出方案）" },
 	{ name: "rewind", description: "打开 Git 检查点与代码回滚" },
@@ -88,13 +92,14 @@ const CLAUDE_ONLY_COMMANDS = new Set([
 	"desktop", "diff", "doctor", "effort", "exit", "export", "fast", "feedback", "fork", "goal", "help", "ide",
 	"insights", "install-github-app", "keybindings", "login", "logout", "mobile", "model", "output-style",
 	"plugin", "pr-comments", "privacy-settings", "quit", "recap", "release-notes", "remote-control", "rename",
-	"resume", "review", "run", "sandbox", "schedule", "security-review", "simplify", "stats", "statusline",
+	"resume", "review", "run", "schedule", "security-review", "simplify", "stats", "statusline",
 	"subtask", "teleport", "terminal-setup", "theme", "upgrade", "usage", "verify", "vim", "voice", "workflows",
 	"config", "code-review",
 ]);
 
 export function LiveComposer({
 	snapshot,
+	activeProject,
 	draft,
 	setDraft,
 	running,
@@ -105,6 +110,12 @@ export function LiveComposer({
 	stop,
 	command,
 	setPermission,
+	onSelectProject,
+	onOpenProject,
+	sandboxStatus,
+	sandboxOpen,
+	setSandboxOpen,
+	onUpdateSandbox,
 	openSettings,
 	onBuiltinSlash,
 	onCompactInstructions,
@@ -115,6 +126,7 @@ export function LiveComposer({
 	fail,
 }: {
 	snapshot: Snapshot;
+	activeProject?: Project;
 	draft: string;
 	setDraft: (value: string) => void;
 	running: boolean;
@@ -125,6 +137,12 @@ export function LiveComposer({
 	stop: () => void;
 	command: (value: Command) => Promise<void>;
 	setPermission: (value: PermissionMode) => void;
+	onSelectProject: (path: string) => void;
+	onOpenProject: () => void;
+	sandboxStatus: SandboxStatus | null;
+	sandboxOpen: boolean;
+	setSandboxOpen: (open: boolean) => void;
+	onUpdateSandbox: (next: { sandbox: boolean; sandboxOffline: boolean }) => Promise<void>;
 	openSettings: () => void;
 	onBuiltinSlash: (action: BuiltinSlashAction) => void;
 	onCompactInstructions?: (instructions: string) => void;
@@ -362,7 +380,11 @@ export function LiveComposer({
 			setSending(false);
 		}
 	};
-	const selected = snapshot.state?.model;
+	const selected =
+		snapshot.state?.model &&
+		snapshot.models.some((m) => m.provider === snapshot.state?.model?.provider && m.id === snapshot.state?.model?.id)
+			? snapshot.state.model
+			: undefined;
 	const slashMatch = !slashDismissed ? /^\/([^\s\n]*)$/.exec(draft) : null;
 	const slashQuery = slashMatch ? slashMatch[1].toLowerCase() : "";
 	const mergedCommands = [
@@ -625,71 +647,83 @@ export function LiveComposer({
 					}}
 				/>
 				<div className="cl-composer-row">
-					<button className="cl-icon-btn" type="button" aria-label="添加附件" onClick={() => fileInput.current?.click()}>
-						<Paperclip size={17} />
-					</button>
-					<span className="cl-composer-hint">
-						{running ? "发送补充指令会进入 Pi 的引导队列" : "Enter 发送 · Shift Enter 换行"}
-					</span>
-					{running ? (
-						<button type="button" className="cl-send stop" aria-label="停止任务" onClick={stop}>
-							<Square size={13} fill="currentColor" />
+					<div className="cl-composer-row-left">
+						<button className="cl-icon-btn" type="button" aria-label="添加附件" title="添加图片或代码附件" onClick={() => fileInput.current?.click()}>
+							<Paperclip size={16} />
 						</button>
-					) : (
-						<button
-							type="submit"
-							className="cl-send"
-							aria-label="发送任务"
-							disabled={disabled || (!draft.trim() && !attachments.length)}
-						>
-							<ArrowUp size={17} />
-						</button>
-					)}
-				</div>
-			</form>
-			<div className="cl-composer-bar">
-				<div className="cl-pills">
-					<label className="cl-pill">
-						<span className="cl-pill-select">
-							<select
-								aria-label="选择模型"
-								value={selected ? `${selected.provider}\0${selected.id}` : ""}
-								disabled={changing || running || !snapshot.models.length}
-								onChange={(event) => {
-									const [provider, modelId] = event.target.value.split("\0");
-									void command({ type: "set_model", provider, modelId });
-								}}
-							>
-								<option value="" disabled>
-									未连接模型
-								</option>
-								{snapshot.models.map((model) => (
-									<option key={`${model.provider}/${model.id}`} value={`${model.provider}\0${model.id}`}>
-										{model.name || model.id}
-									</option>
-								))}
-							</select>
-						</span>
-					</label>
-					{snapshot.thinkingLevels.length > 0 && (
-						<label className="cl-pill">
-							<Brain size={13} />
+						<WorkspacePicker
+							variant="composer"
+							projects={snapshot.projects}
+							activeProject={activeProject}
+							disabled={changing}
+							onSelectProject={onSelectProject}
+							onOpenProject={onOpenProject}
+						/>
+						<label className="cl-pill cl-pill-inline">
 							<span className="cl-pill-select">
 								<select
-									aria-label="思考强度"
-									value={snapshot.state?.thinkingLevel ?? "off"}
-									disabled={changing || running || !snapshot.thinkingLevels.length}
-									onChange={(event) =>
-										void command({ type: "set_thinking_level", level: event.target.value as ThinkingLevel })
-									}
+									aria-label="选择模型"
+									value={selected ? `${selected.provider}\0${selected.id}` : ""}
+									disabled={changing || running || !snapshot.models.length}
+									onChange={(event) => {
+										const [provider, modelId] = event.target.value.split("\0");
+										void command({ type: "set_model", provider, modelId });
+									}}
 								>
-									{snapshot.thinkingLevels.map((level) => (
-										<option key={level}>{level}</option>
+									<option value="" disabled>
+										未连接模型
+									</option>
+									{snapshot.models.map((model) => (
+										<option key={`${model.provider}/${model.id}`} value={`${model.provider}\0${model.id}`}>
+											{model.name || model.id}
+										</option>
 									))}
 								</select>
 							</span>
 						</label>
-					)}
+						{snapshot.thinkingLevels.length > 0 && (
+							<label className="cl-pill cl-pill-inline">
+								<Brain size={13} />
+								<span className="cl-pill-select">
+									<select
+										aria-label="思考强度"
+										value={snapshot.state?.thinkingLevel ?? "off"}
+										disabled={changing || running || !snapshot.thinkingLevels.length}
+										onChange={(event) =>
+											void command({ type: "set_thinking_level", level: event.target.value as ThinkingLevel })
+										}
+									>
+										{snapshot.thinkingLevels.map((level) => (
+											<option key={level}>{level}</option>
+										))}
+									</select>
+								</span>
+							</label>
+						)}
+					</div>
+					<div className="cl-composer-row-right">
+						<span className="cl-composer-hint">
+							{running ? "补充指令将进入引导队列" : "Enter 发送"}
+						</span>
+						{running ? (
+							<button type="button" className="cl-send stop" aria-label="停止任务" onClick={stop}>
+								<Square size={13} fill="currentColor" />
+							</button>
+						) : (
+							<button
+								type="submit"
+								className="cl-send"
+								aria-label="发送任务"
+								disabled={disabled || (!draft.trim() && !attachments.length)}
+							>
+								<ArrowUp size={17} />
+							</button>
+						)}
+					</div>
+				</div>
+			</form>
+			<div className="cl-composer-bar">
+				<div className="cl-pills">
 					<label className={`cl-pill cc-perm-pill cc-perm-${snapshot.settings.permission}`}>
 						<span className={`cc-perm-dot ${snapshot.settings.permission}`} aria-hidden="true" />
 						<ShieldCheck size={13} />
@@ -708,6 +742,16 @@ export function LiveComposer({
 							</select>
 						</span>
 					</label>
+					<SandboxControl
+						enabled={Boolean(snapshot.settings.sandbox)}
+						offline={Boolean(snapshot.settings.sandbox && snapshot.settings.sandboxOffline)}
+						status={sandboxStatus}
+						projectPath={activeProject?.path}
+						disabled={changing || running}
+						open={sandboxOpen}
+						onOpenChange={setSandboxOpen}
+						onChange={onUpdateSandbox}
+					/>
 					{onTogglePlanMode && (
 						<button
 							type="button"

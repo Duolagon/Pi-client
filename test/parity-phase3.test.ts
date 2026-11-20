@@ -291,7 +291,13 @@ test("DesktopService and IPC expose plan files, context report, hooks, skills, b
 		assert.equal(exported.exported, 1);
 
 		const sb = await invoke<SandboxStatus>("pi:sandbox:status");
-		assert.equal(sb.enabled, false);
+		assert.equal(sb.enabled, sb.supported);
+		if (sb.supported) {
+			await service.saveSettings({ permission: snap.settings.permission, theme: snap.settings.theme, sandbox: false });
+			assert.equal((await invoke<SandboxStatus>("pi:sandbox:status")).enabled, false);
+			await service.saveSettings({ permission: snap.settings.permission, theme: snap.settings.theme, sandbox: true });
+			assert.equal((await invoke<SandboxStatus>("pi:sandbox:status")).enabled, true);
+		}
 
 		// /btw works without mutating main conversation transcript
 		const beforeCount = (await service.snapshot()).messages.length;

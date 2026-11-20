@@ -120,6 +120,10 @@ try {
 	const closeError = async () => {
 		await page.getByRole("button", { name: "关闭错误提示", exact: true }).click();
 	};
+	const openMore = async (name) => {
+		await page.getByRole("button", { name: "更多工具", exact: true }).click();
+		await page.getByRole("menuitem", { name, exact: true }).click();
+	};
 	await ready();
 	assert.ok((await snapshot()).models.length >= 2);
 	await page.getByRole("combobox", { name: "选择模型", exact: true }).selectOption({ label: "本地演示模型 · 备用" });
@@ -379,12 +383,12 @@ try {
 	checks.push("local external executor discovery, configuration and task namespace through real preload");
 
 	// Verify Claude Code UI modals, autocomplete, and interactive PTY tab
-	await page.getByRole("button", { name: "检查点与回滚", exact: true }).click();
+	await openMore("检查点与回滚");
 	await page.getByRole("dialog", { name: "检查点与代码回滚 (/rewind)", exact: true }).waitFor();
 	await page.locator(".cc-rewind-file-bar").filter({ hasText: "greeting.mjs" }).waitFor();
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
-	await page.getByRole("button", { name: "工具与权限", exact: true }).click();
+	await openMore("工具与权限");
 	await page.getByRole("dialog", { name: "工具、MCP 与权限规则", exact: true }).waitFor();
 	await page.locator(".cc-tool-ctrl-name strong").getByText("Agent", { exact: true }).waitFor();
 	await page.getByRole("tab", { name: /权限规则/ }).click();
@@ -397,7 +401,7 @@ try {
 	await page.getByRole("tab", { name: /Worktrees/ }).click();
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
-	await page.getByRole("button", { name: "会话分支树", exact: true }).click();
+	await openMore("会话分支树");
 	await page.getByRole("dialog", { name: "会话分支树与 CLI 历史导入 (/sessions)", exact: true }).waitFor();
 	await page.getByRole("tab", { name: /Pi CLI 历史/ }).click();
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
@@ -444,7 +448,7 @@ try {
 	await page.getByRole("button", { name: "关闭工作区面板", exact: true }).click();
 	checks.push("split Diff line feedback enters the active draft");
 
-	await page.getByRole("button", { name: "项目记忆与状态", exact: true }).click();
+	await openMore("项目记忆与状态");
 	await page.getByRole("dialog", { name: "项目记忆与会话状态", exact: true }).waitFor();
 	await page.getByRole("textbox", { name: "编辑 AGENTS.md", exact: true }).fill("# Verify Project Rules\n");
 	await page.getByRole("button", { name: "保存 AGENTS.md", exact: true }).click();
@@ -459,7 +463,7 @@ try {
 	await page.getByText("工具与 MCP 挂载", { exact: true }).waitFor();
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
-	await page.getByRole("button", { name: "本地网页预览", exact: true }).click();
+	await openMore("本地网页预览");
 	await page.locator("aside[aria-label='本地应用预览']").waitFor();
 	await page.getByRole("textbox", { name: "预览地址", exact: true }).fill("https://example.com");
 	await page.getByRole("button", { name: "访问", exact: true }).click();
@@ -496,7 +500,7 @@ try {
 	checks.push("local Chromium preview and console validation");
 	await page.getByRole("button", { name: "关闭预览面板", exact: true }).click();
 
-	await page.getByRole("button", { name: "命令面板", exact: true }).click();
+	await openMore("命令面板");
 	await page.getByRole("dialog", { name: "命令面板 (⌘P)", exact: true }).waitFor();
 	await page.getByRole("textbox", { name: "搜索客户端命令", exact: true }).fill("AGENTS.md");
 	await page.locator(".search-results button").filter({ hasText: "/memory" }).waitFor();
@@ -520,7 +524,7 @@ try {
 	);
 	await input.fill("");
 
-	await page.getByRole("button", { name: "工具与权限", exact: true }).click();
+	await openMore("工具与权限");
 	await page.getByRole("dialog", { name: "工具、MCP 与权限规则", exact: true }).waitFor();
 	await page.getByRole("tab", { name: /^Hooks/ }).click();
 	await page.getByRole("textbox", { name: "Hook 命令", exact: true }).fill("echo HOOK_UI_OK");
@@ -543,7 +547,7 @@ try {
 	await page.getByRole("button", { name: "删除 Skill e2e-skill", exact: true }).click();
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
-	await page.getByRole("button", { name: "项目记忆与状态", exact: true }).click();
+	await openMore("项目记忆与状态");
 	await page.getByRole("dialog", { name: "项目记忆与会话状态", exact: true }).waitFor();
 	await page.getByRole("textbox", { name: "新建规则文件名", exact: true }).fill("ui-rule");
 	await page.getByRole("button", { name: "新建规则", exact: true }).click();
@@ -559,7 +563,7 @@ try {
 	await page.locator('[aria-label="上下文分段占用条"]').waitFor();
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
-	await page.getByRole("button", { name: "命令面板", exact: true }).click();
+	await openMore("命令面板");
 	await page.getByRole("dialog", { name: "命令面板 (⌘P)", exact: true }).waitFor();
 	await page.locator(".search-results button").filter({ hasText: "会话内关键词搜索" }).click();
 	await page.getByRole("search", { name: "会话内查找", exact: true }).waitFor();
@@ -578,7 +582,7 @@ try {
 		"restore ask mode",
 	);
 
-	await page.getByRole("button", { name: "Agents 与子 Agent", exact: true }).click();
+	await openMore("Agents 与子 Agent");
 	await page.getByRole("dialog", { name: "Agents 与子 Agent", exact: true }).waitFor();
 	await page.getByText("general-purpose", { exact: true }).waitFor();
 	await page.getByRole("button", { name: "新建", exact: true }).click();
@@ -601,7 +605,7 @@ try {
 	assert.match(savedAgentText, /omitClaudeMd: true/);
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
-	await page.getByRole("button", { name: "MCP 服务器", exact: true }).click();
+	await openMore("MCP 服务器");
 	await page.getByRole("dialog", { name: "MCP 服务器", exact: true }).waitFor();
 	await page.getByRole("button", { name: "新建", exact: true }).click();
 	await page.getByRole("textbox", { name: "名称", exact: true }).fill("e2e-mcp");
@@ -620,8 +624,30 @@ try {
 	const secondProject = join(root, "parallel-project");
 	await mkdir(secondProject);
 	const secondSession = (await page.evaluate((dir) => window.pi.selectProject(dir), secondProject)).active;
-	await page.getByRole("button", { name: "刷新会话", exact: true }).click();
+	await openMore("刷新会话");
 	await until(async () => (await page.locator(".cl-conv.selected").innerText()).includes("parallel-project"), "the other project");
+	// Verify Claude Code topbar workspace picker can switch between opened projects
+	await page.getByRole("button", { name: "切换工作目录", exact: true }).click();
+	await page.getByRole("menu", { name: "工作目录列表", exact: true }).waitFor();
+	await page.getByRole("menuitemradio").filter({ hasText: "pi-client-demo" }).click();
+	await until(async () => (await snapshot()).active?.project?.endsWith("pi-client-demo"), "workspace picker switch back to pi-client-demo");
+	await page.getByRole("button", { name: "切换工作目录", exact: true }).click();
+	await page.getByRole("menuitemradio").filter({ hasText: "parallel-project" }).click();
+	await until(async () => (await snapshot()).active?.project?.endsWith("parallel-project"), "workspace picker switch to parallel-project");
+	// Verify composer sandbox pill & popover control
+	await page.getByRole("button", { name: "命令沙箱设置", exact: true }).click();
+	await page.getByRole("region", { name: "命令沙箱控制", exact: true }).waitFor();
+	const sbStatus = await page.evaluate(() => window.pi.sandboxStatus());
+	if (sbStatus.supported) {
+		assert.equal(await page.getByRole("checkbox", { name: "快捷开启 macOS Seatbelt 命令沙箱", exact: true }).isChecked(), true);
+		const offlineBox = page.getByRole("checkbox", { name: "快捷禁止 Bash 命令访问网络", exact: true });
+		await offlineBox.check();
+		await until(async () => (await snapshot()).settings.sandboxOffline === true && !(await offlineBox.isDisabled()), "sandbox offline enabled via popover");
+		await offlineBox.uncheck();
+		await until(async () => (await snapshot()).settings.sandboxOffline === false && !(await offlineBox.isDisabled()), "sandbox offline disabled via popover");
+	}
+	await page.getByRole("button", { name: "命令沙箱设置", exact: true }).click();
+	checks.push("workspace directory switcher and inline Seatbelt sandbox popover");
 	await page.locator(".cl-conv").filter({ hasText: originalSession.title }).first().click();
 	await ready();
 	await page.getByRole("button", { name: "新建会话", exact: true }).first().click();
