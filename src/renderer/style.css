@@ -1044,6 +1044,24 @@
 	content: "·";
 	margin-right: 8px;
 }
+/* Per-turn quality omen badge. Quiet in light/dark; the Grail theme adds glow + reveal. */
+.cc-omen {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+.cc-omen svg {
+	flex-shrink: 0;
+}
+.cc-omen-grail {
+	color: var(--cl-green, #16a34a);
+}
+.cc-omen-problem {
+	color: var(--cl-red, #dc2626);
+}
+.cc-omen-unverified {
+	color: var(--cl-3);
+}
 .cl-streaming-dot {
 	width: 7px;
 	height: 7px;

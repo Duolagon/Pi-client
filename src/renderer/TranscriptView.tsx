@@ -6,6 +6,8 @@ import type { DesktopTask, ExternalTask, Message, TaskProgress } from "../shared
 import type { Transcript, ToolProgress } from "./messages.ts";
 import { CodeLines, InlineEditDiff, computeLineDiff } from "./DiffView.tsx";
 import { highlightCode } from "./highlight.tsx";
+import { scoreTurn, type QualityVerdict } from "./quality-verdict.ts";
+import { OmenGlyph } from "./GrailIcons.tsx";
 
 export interface TodoItem {
 	id: string;
@@ -350,6 +352,9 @@ export function TranscriptView({
 				const errorMessage = [...unit.messages].reverse().find((message) => message.errorMessage)?.errorMessage;
 				const aborted = unit.messages.some((message) => message.stopReason === "aborted");
 				const usage = last.usage;
+				// Score from the full turn slice (assistant messages + their interleaved toolResults).
+				const verdict: QualityVerdict | null =
+					isStreaming || firstIndex < 0 ? null : scoreTurn(state.messages.slice(firstIndex, lastIndex + 1));
 				const turnText = unit.messages
 					.flatMap((m) => m.content)
 					.filter((b): b is Extract<typeof b, { type: "text" }> => b.type === "text")
@@ -390,6 +395,12 @@ export function TranscriptView({
 									</span>
 								)}
 								<span>{formatTime(last.timestamp)}</span>
+								{verdict && verdict.omen !== "none" && (
+									<span className={`cc-omen cc-omen-${verdict.omen}`} title={`${verdict.label}：${verdict.reason}`}>
+										<OmenGlyph omen={verdict.omen} width={13} height={13} />
+										<span className="cc-omen-label">{verdict.label}</span>
+									</span>
+								)}
 								<CopyTurnButton text={turnText} />
 							</footer>
 						)}

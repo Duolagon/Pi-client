@@ -117,3 +117,35 @@ export function getServantInfo(modelId?: string): ServantInfo {
 	if (id.includes("deepseek")) return { className: "Archer", rarity: "SSR", title: "深渊星矢", accent: "#60a5fa" };
 	return { className: "Servant", rarity: "SR", title: "契约从者", accent: "#f5c542" };
 }
+
+/** Cracked chalice — the "杂音/愿未达成" omen when a turn errors or fails verification. */
+export function CrackedGrailIcon(props: SVGProps<SVGSVGElement>) {
+	return (
+		<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" {...props}>
+			<path d="M7.5 8.5C7.5 12.8 9.2 15.5 12 15.5C14.8 15.5 16.5 12.8 16.5 8.5Z" fill="currentColor" fillOpacity="0.1" strokeLinecap="round" strokeLinejoin="round" />
+			<path d="M6 8.5H18" strokeLinecap="round" />
+			<path d="M12 15.5V19.5M8.5 19.5H15.5" strokeLinecap="round" />
+			{/* Lightning crack across the bowl. */}
+			<path d="M11 8.8L9.6 11.4L12.4 12.1L10.8 15" strokeLinecap="round" strokeLinejoin="round" />
+		</svg>
+	);
+}
+
+/** Dim ember — the neutral "悬而未验" omen when code changed but no check ran. */
+export function EmberIcon(props: SVGProps<SVGSVGElement>) {
+	return (
+		<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" {...props}>
+			<circle cx="12" cy="13" r="6" fill="currentColor" fillOpacity="0.12" />
+			<path d="M12 5.5C12 5.5 9 8.5 9 11.5" strokeLinecap="round" opacity="0.7" />
+			<path d="M12 10.5V13.5M12 16.2V16.4" strokeLinecap="round" />
+		</svg>
+	);
+}
+
+/** Pick the glyph for a quality omen. "grail" reuses the Holy Grail chalice. */
+export function OmenGlyph({ omen, ...props }: { omen: "grail" | "problem" | "unverified" | "none" } & SVGProps<SVGSVGElement>) {
+	if (omen === "grail") return <HolyGrailIcon {...props} />;
+	if (omen === "problem") return <CrackedGrailIcon {...props} />;
+	if (omen === "unverified") return <EmberIcon {...props} />;
+	return null;
+}

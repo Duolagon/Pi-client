@@ -55,7 +55,8 @@ import { useDesktop } from "./useDesktop.ts";
 import { TranscriptView, type TodoItem } from "./TranscriptView.tsx";
 import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
 import { WorkspacePicker } from "./WorkspacePicker.tsx";
-import { GrailEmblem, HolyGrailIcon, MagicCircleBackdrop, MagicCircleLoader, getServantInfo } from "./GrailIcons.tsx";
+import { GrailEmblem, HolyGrailIcon, MagicCircleBackdrop, MagicCircleLoader, OmenGlyph, getServantInfo } from "./GrailIcons.tsx";
+import { scoreTurn, type QualityVerdict } from "./quality-verdict.ts";
 import { SubagentPanel, type SubagentPanelHandle } from "./SubagentPanel.tsx";
 import { SubagentTranscriptView } from "./SubagentTranscriptView.tsx";
 import { SubagentApprovals } from "./SubagentApprovals.tsx";
@@ -99,6 +100,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [focusedTerminal, setFocusedTerminal] = useState<{ conversationId: string; terminalId: string }>();
 	const [controlsTab, setControlsTab] = useState<ControlsTab | null>(null);
 	const [checkpointsOpen, setCheckpointsOpen] = useState(false);
+	const [omenReveal, setOmenReveal] = useState<QualityVerdict | null>(null);
 	const [rewindQuery, setRewindQuery] = useState<string | undefined>(undefined);
 	const [tasksOpen, setTasksOpen] = useState(false);
 	const [taskInitialId, setTaskInitialId] = useState<string | undefined>(undefined);
@@ -176,6 +178,23 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	useEffect(() => {
 		if (stickToEnd.current) scroll.current?.scrollTo({ top: scroll.current.scrollHeight });
 	}, [history, running]);
+	// On turn settle (running true→false), reveal the just-finished turn's quality omen briefly.
+	const wasRunning = useRef(false);
+	useEffect(() => {
+		if (wasRunning.current && !running) {
+			const messages = history.messages;
+			let start = messages.length;
+			while (start > 0 && messages[start - 1].role !== "user" && messages[start - 1].role !== "custom") start--;
+			const verdict = start < messages.length ? scoreTurn(messages.slice(start)) : null;
+			if (verdict && verdict.omen !== "none") {
+				setOmenReveal(verdict);
+				const timer = setTimeout(() => setOmenReveal(null), 2500);
+				wasRunning.current = running;
+				return () => clearTimeout(timer);
+			}
+		}
+		wasRunning.current = running;
+	}, [running, history.messages]);
 	useEffect(() => {
 		let active = true;
 		void api.tasks.list().then((list) => {
@@ -1462,6 +1481,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											{isGrail ? <MagicCircleLoader size={16} /> : <span className="cl-spinner" />}
 											{isGrail ? "从者正在咏唱与执行…" : "Pi 正在工作"}
 											{snapshot.state?.pendingMessageCount ? ` · ${snapshot.state.pendingMessageCount} 条指令待处理` : ""}
+										</div>
+									)}
+									{!running && isGrail && omenReveal && (
+										<div className={`cl-working grail-omen-reveal omen-${omenReveal.omen}`} role="status">
+											<OmenGlyph omen={omenReveal.omen} width={17} height={17} />
+											<span>{omenReveal.label}</span>
 										</div>
 									)}
 								</div>
