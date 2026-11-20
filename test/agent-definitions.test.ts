@@ -53,7 +53,7 @@ test("lists built-ins, project/user files and Claude-compatible tools", async ()
 		const agents = await registry.list(f.project);
 		assert.deepEqual(
 			agents.filter((agent) => agent.scope === "builtin").map((agent) => agent.name),
-			["general-purpose", "Explore", "Plan"],
+			["general-purpose", "Explore", "Plan", "Review"],
 		);
 		const reviewer = agents.find((agent) => agent.name === "reviewer");
 		assert.ok(reviewer);

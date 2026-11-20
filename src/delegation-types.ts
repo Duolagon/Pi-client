@@ -1,5 +1,5 @@
 import type { Conversation, Message, ThinkingLevel } from "./shared.ts";
-import type { AgentDefinition, AgentModelAlias } from "./agent-types.ts";
+import type { AgentDefinition, AgentModelAlias, ModelRoutingRole } from "./agent-types.ts";
 import type { DesktopTask, TaskProgress, TaskSendResult, TaskStartInput, TaskStatus, TaskStopReason } from "./task-types.ts";
 import type {
 	WorktreeCreateInput,
@@ -134,6 +134,11 @@ export interface DelegationCallbacks {
 	resolveAgent?(project: string, name: string): Promise<AgentDefinition | undefined>;
 	/** Resolve Claude-style model aliases (sonnet/opus/haiku/inherit) for the parent conversation. */
 	resolveModelAlias?(parentConversationId: string, alias: NonNullable<AgentDefinition["modelAlias"]>, strict?: boolean): Promise<{ provider: string; id: string } | undefined>;
+	/**
+	 * `settings.modelRouting`: the configured model for a routed child role, only when it is
+	 * available to the parent conversation. Undefined means inherit the parent's model.
+	 */
+	routedModel?(parentConversationId: string, role: ModelRoutingRole): Promise<{ provider: string; id: string } | undefined>;
 	/** Names of the agent types available in `project` (trusted scopes only), for error messages. */
 	listAgentNames?(project: string): Promise<string[]>;
 	/** `settings.subagentDefaultBackground`; true when absent. */

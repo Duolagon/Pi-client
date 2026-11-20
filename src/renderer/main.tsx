@@ -1770,6 +1770,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				<SettingsDialog
 					settings={snapshot.settings}
 					presets={snapshot.providerPresets}
+					models={snapshot.models}
 					busy={blocked}
 					close={() => setSettings(false)}
 					apply={app.apply}

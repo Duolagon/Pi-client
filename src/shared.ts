@@ -16,7 +16,7 @@ import type { LiveTranscript } from "./transcript.ts";
 import type { DesktopToolsAPI, DesktopPermissionsAPI } from "./control-types.ts";
 import type { DelegatedTaskResult } from "./delegation-types.ts";
 import type { DesktopExternalAgentsAPI } from "./external-types.ts";
-import type { DesktopAgentsAPI } from "./agent-types.ts";
+import type { DesktopAgentsAPI, ModelRouting } from "./agent-types.ts";
 import type { DesktopMcpAPI } from "./mcp-types.ts";
 import type { DesktopHooksAPI } from "./hook-types.ts";
 import type { ContextBreakdown, ContextMemorySource } from "./context-inspector.ts";
@@ -223,6 +223,11 @@ export interface Settings {
 	cronEnabled?: boolean;
 	/** Experimental multi-agent Teams collaboration (TeamCreate / TeamDelete); absent means false. */
 	agentTeams?: boolean;
+	/**
+	 * Default model for built-in Explore / Plan / Review children when the call and the
+	 * definition name none. A missing role, or a model the parent cannot reach, inherits.
+	 */
+	modelRouting?: ModelRouting;
 	configuredProviders: Provider[];
 	connections: Partial<
 		Record<Provider, { baseUrl?: string; modelId?: string; api?: ConnectionProtocol; mode?: ConnectionMode }>
@@ -435,6 +440,7 @@ export interface DesktopAPI {
 		maxConcurrentSubagents?: number;
 		cronEnabled?: boolean;
 		agentTeams?: boolean;
+		modelRouting?: ModelRouting;
 		provider?: Provider;
 		mode?: ConnectionMode;
 		apiKey?: string;

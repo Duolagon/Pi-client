@@ -14,6 +14,28 @@ import type {
 } from "../shared.ts";
 import { Modal } from "../prototype/ui.tsx";
 import { parseForegroundMinutes } from "./settings-input.ts";
+import { MODEL_ROUTING_ROLES, type ModelRoutingRole } from "../agent-types.ts";
+
+const ROUTING_LABELS: Record<ModelRoutingRole, { title: string; hint: string }> = {
+	explore: { title: "Explore（检索）", hint: "只读找代码，适合便宜快速的模型" },
+	plan: { title: "Plan（规划）", hint: "只读出方案，适合推理强的模型" },
+	review: { title: "Review（审查）", hint: "只读审改动，选一个和主模型不同的模型做交叉审查" },
+};
+
+/** "provider/id" select value for each role; "" means inherit the parent's model. */
+function routingKeys(routing: Settings["modelRouting"]): Record<ModelRoutingRole, string> {
+	const keys = { explore: "", plan: "", review: "" };
+	for (const role of MODEL_ROUTING_ROLES) {
+		const ref = routing?.[role];
+		if (ref) keys[role] = `${ref.provider}/${ref.id}`;
+	}
+	return keys;
+}
+
+function parseRoutingKey(key: string): { provider: string; id: string } | undefined {
+	const at = key.indexOf("/");
+	return at > 0 && at < key.length - 1 ? { provider: key.slice(0, at), id: key.slice(at + 1) } : undefined;
+}
 
 const protocols: { value: ConnectionProtocol; label: string }[] = [
 	{ value: "anthropic-messages", label: "Anthropic Messages" },
@@ -40,12 +62,15 @@ function connectionValues(settings: Settings, preset: ProviderPreset) {
 export function SettingsDialog({
 	settings,
 	presets,
+	models = [],
 	busy,
 	close,
 	apply,
 }: {
 	settings: Settings;
 	presets: ProviderPreset[];
+	/** Models the active conversation can reach; routing choices are limited to these. */
+	models?: Array<{ provider: string; id: string; name: string }>;
 	busy: boolean;
 	close: () => void;
 	apply: (snapshot: Snapshot) => void;
@@ -71,6 +96,8 @@ export function SettingsDialog({
 	const [maxConcurrentText, setMaxConcurrentText] = useState(String(settings.maxConcurrentSubagents ?? 8));
 	const [cronEnabled, setCronEnabled] = useState<boolean>(settings.cronEnabled !== false);
 	const [agentTeams, setAgentTeams] = useState<boolean>(settings.agentTeams === true);
+	const initialRouting = routingKeys(settings.modelRouting);
+	const [routing, setRouting] = useState<Record<ModelRoutingRole, string>>(initialRouting);
 	const [sandboxOffline, setSandboxOffline] = useState(Boolean(settings.sandboxOffline));
 	const [sandboxInfo, setSandboxInfo] = useState<SandboxStatus | null>(null);
 	const [provider, setProvider] = useState<Provider>(initialProvider);
@@ -111,6 +138,7 @@ export function SettingsDialog({
 		maxConcurrentText.trim() !== String(settings.maxConcurrentSubagents ?? 8) ||
 		cronEnabled !== (settings.cronEnabled !== false) ||
 		agentTeams !== (settings.agentTeams === true) ||
+		MODEL_ROUTING_ROLES.some((role) => routing[role] !== initialRouting[role]) ||
 		agentDir.trim() !== (settings.agentDir ?? "");
 	const connectionChanged =
 		Boolean(apiKey.trim()) ||
@@ -190,6 +218,15 @@ export function SettingsDialog({
 				cronEnabled,
 				agentTeams,
 			};
+			if (MODEL_ROUTING_ROLES.some((role) => routing[role] !== initialRouting[role])) {
+				// The backend replaces the whole map, so an omitted role means "inherit".
+				const next: NonNullable<Settings["modelRouting"]> = {};
+				for (const role of MODEL_ROUTING_ROLES) {
+					const ref = parseRoutingKey(routing[role]);
+					if (ref) next[role] = ref;
+				}
+				update.modelRouting = next;
+			}
 			if (agentDir.trim() !== (settings.agentDir ?? "")) update.agentDir = agentDir.trim();
 			if (connectionChanged) Object.assign(update, connectionInput);
 			const next = await window.pi.saveSettings(update);
@@ -567,6 +604,36 @@ export function SettingsDialog({
 							/>
 							启用实验性 Agent Teams 多成员协作（TeamCreate / TeamDelete 与结构化团队消息）
 						</label>
+						<fieldset className="live-routing">
+							<legend>子 Agent 模型路由</legend>
+							<small>
+								内置 Explore / Plan / Review 子 Agent 在调用和定义都没指定模型时使用这里的模型；选"继承主会话"或所选模型当前不可用时，沿用父会话模型。
+							</small>
+							{MODEL_ROUTING_ROLES.map((role) => {
+								const value = routing[role];
+								const known = !value || models.some((m) => `${m.provider}/${m.id}` === value);
+								return (
+									<label className="field-label" key={role}>
+										{ROUTING_LABELS[role].title}
+										<select
+											aria-label={`${ROUTING_LABELS[role].title} 模型`}
+											value={value}
+											disabled={pending}
+											onChange={(event) => setRouting((current) => ({ ...current, [role]: event.target.value }))}
+										>
+											<option value="">继承主会话模型</option>
+											{!known && <option value={value}>{value}（当前不可用）</option>}
+											{models.map((m) => (
+												<option key={`${m.provider}/${m.id}`} value={`${m.provider}/${m.id}`}>
+													{m.name || m.id} · {m.provider}
+												</option>
+											))}
+										</select>
+										<small>{ROUTING_LABELS[role].hint}</small>
+									</label>
+								);
+							})}
+						</fieldset>
 					</div>
 				</details>
 				{testResult && (

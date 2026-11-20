@@ -833,3 +833,37 @@ test("foreground Agent call keeps waiting while a worktree child waits for appro
 	assert.equal(result.status, "completed");
 	assert.equal(result.output, "approved and completed");
 });
+
+test("settings routing picks a model for built-in Explore/Plan/Review only, after call and definition", async (t) => {
+	const data = fixture();
+	t.after(() => data.service.dispose());
+	const routes: Record<string, { provider: string; id: string } | undefined> = {
+		explore: { provider: "cheap", id: "flash" },
+		review: { provider: "other", id: "gpt" },
+		plan: undefined,
+	};
+	data.callbacks.routedModel = async (_owner, role) => routes[role];
+	data.callbacks.resolveModelAlias = async (_owner, alias) => (alias === "opus" ? { provider: "fixture", id: "big" } : undefined);
+	data.callbacks.resolveAgent = async (_project, name) =>
+		name === "general-purpose"
+			? { name, description: name, prompt: "", readOnly: false, scope: "builtin" }
+			: name === "Explore" || name === "Plan" || name === "Review"
+			? { name, description: name, prompt: "", readOnly: true, scope: "builtin" }
+			: name === "shadow"
+				? { name, description: name, prompt: "", readOnly: true, scope: "project" }
+				: undefined;
+	const model = (index: number) => (data.inputs[index] as { input: { model: unknown } }).input.model;
+	const ro = { description: "Look around", prompt: "Find it", run_in_background: true };
+	await data.service.handle({ ...context, toolCallId: "explore" }, "Agent", { ...ro, subagent_type: "Explore" });
+	assert.deepEqual(model(0), { provider: "cheap", id: "flash" }, "Explore uses the routed model");
+	await data.service.handle({ ...context, toolCallId: "review" }, "Agent", { ...ro, subagent_type: "Review" });
+	assert.deepEqual(model(1), { provider: "other", id: "gpt" }, "Review uses its own routed model");
+	await data.service.handle({ ...context, toolCallId: "plan" }, "Agent", { ...ro, subagent_type: "Plan" });
+	assert.deepEqual(model(2), { provider: "fixture", id: "parent-model" }, "an unrouted (or unavailable) role inherits");
+	await data.service.handle({ ...context, toolCallId: "call" }, "Agent", { ...ro, subagent_type: "Explore", model: "opus" });
+	assert.deepEqual(model(3), { provider: "fixture", id: "big" }, "an explicit call model wins over routing");
+	await data.service.handle({ ...context, toolCallId: "shadow" }, "Agent", { ...ro, subagent_type: "shadow" });
+	assert.deepEqual(model(4), { provider: "fixture", id: "parent-model" }, "custom agents are never routed");
+	await data.service.handle({ ...context, toolCallId: "gp" }, "Agent", { ...background });
+	assert.deepEqual(model(5), { provider: "fixture", id: "parent-model" }, "general-purpose is not routed");
+});

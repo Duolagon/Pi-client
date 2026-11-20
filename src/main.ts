@@ -11,6 +11,7 @@ import type { Command, ConnectionInput, DesktopAPI } from "./shared.ts";
 import { checkPreview } from "./preview-check.ts";
 import { captureToolPath } from "./tool-path.ts";
 import { MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS } from "./delegation-limits.ts";
+import { parseModelRoutingUpdate } from "./model-routing.ts";
 import type { RpcExtensionUIResponse } from "@earendil-works/pi-coding-agent";
 
 app.setName("Pi Desktop");
@@ -244,6 +245,7 @@ function installHandlers() {
 				(settings.foregroundSubagentTimeoutMs as number) > MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS)
 		)
 			throw new Error("前台子 Agent 等待时长格式错误。");
+		if (settings.modelRouting !== undefined) parseModelRoutingUpdate(settings.modelRouting);
 		if (settings.provider !== undefined) connection(settings);
 		if (settings.agentDir !== undefined) string(settings.agentDir, "Pi 配置目录", 16384);
 		return service.saveSettings(settings as Parameters<DesktopAPI["saveSettings"]>[0]);

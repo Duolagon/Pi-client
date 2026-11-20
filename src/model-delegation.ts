@@ -1,6 +1,6 @@
 import { isAbsolute, relative, sep } from "node:path";
 import type { DesktopTask, TaskRunStats, TaskStopReason } from "./task-types.ts";
-import type { AgentDefinition } from "./agent-types.ts";
+import { ROUTED_AGENT_TYPES, type AgentDefinition } from "./agent-types.ts";
 import type { WorktreeInfo } from "./worktree-types.ts";
 import {
 	AGENT_CALL_NAME_PATTERN, DEFAULT_FOREGROUND_SUBAGENT_TIMEOUT_MS, DEFAULT_MAX_CONCURRENT_SUBAGENTS,
@@ -235,7 +235,7 @@ export class ModelDelegation {
 				throw new Error("Plan 模式下仅允许委派 Explore / Plan 等只读子 Agent。");
 			const selection = await this.callbacks.getSelection(owner.id);
 			// Model precedence: the call's alias, then the definition, then the parent's selection.
-			const model = fork ? selection.model : await this.resolveModel(owner.id, input.model, definition, selection.model);
+			const model = fork ? selection.model : await this.resolveModel(owner.id, input.model, definition, selection.model, typeName);
 			const git = await this.callbacks.isGit(owner.project);
 			const isolation = input.isolation ?? definition?.isolation ?? (readOnly ? "shared" : git ? "worktree" : "shared");
 			if (input.worktree_id) await this.ownedWorktree(owner.id, input.worktree_id);
@@ -452,6 +452,7 @@ export class ModelDelegation {
 		alias: AgentCallModel | undefined,
 		definition: AgentDefinition | undefined,
 		inherited: { provider: string; id: string } | undefined,
+		typeName?: string,
 	): Promise<{ provider: string; id: string } | undefined> {
 		if (alias) {
 			if (alias === "inherit") return inherited;
@@ -462,6 +463,9 @@ export class ModelDelegation {
 		}
 		if (definition?.model) return definition.model;
 		if (definition?.modelAlias && this.callbacks.resolveModelAlias) return (await this.callbacks.resolveModelAlias(owner, definition.modelAlias)) ?? inherited;
+		// Settings-level routing applies only to built-in types, never to a custom agent that shadows the name.
+		const role = typeName && (!definition || definition.scope === "builtin") ? ROUTED_AGENT_TYPES[typeName] : undefined;
+		if (role && this.callbacks.routedModel) return (await this.callbacks.routedModel(owner, role)) ?? inherited;
 		return inherited;
 	}
 
@@ -475,7 +479,7 @@ export class ModelDelegation {
 			if (definition.definitionError) throw new Error(definition.definitionError);
 			return definition;
 		}
-		const available = (await this.callbacks.listAgentNames?.(project).catch(() => undefined)) ?? ["general-purpose", "Explore", "Plan"];
+		const available = (await this.callbacks.listAgentNames?.(project).catch(() => undefined)) ?? ["general-purpose", "Explore", "Plan", "Review"];
 		throw new Error(`Agent type '${name.slice(0, 100)}' not found. Available agents: ${available.slice(0, 64).join(", ")}`);
 	}
 

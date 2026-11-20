@@ -2329,6 +2329,25 @@
 .live-setting-toggle input {
 	accent-color: var(--cl-clay);
 }
+.live-routing {
+	border: 1px solid var(--cl-line);
+	border-radius: 10px;
+	padding: 10px 12px 2px;
+	margin: 0 0 16px;
+	min-width: 0;
+}
+.live-routing legend {
+	padding: 0 6px;
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--cl-1);
+}
+.live-routing > small {
+	display: block;
+	margin-bottom: 10px;
+	font-size: 11px;
+	color: var(--cl-3);
+}
 .live-settings-config-dir {
 	border-top: 1px solid var(--cl-line-soft);
 	padding-top: 16px;

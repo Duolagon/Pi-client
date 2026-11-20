@@ -5,6 +5,16 @@ export type AgentScope = "builtin" | "project" | "user";
 export type AgentPermissionMode = "default" | "acceptEdits" | "plan" | "dontAsk" | "bypassPermissions" | "read";
 export type AgentMemoryScope = "user" | "project" | "local";
 export type AgentModelAlias = "sonnet" | "opus" | "haiku" | "fable" | "inherit";
+/** Child roles whose default model can be routed in settings (`settings.modelRouting`). */
+export type ModelRoutingRole = "explore" | "plan" | "review";
+export const MODEL_ROUTING_ROLES: readonly ModelRoutingRole[] = ["explore", "plan", "review"];
+export type ModelRouting = Partial<Record<ModelRoutingRole, { provider: string; id: string }>>;
+/** Built-in agent type → routed role. Custom agents are never routed implicitly. */
+export const ROUTED_AGENT_TYPES: Readonly<Record<string, ModelRoutingRole>> = {
+	Explore: "explore",
+	Plan: "plan",
+	Review: "review",
+};
 
 /** A resolved subagent definition. Built-ins have no source path. */
 export interface AgentDefinition {

@@ -106,7 +106,8 @@ import { ModelDelegation, runToolUsage } from "./model-delegation.ts";
 import { finalAssistantText, type DelegationMetadata, type ResumeOptions } from "./delegation-types.ts";
 import { AgentRegistry } from "./agent-definitions.ts";
 import { buildAgentListing } from "./agent-listing.ts";
-import type { AgentDefinition, AgentModelAlias, AgentPermissionMode, AgentRemoveInput, AgentSaveInput } from "./agent-types.ts";
+import type { AgentDefinition, AgentModelAlias, AgentPermissionMode, AgentRemoveInput, AgentSaveInput, ModelRouting, ModelRoutingRole } from "./agent-types.ts";
+import { parseModelRoutingUpdate, sanitizeModelRouting } from "./model-routing.ts";
 import { McpRegistry } from "./mcp-registry.ts";
 import type { McpRemoveInput, McpSaveInput, McpServerInfo } from "./mcp-types.ts";
 import { HooksService } from "./hooks-service.ts";
@@ -463,6 +464,7 @@ export class DesktopService {
 			},
 			resolveAgent: (project, name) => this.agents.resolve(this.trustProjectFor(project), name, this.projectTrusted(this.trustProjectFor(project))),
 			resolveModelAlias: (parentId, alias, strict) => this.resolveAgentModelAlias(parentId, alias, strict),
+			routedModel: (parentId, role) => this.routedModel(parentId, role),
 			listAgentNames: async (project) => (await this.agents.list(this.trustProjectFor(project), this.projectTrusted(this.trustProjectFor(project)))).map((agent) => agent.name),
 			defaultBackground: () => this.store.settings.subagentDefaultBackground !== false,
 			foregroundTimeoutMs: () => this.store.settings.foregroundSubagentTimeoutMs ?? DEFAULT_FOREGROUND_SUBAGENT_TIMEOUT_MS,
@@ -1003,6 +1005,14 @@ export class DesktopService {
 			extraHooks: meta.extraHooks,
 			env: this.options.env,
 		});
+	}
+
+	/** The routed model for a built-in child role, only when the parent conversation can reach it. */
+	private async routedModel(parentConversationId: string, role: ModelRoutingRole): Promise<{ provider: string; id: string } | undefined> {
+		const configured = this.store.settings.modelRouting?.[role];
+		if (!configured) return undefined;
+		const runtime = await this.ensureRuntime(this.conversation(parentConversationId));
+		return runtime.models.some((m) => m.provider === configured.provider && m.id === configured.id) ? { ...configured } : undefined;
 	}
 
 	/** `strict` (an explicit Agent `model`) returns undefined instead of the parent's model when nothing matches. */
@@ -2419,6 +2429,7 @@ export class DesktopService {
 		maxConcurrentSubagents?: number;
 		cronEnabled?: boolean;
 		agentTeams?: boolean;
+		modelRouting?: ModelRouting;
 		provider?: Provider;
 		apiKey?: string;
 		baseUrl?: string;
@@ -2475,6 +2486,11 @@ export class DesktopService {
 			if (settings.agentTeams !== undefined) {
 				if (typeof settings.agentTeams !== "boolean") throw new Error("实验性 Agent Teams 开关设置无效。");
 				next.settings.agentTeams = settings.agentTeams;
+			}
+			if (settings.modelRouting !== undefined) {
+				const routing = parseModelRoutingUpdate(settings.modelRouting);
+				if (Object.keys(routing).length) next.settings.modelRouting = routing;
+				else delete next.settings.modelRouting;
 			}
 			if (settings.agentDir !== undefined) {
 				const value = settings.agentDir.trim();
@@ -5220,6 +5236,7 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 					: undefined,
 			cronEnabled: typeof value.settings.cronEnabled === "boolean" ? value.settings.cronEnabled : undefined,
 			agentTeams: typeof value.settings.agentTeams === "boolean" ? value.settings.agentTeams : undefined,
+			modelRouting: sanitizeModelRouting(value.settings.modelRouting),
 			defaultModel: value.settings.defaultModel,
 			connections: value.settings.connections ?? {},
 			agentDir: value.settings.agentDir,
