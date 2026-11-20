@@ -200,7 +200,7 @@ export interface Settings {
 	agentDir?: string;
 	defaultModel?: { provider: string; id: string };
 	permission: PermissionMode;
-	theme: "light" | "dark" | "system";
+	theme: "light" | "dark" | "grail" | "system";
 	sandbox?: boolean;
 	sandboxOffline?: boolean;
 	notifications?: boolean;

@@ -5160,7 +5160,7 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 		throw new Error("会话配置格式错误。");
 	if (
 		!["ask", "acceptEdits", "read", "auto", "plan"].includes(value.settings.permission) ||
-		!["light", "dark", "system"].includes(value.settings.theme)
+		!["light", "dark", "grail", "system"].includes(value.settings.theme)
 	)
 		throw new Error("设置格式错误。");
 	const defaultModel = value.settings.defaultModel;

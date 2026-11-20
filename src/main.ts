@@ -205,7 +205,7 @@ function installHandlers() {
 		const settings = object(input);
 		if (
 			!["ask", "acceptEdits", "auto", "read", "plan"].includes(String(settings.permission)) ||
-			!["light", "dark", "system"].includes(String(settings.theme))
+			!["light", "dark", "grail", "system"].includes(String(settings.theme))
 		)
 			throw new Error("设置格式错误。");
 		if (settings.sandboxOffline !== undefined && typeof settings.sandboxOffline !== "boolean") throw new Error("沙箱网络设置格式错误。");

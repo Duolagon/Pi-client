@@ -442,6 +442,7 @@ export function SettingsDialog({
 							>
 								<option value="light">浅色</option>
 								<option value="dark">深色</option>
+								<option value="grail">圣杯（二次元）</option>
 								<option value="system">跟随系统</option>
 							</select>
 						</label>

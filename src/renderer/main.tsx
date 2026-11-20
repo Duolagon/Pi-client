@@ -33,6 +33,8 @@ import {
 	Folder,
 	Sparkles,
 	WifiOff,
+	Moon,
+	Sun,
 } from "lucide-react";
 import type {
 	Conversation,
@@ -53,6 +55,7 @@ import { useDesktop } from "./useDesktop.ts";
 import { TranscriptView, type TodoItem } from "./TranscriptView.tsx";
 import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
 import { WorkspacePicker } from "./WorkspacePicker.tsx";
+import { GrailEmblem, HolyGrailIcon, MagicCircleBackdrop, MagicCircleLoader, getServantInfo } from "./GrailIcons.tsx";
 import { SubagentPanel, type SubagentPanelHandle } from "./SubagentPanel.tsx";
 import { SubagentTranscriptView } from "./SubagentTranscriptView.tsx";
 import { SubagentApprovals } from "./SubagentApprovals.tsx";
@@ -73,6 +76,7 @@ import { AgentsDialog } from "./AgentsDialog.tsx";
 import { McpDialog } from "./McpDialog.tsx";
 import "../prototype/style.css";
 import "./style.css";
+import "./grail-theme.css";
 
 function formatTime(timestamp: number): string {
 	return new Date(timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
@@ -412,6 +416,13 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		setMoreMenuOpen(false);
 		void app.switchTo(() => api.openProject());
 	};
+	const cycleTheme = async () => {
+		if (!snapshot || blocked) return;
+		const order: Array<"light" | "dark" | "grail"> = ["light", "dark", "grail"];
+		const current = snapshot.settings.theme === "system" ? "light" : snapshot.settings.theme;
+		const next = order[(order.indexOf(current) + 1) % order.length];
+		await app.switchTo(() => api.saveSettings({ permission: snapshot.settings.permission, theme: next }));
+	};
 	const decideTrust = async (decision: ProjectTrustDecision) => {
 		if (!snapshot?.trust || trustBusy) return;
 		setTrustBusy(true);
@@ -669,6 +680,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		{ id: "find", label: "会话内关键词搜索", shortcut: "⌘F", keywords: "find in transcript", disabled: !snapshot.active, run: () => setFindOpen(true) },
 		{ id: "open", label: "打开项目文件夹", keywords: "open project folder", disabled: changing, run: () => openWorkspace() },
 		{ id: "sandbox", label: "命令沙箱设置 (/sandbox)", keywords: "sandbox seatbelt offline isolation", run: () => setSandboxOpen(true) },
+		{ id: "theme", label: "切换外观主题（浅色 / 深色 / 圣杯二次元）", keywords: "theme light dark grail anime 圣杯 二次元", disabled: blocked, run: () => void cycleTheme() },
 		{ id: "plan", label: inPlanMode ? "退出 Plan 计划模式" : "进入 Plan 计划模式", keywords: "plan mode readonly", disabled: blocked, run: () => void togglePlanMode() },
 		{ id: "rewind", label: "检查点与代码回滚 (/rewind)", keywords: "git checkpoint restore", disabled: !snapshot.active, run: () => { setRewindQuery(undefined); setCheckpointsOpen(true); } },
 		{ id: "tasks", label: "后台任务、子 Agent 与 Worktree (/tasks)", keywords: "subagent external codex claude kimi", run: () => { setTaskInitialId(undefined); setTasksOpen(true); } },
@@ -690,14 +702,16 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		{ id: "compact", label: "压缩会话上下文 (/compact)", keywords: "compact context", disabled: blocked || !history.messages.length, run: () => void app.command({ type: "compact" }) },
 		{ id: "settings", label: "打开客户端与模型设置", keywords: "settings model api key theme", run: () => setSettings(true) },
 	];
+	const isGrail = snapshot.settings.theme === "grail";
+	const servant = isGrail ? getServantInfo(snapshot.state?.model?.id) : null;
 	return (
 		<div className={`desktop-app live-app ${sidebar ? "" : "cl-side-hidden"} ${pane || previewUrl ? "has-inspector" : ""}`}>
 			{sidebar && (
 				<aside className="cl-side" aria-label="项目与会话">
 					<div className="cl-side-head">
 						<span className="cl-side-brand">
-							<PiMark />
-							<span className="cl-side-title">Pi Code</span>
+							{isGrail ? <HolyGrailIcon width={18} height={18} /> : <PiMark />}
+							<span className="cl-side-title">{isGrail ? "Pi Grail" : "Pi Code"}</span>
 						</span>
 						<IconButton icon={PanelLeftClose} label="收起侧栏" onClick={() => setSidebar(false)} />
 					</div>
@@ -710,7 +724,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							onClick={() => switchTo(() => api.newConversation())}
 						>
 							<Plus size={15} />
-							<span>新建会话</span>
+							<span>{isGrail ? "召唤新会话" : "新建会话"}</span>
 							<kbd aria-hidden="true">⌘N</kbd>
 						</button>
 						<div className="cl-side-action-row">
@@ -882,6 +896,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				</aside>
 			)}
 			<main className="cl-main">
+				{isGrail && <MagicCircleBackdrop />}
 				<header className={`cl-top ${sidebar ? "" : "cl-top-collapsed"}`}>
 					<div className="cl-top-title">
 						{!sidebar && (
@@ -981,6 +996,31 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								)}
 							</button>
 						</div>
+						<button
+							type="button"
+							className={`cc-theme-pill ${isGrail ? "grail" : ""}`}
+							aria-label="切换主题"
+							disabled={blocked}
+							title="一键切换外观主题：浅色 / 深色 / 圣杯（二次元）"
+							onClick={() => void cycleTheme()}
+						>
+							{isGrail ? (
+								<>
+									<HolyGrailIcon width={14} height={14} />
+									<span>圣杯</span>
+								</>
+							) : snapshot.settings.theme === "dark" ? (
+								<>
+									<Moon size={13} />
+									<span>深色</span>
+								</>
+							) : (
+								<>
+									<Sun size={13} />
+									<span>浅色</span>
+								</>
+							)}
+						</button>
 						<div className="cc-more-wrap" ref={moreMenuRef}>
 							<button
 								type="button"
@@ -1327,10 +1367,32 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										/>
 									) : (
 										<div className="cl-empty">
-											<div className="cl-empty-emblem">
-												<PiMark />
-											</div>
-											<h1>{snapshot.active ? "今天想一起做什么？" : "选择工作目录开始"}</h1>
+											{isGrail ? (
+												<GrailEmblem />
+											) : (
+												<div className="cl-empty-emblem">
+													<PiMark />
+												</div>
+											)}
+											<h1>
+												{snapshot.active
+													? isGrail
+														? "向圣杯许下你的编程愿望"
+														: "今天想一起做什么？"
+													: isGrail
+														? "选择召唤结界（工作目录）"
+														: "选择工作目录开始"}
+											</h1>
+											{isGrail && servant && (
+												<div className="grail-servant-badge">
+													<span className="grail-servant-rarity">{servant.rarity}</span>
+													<span className="grail-servant-class" style={{ color: servant.accent }}>
+														{servant.className}
+													</span>
+													<span>· {servant.title}</span>
+													{snapshot.state?.model?.id && <span>({snapshot.state.model.name || snapshot.state.model.id})</span>}
+												</div>
+											)}
 											{snapshot.active ? (
 												<>
 													<div className="cc-empty-workspace">
@@ -1397,8 +1459,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									)}
 									{running && (
 										<div className="cl-working" role="status">
-											<span className="cl-spinner" />
-											Pi 正在工作
+											{isGrail ? <MagicCircleLoader size={16} /> : <span className="cl-spinner" />}
+											{isGrail ? "从者正在咏唱与执行…" : "Pi 正在工作"}
 											{snapshot.state?.pendingMessageCount ? ` · ${snapshot.state.pendingMessageCount} 条指令待处理` : ""}
 										</div>
 									)}

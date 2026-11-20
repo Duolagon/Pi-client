@@ -274,7 +274,22 @@ try {
 		await page.locator(".live-diff").filter({ hasText: "你好" }).waitFor();
 		await page.screenshot({ path: join(screenshots, "client-dark.png"), scale: "css" });
 		await page.getByRole("button", { name: "关闭工作区面板", exact: true }).click();
+		await page.getByRole("button", { name: "切换主题", exact: true }).click();
+		await page.waitForFunction(() => document.documentElement.dataset.theme === "grail");
+		await page.locator(".grail-magic-backdrop").waitFor();
+		await page.screenshot({ path: join(screenshots, "client-grail.png"), scale: "css" });
+		await page.getByRole("button", { name: "切换主题", exact: true }).click();
+		await page.waitForFunction(() => document.documentElement.dataset.theme === "light");
+	} else {
+		await page.getByRole("button", { name: "切换主题", exact: true }).click();
+		await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
+		await page.getByRole("button", { name: "切换主题", exact: true }).click();
+		await page.waitForFunction(() => document.documentElement.dataset.theme === "grail");
+		await page.locator(".grail-magic-backdrop").waitFor();
+		await page.getByRole("button", { name: "切换主题", exact: true }).click();
+		await page.waitForFunction(() => document.documentElement.dataset.theme === "light");
 	}
+	checks.push("light, dark and Holy Grail anime theme switching");
 
 	await page.getByRole("button", { name: "终端", exact: true }).click();
 	await page.getByRole("textbox", { name: "终端命令", exact: true }).fill("printf 'UI_SHELL_OK\\n'");

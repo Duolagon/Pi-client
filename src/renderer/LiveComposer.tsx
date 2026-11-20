@@ -3,6 +3,7 @@ import { ArrowUp, Brain, Paperclip, ShieldCheck, Square, X } from "lucide-react"
 import type { Command, PermissionMode, Project, SandboxStatus, Snapshot, ThinkingLevel } from "../shared.ts";
 import { WorkspacePicker } from "./WorkspacePicker.tsx";
 import { SandboxControl } from "./SandboxControl.tsx";
+import { CommandSealIcon } from "./GrailIcons.tsx";
 
 type Image = NonNullable<Extract<Command, { type: "prompt" }>["images"]>[number];
 interface Attachment {
@@ -542,7 +543,9 @@ export function LiveComposer({
 					placeholder={
 						snapshot.active
 							? hasModel
-								? "描述任务，或在运行中补充指令…"
+								? snapshot.settings.theme === "grail"
+									? "向圣杯许愿，或在咏唱中补充指令…"
+									: "描述任务，或在运行中补充指令…"
 								: "先在设置中连接 Pi 的模型配置"
 							: "先打开项目文件夹"
 					}
@@ -716,7 +719,7 @@ export function LiveComposer({
 								aria-label="发送任务"
 								disabled={disabled || (!draft.trim() && !attachments.length)}
 							>
-								<ArrowUp size={17} />
+								{snapshot.settings.theme === "grail" ? <CommandSealIcon width={17} height={17} /> : <ArrowUp size={17} />}
 							</button>
 						)}
 					</div>
