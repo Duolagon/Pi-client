@@ -1,63 +1,51 @@
-/* ── Fate「许愿圣杯」二次元主题 (data-theme="grail") ──
-   Scoped exclusively under :root[data-theme="grail"] so light and dark
-   Claude Code themes remain 100% untouched. Deep starry night canvas,
-   Holy Grail gold (#f5c542), Mana azure (#38bdf8), Command Seal crimson
-   (#f43f5e), frosted obsidian glass, and a subtle rotating summoning circle. */
+/* ── 星夜祈愿 Starlit (data-theme="grail") ──
+   Night sky canvas, starlight gold signal, lavender-blue glass surfaces and
+   a Mincho display face. Scoped under :root[data-theme="grail"]; it only
+   overrides tokens and a few signature surfaces, so layout stays shared
+   with 雾白 and 石墨. */
 
 :root[data-theme="grail"] {
 	color-scheme: dark;
-	--cl-bg: #070b15;
-	--cl-side: #0b1020;
-	--cl-surface: #11182c;
-	--cl-soft: #17213a;
-	--cl-text: #eef3ff;
-	--cl-1: #eef3ff;
-	--cl-2: #b3c2e2;
-	--cl-3: #7c8fb8;
-	--cl-line: rgba(148, 179, 255, 0.18);
-	--cl-line-soft: rgba(148, 179, 255, 0.11);
-	--cl-hover: rgba(56, 189, 248, 0.12);
-	--cl-active: rgba(245, 197, 66, 0.16);
-	--cl-clay: #f5c542;
-	--cl-clay-hover: #ffd666;
-	--cl-clay-soft: rgba(245, 197, 66, 0.14);
-	--cl-bubble: rgba(56, 189, 248, 0.11);
-	--cl-green: #4ade80;
-	--cl-green-soft: rgba(74, 222, 128, 0.14);
-	--cl-amber: #fbbf24;
-	--cl-amber-soft: rgba(251, 191, 36, 0.14);
-	--cl-red: #fb7185;
-	--cl-add: rgba(52, 211, 153, 0.14);
-	--cl-remove: rgba(244, 63, 94, 0.16);
+	--font-display: "Hiragino Mincho ProN", "Songti SC", serif;
+	--cl-bg: #0a0f24;
+	--cl-side: #080c1e;
+	--cl-surface: #141c3c;
+	--cl-soft: #1a2348;
+	--cl-text: #eef1ff;
+	--cl-1: #eef1ff;
+	--cl-2: #b8c0e6;
+	--cl-3: #7f89b6;
+	--cl-line: rgba(160, 175, 255, 0.16);
+	--cl-line-soft: rgba(160, 175, 255, 0.1);
+	--cl-hover: rgba(120, 150, 255, 0.12);
+	--cl-active: rgba(242, 201, 107, 0.14);
+	--cl-clay: #f2c96b;
+	--cl-clay-hover: #ffd98c;
+	--cl-clay-soft: rgba(242, 201, 107, 0.15);
+	--cl-on-accent: #1a1430;
+	--cl-bubble: rgba(110, 120, 235, 0.2);
+	--cl-green: #7be0b8;
+	--cl-green-soft: rgba(123, 224, 184, 0.13);
+	--cl-amber: #f2c96b;
+	--cl-amber-soft: rgba(242, 201, 107, 0.13);
+	--cl-red: #ff8fa3;
+	--cl-add: rgba(123, 224, 184, 0.13);
+	--cl-remove: rgba(255, 143, 163, 0.14);
+	--cl-hunk: #16204a;
 
-	--grail-gold: #f5c542;
-	--grail-gold-glow: rgba(245, 197, 66, 0.34);
-	--grail-azure: #38bdf8;
-	--grail-azure-glow: rgba(56, 189, 248, 0.28);
-	--grail-crimson: #f43f5e;
-	--grail-violet: #a78bfa;
+	--grail-gold: #f2c96b;
+	--grail-gold-glow: rgba(242, 201, 107, 0.34);
+	--grail-azure: #8ea2ff;
+	--grail-azure-glow: rgba(142, 162, 255, 0.28);
+	--grail-crimson: #ff8fa3;
+	--grail-violet: #c4a7ff;
 
-	/* Mirror shared prototype tokens so dialogs, drawers, and panels harmonize. */
-	--bg: var(--cl-bg);
-	--sidebar: var(--cl-side);
-	--surface: var(--cl-surface);
-	--surface-soft: var(--cl-soft);
-	--text: var(--cl-text);
-	--muted: var(--cl-3);
-	--secondary: var(--cl-2);
-	--line: var(--cl-line);
-	--line-soft: var(--cl-line-soft);
-	--hover: var(--cl-hover);
-	--selected: var(--cl-active);
+	--elev-1: 0 1px 2px rgba(2, 4, 16, 0.4);
+	--elev-2: 0 1px 2px rgba(2, 4, 16, 0.4), 0 10px 26px -10px rgba(2, 4, 16, 0.7);
+	--elev-3: 0 2px 8px rgba(2, 4, 16, 0.5), 0 0 0 1px rgba(242, 201, 107, 0.08), 0 30px 60px -14px rgba(2, 4, 16, 0.8);
+
+	--code: #c7d0f5;
 	--brand: var(--grail-gold);
-	--brand-soft: var(--cl-clay-soft);
-	--green: var(--cl-green);
-	--red: var(--cl-red);
-	--code: #c7d6f5;
-	--add: var(--cl-add);
-	--remove: var(--cl-remove);
-	--hunk: #13203d;
-	--shadow: 0 16px 46px rgba(2, 6, 20, 0.72), 0 0 24px rgba(56, 189, 248, 0.08);
 }
 
 @keyframes grail-rotate-slow {
@@ -72,26 +60,26 @@
 @keyframes grail-pulse-aura {
 	0%,
 	100% {
-		filter: drop-shadow(0 0 10px rgba(245, 197, 66, 0.45));
+		filter: drop-shadow(0 0 10px rgba(242, 201, 107, 0.45));
 	}
 	50% {
-		filter: drop-shadow(0 0 20px rgba(245, 197, 66, 0.8));
+		filter: drop-shadow(0 0 20px rgba(242, 201, 107, 0.8));
 	}
 }
 
 .grail-spin {
 	animation: grail-rotate-slow 2.6s linear infinite;
-	color: var(--grail-gold, #f5c542);
+	color: var(--grail-gold, #f2c96b);
 	flex-shrink: 0;
 }
 
 /* ── Starry night canvas + ambient summoning circle ── */
 :root[data-theme="grail"] .live-app {
 	background:
-		radial-gradient(ellipse 68% 48% at 82% 8%, rgba(56, 189, 248, 0.11), transparent 65%),
-		radial-gradient(ellipse 56% 42% at 18% 92%, rgba(245, 197, 66, 0.08), transparent 62%),
-		radial-gradient(ellipse 40% 35% at 50% 45%, rgba(167, 139, 250, 0.05), transparent 70%),
-		#070b15;
+		radial-gradient(ellipse 68% 48% at 82% 8%, rgba(142, 162, 255, 0.11), transparent 65%),
+		radial-gradient(ellipse 56% 42% at 18% 92%, rgba(242, 201, 107, 0.08), transparent 62%),
+		radial-gradient(ellipse 40% 35% at 50% 45%, rgba(196, 167, 255, 0.05), transparent 70%),
+		#0a0f24;
 }
 
 :root[data-theme="grail"] .cl-main {
@@ -130,8 +118,8 @@
 /* ── Sidebar: obsidian sanctuary with golden hairline ── */
 :root[data-theme="grail"] .cl-side {
 	background: linear-gradient(180deg, rgba(13, 19, 38, 0.96) 0%, rgba(8, 12, 24, 0.98) 100%);
-	border-right: 1px solid rgba(245, 197, 66, 0.18);
-	box-shadow: inset -1px 0 24px rgba(56, 189, 248, 0.04);
+	border-right: 1px solid rgba(242, 201, 107, 0.18);
+	box-shadow: inset -1px 0 24px rgba(142, 162, 255, 0.04);
 }
 
 :root[data-theme="grail"] .cl-side-brand {
@@ -140,11 +128,11 @@
 
 :root[data-theme="grail"] .cl-side-brand svg {
 	color: var(--grail-gold);
-	filter: drop-shadow(0 0 6px rgba(245, 197, 66, 0.55));
+	filter: drop-shadow(0 0 6px rgba(242, 201, 107, 0.55));
 }
 
 :root[data-theme="grail"] .cl-side-title {
-	background: linear-gradient(90deg, #ffe27a 0%, #f5c542 55%, #7dd3fc 100%);
+	background: linear-gradient(90deg, #ffe1a0 0%, #f2c96b 55%, #b8c4ff 100%);
 	-webkit-background-clip: text;
 	background-clip: text;
 	color: transparent;
@@ -153,35 +141,35 @@
 }
 
 :root[data-theme="grail"] .cl-side-new {
-	background: linear-gradient(135deg, rgba(245, 197, 66, 0.16) 0%, rgba(56, 189, 248, 0.11) 100%);
-	border: 1px solid rgba(245, 197, 66, 0.34);
+	background: linear-gradient(135deg, rgba(242, 201, 107, 0.16) 0%, rgba(142, 162, 255, 0.11) 100%);
+	border: 1px solid rgba(242, 201, 107, 0.34);
 	color: #fff5d6;
-	box-shadow: 0 2px 12px rgba(245, 197, 66, 0.12);
+	box-shadow: 0 2px 12px rgba(242, 201, 107, 0.12);
 }
 
 :root[data-theme="grail"] .cl-side-new:hover:not(:disabled) {
-	border-color: rgba(245, 197, 66, 0.72);
-	box-shadow: 0 0 18px rgba(245, 197, 66, 0.24);
+	border-color: rgba(242, 201, 107, 0.72);
+	box-shadow: 0 0 18px rgba(242, 201, 107, 0.24);
 }
 
 :root[data-theme="grail"] .cl-ws-chip.active {
-	background: rgba(245, 197, 66, 0.14);
-	border-color: rgba(245, 197, 66, 0.5);
+	background: rgba(242, 201, 107, 0.14);
+	border-color: rgba(242, 201, 107, 0.5);
 	color: #ffe89e;
 }
 
 :root[data-theme="grail"] .cl-conv.selected {
-	background: linear-gradient(135deg, rgba(245, 197, 66, 0.15) 0%, rgba(56, 189, 248, 0.1) 100%);
-	box-shadow: 0 0 16px rgba(245, 197, 66, 0.14), inset 0 0 0 1px rgba(245, 197, 66, 0.36);
+	background: linear-gradient(135deg, rgba(242, 201, 107, 0.15) 0%, rgba(142, 162, 255, 0.1) 100%);
+	box-shadow: 0 0 16px rgba(242, 201, 107, 0.14), inset 0 0 0 1px rgba(242, 201, 107, 0.36);
 }
 
 :root[data-theme="grail"] .cl-conv.selected::before {
-	background: linear-gradient(180deg, #ffe27a 0%, #38bdf8 100%);
+	background: linear-gradient(180deg, #ffe1a0 0%, #8ea2ff 100%);
 	box-shadow: 0 0 8px var(--grail-gold-glow);
 }
 
 :root[data-theme="grail"] .cl-side-foot {
-	border-top-color: rgba(245, 197, 66, 0.15);
+	border-top-color: rgba(242, 201, 107, 0.15);
 	background: rgba(6, 9, 20, 0.55);
 }
 
@@ -189,29 +177,29 @@
 :root[data-theme="grail"] .cl-top {
 	background: rgba(11, 16, 32, 0.78);
 	backdrop-filter: blur(12px);
-	border-bottom: 1px solid rgba(245, 197, 66, 0.16);
+	border-bottom: 1px solid rgba(242, 201, 107, 0.16);
 }
 
 :root[data-theme="grail"] .cc-ws-topbar-btn {
 	background: rgba(17, 24, 44, 0.9);
-	border-color: rgba(148, 179, 255, 0.24);
+	border-color: rgba(160, 175, 255, 0.24);
 }
 
 :root[data-theme="grail"] .cc-ws-topbar-btn:hover,
 :root[data-theme="grail"] .cc-ws-topbar-btn.open {
-	border-color: rgba(245, 197, 66, 0.65);
-	box-shadow: 0 0 14px rgba(245, 197, 66, 0.18);
+	border-color: rgba(242, 201, 107, 0.65);
+	box-shadow: 0 0 14px rgba(242, 201, 107, 0.18);
 }
 
 :root[data-theme="grail"] .cc-top-seg {
 	background: rgba(15, 22, 42, 0.85);
-	border-color: rgba(148, 179, 255, 0.18);
+	border-color: rgba(160, 175, 255, 0.18);
 }
 
 :root[data-theme="grail"] .cc-top-btn.active {
-	background: linear-gradient(135deg, rgba(245, 197, 66, 0.2) 0%, rgba(56, 189, 248, 0.16) 100%);
+	background: linear-gradient(135deg, rgba(242, 201, 107, 0.2) 0%, rgba(142, 162, 255, 0.16) 100%);
 	color: #fff4d1;
-	box-shadow: inset 0 0 0 1px rgba(245, 197, 66, 0.35);
+	box-shadow: inset 0 0 0 1px rgba(242, 201, 107, 0.35);
 }
 
 .cc-theme-pill {
@@ -220,11 +208,11 @@
 	gap: 5px;
 	height: 30px;
 	padding: 0 9px;
-	border-radius: 8px;
+	border-radius: var(--r-md);
 	border: 1px solid var(--cl-line);
 	background: var(--cl-surface);
 	color: var(--cl-2);
-	font-size: 12px;
+	font-size: var(--fs-sm);
 	font-weight: 500;
 	white-space: nowrap;
 }
@@ -235,13 +223,13 @@
 }
 
 .cc-theme-pill.grail {
-	background: linear-gradient(135deg, rgba(245, 197, 66, 0.18) 0%, rgba(56, 189, 248, 0.14) 100%);
-	border-color: rgba(245, 197, 66, 0.45);
+	background: linear-gradient(135deg, rgba(242, 201, 107, 0.18) 0%, rgba(142, 162, 255, 0.14) 100%);
+	border-color: rgba(242, 201, 107, 0.45);
 	color: #ffe58f;
-	box-shadow: 0 0 12px rgba(245, 197, 66, 0.16);
+	box-shadow: 0 0 12px rgba(242, 201, 107, 0.16);
 }
 
-/* ── Welcome screen: Holy Grail Summoning Crest + Servant Class Badge ── */
+/* ── Welcome screen: grail crest + model badge ── */
 .grail-emblem {
 	position: relative;
 	width: 104px;
@@ -261,9 +249,9 @@
 	width: 58px;
 	height: 58px;
 	border-radius: 50%;
-	background: radial-gradient(circle, rgba(245, 197, 66, 0.28) 0%, rgba(56, 189, 248, 0.12) 70%, transparent 100%);
-	border: 1px solid rgba(245, 197, 66, 0.55);
-	color: #f5c542;
+	background: radial-gradient(circle, rgba(242, 201, 107, 0.28) 0%, rgba(142, 162, 255, 0.12) 70%, transparent 100%);
+	border: 1px solid rgba(242, 201, 107, 0.55);
+	color: #f2c96b;
 	display: flex;
 	align-items: center;
 	justify-content: center;
@@ -271,7 +259,7 @@
 }
 
 :root[data-theme="grail"] .cl-empty h1 {
-	background: linear-gradient(90deg, #fff5cc 0%, #f5c542 48%, #7dd3fc 100%);
+	background: linear-gradient(90deg, #fff5cc 0%, #f2c96b 48%, #b8c4ff 100%);
 	-webkit-background-clip: text;
 	background-clip: text;
 	color: transparent;
@@ -282,21 +270,21 @@
 	align-items: center;
 	gap: 7px;
 	padding: 4px 11px;
-	border-radius: 999px;
+	border-radius: var(--r-pill);
 	background: rgba(17, 24, 44, 0.85);
-	border: 1px solid rgba(245, 197, 66, 0.34);
-	font-size: 11.5px;
+	border: 1px solid rgba(242, 201, 107, 0.34);
+	font-size: var(--fs-sm);
 	color: #dbe7ff;
-	box-shadow: 0 0 14px rgba(56, 189, 248, 0.14);
+	box-shadow: 0 0 14px rgba(142, 162, 255, 0.14);
 }
 
 .grail-servant-rarity {
 	font-family: var(--mono);
-	font-size: 10.5px;
+	font-size: var(--fs-xs);
 	font-weight: 700;
 	padding: 1px 6px;
-	border-radius: 999px;
-	background: linear-gradient(135deg, #f5c542, #fb923c);
+	border-radius: var(--r-pill);
+	background: linear-gradient(135deg, #f2c96b, #e8b25a);
 	color: #161005;
 }
 
@@ -308,29 +296,29 @@
 :root[data-theme="grail"] .cc-empty-workspace,
 :root[data-theme="grail"] .cc-starter-chip {
 	background: rgba(17, 24, 44, 0.82);
-	border-color: rgba(148, 179, 255, 0.22);
+	border-color: rgba(160, 175, 255, 0.22);
 	backdrop-filter: blur(8px);
 }
 
 :root[data-theme="grail"] .cc-starter-chip:hover {
-	border-color: rgba(245, 197, 66, 0.65);
-	box-shadow: 0 0 18px rgba(245, 197, 66, 0.16);
+	border-color: rgba(242, 201, 107, 0.65);
+	box-shadow: 0 0 18px rgba(242, 201, 107, 0.16);
 	color: #fff6d6;
 }
 
 :root[data-theme="grail"] .cc-empty-cta {
-	background: linear-gradient(135deg, #f5c542 0%, #f59e0b 100%);
+	background: linear-gradient(135deg, #f2c96b 0%, #e0a94a 100%);
 	color: #140f04;
 	font-weight: 600;
-	box-shadow: 0 0 22px rgba(245, 197, 66, 0.35);
+	box-shadow: 0 0 22px rgba(242, 201, 107, 0.35);
 }
 
-/* ── Transcript: Master (Mana Azure + Command Seal) & Servant (Holy Grail Gold) ── */
+/* ── Transcript: user bubble (lavender glass) and assistant (starlight gold) ── */
 :root[data-theme="grail"] .cl-user-bubble {
 	position: relative;
-	background: linear-gradient(135deg, rgba(56, 189, 248, 0.16) 0%, rgba(30, 58, 110, 0.22) 100%);
-	border: 1px solid rgba(56, 189, 248, 0.38);
-	box-shadow: 0 4px 20px rgba(56, 189, 248, 0.1);
+	background: linear-gradient(135deg, rgba(142, 162, 255, 0.16) 0%, rgba(60, 70, 160, 0.22) 100%);
+	border: 1px solid rgba(142, 162, 255, 0.38);
+	box-shadow: 0 4px 20px rgba(142, 162, 255, 0.1);
 }
 
 :root[data-theme="grail"] .cl-user-bubble::after {
@@ -338,9 +326,9 @@
 	position: absolute;
 	top: 7px;
 	right: 11px;
-	font-size: 11px;
-	color: #fb7185;
-	text-shadow: 0 0 8px rgba(244, 63, 94, 0.75);
+	font-size: var(--fs-xs);
+	color: #ff8fa3;
+	text-shadow: 0 0 8px rgba(255, 143, 163, 0.75);
 	pointer-events: none;
 }
 
@@ -352,9 +340,9 @@
 :root[data-theme="grail"] .cl-msg-ai {
 	position: relative;
 	padding: 12px 14px 12px 18px;
-	border-radius: 14px;
+	border-radius: var(--r-lg);
 	background: linear-gradient(180deg, rgba(16, 23, 42, 0.78) 0%, rgba(12, 18, 34, 0.72) 100%);
-	border: 1px solid rgba(245, 197, 66, 0.16);
+	border: 1px solid rgba(242, 201, 107, 0.16);
 	box-shadow: 0 4px 24px rgba(2, 6, 20, 0.35);
 }
 
@@ -366,8 +354,8 @@
 	bottom: 10px;
 	width: 3px;
 	border-radius: 0 3px 3px 0;
-	background: linear-gradient(180deg, #f5c542 0%, #38bdf8 100%);
-	box-shadow: 0 0 10px rgba(245, 197, 66, 0.55);
+	background: linear-gradient(180deg, #f2c96b 0%, #8ea2ff 100%);
+	box-shadow: 0 0 10px rgba(242, 201, 107, 0.55);
 }
 
 :root[data-theme="grail"] .cc-ai-bullet {
@@ -379,35 +367,35 @@
 :root[data-theme="grail"] .cl-tool-body,
 :root[data-theme="grail"] .cc-codeblock {
 	background: rgba(7, 11, 22, 0.9);
-	border-color: rgba(148, 179, 255, 0.2);
+	border-color: rgba(160, 175, 255, 0.2);
 }
 
 :root[data-theme="grail"] .cl-working {
 	color: #ffe58f;
 }
 
-/* ── Composer: frosted midnight glass + mana focus ring + golden Command Seal send ── */
+/* ── Composer: frosted night glass, gold focus ring and send ── */
 :root[data-theme="grail"] .cl-composer-box {
 	background: rgba(15, 22, 42, 0.9);
 	backdrop-filter: blur(14px);
-	border: 1px solid rgba(148, 179, 255, 0.24);
-	box-shadow: 0 10px 34px rgba(2, 6, 20, 0.55), 0 0 18px rgba(56, 189, 248, 0.08);
+	border: 1px solid rgba(160, 175, 255, 0.24);
+	box-shadow: 0 10px 34px rgba(2, 6, 20, 0.55), 0 0 18px rgba(142, 162, 255, 0.08);
 }
 
 :root[data-theme="grail"] .cl-composer-box:focus-within {
-	border-color: rgba(56, 189, 248, 0.72);
-	box-shadow: 0 10px 36px rgba(2, 6, 20, 0.6), 0 0 0 3px rgba(56, 189, 248, 0.18), 0 0 24px rgba(245, 197, 66, 0.14);
+	border-color: rgba(142, 162, 255, 0.72);
+	box-shadow: 0 10px 36px rgba(2, 6, 20, 0.6), 0 0 0 3px rgba(142, 162, 255, 0.18), 0 0 24px rgba(242, 201, 107, 0.14);
 }
 
 :root[data-theme="grail"] .cl-send {
-	background: linear-gradient(135deg, #f5c542 0%, #f59e0b 100%);
+	background: linear-gradient(135deg, #f2c96b 0%, #e0a94a 100%);
 	color: #161004;
-	box-shadow: 0 0 16px rgba(245, 197, 66, 0.42);
+	box-shadow: 0 0 16px rgba(242, 201, 107, 0.42);
 }
 
 :root[data-theme="grail"] .cl-send:hover:not(:disabled) {
 	background: linear-gradient(135deg, #ffe074 0%, #fbbf24 100%);
-	box-shadow: 0 0 22px rgba(245, 197, 66, 0.65);
+	box-shadow: 0 0 22px rgba(242, 201, 107, 0.65);
 }
 
 :root[data-theme="grail"] .cl-send:disabled {
@@ -419,31 +407,31 @@
 :root[data-theme="grail"] .cl-send.stop {
 	background: linear-gradient(135deg, #f43f5e 0%, #e11d48 100%);
 	color: #fff;
-	box-shadow: 0 0 16px rgba(244, 63, 94, 0.45);
+	box-shadow: 0 0 16px rgba(255, 143, 163, 0.45);
 }
 
 :root[data-theme="grail"] .cl-pill {
 	background: rgba(17, 24, 44, 0.85);
-	border-color: rgba(148, 179, 255, 0.22);
+	border-color: rgba(160, 175, 255, 0.22);
 }
 
 :root[data-theme="grail"] .cc-sandbox-pill.on,
 :root[data-theme="grail"] .cc-sandbox-pill.offline {
-	background: rgba(56, 189, 248, 0.14);
-	border-color: rgba(56, 189, 248, 0.42);
-	color: #7dd3fc;
+	background: rgba(142, 162, 255, 0.14);
+	border-color: rgba(142, 162, 255, 0.42);
+	color: #b8c4ff;
 }
 
 :root[data-theme="grail"] .cc-sandbox-pill.on > svg,
 :root[data-theme="grail"] .cc-sandbox-pill.offline > svg {
-	color: #38bdf8;
+	color: #8ea2ff;
 }
 
 /* ── Syntax highlighting for Grail starry code blocks ── */
 :root[data-theme="grail"] .tok-keyword { color: #c084fc; }
 :root[data-theme="grail"] .tok-string { color: #6ee7b7; }
 :root[data-theme="grail"] .tok-number { color: #fbbf24; }
-:root[data-theme="grail"] .tok-type { color: #38bdf8; }
+:root[data-theme="grail"] .tok-type { color: #8ea2ff; }
 :root[data-theme="grail"] .tok-comment { color: #64748b; }
 
 @media (max-width: 1000px) {
@@ -454,31 +442,31 @@
 
 /* ── Per-turn quality omen (显灵/征兆): badge glow + settle reveal ── */
 :root[data-theme="grail"] .cc-omen-grail {
-	color: var(--grail-gold, #f5c542);
-	text-shadow: 0 0 8px var(--grail-gold-glow, rgba(245, 197, 66, 0.34));
+	color: var(--grail-gold, #f2c96b);
+	text-shadow: 0 0 8px var(--grail-gold-glow, rgba(242, 201, 107, 0.34));
 }
 :root[data-theme="grail"] .cc-omen-grail svg {
-	filter: drop-shadow(0 0 5px var(--grail-gold-glow, rgba(245, 197, 66, 0.34)));
+	filter: drop-shadow(0 0 5px var(--grail-gold-glow, rgba(242, 201, 107, 0.34)));
 }
 :root[data-theme="grail"] .cc-omen-problem {
 	color: var(--grail-crimson, #f43f5e);
 }
 :root[data-theme="grail"] .cc-omen-unverified {
-	color: var(--grail-azure, #38bdf8);
+	color: var(--grail-azure, #8ea2ff);
 	opacity: 0.8;
 }
 
 /* Reveal animation shown in the working-indicator slot right after a turn settles. */
 .grail-omen-reveal {
-	display: inline-flex;
+	display: flex;
 	align-items: center;
 	gap: 8px;
-	font-size: 13px;
+	font-size: var(--fs-md);
 	font-weight: 600;
 	letter-spacing: 0.02em;
 }
 .grail-omen-reveal.omen-grail {
-	color: var(--grail-gold, #f5c542);
+	color: var(--grail-gold, #f2c96b);
 	animation: grail-bloom 2.5s ease-out both;
 }
 .grail-omen-reveal.omen-problem {
@@ -486,7 +474,7 @@
 	animation: grail-omen-shake 2.5s ease-out both;
 }
 .grail-omen-reveal.omen-unverified {
-	color: var(--grail-azure, #38bdf8);
+	color: var(--grail-azure, #8ea2ff);
 	animation: grail-fade-dim 2.5s ease-out both;
 }
 .grail-omen-reveal svg {
@@ -497,20 +485,20 @@
 	0% {
 		opacity: 0;
 		transform: scale(0.7);
-		filter: drop-shadow(0 0 0 rgba(245, 197, 66, 0));
+		filter: drop-shadow(0 0 0 rgba(242, 201, 107, 0));
 	}
 	35% {
 		opacity: 1;
 		transform: scale(1.12);
-		filter: drop-shadow(0 0 18px rgba(245, 197, 66, 0.9));
+		filter: drop-shadow(0 0 18px rgba(242, 201, 107, 0.9));
 	}
 	60% {
 		transform: scale(1);
-		filter: drop-shadow(0 0 12px rgba(245, 197, 66, 0.6));
+		filter: drop-shadow(0 0 12px rgba(242, 201, 107, 0.6));
 	}
 	100% {
 		opacity: 0;
-		filter: drop-shadow(0 0 6px rgba(245, 197, 66, 0.2));
+		filter: drop-shadow(0 0 6px rgba(242, 201, 107, 0.2));
 	}
 }
 @keyframes grail-omen-shake {

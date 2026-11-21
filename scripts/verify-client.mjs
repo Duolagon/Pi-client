@@ -438,7 +438,7 @@ try {
 	await input.fill("");
 
 	await page.getByRole("button", { name: "终端", exact: true }).click();
-	await page.getByRole("button", { name: /^交互 PTY/ }).click();
+	await page.getByRole("tab", { name: /^交互 PTY/ }).click();
 	await page.getByRole("textbox", { name: "PTY 输入", exact: true }).waitFor();
 	await page.getByRole("textbox", { name: "PTY 输入", exact: true }).fill("echo UI_PTY_PANEL_OK");
 	await page.getByRole("textbox", { name: "PTY 输入", exact: true }).press("Enter");
@@ -679,14 +679,14 @@ try {
 	await submit("停止生成验证");
 	await page.waitForFunction(() => document.querySelector(".cl-transcript")?.textContent.includes("流式恢复验证："));
 	await input.fill("第二条会话草稿");
-	await page.locator(".cl-conv").filter({ hasText: "审批拒绝验证 · 待确认" }).first().click();
+	await page.locator(".cl-conv").filter({ hasText: "审批拒绝验证" }).filter({ has: page.locator(".cl-conv-status", { hasText: "待确认" }) }).first().click();
 	await page.getByRole("dialog", { name: "允许执行 write？", exact: true }).waitFor();
 	assert.equal(await input.inputValue(), "只属于第一条会话的草稿");
 	assert.equal((await snapshot()).active.id, approvalSession.id);
 	assert.equal((await snapshot()).activity[secondSession.id], "running");
 	await page.getByRole("button", { name: "拒绝", exact: true }).click();
 	await idle();
-	await page.locator(".cl-conv").filter({ hasText: "停止生成验证 · 运行中" }).click();
+	await page.locator(".cl-conv").filter({ hasText: "停止生成验证" }).filter({ has: page.locator(".cl-conv-status", { hasText: "运行中" }) }).click();
 	await page.getByRole("button", { name: "停止任务", exact: true }).click();
 	await idle();
 	assert.equal(await input.inputValue(), "第二条会话草稿");
@@ -723,7 +723,7 @@ try {
 	await submit("子Agent审批面板验证");
 	await page.getByRole("region", { name: "子 Agent 面板", exact: true }).waitFor();
 	await page.locator(".cc-subagent-row").filter({ hasText: "E2E 子审批" }).waitFor();
-	await page.locator(".cl-conv-fold").filter({ hasText: "(+1)" }).waitFor();
+	await page.getByRole("button", { name: "展开 1 个子 Agent 会话", exact: true }).waitFor();
 	await page.getByRole("dialog", { name: /子 Agent ‹E2E 子审批›.*允许执行 write？/ }).waitFor();
 	await page.getByRole("button", { name: "稍后处理", exact: true }).click();
 	await page.getByRole("button", { name: "继续处理子 Agent 审批 (1)", exact: true }).waitFor();

@@ -107,3 +107,48 @@ test("cancelled verify = problem", () => {
 	const msgs: Message[] = [assistant(null, { tools: [edit()] }), bashExec("pytest", undefined, true)];
 	assert.equal(scoreTurn(msgs).omen, "problem");
 });
+
+// Pi registers its built-in tools in lower case. These mirror the real demo turn:
+// read → write → `node --test`, which must reach the grail.
+test("Pi lowercase tool names: write + passing node --test = grail", () => {
+	const msgs: Message[] = [
+		assistant(null, {
+			tools: [
+				{ id: "r1", name: "read", arguments: { path: "src/greeting.mjs" } },
+				{ id: "w1", name: "write", arguments: { path: "src/greeting.mjs" } },
+				{ id: "b1", name: "bash", arguments: { command: "node --test test/greeting.test.mjs" } },
+			],
+		}),
+		toolResult("r1", false),
+		toolResult("w1", false),
+		toolResult("b1", false),
+	];
+	const v = scoreTurn(msgs);
+	assert.equal(v.signals.edited, true);
+	assert.equal(v.signals.verifyPassed, true);
+	assert.equal(v.omen, "grail");
+});
+
+test("Pi lowercase tool names: edit without verification = unverified", () => {
+	const msgs: Message[] = [assistant(null, { tools: [{ id: "e1", name: "edit", arguments: { path: "a.ts" } }] }), toolResult("e1", false)];
+	assert.equal(scoreTurn(msgs).omen, "unverified");
+});
+
+test("Pi lowercase tool names: failing bash verify = problem", () => {
+	const msgs: Message[] = [
+		assistant(null, {
+			tools: [
+				{ id: "w1", name: "write", arguments: { path: "a.ts" } },
+				{ id: "b1", name: "bash", arguments: { command: "npm test" } },
+			],
+		}),
+		toolResult("w1", false),
+		toolResult("b1", true),
+	];
+	assert.equal(scoreTurn(msgs).omen, "problem");
+});
+
+test("read-only Pi turn yields no omen", () => {
+	const msgs: Message[] = [assistant(null, { tools: [{ id: "r1", name: "read", arguments: { path: "a.ts" } }] }), toolResult("r1", false)];
+	assert.equal(scoreTurn(msgs).omen, "none");
+});

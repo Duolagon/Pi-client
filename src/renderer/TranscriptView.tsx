@@ -190,7 +190,7 @@ function TaskNotificationCard({ details, onOpenTask }: { details: unknown; onOpe
 				<span className={`cc-dot ${status === "completed" ? "ok" : status === "failed" ? "err" : ""}`} />
 				<span className="cc-tool-head">
 					<span className="cc-tool-verb">子 Agent</span>
-					<span className="cl-tool-name">{description}</span>
+					<span className="cl-tool-name cl-tool-name-free">{description}</span>
 					<span className={`cc-task-notice-status ${status}`}>{noticeStatusLabel[status] ?? status}</span>
 				</span>
 				<ChevronRight size={13} className="cl-tool-chevron" />
@@ -264,7 +264,7 @@ export function TranscriptView({
 									<span className="cc-dot ok" />
 									<span className="cc-tool-head">
 										<span className="cc-tool-verb">{cardMeta.verb}</span>
-										<span className="cl-tool-name">{cardMeta.label}</span>
+										<span className="cl-tool-name cl-tool-name-free">{cardMeta.label}</span>
 									</span>
 									<ChevronRight size={13} className="cl-tool-chevron" />
 								</summary>
@@ -334,7 +334,7 @@ export function TranscriptView({
 							<summary>
 								<span className="cc-dot ok" />
 								<span className="cc-tool-verb">Compact</span>
-								<span className="cl-tool-name">上下文已压缩摘要</span>
+								<span className="cl-tool-name cl-tool-name-free">上下文已压缩摘要</span>
 								<ChevronRight size={13} className="cl-tool-chevron" />
 							</summary>
 							<div className="cl-tool-body">

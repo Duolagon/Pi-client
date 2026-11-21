@@ -311,7 +311,7 @@ export function WorkspacePanel({
 							<div key={`staged-${change.path}`} className="cc-change-row">
 								<button type="button" className="cc-change-open" onClick={() => void open(change.path)}>
 									<FileCode2 size={14} />
-									<span className="file-name">{change.path}</span>
+									<span className="file-name" title={change.path}>{change.path}</span>
 									<span>{change.status}</span>
 								</button>
 								{!readOnly && (
@@ -336,7 +336,7 @@ export function WorkspacePanel({
 							<div key={`unstaged-${change.path}`} className="cc-change-row">
 								<button type="button" className="cc-change-open" onClick={() => void open(change.path)}>
 									<FileCode2 size={14} />
-									<span className="file-name">{change.path}</span>
+									<span className="file-name" title={change.path}>{change.path}</span>
 									<span>{change.status}</span>
 								</button>
 								{!readOnly && (

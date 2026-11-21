@@ -135,6 +135,7 @@ export const SubagentPanel = forwardRef<
 					tabIndex={0}
 					role="listbox"
 					aria-label="当前会话的子 Agent"
+					aria-activedescendant={state.rows[selectedIndex] ? `cc-subagent-opt-${state.rows[selectedIndex].id}` : undefined}
 					onKeyDown={handleKeyDown}
 				>
 					<div className="cc-subagent-panel-head">
@@ -149,6 +150,7 @@ export const SubagentPanel = forwardRef<
 						return (
 							<div
 								key={row.id}
+								id={`cc-subagent-opt-${row.id}`}
 								role="option"
 								aria-selected={selected}
 								className={`cc-subagent-row ${selected ? "selected" : ""} ${active ? "active" : "ended"}`}

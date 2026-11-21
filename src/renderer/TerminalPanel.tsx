@@ -132,10 +132,12 @@ export function TerminalPanel({
 	return (
 		<section className="terminal-panel" aria-label="集成终端">
 			<header>
-				<span className="cc-term-title">
-					<TerminalIcon size={14} />
+				<span className="cc-term-title" role="tablist" aria-label="终端模式">
+					<TerminalIcon size={14} aria-hidden="true" />
 					<button
 						type="button"
+						role="tab"
+						aria-selected={mode === "bash"}
 						className={`cc-term-tab ${mode === "bash" ? "active" : ""}`}
 						onClick={() => setMode("bash")}
 					>
@@ -143,6 +145,8 @@ export function TerminalPanel({
 					</button>
 					<button
 						type="button"
+						role="tab"
+						aria-selected={mode === "pty"}
 						className={`cc-term-tab ${mode === "pty" ? "active" : ""}`}
 						onClick={() => {
 							setMode("pty");

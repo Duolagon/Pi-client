@@ -99,7 +99,7 @@ export function Inspector({ panel, setPanel, close, selected, select, notify, co
 						{changedFiles.map((item, index) => (
 							<button key={item.path} onClick={() => select(index)} className={selected === index ? "selected" : ""}>
 								<FileCode2 size={14} />
-								<span className="file-name">{item.path.split("/").pop()}</span>
+								<span className="file-name" title={item.path}>{item.path.split("/").pop()}</span>
 								<span className="diff-count">
 									<b>+{item.added}</b>
 									<i>−{item.removed}</i>

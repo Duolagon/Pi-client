@@ -37,8 +37,15 @@ type Assistant = Extract<Message, { role: "assistant" }>;
 type ToolResult = Extract<Message, { role: "toolResult" }>;
 type BashExecution = Extract<Message, { role: "bashExecution" }>;
 
-/** Tools that write code to disk. */
-const EDIT_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "MultiEdit"]);
+/**
+ * Tools that write code to disk. Pi registers its built-in tools in lower case
+ * (`edit`, `write`, `bash`), so names are compared case-insensitively.
+ */
+const EDIT_TOOLS = new Set(["edit", "write", "notebookedit", "multiedit"]);
+
+function toolName(call: { name: string }): string {
+	return call.name.toLowerCase();
+}
 
 /**
  * Recognized verification commands. Matched against the leading program token of a
@@ -59,7 +66,7 @@ function isVerifyCommand(command: string): boolean {
 
 /** A Bash tool call's command string, from its finalized arguments. */
 function bashCommandOf(call: Extract<Assistant["content"][number], { type: "toolCall" }>): string | null {
-	if (call.name !== "Bash") return null;
+	if (toolName(call) !== "bash") return null;
 	const args = call.arguments as { command?: unknown };
 	return typeof args.command === "string" ? args.command : null;
 }
@@ -80,7 +87,7 @@ export function scoreTurn(turnMessages: Message[]): QualityVerdict {
 		m.content.filter((b): b is Extract<typeof b, { type: "toolCall" }> => b.type === "toolCall"),
 	);
 
-	const edited = toolCalls.some((c) => EDIT_TOOLS.has(c.name));
+	const edited = toolCalls.some((c) => EDIT_TOOLS.has(toolName(c)));
 	const aborted = assistants.some((m) => m.stopReason === "aborted");
 	const modelError = assistants.some((m) => m.stopReason === "error");
 	const toolErrors = toolResults.filter((r) => r.isError).length;

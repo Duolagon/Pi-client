@@ -30,6 +30,7 @@ import {
 	Circle,
 	LoaderCircle,
 	MoreHorizontal,
+	ChevronRight,
 	Folder,
 	Sparkles,
 	WifiOff,
@@ -179,22 +180,31 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		if (stickToEnd.current) scroll.current?.scrollTo({ top: scroll.current.scrollHeight });
 	}, [history, running]);
 	// On turn settle (running true→false), reveal the just-finished turn's quality omen briefly.
+	// The run is tied to the conversation it started in, so switching away from a running
+	// conversation never reveals a verdict for a different one.
 	const wasRunning = useRef(false);
+	const runningConversation = useRef<string | undefined>(undefined);
 	useEffect(() => {
-		if (wasRunning.current && !running) {
+		const conversation = snapshot?.active?.id;
+		if (running && !wasRunning.current) runningConversation.current = conversation;
+		if (wasRunning.current && !running && runningConversation.current === conversation) {
 			const messages = history.messages;
 			let start = messages.length;
 			while (start > 0 && messages[start - 1].role !== "user" && messages[start - 1].role !== "custom") start--;
 			const verdict = start < messages.length ? scoreTurn(messages.slice(start)) : null;
-			if (verdict && verdict.omen !== "none") {
-				setOmenReveal(verdict);
-				const timer = setTimeout(() => setOmenReveal(null), 2500);
-				wasRunning.current = running;
-				return () => clearTimeout(timer);
-			}
+			if (verdict && verdict.omen !== "none") setOmenReveal(verdict);
 		}
 		wasRunning.current = running;
-	}, [running, history.messages]);
+	}, [running, history.messages, snapshot?.active?.id]);
+	// The timer depends only on the reveal itself, so transcript updates cannot cancel it.
+	useEffect(() => {
+		if (!omenReveal) return;
+		const timer = setTimeout(() => setOmenReveal(null), 2500);
+		return () => clearTimeout(timer);
+	}, [omenReveal]);
+	useEffect(() => {
+		setOmenReveal(null);
+	}, [snapshot?.active?.id]);
 	useEffect(() => {
 		let active = true;
 		void api.tasks.list().then((list) => {
@@ -815,15 +825,17 @@ function Desktop({ api }: { api: DesktopAPI }) {
 													onClick={() => switchTo(() => api.selectConversation(session.id))}
 													aria-current={session.id === snapshot.active?.id ? "page" : undefined}
 												>
-													<span className="cl-conv-title">
-														{session.title}
-														{app.activity[session.id] === "approval"
-															? " · 待确认"
-															: childWaiting > 0
-																? ` · !${childWaiting} 子 Agent 待确认`
-																: app.activity[session.id] === "running"
-																	? " · 运行中"
-																	: ""}
+													<span className="cl-conv-line">
+														<span className="cl-conv-title">{session.title}</span>
+														{app.activity[session.id] === "approval" ? (
+															<span className="cl-conv-status warn">待确认</span>
+														) : childWaiting > 0 ? (
+															<span className="cl-conv-status warn" title={`${childWaiting} 个子 Agent 待确认`}>
+																子 Agent 待确认 {childWaiting}
+															</span>
+														) : app.activity[session.id] === "running" ? (
+															<span className="cl-conv-status run">运行中</span>
+														) : null}
 													</span>
 													<span className="cl-conv-sub">
 														{projectName(snapshot, session.project)} · {formatTime(session.updatedAt)}
@@ -834,13 +846,15 @@ function Desktop({ api }: { api: DesktopAPI }) {
 														type="button"
 														className="cl-conv-fold"
 														title={expanded ? "收起子 Agent 会话" : `展开 ${children.length} 个子 Agent 会话`}
+														aria-label={expanded ? "收起子 Agent 会话" : `展开 ${children.length} 个子 Agent 会话`}
 														aria-expanded={expanded}
 														onClick={(event) => {
 															event.stopPropagation();
 															setExpandedParents((prev) => ({ ...prev, [session.id]: !expanded }));
 														}}
 													>
-														(+{children.length})
+														<ChevronRight size={12} className={`cl-conv-fold-icon ${expanded ? "open" : ""}`} aria-hidden="true" />
+														{children.length}
 													</button>
 												)}
 											</div>
@@ -854,9 +868,13 @@ function Desktop({ api }: { api: DesktopAPI }) {
 															onClick={() => switchTo(() => api.selectConversation(child.id))}
 															aria-current={child.id === snapshot.active?.id ? "page" : undefined}
 														>
-															<span className="cl-conv-title">
-																{child.title}
-																{app.activity[child.id] === "approval" ? " · 待确认" : app.activity[child.id] === "running" ? " · 运行中" : ""}
+															<span className="cl-conv-line">
+																<span className="cl-conv-title">{child.title}</span>
+																{app.activity[child.id] === "approval" ? (
+																	<span className="cl-conv-status warn">待确认</span>
+																) : app.activity[child.id] === "running" ? (
+																	<span className="cl-conv-status run">运行中</span>
+																) : null}
 															</span>
 															<span className="cl-conv-sub">子 Agent · {formatTime(child.updatedAt)}</span>
 														</button>
