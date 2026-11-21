@@ -89,6 +89,7 @@ import type {
 	ConnectionInput,
 	ConnectionProtocol,
 	ConnectionTestResult,
+	ProviderBalanceResult,
 	ConnectionMode,
 } from "./shared.ts";
 import { connectionMode, validateEndpoint } from "./model-connections.ts";
@@ -112,7 +113,10 @@ import { McpRegistry } from "./mcp-registry.ts";
 import type { McpRemoveInput, McpSaveInput, McpServerInfo } from "./mcp-types.ts";
 import { HooksService } from "./hooks-service.ts";
 import type { HookEntry, HookRemoveInput, HookRunResult, HookSaveInput, HookTestInput } from "./hook-types.ts";
-import { SkillRegistry } from "./skill-registry.ts";
+import { BUNDLED_SKILLS, SkillRegistry, bundledSkillFile } from "./skill-registry.ts";
+import { balanceTarget, fetchBalance, type BalanceTarget } from "./provider-balance.ts";
+import { EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
+import { rootCertificates } from "node:tls";
 import type { SkillDefinitionEntry, SkillRemoveInput, SkillSaveInput } from "./skill-registry.ts";
 import { TodoService } from "./todo-service.ts";
 import type { TodoCreateInput, TodoEvent, TodoGetInput, TodoListInput, TodoRecord, TodoUpdateInput } from "./todo-types.ts";
@@ -192,6 +196,8 @@ interface StoredState {
 	activeId?: string;
 	settings: Omit<Settings, "configuredProviders">;
 	keys: Partial<Record<Provider, string>>;
+	/** Encrypted JSON of each connection's custom request headers. */
+	headerKeys?: Partial<Record<Provider, string>>;
 	tasks: DesktopTask[];
 	taskPolicies?: Record<string, RuntimePermissionPolicy>;
 	/** Canonical project path to the user's explicit trust decision. */
@@ -277,6 +283,8 @@ export interface ServiceOptions {
 	initialProject?: string;
 	args?: string[];
 	providerBaseUrls?: Partial<Record<Provider, string>>;
+	/** Loopback origin that replaces every official balance host (tests only). */
+	balanceOrigin?: string;
 	ptyHelperPath?: string;
 	archiveEntry?: string;
 	historyEntry?: string;
@@ -359,7 +367,10 @@ export class DesktopService {
 		this.toolSettings = new ToolSettingsStore(options.dataDir);
 		this.agents = new AgentRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
 		this.mcp = new McpRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
-		this.hooks = new HooksService({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
+		this.hooks = new HooksService({
+			agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir(),
+			disabled: () => this.store.settings.disableAllHooks === true,
+		});
 		this.skills = new SkillRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
 		this.todos = new TodoService({ dataDir: () => this.options.dataDir });
 		this.monitors = new MonitorService({ deliver: (id, params) => this.deliverToConversation(id, params) });
@@ -721,6 +732,170 @@ export class DesktopService {
 		return () => this.listeners.delete(listener);
 	}
 
+	/**
+	 * Spend limit for a session process. A delegated child gets what the root
+	 * conversation has left, so subagents cannot run past the cap on their own.
+	 * A fork copies the parent's history, and its own entries already include
+	 * the parent's spend, so it gets the whole cap.
+	 */
+	private async costCapFor(conversationId: string, delegated?: DesktopTask): Promise<number | undefined> {
+		const cap = this.store.settings.maxCostUsd;
+		if (!cap) return undefined;
+		if (!delegated || delegated.isFork) return cap;
+		const rootId = this.rootConversationId(conversationId);
+		const root = rootId === conversationId ? undefined : this.runtimes.get(rootId);
+		const stats = await root?.agent
+			?.request<SessionStats>({ type: "get_session_stats" })
+			.catch(() => undefined);
+		const spent = finiteCount(stats?.cost);
+		// A small positive remainder keeps the child's limit active instead of unlimited.
+		return Math.max(0.0001, cap - spent);
+	}
+
+	private providerAuthenticated(provider: Provider): boolean {
+		return Boolean(this.store.keys[provider] || this.store.settings.connections[provider]?.keyCommand);
+	}
+
+	private connectionHeaders(provider: Provider): Record<string, string> | undefined {
+		const encrypted = this.store.headerKeys?.[provider];
+		if (!encrypted || !this.options.decrypt) return undefined;
+		try {
+			return validateHeaders(JSON.parse(this.options.decrypt(encrypted)));
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Puts each provider's key, key command and headers in `env` and returns the
+	 * connection descriptors the permission extension registers. Secrets travel
+	 * only in environment variables named PI_DESKTOP_KEY_*.
+	 */
+	private connectionEnvironment(env: NodeJS.ProcessEnv, strict = false): Record<string, object> {
+		const connections: Record<string, object> = {};
+		for (const provider of providers) {
+			const connection = this.store.settings.connections[provider];
+			const encrypted = this.store.keys[provider];
+			const envKey = `PI_DESKTOP_KEY_${provider.toUpperCase()}`;
+			if (encrypted) {
+				if (!this.options.decrypt) {
+					if (strict) throw new Error("无法读取系统安全存储中的 API Key。");
+				} else env[envKey] = this.options.decrypt(encrypted);
+			}
+			if (!connection) continue;
+			const keyCommand = !encrypted ? connection.keyCommand : undefined;
+			if (keyCommand) env[`${envKey}_COMMAND`] = keyCommand;
+			const headers = this.connectionHeaders(provider);
+			if (headers && Object.keys(headers).length) env[`${envKey}_HEADERS`] = JSON.stringify(headers);
+			const { headerNames: _names, keyCommand: _command, ...rest } = connection;
+			connections[provider] = {
+				...rest,
+				envKey: encrypted && env[envKey] ? envKey : undefined,
+				keyCommandEnv: keyCommand ? `${envKey}_COMMAND` : undefined,
+				headersEnv: headers && Object.keys(headers).length ? `${envKey}_HEADERS` : undefined,
+				presetBaseUrl: this.options.providerBaseUrls?.[provider],
+				balance: this.balanceTargetFor(provider, connection.mode, connection.baseUrl),
+			};
+		}
+		return connections;
+	}
+
+	private balanceTargetFor(provider: Provider, mode: ConnectionMode | undefined, baseUrl: string | undefined): BalanceTarget | undefined {
+		return balanceTarget(provider, mode ?? "preset", baseUrl, this.options.balanceOrigin);
+	}
+
+	/**
+	 * Asks the provider for the account balance with the given or saved credentials.
+	 * The request uses the configured proxy and CA file; the key goes only to the
+	 * provider's official host and never appears in errors.
+	 */
+	async providerBalance(input: ConnectionInput): Promise<ProviderBalanceResult> {
+		// Read-only: it reads one snapshot of the store and never waits for, or blocks, other operations.
+		if (this.closed) throw new Error("桌面服务已关闭。");
+		const stored = this.store.settings.connections[input.provider];
+		const mode = connectionMode(input, stored);
+		const baseUrl = mode === "custom" ? validateEndpoint(input.baseUrl ?? stored?.baseUrl ?? "") : undefined;
+		const target = this.balanceTargetFor(input.provider, mode, baseUrl);
+		if (!target) return { supported: false, message: "这个连接的服务商没有可用的余额查询接口。" };
+		// Saved credentials belong to the saved endpoint; an edited form that points elsewhere needs its own key.
+		const savedTarget = stored ? this.balanceTargetFor(input.provider, stored.mode ?? "preset", stored.baseUrl) : undefined;
+		const savedUsable = savedTarget?.url === target.url;
+		let key = input.apiKey?.trim();
+		const encrypted = this.store.keys[input.provider];
+		if (!key && savedUsable && encrypted && this.options.decrypt) key = this.options.decrypt(encrypted);
+		const command = key
+			? undefined
+			: input.keyCommand !== undefined
+				? validateKeyCommand(input.keyCommand)
+				: savedUsable
+					? stored?.keyCommand
+					: undefined;
+		try {
+			if (!key && command) key = await this.runKeyCommand(command);
+			if (!key)
+				return {
+					supported: true,
+					success: false,
+					message: savedUsable || !stored
+						? "请填写 API Key 或取 Key 命令，或先保存此服务商的密钥。"
+						: "接口地址已改动，已保存的密钥不会发给新地址。请填写这个地址的 API Key。",
+				};
+			const dispatcher = await this.balanceDispatcher();
+			try {
+				const result = await fetchBalance(target, key, {
+					fetch: undiciFetch as unknown as typeof fetch,
+					dispatcher,
+				});
+				return { supported: true, success: true, ...result, checkedAt: Date.now() };
+			} finally {
+				await dispatcher?.close().catch(() => {});
+			}
+		} catch (error) {
+			let message = error instanceof Error ? error.message : String(error);
+			if (key && key.length >= 4) message = message.replaceAll(key, "[已隐藏密钥]");
+			return { supported: true, success: false, message: message.slice(0, 600) };
+		}
+	}
+
+	private async runKeyCommand(command: string): Promise<string | undefined> {
+		const { stdout } = await exec("/bin/sh", ["-c", command], {
+			env: { ...process.env, ...this.options.env },
+			timeout: 10000,
+			maxBuffer: 64 * 1024,
+		}).catch(() => {
+			throw new Error("取 Key 命令执行失败或超时。");
+		});
+		return stdout.trim() || undefined;
+	}
+
+	/** A proxy- and CA-aware dispatcher for balance queries; undefined means a direct connection. */
+	private async balanceDispatcher(): Promise<EnvHttpProxyAgent | undefined> {
+		const env = { ...process.env, ...this.options.env, ...networkEnvironment(this.store.settings) };
+		const httpsProxy = env.HTTPS_PROXY || env.https_proxy;
+		const httpProxy = env.HTTP_PROXY || env.http_proxy;
+		const noProxy = env.NO_PROXY || env.no_proxy;
+		const caFile = this.store.settings.caFile ?? env.NODE_EXTRA_CA_CERTS;
+		let ca: string[] | undefined;
+		if (caFile) {
+			const path = caFile.startsWith("~/") ? join(homedir(), caFile.slice(2)) : caFile;
+			ca = [...rootCertificates, await readFile(path, "utf8").catch(() => { throw new Error("无法读取自定义 CA 证书文件。"); })];
+		}
+		if (!httpsProxy && !httpProxy && !ca) return undefined;
+		return new EnvHttpProxyAgent({
+			...(httpProxy ? { httpProxy } : {}),
+			...(httpsProxy ? { httpsProxy } : {}),
+			...(noProxy ? { noProxy } : {}),
+			...(ca ? { connect: { ca }, requestTls: { ca }, proxyTls: { ca } } : {}),
+		});
+	}
+
+	/** Approval and question prompts waiting across every running conversation. */
+	pendingApprovalCount(): number {
+		let count = 0;
+		for (const runtime of this.runtimes.values()) count += runtime.pendingUI.size;
+		return count;
+	}
+
 	async snapshot(): Promise<Snapshot> {
 		await this.operation;
 		return this.buildSnapshot();
@@ -878,7 +1053,37 @@ export class DesktopService {
 				if (entry.isDirectory() && !entry.name.startsWith(".")) args.push("--prompt-template", join(commands, entry.name));
 			}
 		}
+		args.push(...(await this.bundledSkillArgs()));
 		return args;
+	}
+
+	private bundledSkillsReady?: Promise<string[]>;
+
+	/**
+	 * Bundled skills are written under the data directory and passed last, so a
+	 * user or project skill with the same name loads first and wins.
+	 */
+	private bundledSkillArgs(): Promise<string[]> {
+		this.bundledSkillsReady ??= (async () => {
+			const root = join(this.options.dataDir, "bundled-skills");
+			const args: string[] = [];
+			for (const skill of BUNDLED_SKILLS) {
+				if (skill.name === "batch") continue;
+				const dir = join(root, skill.name);
+				await mkdir(dir, { recursive: true, mode: 0o700 });
+				const file = join(dir, "SKILL.md");
+				const content = bundledSkillFile(skill);
+				const current = await readFile(file, "utf8").catch(() => "");
+				if (current !== content) await writeFile(file, content, { mode: 0o600 });
+				args.push("--skill", file);
+			}
+			return args;
+		})().catch((error) => {
+			this.bundledSkillsReady = undefined;
+			this.engineError = `无法写入内置 Skills：${error instanceof Error ? error.message : String(error)}`;
+			return [];
+		});
+		return this.bundledSkillsReady;
 	}
 
 	private isReadRestricted(conversationId?: string): boolean {
@@ -2467,8 +2672,16 @@ export class DesktopService {
 		cronEnabled?: boolean;
 		agentTeams?: boolean;
 		modelRouting?: ModelRouting;
+		proxy?: string;
+		noProxy?: string;
+		caFile?: string;
+		maxCostUsd?: number | null;
+		minBalance?: number | null;
+		disableAllHooks?: boolean;
 		provider?: Provider;
 		apiKey?: string;
+		keyCommand?: string;
+		headers?: Record<string, string>;
 		baseUrl?: string;
 		modelId?: string;
 		agentDir?: string;
@@ -2529,6 +2742,45 @@ export class DesktopService {
 				if (Object.keys(routing).length) next.settings.modelRouting = routing;
 				else delete next.settings.modelRouting;
 			}
+			if (settings.maxCostUsd !== undefined) {
+				const value = settings.maxCostUsd;
+				if (value === null) delete next.settings.maxCostUsd;
+				else if (typeof value !== "number" || !Number.isFinite(value) || value < 0.01 || value > 100000)
+					throw new Error("费用上限需为 0.01–100000 美元。");
+				else next.settings.maxCostUsd = Math.round(value * 100) / 100;
+			}
+			if (settings.minBalance !== undefined) {
+				const value = settings.minBalance;
+				if (value === null) delete next.settings.minBalance;
+				else if (typeof value !== "number" || !Number.isFinite(value) || value < 0.01 || value > 1000000)
+					throw new Error("余额底线需为 0.01–1000000。");
+				else next.settings.minBalance = Math.round(value * 100) / 100;
+			}
+			if (settings.disableAllHooks !== undefined) {
+				if (typeof settings.disableAllHooks !== "boolean") throw new Error("Hooks 开关设置无效。");
+				if (settings.disableAllHooks) next.settings.disableAllHooks = true;
+				else delete next.settings.disableAllHooks;
+			}
+			if (settings.proxy !== undefined) {
+				const value = validateProxyUrl(settings.proxy);
+				if (value) next.settings.proxy = value;
+				else delete next.settings.proxy;
+			}
+			if (settings.noProxy !== undefined) {
+				const value = settings.noProxy.trim();
+				if (/[\r\n\0]/.test(value) || value.length > 4096) throw new Error("代理例外格式错误。");
+				if (value) next.settings.noProxy = value;
+				else delete next.settings.noProxy;
+			}
+			if (settings.caFile !== undefined) {
+				const value = settings.caFile.trim();
+				if (value) {
+					const path = resolve(value.startsWith("~/") ? join(homedir(), value.slice(2)) : value);
+					if (!isAbsolute(value) && !value.startsWith("~/")) throw new Error("CA 证书需填写绝对路径。");
+					if (!(await stat(path).then((info) => info.isFile(), () => false))) throw new Error("找不到 CA 证书文件。");
+					next.settings.caFile = path;
+				} else delete next.settings.caFile;
+			}
 			if (settings.agentDir !== undefined) {
 				const value = settings.agentDir.trim();
 				if (value) {
@@ -2555,7 +2807,12 @@ export class DesktopService {
 							: preset.defaultModelId;
 					if (settings.modelId?.trim() && settings.modelId.trim() !== modelId)
 						throw new Error("请选择该服务商的内置模型，或切换到自定义连接填写模型 ID。");
-					connection = { mode, modelId };
+					connection = {
+						mode,
+						modelId,
+						...(stored?.keyCommand ? { keyCommand: stored.keyCommand } : {}),
+						...(stored?.headerNames ? { headerNames: stored.headerNames } : {}),
+					};
 				} else {
 					connection = { ...stored, mode };
 					if (settings.baseUrl !== undefined) connection.baseUrl = validateEndpoint(settings.baseUrl);
@@ -2569,10 +2826,28 @@ export class DesktopService {
 					if (!this.options.encrypt) throw new Error("系统安全存储不可用，未保存 API Key。");
 					next.keys[provider] = this.options.encrypt(settings.apiKey.trim());
 				}
-				if (next.keys[provider] && !connection.modelId)
+				if (settings.keyCommand !== undefined) {
+					const command = validateKeyCommand(settings.keyCommand);
+					if (command) connection.keyCommand = command;
+					else delete connection.keyCommand;
+				}
+				if (settings.headers !== undefined) {
+					const headers = validateHeaders(settings.headers);
+					next.headerKeys ??= {};
+					if (Object.keys(headers).length) {
+						if (!this.options.encrypt) throw new Error("系统安全存储不可用，未保存请求头。");
+						next.headerKeys[provider] = this.options.encrypt(JSON.stringify(headers));
+						connection.headerNames = Object.keys(headers);
+					} else {
+						delete next.headerKeys[provider];
+						delete connection.headerNames;
+					}
+				}
+				const authenticated = Boolean(next.keys[provider] || connection.keyCommand);
+				if (authenticated && !connection.modelId)
 					throw new Error("请填写此连接的模型 ID；留空密钥会保留已保存的认证。");
 				next.settings.connections[provider] = connection;
-				if (connection.modelId && next.keys[provider])
+				if (connection.modelId && authenticated)
 					next.settings.defaultModel = { provider: `desktop-${provider}`, id: connection.modelId };
 			}
 			const needsRestart =
@@ -2581,6 +2856,11 @@ export class DesktopService {
 				Boolean(next.settings.sandboxOffline) !== Boolean(this.store.settings.sandboxOffline) ||
 				Boolean(next.settings.agentTeams) !== Boolean(this.store.settings.agentTeams) ||
 				next.settings.agentDir !== this.store.settings.agentDir ||
+				next.settings.proxy !== this.store.settings.proxy ||
+				next.settings.noProxy !== this.store.settings.noProxy ||
+				next.settings.caFile !== this.store.settings.caFile ||
+				next.settings.maxCostUsd !== this.store.settings.maxCostUsd ||
+				next.settings.minBalance !== this.store.settings.minBalance ||
 				Boolean(settings.provider);
 			this.store = next;
 			await this.persist();
@@ -2594,7 +2874,7 @@ export class DesktopService {
 				if (active) await this.activate(active);
 				const connection = settings.provider && this.store.settings.connections[settings.provider];
 				const runtime = active && this.runtimes.get(active.id);
-				if (settings.provider && connection?.modelId && this.store.keys[settings.provider] && runtime?.agent) {
+				if (settings.provider && connection?.modelId && this.providerAuthenticated(settings.provider) && runtime?.agent) {
 					await runtime.agent.request({
 						type: "set_model",
 						provider: `desktop-${settings.provider}`,
@@ -2626,7 +2906,13 @@ export class DesktopService {
 			let key = input.apiKey?.trim();
 			const encrypted = this.store.keys[input.provider];
 			if (!key && encrypted && this.options.decrypt) key = this.options.decrypt(encrypted);
-			if (!key) return { success: false, message: "请填写 API Key，或先保存此服务商的密钥。" };
+			const keyCommand = key
+				? undefined
+				: input.keyCommand !== undefined
+					? validateKeyCommand(input.keyCommand)
+					: stored?.keyCommand;
+			if (!key && !keyCommand) return { success: false, message: "请填写 API Key 或取 Key 命令，或先保存此服务商的密钥。" };
+			const headers = input.headers !== undefined ? validateHeaders(input.headers) : this.connectionHeaders(input.provider);
 			if (!modelId) return { success: false, message: "请填写服务商提供的模型 ID。" };
 			if (mode === "preset" && input.modelId?.trim() && input.modelId.trim() !== modelId)
 				return { success: false, message: "请选择该服务商的内置模型，或切换到自定义连接填写模型 ID。" };
@@ -2653,14 +2939,19 @@ export class DesktopService {
 					PI_SKIP_VERSION_CHECK: "1",
 					PI_OFFLINE: "1",
 					PI_DESKTOP_CONNECTION_TEST: "1",
-					[envKey]: key,
+					...networkEnvironment(this.store.settings),
+					...(key ? { [envKey]: key } : {}),
+					...(keyCommand ? { [`${envKey}_COMMAND`]: keyCommand } : {}),
+					...(headers && Object.keys(headers).length ? { [`${envKey}_HEADERS`]: JSON.stringify(headers) } : {}),
 					PI_DESKTOP_CONNECTIONS: JSON.stringify({
 						[input.provider]: {
 							mode,
 							baseUrl,
 							modelId,
 							api: mode === "custom" ? (input.api ?? stored?.api) : undefined,
-							envKey,
+							envKey: key ? envKey : undefined,
+							keyCommandEnv: keyCommand ? `${envKey}_COMMAND` : undefined,
+							headersEnv: headers && Object.keys(headers).length ? `${envKey}_HEADERS` : undefined,
 							presetBaseUrl: this.options.providerBaseUrls?.[input.provider],
 						},
 					}),
@@ -2707,7 +2998,9 @@ export class DesktopService {
 					latencyMs: Date.now() - started,
 				};
 			} catch (error) {
-				const message = (error instanceof Error ? error.message : String(error)).replaceAll(key, "[已隐藏密钥]");
+				let message = error instanceof Error ? error.message : String(error);
+				for (const secret of [key, ...Object.values(headers ?? {})])
+					if (secret && secret.length >= 4) message = message.replaceAll(secret, "[已隐藏密钥]");
 				return { success: false, message: message.slice(0, 1200), latencyMs: Date.now() - started };
 			} finally {
 				clearTimeout(timer);
@@ -2756,17 +3049,10 @@ export class DesktopService {
 				...this.options.env,
 				PI_SKIP_VERSION_CHECK: "1",
 				PI_DESKTOP_CONNECTION_TEST: "1",
+				...networkEnvironment(this.store.settings),
 			};
 			if (this.store.settings.agentDir) env.PI_CODING_AGENT_DIR = this.store.settings.agentDir;
-			const connections: Record<string, { baseUrl?: string; modelId?: string; envKey?: string; api?: ConnectionProtocol; mode?: ConnectionMode; presetBaseUrl?: string }> = {};
-			for (const provider of providers) {
-				const conn = this.store.settings.connections[provider];
-				const encrypted = this.store.keys[provider];
-				const envKey = `PI_DESKTOP_KEY_${provider.toUpperCase()}`;
-				if (encrypted && this.options.decrypt) env[envKey] = this.options.decrypt(encrypted);
-				if (conn) connections[provider] = { ...conn, envKey: encrypted ? envKey : undefined, presetBaseUrl: this.options.providerBaseUrls?.[provider] };
-			}
-			env.PI_DESKTOP_CONNECTIONS = JSON.stringify(connections);
+			env.PI_DESKTOP_CONNECTIONS = JSON.stringify(this.connectionEnvironment(env));
 			const runtimeDir = this.options.runtimeDir ?? dirname(dirname(dirname(this.options.entry!)));
 			let resultMessage: Extract<Message, { role: "assistant" }> | undefined;
 			let settle!: () => void;
@@ -4492,35 +4778,13 @@ export class DesktopService {
 				...this.options.env,
 				PI_SKIP_VERSION_CHECK: "1",
 				PI_DESKTOP_PERMISSION_MODE: this.store.settings.permission,
+				...networkEnvironment(this.store.settings),
 			};
 			if (this.store.settings.agentDir) env.PI_CODING_AGENT_DIR = this.store.settings.agentDir;
-			const connections: Record<
-				string,
-				{
-					baseUrl?: string;
-					modelId?: string;
-					envKey?: string;
-					api?: ConnectionProtocol;
-					mode?: ConnectionMode;
-					presetBaseUrl?: string;
-				}
-			> = {};
-			for (const provider of providers) {
-				const connection = this.store.settings.connections[provider];
-				const encrypted = this.store.keys[provider];
-				const envKey = `PI_DESKTOP_KEY_${provider.toUpperCase()}`;
-				if (encrypted) {
-					if (!this.options.decrypt) throw new Error("无法读取系统安全存储中的 API Key。");
-					env[envKey] = this.options.decrypt(encrypted);
-				}
-				if (connection)
-					connections[provider] = {
-						...connection,
-						envKey: encrypted ? envKey : undefined,
-						presetBaseUrl: this.options.providerBaseUrls?.[provider],
-					};
-			}
-			env.PI_DESKTOP_CONNECTIONS = JSON.stringify(connections);
+			env.PI_DESKTOP_CONNECTIONS = JSON.stringify(this.connectionEnvironment(env, true));
+			delete env.PI_DESKTOP_MAX_COST;
+			delete env.PI_DESKTOP_MIN_BALANCE;
+			if (this.store.settings.minBalance) env.PI_DESKTOP_MIN_BALANCE = String(this.store.settings.minBalance);
 			runtime.policyFile = join(this.options.dataDir, `policy-${conversation.id}-${randomBytes(8).toString("hex")}.json`);
 			env.PI_DESKTOP_POLICY_FILE = runtime.policyFile;
 			const task = this.store.tasks.find((item) => item.conversationId === conversation.id);
@@ -4543,6 +4807,8 @@ export class DesktopService {
 			}
 			// Set these explicitly so an inherited shell environment cannot change a session's role.
 			env.PI_DESKTOP_CHILD = delegated ? "1" : "0";
+			const costCap = await this.costCapFor(conversation.id, delegated);
+			if (costCap !== undefined) env.PI_DESKTOP_MAX_COST = String(costCap);
 			env.PI_DESKTOP_READ_ONLY_CHILD = delegated?.readOnly ? "1" : "0";
 			env.PI_DESKTOP_FORK_CHILD = delegated?.isFork ? "1" : "0";
 			env.PI_DESKTOP_DELEGATION_DEPTH = String(delegated ? (delegated.delegationDepth ?? 1) : 0);
@@ -5103,7 +5369,7 @@ export class DesktopService {
 			settings: {
 				...this.store.settings,
 				agentDir: this.store.settings.agentDir ?? this.defaultAgentDir(),
-				configuredProviders: providers.filter((provider) => Boolean(this.store.keys[provider])),
+				configuredProviders: providers.filter((provider) => this.providerAuthenticated(provider)),
 			},
 			messages,
 			stats,
@@ -5188,6 +5454,72 @@ function inside(root: string, path: string): boolean {
 function overlaps(left: string, right: string): boolean {
 	return inside(left, right) || inside(right, left);
 }
+function storedText(value: unknown, max: number, absolute = false): string | undefined {
+	if (typeof value !== "string" || !value || value.length > max || /[\r\n\0]/.test(value)) return undefined;
+	return absolute && !isAbsolute(value) ? undefined : value;
+}
+
+/** A one-line shell command; Pi runs it with the user's shell and caches the key. */
+export function validateKeyCommand(raw: string): string | undefined {
+	const value = raw.trim();
+	if (!value) return undefined;
+	if (value.length > 4096 || /[\r\n\0]/.test(value)) throw new Error("取 Key 命令只能是一行，且不超过 4096 字符。");
+	return value;
+}
+
+const headerNamePattern = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/;
+const reservedHeaders = new Set(["host", "content-length", "transfer-encoding", "connection"]);
+
+export function validateHeaders(raw: unknown): Record<string, string> {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("请求头格式错误。");
+	const entries = Object.entries(raw as Record<string, unknown>);
+	if (entries.length > 32) throw new Error("自定义请求头最多 32 个。");
+	const headers: Record<string, string> = {};
+	for (const [name, value] of entries) {
+		if (!headerNamePattern.test(name)) throw new Error(`请求头名称无效：${name.slice(0, 40)}`);
+		if (reservedHeaders.has(name.toLowerCase())) throw new Error(`不能自定义 ${name} 请求头。`);
+		if (typeof value !== "string" || value.length > 8192 || /[\r\n\0]/.test(value)) throw new Error(`请求头 ${name} 的值无效。`);
+		headers[name] = value;
+	}
+	return headers;
+}
+
+/** Accepts an http(s) proxy URL; an empty value clears the setting. */
+export function validateProxyUrl(raw: string): string | undefined {
+	const value = raw.trim();
+	if (!value) return undefined;
+	let url: URL;
+	try {
+		url = new URL(value);
+	} catch {
+		throw new Error("代理地址格式错误，例如 http://127.0.0.1:7890。");
+	}
+	if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("代理地址仅支持 http:// 或 https://。");
+	if (!url.hostname) throw new Error("代理地址缺少主机名。");
+	// Settings are stored in plain JSON; a credentialed proxy belongs in the shell's HTTPS_PROXY.
+	if (url.username || url.password)
+		throw new Error("代理地址不能包含用户名或密码。需要认证的代理请在终端配置 HTTPS_PROXY，应用会自动读取。");
+	return value;
+}
+
+/**
+ * Proxy and CA variables for an agent process. Settings override what the app
+ * inherited from the shell; both upper and lower case are set because undici
+ * reads the lower-case names first.
+ */
+export function networkEnvironment(settings: Pick<Settings, "proxy" | "noProxy" | "caFile">): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = {};
+	if (settings.proxy) {
+		for (const name of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) env[name] = settings.proxy;
+	}
+	if (settings.noProxy) {
+		env.NO_PROXY = settings.noProxy;
+		env.no_proxy = settings.noProxy;
+	}
+	if (settings.caFile) env.NODE_EXTRA_CA_CERTS = settings.caFile;
+	return env;
+}
+
 function validateStore(input: unknown, promptDir?: string): { state: StoredState; dropped: string[] } {
 	if (!input || typeof input !== "object") throw new Error("配置格式错误。");
 	const value = input as Partial<StoredState>;
@@ -5274,11 +5606,37 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 			cronEnabled: typeof value.settings.cronEnabled === "boolean" ? value.settings.cronEnabled : undefined,
 			agentTeams: typeof value.settings.agentTeams === "boolean" ? value.settings.agentTeams : undefined,
 			modelRouting: sanitizeModelRouting(value.settings.modelRouting),
+			maxCostUsd:
+				typeof value.settings.maxCostUsd === "number" &&
+				Number.isFinite(value.settings.maxCostUsd) &&
+				value.settings.maxCostUsd > 0 &&
+				value.settings.maxCostUsd <= 100000
+					? value.settings.maxCostUsd
+					: undefined,
+			minBalance:
+				typeof value.settings.minBalance === "number" &&
+				Number.isFinite(value.settings.minBalance) &&
+				value.settings.minBalance > 0 &&
+				value.settings.minBalance <= 1000000
+					? value.settings.minBalance
+					: undefined,
+			disableAllHooks: value.settings.disableAllHooks === true ? true : undefined,
+			proxy: storedText(value.settings.proxy, 2048),
+			noProxy: storedText(value.settings.noProxy, 4096),
+			caFile: storedText(value.settings.caFile, 4096, true),
 			defaultModel: value.settings.defaultModel,
 			connections: value.settings.connections ?? {},
 			agentDir: value.settings.agentDir,
 		},
 		keys: value.keys,
+		headerKeys:
+			value.headerKeys && typeof value.headerKeys === "object" && !Array.isArray(value.headerKeys)
+				? Object.fromEntries(
+						Object.entries(value.headerKeys).filter(
+							([provider, encrypted]) => providers.includes(provider as Provider) && typeof encrypted === "string",
+						),
+					)
+				: undefined,
 		tasks,
 		taskPolicies,
 		projectTrust,

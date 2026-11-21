@@ -9,13 +9,23 @@ import { installExternalHandlers } from "./external-ipc.ts";
 import { installP8Handlers } from "./p8-ipc.ts";
 import type { Command, ConnectionInput, DesktopAPI } from "./shared.ts";
 import { checkPreview, probePreview } from "./preview-check.ts";
-import { captureToolPath } from "./tool-path.ts";
+import { captureShellEnvironment, mergeNetworkEnvironment } from "./tool-path.ts";
 import { MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS } from "./delegation-limits.ts";
 import { parseModelRoutingUpdate } from "./model-routing.ts";
 import type { RpcExtensionUIResponse } from "@earendil-works/pi-coding-agent";
 
 app.setName("Pi Desktop");
 if (process.env.PI_DESKTOP_DATA_DIR) app.setPath("userData", process.env.PI_DESKTOP_DATA_DIR);
+// Electron keys the lock on the userData directory, so a second launch with the
+// same data focuses the open window while separate data directories still coexist.
+const primaryInstance = app.requestSingleInstanceLock();
+if (!primaryInstance) app.quit();
+app.on("second-instance", () => {
+	if (!window || window.isDestroyed()) return;
+	if (window.isMinimized()) window.restore();
+	window.show();
+	window.focus();
+});
 let window: BrowserWindow | null = null;
 let service: DesktopService;
 let ready: Promise<unknown>;
@@ -51,6 +61,7 @@ function createWindow() {
 		callback(permission === "clipboard-sanitized-write"),
 	);
 	window.webContents.session.setPermissionCheckHandler((_contents, permission) => permission === "clipboard-sanitized-write");
+	window.on("focus", () => updateDock());
 	window.on("closed", () => {
 		window = null;
 	});
@@ -77,8 +88,16 @@ function connection(value: unknown): ConnectionInput {
 		)
 	)
 		throw new Error("接口协议无效。");
-	for (const field of ["apiKey", "baseUrl", "modelId"])
+	for (const field of ["apiKey", "baseUrl", "modelId", "keyCommand"])
 		if (record[field] !== undefined) string(record[field], field, 16384);
+	if (record.headers !== undefined) {
+		const headers = object(record.headers);
+		if (Object.keys(headers).length > 32) throw new Error("自定义请求头最多 32 个。");
+		for (const [name, value] of Object.entries(headers)) {
+			if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/.test(name)) throw new Error(`请求头名称无效：${name.slice(0, 40)}`);
+			if (/[\r\n\0]/.test(string(value, "请求头的值", 8192))) throw new Error("请求头的值不能包含换行。");
+		}
+	}
 	return record as unknown as ConnectionInput;
 }
 function command(value: unknown): Command {
@@ -188,7 +207,11 @@ function installHandlers() {
 		)
 			throw new Error("确认响应格式错误。");
 		if (typeof record.value === "string") string(record.value, "确认内容", 1024 * 1024);
-		return service.respond(record as RpcExtensionUIResponse, id === undefined ? undefined : string(id, "会话 ID", 200));
+		try {
+			return await service.respond(record as RpcExtensionUIResponse, id === undefined ? undefined : string(id, "会话 ID", 200));
+		} finally {
+			updateDock();
+		}
 	});
 	handle("pi:files", (path) => service.files(string(path, "文件路径")));
 	handle("pi:read-file", (path) => service.readFile(string(path, "文件路径")));
@@ -252,11 +275,29 @@ function installHandlers() {
 		)
 			throw new Error("前台子 Agent 等待时长格式错误。");
 		if (settings.modelRouting !== undefined) parseModelRoutingUpdate(settings.modelRouting);
+		if (settings.proxy !== undefined) string(settings.proxy, "代理地址", 2048);
+		if (settings.noProxy !== undefined) string(settings.noProxy, "代理例外", 4096);
+		if (settings.caFile !== undefined) string(settings.caFile, "CA 证书路径", 4096);
+		if (
+			settings.maxCostUsd !== undefined &&
+			settings.maxCostUsd !== null &&
+			(typeof settings.maxCostUsd !== "number" || !Number.isFinite(settings.maxCostUsd) || settings.maxCostUsd < 0.01 || settings.maxCostUsd > 100000)
+		)
+			throw new Error("费用上限需为 0.01–100000 美元。");
+		if (
+			settings.minBalance !== undefined &&
+			settings.minBalance !== null &&
+			(typeof settings.minBalance !== "number" || !Number.isFinite(settings.minBalance) || settings.minBalance < 0.01 || settings.minBalance > 1000000)
+		)
+			throw new Error("余额底线需为 0.01–1000000。");
+		if (settings.disableAllHooks !== undefined && typeof settings.disableAllHooks !== "boolean")
+			throw new Error("Hooks 开关格式错误。");
 		if (settings.provider !== undefined) connection(settings);
 		if (settings.agentDir !== undefined) string(settings.agentDir, "Pi 配置目录", 16384);
 		return service.saveSettings(settings as Parameters<DesktopAPI["saveSettings"]>[0]);
 	});
 	handle("pi:test-connection", (input) => service.testConnection(connection(input)));
+	handle("pi:provider-balance", (input) => service.providerBalance(connection(input)));
 	handle("pi:export", async () => {
 		const result = await dialog.showSaveDialog(window!, {
 			title: "导出会话",
@@ -272,7 +313,22 @@ function installHandlers() {
 	installP8Handlers(handle, service);
 }
 
+let dockBounce: number | undefined;
+/** Dock badge shows the approvals waiting; cleared when none remain. */
+function updateDock(requestAttention = false) {
+	if (process.platform !== "darwin" || !app.dock || !service) return;
+	const count = service.pendingApprovalCount();
+	app.dock.setBadge(count ? String(count) : "");
+	if (!count && dockBounce !== undefined) {
+		app.dock.cancelBounce(dockBounce);
+		dockBounce = undefined;
+	}
+	const focused = Boolean(window && !window.isDestroyed() && window.isFocused());
+	if (requestAttention && count && !focused && dockBounce === undefined) dockBounce = app.dock.bounce("critical");
+}
+
 void app.whenReady().then(() => {
+	if (!primaryInstance) return;
 	const runtimeDir = app.isPackaged ? join(process.resourcesPath, "runtime") : join(__dirname, "runtime");
 	const environment: NodeJS.ProcessEnv = { ...process.env, ELECTRON_RUN_AS_NODE: "1" };
 	service = new DesktopService({
@@ -288,8 +344,9 @@ void app.whenReady().then(() => {
 		},
 		decrypt: (value) => safeStorage.decryptString(Buffer.from(value, "base64")),
 	});
-	ready = captureToolPath().then((path) => {
+	ready = captureShellEnvironment().then(({ path, network }) => {
 		environment.PATH = path;
+		mergeNetworkEnvironment(environment, network);
 		return service.initialize();
 	});
 	const notifyDesktop = (title: string, body: string) => {
@@ -312,7 +369,9 @@ void app.whenReady().then(() => {
 		if (packet.event.type === "extension_ui_request" && ["confirm", "select", "input", "editor"].includes(packet.event.method)) {
 			const reqTitle = "title" in packet.event ? packet.event.title : undefined;
 			notifyDesktop("Pi 需要你的确认", reqTitle === "__PI_ASK_QUESTIONS__" ? "模型发起了结构化提问，请查看并选择。" : (reqTitle ?? "工具执行等待批准"));
+			updateDock(true);
 		} else if (packet.event.type === "agent_settled") {
+			updateDock();
 			notifyDesktop("Pi 任务已结束", packet.event.aborted ? "当前回合已停止。" : "回复与工具执行已完成。");
 		}
 	});
@@ -321,6 +380,7 @@ void app.whenReady().then(() => {
 	const taskStatuses = new Map<string, string>();
 	service.subscribeTasks((event) => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:task:event", event);
+		if (event.type === "task_updated") updateDock(event.task.status === "waiting_for_input");
 		if (event.type === "task_updated") {
 			const previous = taskStatuses.get(event.task.id);
 			taskStatuses.set(event.task.id, event.task.status);

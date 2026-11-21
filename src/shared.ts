@@ -143,9 +143,24 @@ export interface ConnectionInput {
 	provider: Provider;
 	mode?: ConnectionMode;
 	apiKey?: string;
+	/** Shell command that prints the API key (like Claude Code's apiKeyHelper); "" clears it. */
+	keyCommand?: string;
+	/** Extra request headers; stored encrypted. An empty object clears them. */
+	headers?: Record<string, string>;
 	baseUrl?: string;
 	modelId?: string;
 	api?: ConnectionProtocol;
+}
+export interface ProviderBalanceResult {
+	/** False when this connection's provider has no balance API. */
+	supported: boolean;
+	success?: boolean;
+	message?: string;
+	available?: boolean;
+	balances?: { currency: string; amount: number }[];
+	usage?: number;
+	note?: string;
+	checkedAt?: number;
 }
 export interface ConnectionTestResult {
 	success: boolean;
@@ -228,10 +243,36 @@ export interface Settings {
 	 * definition name none. A missing role, or a model the parent cannot reach, inherits.
 	 */
 	modelRouting?: ModelRouting;
+	/** HTTP(S) proxy URL for model and web requests; overrides the shell's HTTPS_PROXY. */
+	proxy?: string;
+	/** Comma-separated hosts that bypass the proxy (NO_PROXY). */
+	noProxy?: string;
+	/** Absolute path to an extra PEM certificate bundle (NODE_EXTRA_CA_CERTS). */
+	caFile?: string;
 	configuredProviders: Provider[];
 	connections: Partial<
-		Record<Provider, { baseUrl?: string; modelId?: string; api?: ConnectionProtocol; mode?: ConnectionMode }>
+		Record<
+			Provider,
+			{
+				baseUrl?: string;
+				modelId?: string;
+				api?: ConnectionProtocol;
+				mode?: ConnectionMode;
+				keyCommand?: string;
+				/** Names of the saved custom headers; values stay encrypted in the backend. */
+				headerNames?: string[];
+			}
+		>
 	>;
+	/** Stop a conversation once its recorded spend reaches this many US dollars; absent means no limit. */
+	maxCostUsd?: number;
+	/**
+	 * Stop a conversation when the provider's account balance falls to this amount
+	 * (in the balance's own currency). Only providers with a balance API are checked.
+	 */
+	minBalance?: number;
+	/** Skip every Claude-compatible and Pi hook (like Claude Code's disableAllHooks). */
+	disableAllHooks?: boolean;
 }
 export interface PlanFileState {
 	path: string;
@@ -445,14 +486,23 @@ export interface DesktopAPI {
 		cronEnabled?: boolean;
 		agentTeams?: boolean;
 		modelRouting?: ModelRouting;
+		proxy?: string;
+		noProxy?: string;
+		caFile?: string;
+		maxCostUsd?: number | null;
+		minBalance?: number | null;
+		disableAllHooks?: boolean;
 		provider?: Provider;
 		mode?: ConnectionMode;
 		apiKey?: string;
+		keyCommand?: string;
+		headers?: Record<string, string>;
 		baseUrl?: string;
 		modelId?: string;
 		api?: ConnectionProtocol;
 	}): Promise<Snapshot>;
 	testConnection(input: ConnectionInput): Promise<ConnectionTestResult>;
+	providerBalance(input: ConnectionInput): Promise<ProviderBalanceResult>;
 	exportConversation(): Promise<string | null>;
 	onEvent(listener: (event: DesktopEvent) => void): () => void;
 }

@@ -4,6 +4,7 @@ import type {
 	ConnectionMode,
 	ConnectionProtocol,
 	ConnectionTestResult,
+	ProviderBalanceResult,
 	DesktopAPI,
 	PermissionMode,
 	Provider,
@@ -53,10 +54,27 @@ function connectionValues(settings: Settings, preset: ProviderPreset) {
 	const mode: ConnectionMode = stored?.mode ?? (stored?.baseUrl || stored?.api || unknownModel ? "custom" : "preset");
 	return {
 		mode,
+		keyCommand: stored?.keyCommand ?? "",
+		headerNames: stored?.headerNames ?? [],
 		modelId: mode === "preset" && unknownModel ? preset.defaultModelId : modelId,
 		baseUrl: stored?.baseUrl ?? "",
 		api: stored?.api ?? preset.models.find((model) => model.id === modelId)?.api ?? preset.api,
 	};
+}
+
+/** Parses "Name: value" lines into headers, or returns an error message. */
+export function parseHeaderLines(text: string): Record<string, string> | string {
+	const headers: Record<string, string> = {};
+	for (const raw of text.split("\n")) {
+		const line = raw.trim();
+		if (!line) continue;
+		const colon = line.indexOf(":");
+		if (colon <= 0) return `请求头格式应为“名称: 值”：${line.slice(0, 40)}`;
+		const name = line.slice(0, colon).trim();
+		if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/.test(name)) return `请求头名称无效：${name.slice(0, 40)}`;
+		headers[name] = line.slice(colon + 1).trim();
+	}
+	return headers;
 }
 
 export function SettingsDialog({
@@ -105,7 +123,18 @@ export function SettingsDialog({
 	const [provider, setProvider] = useState<Provider>(initialProvider);
 	const [mode, setMode] = useState<ConnectionMode>(initial.mode);
 	const [agentDir, setAgentDir] = useState(settings.agentDir ?? "");
+	const [proxy, setProxy] = useState(settings.proxy ?? "");
+	const [noProxy, setNoProxy] = useState(settings.noProxy ?? "");
+	const [caFile, setCaFile] = useState(settings.caFile ?? "");
 	const [apiKey, setApiKey] = useState("");
+	const [keyCommand, setKeyCommand] = useState(initial.keyCommand);
+	const [headerText, setHeaderText] = useState("");
+	const [clearHeaders, setClearHeaders] = useState(false);
+	const [maxCostText, setMaxCostText] = useState(settings.maxCostUsd ? String(settings.maxCostUsd) : "");
+	const [disableAllHooks, setDisableAllHooks] = useState(settings.disableAllHooks === true);
+	const [minBalanceText, setMinBalanceText] = useState(settings.minBalance ? String(settings.minBalance) : "");
+	const [balance, setBalance] = useState<ProviderBalanceResult | null>(null);
+	const [checkingBalance, setCheckingBalance] = useState(false);
 	const [baseUrl, setBaseUrl] = useState(initial.baseUrl);
 	const [modelId, setModelId] = useState(initial.modelId);
 	const [api, setApi] = useState<ConnectionProtocol>(initial.api);
@@ -127,9 +156,9 @@ export function SettingsDialog({
 			: undefined;
 	const original = connectionValues(settings, preset);
 	const model = preset.models.find((item) => item.id === modelId);
-	const pending = saving || testing;
+	const pending = saving || testing || checkingBalance;
 	const storedKey = settings.configuredProviders.includes(provider);
-	const hasKey = Boolean(apiKey.trim()) || storedKey;
+	const hasKey = Boolean(apiKey.trim()) || storedKey || Boolean(keyCommand.trim());
 	const generalSettingsChanged =
 		permission !== settings.permission ||
 		theme !== settings.theme ||
@@ -145,23 +174,36 @@ export function SettingsDialog({
 		cronEnabled !== (settings.cronEnabled !== false) ||
 		agentTeams !== (settings.agentTeams === true) ||
 		MODEL_ROUTING_ROLES.some((role) => routing[role] !== initialRouting[role]) ||
-		agentDir.trim() !== (settings.agentDir ?? "");
+		agentDir.trim() !== (settings.agentDir ?? "") ||
+		proxy.trim() !== (settings.proxy ?? "") ||
+		noProxy.trim() !== (settings.noProxy ?? "") ||
+		caFile.trim() !== (settings.caFile ?? "") ||
+		maxCostText.trim() !== (settings.maxCostUsd ? String(settings.maxCostUsd) : "") ||
+		minBalanceText.trim() !== (settings.minBalance ? String(settings.minBalance) : "") ||
+		disableAllHooks !== (settings.disableAllHooks === true);
+	const headersEdited = Boolean(headerText.trim()) || clearHeaders;
 	const connectionChanged =
 		Boolean(apiKey.trim()) ||
+		keyCommand.trim() !== original.keyCommand ||
+		headersEdited ||
 		mode !== original.mode ||
 		modelId.trim() !== original.modelId ||
 		(mode === "custom" && (baseUrl.trim() !== original.baseUrl || api !== original.api)) ||
 		(hasKey && settings.defaultModel?.provider !== `desktop-${provider}`);
+	const parsedHeaders = headerText.trim() ? parseHeaderLines(headerText) : {};
 	const connectionInput: ConnectionInput = {
 		provider,
 		mode,
 		apiKey: apiKey.trim() || undefined,
+		...(keyCommand.trim() !== original.keyCommand ? { keyCommand: keyCommand.trim() } : {}),
+		...(headersEdited && typeof parsedHeaders === "object" ? { headers: parsedHeaders } : {}),
 		modelId: modelId.trim() || undefined,
 		...(mode === "custom" ? { baseUrl: baseUrl.trim(), api } : {}),
 	};
 	const clearResult = () => {
 		setError("");
 		setTestResult(null);
+		setBalance(null);
 	};
 	const selectProvider = (next: Provider) => {
 		const nextPreset = presets.find((item) => item.provider === next)!;
@@ -169,6 +211,9 @@ export function SettingsDialog({
 		setProvider(next);
 		setMode(values.mode);
 		setApiKey("");
+		setKeyCommand(values.keyCommand);
+		setHeaderText("");
+		setClearHeaders(false);
 		setBaseUrl(values.baseUrl);
 		setModelId(values.modelId);
 		setApi(values.api);
@@ -205,6 +250,21 @@ export function SettingsDialog({
 			setError("前台子 Agent 等待时长需为 0–1440 分钟的整数。");
 			return;
 		}
+		if (typeof parsedHeaders === "string") {
+			setAdvanced(true);
+			setError(parsedHeaders);
+			return;
+		}
+		const maxCost = maxCostText.trim() ? Number(maxCostText.trim()) : null;
+		if (maxCost !== null && (!Number.isFinite(maxCost) || maxCost < 0.01 || maxCost > 100000)) {
+			setError("费用上限需为 0.01–100000 美元，留空表示不限制。");
+			return;
+		}
+		const minBalance = minBalanceText.trim() ? Number(minBalanceText.trim()) : null;
+		if (minBalance !== null && (!Number.isFinite(minBalance) || minBalance < 0.01 || minBalance > 1000000)) {
+			setError("余额底线需为 0.01–1000000，留空表示不检查。");
+			return;
+		}
 		const depthNum = Number(maxSubagentDepthText.trim());
 		if (!/^\d+$/.test(maxSubagentDepthText.trim()) || !Number.isSafeInteger(depthNum) || depthNum < 1 || depthNum > 3) {
 			setError("子 Agent 最大嵌套深度需为 1–3 的整数。");
@@ -227,6 +287,9 @@ export function SettingsDialog({
 				...(maxConcurrentText.trim() !== String(settings.maxConcurrentSubagents ?? 8) ? { maxConcurrentSubagents: concurrentNum } : {}),
 				cronEnabled,
 				agentTeams,
+				...(maxCostText.trim() !== (settings.maxCostUsd ? String(settings.maxCostUsd) : "") ? { maxCostUsd: maxCost } : {}),
+				...(disableAllHooks !== (settings.disableAllHooks === true) ? { disableAllHooks } : {}),
+				...(minBalanceText.trim() !== (settings.minBalance ? String(settings.minBalance) : "") ? { minBalance } : {}),
 			};
 			if (MODEL_ROUTING_ROLES.some((role) => routing[role] !== initialRouting[role])) {
 				// The backend replaces the whole map, so an omitted role means "inherit".
@@ -238,10 +301,15 @@ export function SettingsDialog({
 				update.modelRouting = next;
 			}
 			if (agentDir.trim() !== (settings.agentDir ?? "")) update.agentDir = agentDir.trim();
+			if (proxy.trim() !== (settings.proxy ?? "")) update.proxy = proxy.trim();
+			if (noProxy.trim() !== (settings.noProxy ?? "")) update.noProxy = noProxy.trim();
+			if (caFile.trim() !== (settings.caFile ?? "")) update.caFile = caFile.trim();
 			if (connectionChanged) Object.assign(update, connectionInput);
 			const next = await window.pi.saveSettings(update);
 			apply(next);
 			setApiKey("");
+			setHeaderText("");
+			setClearHeaders(false);
 			if (next.engineError) {
 				setError(`设置已保存，但模型暂不可用：${next.engineError}`);
 				return;
@@ -254,11 +322,32 @@ export function SettingsDialog({
 			setSaving(false);
 		}
 	};
+	const checkBalance = async () => {
+		clearResult();
+		if (typeof parsedHeaders === "string") {
+			setAdvanced(true);
+			setError(parsedHeaders);
+			return;
+		}
+		setCheckingBalance(true);
+		try {
+			setBalance(await window.pi.providerBalance(connectionInput));
+		} catch (error) {
+			setError(error instanceof Error ? error.message : String(error));
+		} finally {
+			setCheckingBalance(false);
+		}
+	};
 	const testConnection = async () => {
 		clearResult();
 		if (mode === "custom" && !modelId.trim()) {
 			setAdvanced(true);
 			setError("请填写自定义接口的模型 ID，或恢复官方预设。");
+			return;
+		}
+		if (typeof parsedHeaders === "string") {
+			setAdvanced(true);
+			setError(parsedHeaders);
 			return;
 		}
 		setTesting(true);
@@ -453,6 +542,59 @@ export function SettingsDialog({
 						) : (
 							<p className="subtle-note">已使用 {preset.baseUrl}，模型参数由服务商预设自动配置。</p>
 						)}
+						<label className="field-label">
+							取 Key 命令（可选）
+							<input
+								aria-label="取 Key 命令"
+								placeholder="例如 security find-generic-password -s my-llm -w"
+								autoComplete="off"
+								spellCheck={false}
+								value={keyCommand}
+								disabled={pending}
+								onChange={(event) => {
+									setKeyCommand(event.target.value);
+									clearResult();
+								}}
+							/>
+							<small>没有保存 API Key 时，用这条命令的输出作为 Key（类似 Claude Code 的 apiKeyHelper）。每次启动模型进程时运行一次。</small>
+						</label>
+						<label className="field-label">
+							<span className="live-setting-label">
+								自定义请求头（可选）
+								{original.headerNames.length > 0 && !clearHeaders && (
+									<span className="live-setting-saved">已保存 {original.headerNames.join("、")}</span>
+								)}
+							</span>
+							<textarea
+								aria-label="自定义请求头"
+								rows={3}
+								placeholder={original.headerNames.length ? "留空保留已保存的请求头；填写会整体替换" : "每行一个，例如 X-Org-Id: team-a"}
+								spellCheck={false}
+								value={headerText}
+								disabled={pending}
+								onChange={(event) => {
+									setHeaderText(event.target.value);
+									if (event.target.value.trim()) setClearHeaders(false);
+									clearResult();
+								}}
+							/>
+							<small>每行“名称: 值”，随每个模型请求发送。值会加密保存，界面不再显示。</small>
+						</label>
+						{original.headerNames.length > 0 && !headerText.trim() && (
+							<label className="live-setting-toggle">
+								<input
+									type="checkbox"
+									aria-label="清除已保存的请求头"
+									checked={clearHeaders}
+									disabled={pending}
+									onChange={(event) => {
+										setClearHeaders(event.target.checked);
+										clearResult();
+									}}
+								/>
+								清除已保存的请求头
+							</label>
+						)}
 						<div className="live-settings-config-dir">
 							<label className="field-label">
 								Pi 配置目录（可选）
@@ -469,6 +611,50 @@ export function SettingsDialog({
 							</label>
 							<p className="subtle-note">留空使用 Pi 标准目录，已有模型和登录配置继续生效。</p>
 						</div>
+					</div>
+				</details>
+				<details className="live-settings-section" open={Boolean(settings.proxy || settings.caFile) || undefined}>
+					<summary>网络与证书</summary>
+					<div className="live-settings-section-content">
+						<label className="field-label">
+							代理地址
+							<input
+								aria-label="代理地址"
+								placeholder="http://127.0.0.1:7890"
+								autoComplete="off"
+								spellCheck={false}
+								value={proxy}
+								disabled={pending || busy}
+								onChange={(event) => setProxy(event.target.value)}
+							/>
+							<small>用于模型请求和 WebFetch。留空时沿用终端里的 HTTPS_PROXY / HTTP_PROXY（从 Finder 启动也会读取）。</small>
+						</label>
+						<label className="field-label">
+							不走代理的地址
+							<input
+								aria-label="不走代理的地址"
+								placeholder="localhost,127.0.0.1,.internal.example.com"
+								autoComplete="off"
+								spellCheck={false}
+								value={noProxy}
+								disabled={pending || busy}
+								onChange={(event) => setNoProxy(event.target.value)}
+							/>
+							<small>逗号分隔，对应 NO_PROXY。</small>
+						</label>
+						<label className="field-label">
+							自定义 CA 证书
+							<input
+								aria-label="自定义 CA 证书"
+								placeholder="/path/to/company-ca.pem"
+								autoComplete="off"
+								spellCheck={false}
+								value={caFile}
+								disabled={pending || busy}
+								onChange={(event) => setCaFile(event.target.value)}
+							/>
+							<small>PEM 文件的绝对路径，公司网络做 HTTPS 解密时需要。保存后会重启当前会话的模型进程。</small>
+						</label>
 					</div>
 				</details>
 				<details className="live-settings-section">
@@ -511,10 +697,21 @@ export function SettingsDialog({
 							/>
 							macOS Seatbelt 命令沙箱（将 Bash 写操作隔离至当前项目与临时目录）
 						</label>
-						{sandbox && <label className="field-label">
-							<span><input type="checkbox" checked={sandboxOffline} disabled={pending || busy} onChange={(event) => setSandboxOffline(event.target.checked)} /> 禁止 Bash 命令访问网络</span>
-							<small>适用于模型的 Bash 和单次命令。交互终端、MCP、Hooks 和模型连接使用各自的权限。</small>
-						</label>}
+						{sandbox && (
+							<div className="live-setting-sub">
+								<label className="live-setting-toggle">
+									<input
+										type="checkbox"
+										aria-label="禁止 Bash 命令访问网络"
+										checked={sandboxOffline}
+										disabled={pending || busy}
+										onChange={(event) => setSandboxOffline(event.target.checked)}
+									/>
+									禁止 Bash 命令访问网络
+								</label>
+								<small>适用于模型的 Bash 和单次命令。交互终端、MCP、Hooks 和模型连接使用各自的权限。</small>
+							</div>
+						)}
 						{sandboxInfo && !sandboxInfo.supported && (
 							<p className="subtle-note">当前运行环境不支持嵌套 Seatbelt 沙箱：{sandboxInfo.reason}</p>
 						)}
@@ -527,6 +724,44 @@ export function SettingsDialog({
 								onChange={(event) => setNotifications(event.target.checked)}
 							/>
 							窗口未聚焦时发送任务完成/待审批系统通知
+						</label>
+						<label className="field-label">
+							单个会话费用上限（美元，可选）
+							<input
+								type="number"
+								aria-label="单个会话费用上限"
+								min={0.01}
+								step="0.01"
+								placeholder="不限制"
+								value={maxCostText}
+								disabled={pending || busy}
+								onChange={(event) => setMaxCostText(event.target.value)}
+							/>
+							<small>按模型返回的用量和价格累计，包含子 Agent。达到上限后当前回合停止，之后的消息不再发送。服务商没有提供价格时无法统计，可改用下面的余额底线。</small>
+						</label>
+						<label className="field-label">
+							账户余额底线（可选）
+							<input
+								type="number"
+								aria-label="账户余额底线"
+								min={0.01}
+								step="0.01"
+								placeholder="不检查"
+								value={minBalanceText}
+								disabled={pending || busy}
+								onChange={(event) => setMinBalanceText(event.target.value)}
+							/>
+							<small>适用于 DeepSeek、OpenRouter（需给 Key 设额度）、Kimi 和硅基流动的官方地址。发送前和每轮结束后查询服务商余额，降到底线时停止。金额按服务商的结算币种计算（DeepSeek 一般为人民币）。服务商更新余额有延迟，属于事后止损；查询失败时不会拦截。</small>
+						</label>
+						<label className="live-setting-toggle">
+							<input
+								type="checkbox"
+								aria-label="停用全部 Hooks"
+								checked={disableAllHooks}
+								disabled={pending || busy}
+								onChange={(event) => setDisableAllHooks(event.target.checked)}
+							/>
+							停用全部 Hooks（.claude/settings.json 与 .pi/hooks.json 中的 Hook 都不再运行）
 						</label>
 						<label className="live-setting-toggle">
 							<input
@@ -666,6 +901,14 @@ export function SettingsDialog({
 						</span>
 					</div>
 				)}
+				{balance && (
+					<div
+						className={balance.success ? "live-notice" : "live-error"}
+						role={balance.success ? "status" : "alert"}
+					>
+						<span>{balanceText(balance)}</span>
+					</div>
+				)}
 				{busy && <p className="live-error">请先停止当前任务，再修改连接和权限。</p>}
 				{error && (
 					<div className="live-error" role="alert">
@@ -684,6 +927,14 @@ export function SettingsDialog({
 					>
 						{testing ? "正在测试…" : "测试连接"}
 					</button>
+					<button
+						type="button"
+						className="secondary-button"
+						disabled={pending || !hasKey}
+						onClick={() => void checkBalance()}
+					>
+						{checkingBalance ? "正在查询…" : "查询余额"}
+					</button>
 					<span />
 					<button type="button" disabled={pending} className="secondary-button" onClick={close}>
 						取消
@@ -695,4 +946,15 @@ export function SettingsDialog({
 			</form>
 		</Modal>
 	);
+}
+
+function balanceText(result: ProviderBalanceResult): string {
+	if (!result.supported || !result.success) return result.message ?? "余额查询失败。";
+	const money = (currency: string, amount: number) =>
+		`${currency === "CNY" ? "¥" : currency === "USD" ? "$" : `${currency} `}${amount.toFixed(2)}`;
+	const parts = (result.balances ?? []).map((item) => `余额 ${money(item.currency, item.amount)}`);
+	if (result.usage !== undefined) parts.push(`该 Key 累计用量 $${result.usage.toFixed(2)}`);
+	if (result.available === false) parts.push("服务商表示余额已不足以调用");
+	if (result.note) parts.push(result.note);
+	return parts.join("，") || "服务商没有返回余额。";
 }

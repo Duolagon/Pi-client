@@ -37,6 +37,7 @@ export function ControlsDialog({
 	project,
 	initialTab = "tools",
 	onNotice,
+	hooksDisabled = false,
 	close,
 	fail,
 }: {
@@ -44,6 +45,8 @@ export function ControlsDialog({
 	project?: string;
 	initialTab?: ControlsTab;
 	onNotice?: (message: string) => void;
+	/** Settings switch that stops every hook from running. */
+	hooksDisabled?: boolean;
 	close: () => void;
 	fail: (error: unknown) => void;
 }) {
@@ -471,6 +474,9 @@ export function ControlsDialog({
 								执行 {hookTestResult.executedCount} 个 Hook · {hookTestResult.blocked ? `已拦截：${hookTestResult.reason}` : "放行"}
 								{hookTestResult.additionalContext ? ` · 上下文：${hookTestResult.additionalContext}` : ""}
 							</div>
+						)}
+						{hooksDisabled && (
+							<p className="subtle-note cc-settings-current">已在设置中停用全部 Hooks，下面的 Hook 暂不运行。</p>
 						)}
 						<p className="subtle-note">兼容 ~/.claude/settings*.json 与受信任项目的 .claude/settings*.json、.pi/hooks.json；支持 command 与 http handler。</p>
 						<div className="cc-list-scroll">

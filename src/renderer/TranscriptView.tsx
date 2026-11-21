@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from "react";
+import { copyText } from "./clipboard.ts";
 import ReactMarkdown from "react-markdown";
 import { ArrowDownToLine, Check, Circle, CircleAlert, ChevronRight, Copy, Eye, GitFork, LoaderCircle, RotateCcw, Square } from "lucide-react";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
@@ -71,32 +72,6 @@ function linesLabel(count: number): string {
 	return `${count} ${count === 1 ? "line" : "lines"}`;
 }
 
-/** Copies text, falling back to a hidden textarea when the async clipboard is unavailable. */
-async function copyText(text: string): Promise<boolean> {
-	try {
-		if (!navigator.clipboard) throw new Error("no clipboard");
-		await navigator.clipboard.writeText(text);
-		return true;
-	} catch {
-		const area = document.createElement("textarea");
-		area.value = text;
-		area.setAttribute("readonly", "");
-		area.style.position = "fixed";
-		area.style.opacity = "0";
-		const previous = document.activeElement as HTMLElement | null;
-		document.body.append(area);
-		area.select();
-		let ok = false;
-		try {
-			ok = document.execCommand("copy");
-		} catch {
-			ok = false;
-		}
-		area.remove();
-		previous?.focus?.();
-		return ok;
-	}
-}
 
 type CopyState = "idle" | "done" | "failed";
 const copyLabel: Record<CopyState, string> = { idle: "复制", done: "已复制", failed: "复制失败" };
