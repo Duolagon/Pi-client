@@ -70,7 +70,10 @@ interface Connection {
 const maxFetchBytes = 2 * 1024 * 1024;
 const maxRedirects = 5;
 
-function blockedIpv4(ip: string): boolean {
+// 198.18.0.0/15 is the benchmarking range that proxy tools (Clash, Surge, sing-box)
+// hand out as fake-ip DNS answers. Allow it only when it comes from DNS resolution,
+// never as a literal IP in the URL.
+function blockedIpv4(ip: string, allowFakeIp = false): boolean {
 	const parts = ip.split(".").map(Number);
 	if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return true;
 	const [a, b, c] = parts;
@@ -84,31 +87,31 @@ function blockedIpv4(ip: string): boolean {
 		(a === 172 && b >= 16 && b <= 31) ||
 		(a === 192 && b === 168) ||
 		(a === 192 && b === 0) ||
-		(a === 198 && (b === 18 || b === 19)) ||
+		(!allowFakeIp && a === 198 && (b === 18 || b === 19)) ||
 		(a === 198 && b === 51 && c === 100) ||
 		(a === 203 && b === 0 && c === 113)
 	);
 }
 
-function blockedIpv6(ip: string): boolean {
+function blockedIpv6(ip: string, allowFakeIp = false): boolean {
 	const value = ip.toLowerCase();
 	if (value === "::" || value === "::1") return true;
 	if (value.startsWith("fc") || value.startsWith("fd")) return true;
 	if (/^fe[89ab]/.test(value)) return true;
 	if (value.startsWith("ff")) return true;
 	const dotted = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(value);
-	if (dotted) return blockedIpv4(dotted[1]);
+	if (dotted) return blockedIpv4(dotted[1], allowFakeIp);
 	const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(value);
 	if (hex) {
 		const high = Number.parseInt(hex[1], 16);
 		const low = Number.parseInt(hex[2], 16);
-		return blockedIpv4(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
+		return blockedIpv4(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`, allowFakeIp);
 	}
 	return false;
 }
 
-function blockedAddress(address: string): boolean {
-	return isIP(address) === 4 ? blockedIpv4(address) : isIP(address) === 6 ? blockedIpv6(address) : true;
+export function blockedAddress(address: string, allowFakeIp = false): boolean {
+	return isIP(address) === 4 ? blockedIpv4(address, allowFakeIp) : isIP(address) === 6 ? blockedIpv6(address, allowFakeIp) : true;
 }
 
 async function publicAddresses(hostname: string): Promise<{ address: string; family: number }[]> {
@@ -126,7 +129,7 @@ async function publicAddresses(hostname: string): Promise<{ address: string; fam
 	} catch {
 		throw new Error("无法解析目标主机。");
 	}
-	if (!addresses.length || addresses.some(({ address }) => blockedAddress(address)))
+	if (!addresses.length || addresses.some(({ address }) => blockedAddress(address, true)))
 		throw new Error("Refusing to fetch private or loopback network addresses.");
 	return addresses;
 }
