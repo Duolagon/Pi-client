@@ -23,6 +23,8 @@ import type { ContextBreakdown, ContextMemorySource } from "./context-inspector.
 import type { SkillDefinitionEntry, SkillRemoveInput, SkillSaveInput } from "./skill-registry.ts";
 import type { DraftPullRequest } from "./review-service.ts";
 import type { CodeIntelligence, CodePosition } from "./language-service.ts";
+import type { GoalState } from "./goal-mode.ts";
+export type { GoalState } from "./goal-mode.ts";
 import type { PreviewCheck } from "./preview-check.ts";
 import type { TodoCreateInput, TodoEvent, TodoRecord, TodoUpdateInput } from "./todo-types.ts";
 import type { MonitorEvent, MonitorRecord } from "./monitor-types.ts";
@@ -206,7 +208,19 @@ export interface Conversation {
 	sessionLeafId?: string | null;
 	/** Host-derived marker for delegated child sessions; folded under their parent in the sidebar. */
 	kind?: "subagent";
+	pinned?: boolean;
+	archived?: boolean;
+	group?: string;
+	/** Additional workspace directories attached via /add-dir (read/write allowed + synced to Seatbelt sandbox). */
+	additionalDirs?: string[];
+	/** Active or last-run /goal autonomous continuation state. */
+	goal?: GoalState;
 	updatedAt: number;
+}
+export interface ConversationMetaPatch {
+	pinned?: boolean;
+	archived?: boolean;
+	group?: string | null;
 }
 export interface Project {
 	path: string;
@@ -285,6 +299,10 @@ export interface Settings {
 	editor?: EditorChoice;
 	/** Show the provider account balance in the composer status line; absent means true. */
 	statusBalance?: boolean;
+	/** Enable WebSearch (DeepSeek Search API for any model; built-in free search on DeepSeek models); absent means true. */
+	webSearchEnabled?: boolean;
+	/** True when a dedicated DeepSeek Search API key is stored in encrypted settings. */
+	webSearchApiKeyConfigured?: boolean;
 }
 export type EditorChoice = "vscode" | "cursor" | "system";
 export interface OutputStyleInfo {
@@ -391,6 +409,20 @@ export interface MemoryFileEntry {
 }
 export type SessionActivity = "running" | "approval";
 
+export type PullRequestMergeMethod = "merge" | "squash" | "rebase";
+
+export interface PullRequestComment {
+	id: string;
+	author: string;
+	body: string;
+	createdAt: string;
+	kind: "issue" | "review" | "inline";
+	path?: string;
+	line?: number;
+	state?: string;
+	url?: string;
+}
+
 export interface PullRequestStatus {
 	number: number;
 	title: string;
@@ -400,7 +432,24 @@ export interface PullRequestStatus {
 	headRefName: string;
 	baseRefName: string;
 	reviewDecision?: string;
+	autoMerge?: { enabled: boolean; mergeMethod?: string };
 	checks: {name: string; status: string}[];
+}
+
+export function formatPullRequestCommentsPrompt(pr: PullRequestStatus, comments: PullRequestComment[]): string {
+	const lines = [
+		`请逐条检查并处理 PR #${pr.number}（${pr.title}，${pr.headRefName} → ${pr.baseRefName}）的评审评论：`,
+		"",
+	];
+	for (const [index, comment] of comments.entries()) {
+		const loc = comment.path ? ` (${comment.path}${comment.line ? `:${comment.line}` : ""})` : "";
+		const tag = comment.kind === "inline" ? "行内评论" : comment.kind === "review" ? `评审${comment.state ? `/${comment.state}` : ""}` : "评论";
+		lines.push(`${index + 1}. [${tag}] @${comment.author}${loc}:`);
+		lines.push(comment.body);
+		lines.push("");
+	}
+	lines.push("请先阅读相关代码核实每条评论；对合理的修改建议直接完成代码改动并运行测试，对不需要修改的评论说明理由。");
+	return lines.join("\n").trim();
 }
 
 export interface Snapshot {
@@ -500,7 +549,12 @@ export interface DesktopAPI {
 	newConversation(): Promise<Snapshot>;
 	selectConversation(id: string): Promise<Snapshot>;
 	renameConversation(id: string, title: string): Promise<Snapshot>;
-	/** Removes the conversation from the list; its Pi session file stays on disk. */
+	updateConversationMeta(id: string, patch: ConversationMetaPatch): Promise<Snapshot>;
+	addDir(conversationId: string, dirPath: string): Promise<{ snapshot: Snapshot; added: string }>;
+	removeDir(conversationId: string, dirPath: string): Promise<Snapshot>;
+	startGoal(conversationId: string, input: { objective: string; maxTurns?: number; maxCostUsd?: number }): Promise<Snapshot>;
+	stopGoal(conversationId: string): Promise<Snapshot>;
+	/** Removes the conversation from the list and moves its Pi session file to Trash when unreferenced. */
 	removeConversation(id: string): Promise<Snapshot>;
 	command(command: Command, conversationId?: string): Promise<unknown>;
 	respond(response: RpcExtensionUIResponse, conversationId?: string): Promise<void>;
@@ -509,6 +563,8 @@ export interface DesktopAPI {
 	workspace(): Promise<Workspace>;
 	createDraftPullRequest(conversationId: string, draft: DraftPullRequest): Promise<{ url: string; number: number }>;
 	pullRequest(conversationId: string, number?: number): Promise<PullRequestStatus | null>;
+	setPullRequestAutoMerge(conversationId: string, number: number, enabled: boolean, method?: PullRequestMergeMethod): Promise<PullRequestStatus | null>;
+	pullRequestComments(conversationId: string, number: number): Promise<PullRequestComment[]>;
 	diff(path: string): Promise<string>;
 	gitStage(paths?: string[]): Promise<Workspace>;
 	gitUnstage(paths?: string[]): Promise<Workspace>;
@@ -567,6 +623,9 @@ export interface DesktopAPI {
 		outputStyle?: string | null;
 		editor?: EditorChoice;
 		statusBalance?: boolean;
+		webSearchEnabled?: boolean;
+		/** Empty string clears the dedicated DeepSeek Search API key; undefined leaves it unchanged. */
+		webSearchApiKey?: string;
 		provider?: Provider;
 		mode?: ConnectionMode;
 		apiKey?: string;

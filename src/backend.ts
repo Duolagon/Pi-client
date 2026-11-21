@@ -1,4 +1,4 @@
-import { createDraftPullRequest, readPullRequest, type DraftPullRequest } from "./review-service.ts";
+import { createDraftPullRequest, readPullRequest, readPullRequestComments, setPullRequestAutoMerge, type DraftPullRequest } from "./review-service.ts";
 import { managedFile, writeManagedFile } from "./managed-path.ts";
 import { execFile } from "node:child_process";
 import { randomBytes, randomUUID, createHash } from "node:crypto";
@@ -97,7 +97,8 @@ import type {
 import { connectionMode, validateEndpoint } from "./model-connections.ts";
 import { providerModels, providerPresets } from "./provider-presets.ts";
 import { memoryLimit, memoryName, privateMemoryLabel } from "./project-memory.ts";
-import { codeIntelligence, type CodePosition } from "./language-service.ts";
+import { codeIntelligence, formatCodeIntelligence, formatLspDiagnostics, isLspSupportedFile, type CodePosition } from "./language-service.ts";
+import { buildGoalInitialPrompt, DEFAULT_GOAL_MAX_TURNS, evaluateGoalContinuation, MAX_GOAL_TURNS } from "./goal-mode.ts";
 import { detectProjectTrustResources } from "./project-trust.ts";
 import { DEFAULT_OUTPUT_STYLE, discoverOutputStyles, findOutputStyle, outputStylePromptSection, validOutputStyleName } from "./output-styles.ts";
 import { EDITOR_CHOICES, type EditorChoice } from "./editor-open.ts";
@@ -118,7 +119,7 @@ import { McpRegistry } from "./mcp-registry.ts";
 import type { McpRemoveInput, McpSaveInput, McpServerInfo } from "./mcp-types.ts";
 import { HooksService, type HookRunContext } from "./hooks-service.ts";
 import type { HookEntry, HookRemoveInput, HookRunResult, HookSaveInput, HookTestInput } from "./hook-types.ts";
-import { BUNDLED_SKILLS, SkillRegistry, bundledSkillFile } from "./skill-registry.ts";
+import { BUNDLED_SKILLS, SkillRegistry, bundledSkillFile, formatForkedSkillPrompt, parseSkillInvocation } from "./skill-registry.ts";
 import { balanceTarget, fetchBalance, type BalanceTarget } from "./provider-balance.ts";
 import { EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
 import { rootCertificates } from "node:tls";
@@ -138,7 +139,7 @@ import { buildContextReport, deleteProjectMemoryRule, writeProjectMemoryFile, ty
 import { buildSeatbeltProfile, probeSeatbeltSupport, resolveGitWorktreeWritablePaths } from "./sandbox.ts";
 import { readClaudeProjectPermissionsDetailed, writeClaudeProjectPermissions } from "./claude-settings-sync.ts";
 import { createForkedSessionSnapshot, findSessionFileById } from "./session-fork.ts";
-import type { BtwResult, ClaudePermissionsSyncResult, DoctorCheck, DoctorReport, OutputStyleInfo, PlanFileState, SandboxStatus, UsageStatsReport } from "./shared.ts";
+import type { BtwResult, ClaudePermissionsSyncResult, ConversationMetaPatch, DoctorCheck, DoctorReport, OutputStyleInfo, PlanFileState, PullRequestMergeMethod, SandboxStatus, UsageStatsReport } from "./shared.ts";
 import { ExternalAgents } from "./external-agents.ts";
 import { CodexAdapter } from "./external-codex.ts";
 import { ClaudeAdapter } from "./external-claude.ts";
@@ -204,6 +205,8 @@ interface StoredState {
 	keys: Partial<Record<Provider, string>>;
 	/** Encrypted JSON of each connection's custom request headers. */
 	headerKeys?: Partial<Record<Provider, string>>;
+	/** Encrypted DeepSeek Search API key for WebSearch. */
+	webSearchApiKey?: string;
 	tasks: DesktopTask[];
 	taskPolicies?: Record<string, RuntimePermissionPolicy>;
 	/** Canonical project path to the user's explicit trust decision. */
@@ -302,6 +305,8 @@ export interface ServiceOptions {
 	/** Loopback origin that replaces every official balance host (tests only). */
 	balanceOrigin?: string;
 	ptyHelperPath?: string;
+	/** Moves a deleted conversation's session file to the OS Trash (defaults to dataDir/trash). */
+	trashItem?: (filePath: string) => Promise<void>;
 	archiveEntry?: string;
 	historyEntry?: string;
 	navigationExtension?: string;
@@ -1740,8 +1745,129 @@ export class DesktopService {
 		return this.buildSnapshot();
 	}
 
+	/** Updates conversation sidebar organization metadata (pin, archive, custom group). */
+	updateConversationMeta(id: string, patch: ConversationMetaPatch): Promise<Snapshot> {
+		return this.serialize(async () => {
+			const conversation = this.conversation(id);
+			if (patch.pinned !== undefined) conversation.pinned = patch.pinned ? true : undefined;
+			if (patch.archived !== undefined) conversation.archived = patch.archived ? true : undefined;
+			if (patch.group !== undefined) {
+				const cleaned = patch.group === null ? "" : patch.group.trim().slice(0, 60);
+				conversation.group = cleaned || undefined;
+			}
+			await this.persist();
+			return this.buildSnapshot();
+		});
+	}
+
+	/** Attaches an extra directory to a conversation, granting read/write permission and syncing Seatbelt sandbox rules. */
+	addDir(conversationId: string, rawPath: string): Promise<{ snapshot: Snapshot; added: string }> {
+		return this.serialize(async () => {
+			const conversation = this.conversation(conversationId);
+			const trimmed = rawPath.trim();
+			if (!trimmed) throw new Error("请提供要附加的目录路径，例如 /add-dir ../shared-lib。");
+			const expanded = trimmed === "~" ? homedir() : trimmed.startsWith("~/") ? join(homedir(), trimmed.slice(2)) : trimmed;
+			const resolved = isAbsolute(expanded) ? resolve(expanded) : resolve(conversation.project, expanded);
+			let info;
+			try {
+				info = await stat(resolved);
+			} catch {
+				throw new Error(`目录不存在：${resolved}`);
+			}
+			if (!info.isDirectory()) throw new Error(`路径不是目录：${resolved}`);
+			const canonical = await realpath(resolved);
+			const existing = conversation.additionalDirs ?? [];
+			if (!existing.includes(canonical)) {
+				conversation.additionalDirs = [...existing, canonical];
+			}
+			await this.persist();
+			const runtime = this.runtimes.get(conversation.id);
+			if (runtime) await this.writeRuntimeControls(runtime);
+			return { snapshot: await this.buildSnapshot(), added: canonical };
+		});
+	}
+
+	/** Removes an attached directory from a conversation and syncs permission & Seatbelt sandbox rules. */
+	removeDir(conversationId: string, rawPath: string): Promise<Snapshot> {
+		return this.serialize(async () => {
+			const conversation = this.conversation(conversationId);
+			const trimmed = rawPath.trim();
+			const expanded = trimmed === "~" ? homedir() : trimmed.startsWith("~/") ? join(homedir(), trimmed.slice(2)) : trimmed;
+			const resolved = isAbsolute(expanded) ? resolve(expanded) : resolve(conversation.project, expanded);
+			const canonical = await realpath(resolved).catch(() => resolved);
+			const current = conversation.additionalDirs ?? [];
+			const next = current.filter((item) => item !== trimmed && item !== resolved && item !== canonical);
+			conversation.additionalDirs = next.length > 0 ? next : undefined;
+			await this.persist();
+			const runtime = this.runtimes.get(conversation.id);
+			if (runtime) await this.writeRuntimeControls(runtime);
+			return this.buildSnapshot();
+		});
+	}
+
+	/** Starts /goal autonomous continuation mode for a conversation. */
+	async startGoal(
+		conversationId: string,
+		input: { objective: string; maxTurns?: number; maxCostUsd?: number },
+	): Promise<Snapshot> {
+		let initialPrompt = "";
+		let targetId = "";
+		const snapshot = await this.serialize(async () => {
+			const conversation = this.conversation(conversationId);
+			const objective = input.objective.trim().slice(0, 4000);
+			if (!objective) throw new Error("目标描述不能为空。");
+			const maxTurns = input.maxTurns ?? DEFAULT_GOAL_MAX_TURNS;
+			if (!Number.isSafeInteger(maxTurns) || maxTurns < 1 || maxTurns > MAX_GOAL_TURNS) {
+				throw new Error(`目标轮数上限需为 1–${MAX_GOAL_TURNS} 的整数。`);
+			}
+			const maxCostUsd = input.maxCostUsd ?? this.store.settings.maxCostUsd;
+			if (maxCostUsd !== undefined && (!Number.isFinite(maxCostUsd) || maxCostUsd < 0.01)) {
+				throw new Error("目标费用上限无效。");
+			}
+			conversation.goal = {
+				objective,
+				maxTurns,
+				turnsUsed: 0,
+				...(maxCostUsd !== undefined ? { maxCostUsd } : {}),
+				active: true,
+				status: "running",
+				startedAt: Date.now(),
+			};
+			initialPrompt = buildGoalInitialPrompt(conversation.goal);
+			targetId = conversation.id;
+			await this.persist();
+			return this.buildSnapshot();
+		});
+		// Kick off the first turn outside the serialize lock so normal prompt streaming runs cleanly.
+		await this.command({ type: "prompt", message: initialPrompt }, targetId);
+		return snapshot;
+	}
+
+	/** Stops an active /goal loop on a conversation and aborts any running turn. */
+	stopGoal(conversationId: string): Promise<Snapshot> {
+		return this.serialize(async () => {
+			const conversation = this.conversation(conversationId);
+			if (conversation.goal?.active) {
+				conversation.goal = {
+					...conversation.goal,
+					active: false,
+					status: "stopped",
+					finishedAt: Date.now(),
+					stopReason: "用户已手动停止目标模式。",
+				};
+				await this.persist();
+			}
+			const runtime = this.runtimes.get(conversation.id);
+			if (runtime?.agent && (runtime.busy || runtime.state?.isStreaming)) {
+				await runtime.agent.request({ type: "abort" }).catch(() => {});
+			}
+			return this.buildSnapshot();
+		});
+	}
+
 	/**
-	 * Removes a conversation from the sidebar. The Pi session file stays on disk.
+	 * Removes a conversation from the sidebar and moves its Pi session file to Trash
+	 * when no other conversation references that file.
 	 * Conversations that tasks or sub-agents still reference are refused, because task
 	 * lookups expect their conversation to exist.
 	 */
@@ -1765,8 +1891,15 @@ export class DesktopService {
 			await this.terminals.closeConversation(id);
 			this.viewing.delete(id);
 			this.store.conversations = this.store.conversations.filter((item) => item.id !== id);
+			const sessionFile = conversation.sessionFile;
+			if (sessionFile && !this.store.conversations.some((item) => item.sessionFile === sessionFile)) {
+				await this.trashSessionFile(sessionFile).catch((error) => {
+					this.diagnostic("warn", "session.trash.failed", id, error instanceof Error ? error.message : String(error));
+				});
+			}
 			if (this.store.activeId === id) {
 				const next =
+					this.store.conversations.find((item) => item.project === conversation.project && !item.parentConversationId && !item.archived) ??
 					this.store.conversations.find((item) => item.project === conversation.project && !item.parentConversationId) ??
 					this.createConversation(conversation.project);
 				await this.activate(next);
@@ -1775,6 +1908,23 @@ export class DesktopService {
 			}
 			return this.buildSnapshot();
 		});
+	}
+
+	private async trashSessionFile(filePath: string): Promise<void> {
+		try {
+			await stat(filePath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
+		if (this.options.trashItem) {
+			await this.options.trashItem(filePath);
+			return;
+		}
+		const trashDir = join(this.options.dataDir, "trash");
+		await mkdir(trashDir, { recursive: true });
+		const target = join(trashDir, `${Date.now()}-${basename(filePath)}`);
+		await rename(filePath, target);
 	}
 
 	forkSession(input: SessionForkInput): Promise<SessionCopyResult> {
@@ -2155,6 +2305,44 @@ export class DesktopService {
 	private async modelTool(request: DesktopToolInvocation, context: ToolHostContext): Promise<unknown> {
 		if (this.closed) throw new Error("桌面服务已关闭。");
 		const input = request.input;
+		if (request.tool === "LSP") {
+			const conv = this.conversation(context.conversationId);
+			const operation = String(input.operation) as "diagnostics" | "documentSymbol" | "goToDefinition" | "inspect";
+			const filePath = String(input.filePath);
+			const silent = input.silent === true;
+			const trusted = this.store.projectTrust?.[this.trustProjectFor(conv.project)] === "trusted";
+			if (!trusted) {
+				if (silent) return { skipped: true, diagnostics: [] };
+				throw new Error("请先在项目菜单中信任此项目，再使用 LSP 语言服务器。");
+			}
+			if (!isLspSupportedFile(filePath)) {
+				if (silent) return { skipped: true, diagnostics: [] };
+				throw new Error("LSP 语言服务支持 JS、TS、Python、Go 和 Rust 文件。");
+			}
+			const at =
+				typeof input.line === "number" && typeof input.character === "number"
+					? { line: input.line, column: input.character }
+					: undefined;
+			try {
+				const intel = await codeIntelligence(conv.project, filePath, this.options.env, at);
+				const formatted = silent
+					? formatLspDiagnostics(filePath, intel)
+					: formatCodeIntelligence(filePath, intel, operation);
+				return {
+					server: intel.server,
+					filePath,
+					operation,
+					diagnostics: intel.diagnostics,
+					symbols: operation === "diagnostics" ? [] : intel.symbols,
+					definitions: intel.definitions,
+					formatted,
+					text: formatted,
+				};
+			} catch (error) {
+				if (silent) return { skipped: true, diagnostics: [], error: error instanceof Error ? error.message : String(error) };
+				throw error;
+			}
+		}
 		if (request.tool === "TodoCreate") {
 			this.conversation(context.conversationId);
 			const rootId = this.rootConversationId(context.conversationId);
@@ -2490,6 +2678,29 @@ export class DesktopService {
 				const sent = await this.sendToTask({ taskId: child.id, message: command.message });
 				return { disposition: "started", task: sent.task };
 			}
+			const skillCall = parseSkillInvocation(command.message);
+			if (skillCall && this.canDelegateFurther(active.id)) {
+				const skills = await this.skills.list(active.project, this.isProjectTrusted(active.project));
+				const matched = skills.find((entry) => entry.name.toLowerCase() === skillCall.name);
+				if (matched?.context === "fork") {
+					const prompt = formatForkedSkillPrompt(matched, skillCall.args);
+					const delegated = await this.delegation.handle(
+						{
+							conversationId: active.id,
+							toolCallId: `skill-fork-${randomUUID()}`,
+							signal: new AbortController().signal,
+						},
+						"Agent",
+						{
+							description: `Skill /${matched.name}`,
+							prompt,
+							subagent_type: matched.agent || "general-purpose",
+							run_in_background: true,
+						},
+					);
+					return { disposition: "forked_skill", skill: matched.name, delegated };
+				}
+			}
 		}
 		const runtime = await this.ensureRuntime(active);
 		await runtime.settling;
@@ -2683,6 +2894,21 @@ export class DesktopService {
 	async pullRequest(conversationId: string, number?: number) {
 		await this.operation;
 		return readPullRequest(this.conversation(conversationId).project, this.options.env, number);
+	}
+
+	async setPullRequestAutoMerge(conversationId: string, number: number, enabled: boolean, method: PullRequestMergeMethod = "squash") {
+		await this.operation;
+		const conv = this.conversation(conversationId);
+		this.assertWritableMode("设置 PR 自动合并", conv.id);
+		this.assertPathAvailable(conv.project, conv.id);
+		const runtime = this.runtimes.get(conv.id);
+		if (runtime?.busy || runtime?.bashBusy || runtime?.settling) throw new Error("请先等待当前项目操作完成。");
+		return setPullRequestAutoMerge(conv.project, number, enabled, method, this.options.env);
+	}
+
+	async pullRequestComments(conversationId: string, number: number) {
+		await this.operation;
+		return readPullRequestComments(this.conversation(conversationId).project, number, this.options.env);
 	}
 
 	async files(path: string, conversationId?: string): Promise<FileEntry[]> {
@@ -2929,6 +3155,8 @@ export class DesktopService {
 		outputStyle?: string | null;
 		editor?: EditorChoice;
 		statusBalance?: boolean;
+		webSearchEnabled?: boolean;
+		webSearchApiKey?: string;
 		provider?: Provider;
 		apiKey?: string;
 		keyCommand?: string;
@@ -3039,6 +3267,19 @@ export class DesktopService {
 				if (settings.statusBalance) delete next.settings.statusBalance;
 				else next.settings.statusBalance = false;
 			}
+			if (settings.webSearchEnabled !== undefined) {
+				if (typeof settings.webSearchEnabled !== "boolean") throw new Error("网络搜索开关设置无效。");
+				if (settings.webSearchEnabled) delete next.settings.webSearchEnabled;
+				else next.settings.webSearchEnabled = false;
+			}
+			if (settings.webSearchApiKey !== undefined) {
+				const trimmedKey = settings.webSearchApiKey.trim();
+				if (!trimmedKey) delete next.webSearchApiKey;
+				else {
+					if (!this.options.encrypt) throw new Error("系统安全存储不可用，未保存 WebSearch API Key。");
+					next.webSearchApiKey = this.options.encrypt(trimmedKey);
+				}
+			}
 			if (settings.proxy !== undefined) {
 				const value = validateProxyUrl(settings.proxy);
 				if (value) next.settings.proxy = value;
@@ -3132,6 +3373,8 @@ export class DesktopService {
 				next.settings.permission !== this.store.settings.permission ||
 				Boolean(next.settings.sandbox) !== Boolean(this.store.settings.sandbox) ||
 				Boolean(next.settings.sandboxOffline) !== Boolean(this.store.settings.sandboxOffline) ||
+				(next.settings.webSearchEnabled !== false) !== (this.store.settings.webSearchEnabled !== false) ||
+				next.webSearchApiKey !== this.store.webSearchApiKey ||
 				Boolean(next.settings.agentTeams) !== Boolean(this.store.settings.agentTeams) ||
 				next.settings.agentDir !== this.store.settings.agentDir ||
 				next.settings.proxy !== this.store.settings.proxy ||
@@ -3541,6 +3784,7 @@ export class DesktopService {
 		const allowedMcpServers = serverLists.length
 			? serverLists.reduce((acc, list) => acc.filter((name) => list.includes(name)))
 			: undefined;
+		const additionalDirs = Array.from(new Set([...(parent?.additionalDirs ?? []), ...(conversation.additionalDirs ?? [])]));
 		return {
 			version: 1,
 			mode,
@@ -3549,6 +3793,7 @@ export class DesktopService {
 			disabledTools: [...disabledTools],
 			...(allowedMcpServers !== undefined ? { allowedMcpServers } : {}),
 			project: conversation.project,
+			...(additionalDirs.length > 0 ? { additionalDirs } : {}),
 		};
 	}
 
@@ -3579,7 +3824,19 @@ export class DesktopService {
 
 	private writeRuntimeControls(runtime: SessionRuntime): Promise<void> {
 		const write = (runtime.controlWrites ?? Promise.resolve()).catch(() => {}).then(async () => {
-			if (runtime.policyFile) await this.atomicJson(runtime.policyFile, this.permissionPolicy(runtime.conversationId));
+			const policy = this.permissionPolicy(runtime.conversationId);
+			if (runtime.policyFile) await this.atomicJson(runtime.policyFile, policy);
+			if (runtime.sandboxProfileFile) {
+				const conversation = this.store.conversations.find((item) => item.id === runtime.conversationId);
+				if (conversation) {
+					const worktreePaths = await resolveGitWorktreeWritablePaths(conversation.project);
+					const extraWritable = [...worktreePaths, ...(policy.additionalDirs ?? [])];
+					const profile = buildSeatbeltProfile(conversation.project, extraWritable, this.store.settings.sandboxOffline);
+					const tmp = `${runtime.sandboxProfileFile}.tmp`;
+					await writeFile(tmp, profile, { mode: 0o600 });
+					await rename(tmp, runtime.sandboxProfileFile);
+				}
+			}
 			if (runtime.controls) await this.atomicJson(join(runtime.controls.directory, "tools.json"), { overrides: this.toolOverrides(runtime.conversationId) });
 			if (runtime.controls) await this.writeAgentListing(runtime).catch(() => {});
 		});
@@ -4805,6 +5062,51 @@ export class DesktopService {
 				else this.updateTask(task, "completed");
 			}
 			await this.persist();
+			if (!task?.parentConversationId) {
+				const conv = this.store.conversations.find((item) => item.id === runtime.conversationId);
+				if (conv?.goal?.active) {
+					if (aborted || error || runtime.stopping || this.closed) {
+						conv.goal = {
+							...conv.goal,
+							active: false,
+							status: "stopped",
+							finishedAt: Date.now(),
+							stopReason: error ? `发生错误：${error}` : "目标模式已停止。",
+						};
+						await this.persist();
+					} else {
+						const latestText = (await this.childFinalText(runtime).catch(() => "")) ?? "";
+						const stats = runtime.agent && runtime.engineStatus === "ready"
+							? await runtime.agent.request<SessionStats>({ type: "get_session_stats" }).catch(() => undefined)
+							: undefined;
+						const spentUsd = typeof stats?.cost === "number" && Number.isFinite(stats.cost) ? stats.cost : 0;
+						const evaluation = evaluateGoalContinuation(conv.goal, latestText, spentUsd);
+						conv.goal = evaluation.next;
+						await this.persist();
+						if (evaluation.shouldContinue && evaluation.continuePrompt) {
+							const nextPrompt = evaluation.continuePrompt;
+							const convId = conv.id;
+							setImmediate(() => {
+								const liveConv = this.store.conversations.find((item) => item.id === convId);
+								if (!this.closed && liveConv?.goal?.active) {
+									void this.command({ type: "prompt", message: nextPrompt }, convId).catch((cause) => {
+										if (liveConv.goal?.active) {
+											liveConv.goal = {
+												...liveConv.goal,
+												active: false,
+												status: "stopped",
+												finishedAt: Date.now(),
+												stopReason: cause instanceof Error ? cause.message : String(cause),
+											};
+											void this.persist().catch(() => {});
+										}
+									});
+								}
+							});
+						}
+					}
+				}
+			}
 			if (!runtime.stopping && !this.closed && !runtime.stopHookRanThisTurn) {
 				if (task?.parentConversationId) {
 					const meta = await this.hookContextFor(runtime.conversationId);
@@ -5147,6 +5449,19 @@ export class DesktopService {
 			delete env.PI_DESKTOP_FALLBACK_MODEL;
 			if (this.store.settings.fallbackModel) env.PI_DESKTOP_FALLBACK_MODEL = JSON.stringify(this.store.settings.fallbackModel);
 			if (this.store.settings.minBalance) env.PI_DESKTOP_MIN_BALANCE = String(this.store.settings.minBalance);
+			env.PI_DESKTOP_WEB_SEARCH_ENABLED = this.store.settings.webSearchEnabled === false ? "0" : "1";
+			delete env.PI_DESKTOP_WEB_SEARCH_KEY;
+			if (this.store.settings.webSearchEnabled !== false) {
+				const rawSearchKey = this.store.webSearchApiKey ?? this.store.keys.deepseek;
+				if (rawSearchKey && this.options.decrypt) {
+					try {
+						const decrypted = this.options.decrypt(rawSearchKey).trim();
+						if (decrypted) env.PI_DESKTOP_WEB_SEARCH_KEY = decrypted;
+					} catch {
+						// Ignore undecryptable key; WebSearch tool will prompt to reconfigure.
+					}
+				}
+			}
 			runtime.policyFile = join(this.options.dataDir, `policy-${conversation.id}-${randomBytes(8).toString("hex")}.json`);
 			env.PI_DESKTOP_POLICY_FILE = runtime.policyFile;
 			const task = this.store.tasks.find((item) => item.conversationId === conversation.id);
@@ -5155,14 +5470,15 @@ export class DesktopService {
 			const shouldConfineWorktreeChild = Boolean(
 				delegated && !delegated.readOnly && delegated.worktreeId && this.store.settings.confineSubagentBash !== false,
 			);
+			const initialExtraDirs = this.permissionPolicy(conversation.id).additionalDirs ?? [];
 			if (this.store.settings.sandbox) {
 				if (!(await probeSeatbeltSupport()).supported) throw new Error("无法启动命令沙箱。请在支持的环境中运行，或在设置中关闭沙箱。");
-				const extraWritable = await resolveGitWorktreeWritablePaths(conversation.project);
+				const extraWritable = [...(await resolveGitWorktreeWritablePaths(conversation.project)), ...initialExtraDirs];
 				runtime.sandboxProfileFile = join(this.options.dataDir, `sandbox-${conversation.id}-${randomBytes(8).toString("hex")}.sb`);
 				await writeFile(runtime.sandboxProfileFile, buildSeatbeltProfile(conversation.project, extraWritable, this.store.settings.sandboxOffline), { mode: 0o600 });
 				env.PI_DESKTOP_SANDBOX_PROFILE = runtime.sandboxProfileFile;
 			} else if (shouldConfineWorktreeChild && (await probeSeatbeltSupport()).supported) {
-				const extraWritable = await resolveGitWorktreeWritablePaths(conversation.project);
+				const extraWritable = [...(await resolveGitWorktreeWritablePaths(conversation.project)), ...initialExtraDirs];
 				runtime.sandboxProfileFile = join(this.options.dataDir, `sandbox-${conversation.id}-${randomBytes(8).toString("hex")}.sb`);
 				await writeFile(runtime.sandboxProfileFile, buildSeatbeltProfile(conversation.project, extraWritable, this.store.settings.sandboxOffline), { mode: 0o600 });
 				env.PI_DESKTOP_SANDBOX_PROFILE = runtime.sandboxProfileFile;
@@ -5752,6 +6068,7 @@ export class DesktopService {
 				...this.store.settings,
 				agentDir: this.store.settings.agentDir ?? this.defaultAgentDir(),
 				configuredProviders: providers.filter((provider) => this.providerAuthenticated(provider)),
+				webSearchApiKeyConfigured: Boolean(this.store.webSearchApiKey),
 			},
 			messages,
 			stats,

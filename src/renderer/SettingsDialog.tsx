@@ -137,6 +137,9 @@ export function SettingsDialog({
 	const [maxCostText, setMaxCostText] = useState(settings.maxCostUsd ? String(settings.maxCostUsd) : "");
 	const [disableAllHooks, setDisableAllHooks] = useState(settings.disableAllHooks === true);
 	const [statusBalance, setStatusBalance] = useState(settings.statusBalance !== false);
+	const [webSearchEnabled, setWebSearchEnabled] = useState(settings.webSearchEnabled !== false);
+	const [webSearchApiKey, setWebSearchApiKey] = useState("");
+	const [clearWebSearchKey, setClearWebSearchKey] = useState(false);
 	const initialOutputStyle = settings.outputStyle ?? "default";
 	const [outputStyle, setOutputStyle] = useState(initialOutputStyle);
 	const [outputStyles, setOutputStyles] = useState<OutputStyleInfo[]>([]);
@@ -194,6 +197,9 @@ export function SettingsDialog({
 		minBalanceText.trim() !== (settings.minBalance ? String(settings.minBalance) : "") ||
 		disableAllHooks !== (settings.disableAllHooks === true) ||
 		statusBalance !== (settings.statusBalance !== false) ||
+		webSearchEnabled !== (settings.webSearchEnabled !== false) ||
+		Boolean(webSearchApiKey.trim()) ||
+		clearWebSearchKey ||
 		outputStyle !== initialOutputStyle ||
 		editor !== initialEditor;
 	const headersEdited = Boolean(headerText.trim()) || clearHeaders;
@@ -307,6 +313,8 @@ export function SettingsDialog({
 				...(outputStyle !== initialOutputStyle ? { outputStyle: outputStyle === "default" ? null : outputStyle } : {}),
 				...(editor !== initialEditor ? { editor } : {}),
 				...(statusBalance !== (settings.statusBalance !== false) ? { statusBalance } : {}),
+				...(webSearchEnabled !== (settings.webSearchEnabled !== false) ? { webSearchEnabled } : {}),
+				...(clearWebSearchKey ? { webSearchApiKey: "" } : webSearchApiKey.trim() ? { webSearchApiKey: webSearchApiKey.trim() } : {}),
 				...(minBalanceText.trim() !== (settings.minBalance ? String(settings.minBalance) : "") ? { minBalance } : {}),
 			};
 			if (MODEL_ROUTING_ROLES.some((role) => routing[role] !== initialRouting[role])) {
@@ -327,6 +335,8 @@ export function SettingsDialog({
 			const next = await window.pi.saveSettings(update);
 			apply(next);
 			setApiKey("");
+			setWebSearchApiKey("");
+			setClearWebSearchKey(false);
 			setHeaderText("");
 			setClearHeaders(false);
 			if (next.engineError) {
@@ -739,6 +749,55 @@ export function SettingsDialog({
 								<option value="system">系统默认应用</option>
 							</select>
 						</label>
+						<label className="live-setting-toggle">
+							<input
+								type="checkbox"
+								aria-label="启用网络搜索 WebSearch"
+								checked={webSearchEnabled}
+								disabled={pending || busy}
+								onChange={(event) => setWebSearchEnabled(event.target.checked)}
+							/>
+							启用网络搜索（WebSearch：DeepSeek 模型自动使用免费内置搜索；其他模型走 DeepSeek Search API，约 $0.75 / 1000 次）
+						</label>
+						{webSearchEnabled && (
+							<div className="live-setting-sub">
+								<label className="field-label">
+									DeepSeek Search API Key
+									<input
+										type="password"
+										aria-label="DeepSeek Search API Key"
+										value={webSearchApiKey}
+										disabled={pending || busy}
+										placeholder={
+											clearWebSearchKey
+												? "保存后清除专用 Key"
+												: settings.webSearchApiKeyConfigured
+													? "已配置专用 Key（留空保持不变）"
+													: settings.configuredProviders.includes("deepseek")
+														? "留空将自动复用已配置的 DeepSeek 模型 Key"
+														: "填写 DeepSeek API Key（sk-...）"
+										}
+										onChange={(event) => {
+											setWebSearchApiKey(event.target.value);
+											if (clearWebSearchKey) setClearWebSearchKey(false);
+										}}
+									/>
+								</label>
+								{settings.webSearchApiKeyConfigured && !clearWebSearchKey && (
+									<button
+										type="button"
+										className="cc-mini-btn"
+										disabled={pending || busy}
+										onClick={() => {
+											setWebSearchApiKey("");
+											setClearWebSearchKey(true);
+										}}
+									>
+										清除专用 Search Key
+									</button>
+								)}
+							</div>
+						)}
 						<label className="live-setting-toggle">
 							<input
 								type="checkbox"

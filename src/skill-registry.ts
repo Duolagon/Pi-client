@@ -19,6 +19,10 @@ export interface SkillDefinitionEntry {
 	estimatedTokens: number;
 	/** Frontmatter `disable-model-invocation: true`; forbids preloading into subagents. */
 	disableModelInvocation?: boolean;
+	/** Frontmatter `context: fork`; executes the skill in an isolated sub-agent. */
+	context?: "fork";
+	/** Optional frontmatter `agent:` specifying the sub-agent type when `context: fork` is set. */
+	agent?: string;
 }
 
 export interface SkillSaveInput {
@@ -27,6 +31,8 @@ export interface SkillSaveInput {
 	body: string;
 	scope: SkillScope;
 	project?: string;
+	context?: "fork";
+	agent?: string;
 }
 
 export interface SkillRemoveInput {
@@ -186,6 +192,8 @@ export function bundledSkillFile(skill: SkillDefinitionEntry): string {
 		// A JSON string is a valid YAML double-quoted scalar, so ": " in the text stays literal.
 		`description: ${JSON.stringify(skill.description)}`,
 		...(skill.disableModelInvocation ? ["disable-model-invocation: true"] : []),
+		...(skill.context === "fork" ? ["context: fork"] : []),
+		...(skill.agent ? [`agent: ${skill.agent}`] : []),
 		"---",
 		"",
 		skill.body,
@@ -229,6 +237,8 @@ async function scanSkillDirectory(
 				const name = (data.name || item.name).trim();
 				const description = (data.description || body.split("\n").find((l) => l.trim()) || name).trim().slice(0, 500);
 				const disableModelInvocation = String(data["disable-model-invocation"] ?? "").trim().toLowerCase() === "true";
+				const context = String(data.context ?? "").trim().toLowerCase() === "fork" ? "fork" as const : undefined;
+				const agent = data.agent?.trim() || undefined;
 				results.push({
 					id: `${scope}:${root}:${name}`,
 					name,
@@ -241,6 +251,8 @@ async function scanSkillDirectory(
 					editable,
 					estimatedTokens: estimateTokens(content),
 					...(disableModelInvocation ? { disableModelInvocation: true } : {}),
+					...(context ? { context } : {}),
+					...(agent ? { agent } : {}),
 				});
 			} catch {
 				// Skip unreadable skill subdirectories.
@@ -264,6 +276,8 @@ async function scanCommandsDirectory(root: string, scope: SkillScope): Promise<S
 				const { data, body } = parseFrontmatter(content);
 				const name = (data.name || basename(item.name, ".md")).trim();
 				const description = (data.description || body.split("\n").find((l) => l.trim()) || name).trim().slice(0, 500);
+				const context = String(data.context ?? "").trim().toLowerCase() === "fork" ? "fork" as const : undefined;
+				const agent = data.agent?.trim() || undefined;
 				results.push({
 					id: `${scope}:cmd:${root}:${name}`,
 					name,
@@ -275,6 +289,8 @@ async function scanCommandsDirectory(root: string, scope: SkillScope): Promise<S
 					filePath,
 					editable: false,
 					estimatedTokens: estimateTokens(content),
+					...(context ? { context } : {}),
+					...(agent ? { agent } : {}),
 				});
 			} catch {
 				// Ignore unreadable files.
@@ -291,6 +307,23 @@ function validateName(raw: unknown): string {
 	const trimmed = raw.trim().toLowerCase();
 	if (!namePattern.test(trimmed)) throw new Error("Skill 名称仅支持小写字母、数字和连字符（最多 64 字符）。");
 	return trimmed;
+}
+
+/** Extracts a `/skill-name [args]` or `/skill:skill-name [args]` invocation from user prompt text. */
+export function parseSkillInvocation(message: string): { name: string; args: string } | null {
+	const trimmed = message.trim();
+	const match = /^\/(?:skill:)?([a-z0-9][a-z0-9-]{0,63})(?:\s+([\s\S]*))?$/i.exec(trimmed);
+	if (!match) return null;
+	return { name: match[1].toLowerCase(), args: (match[2] ?? "").trim() };
+}
+
+/** Builds the self-contained prompt passed to a sub-agent when a skill has `context: fork`. */
+export function formatForkedSkillPrompt(skill: Pick<SkillDefinitionEntry, "name" | "body">, args: string): string {
+	const body = skill.body.trim();
+	if (body.includes("$ARGUMENTS")) {
+		return body.replaceAll("$ARGUMENTS", args);
+	}
+	return args ? `${body}\n\nArguments:\n${args}` : body;
 }
 
 export class SkillRegistry {
@@ -332,6 +365,8 @@ export class SkillRegistry {
 			"---",
 			`name: ${name}`,
 			`description: ${input.description.trim().replace(/\r?\n/g, " ")}`,
+			...(input.context === "fork" ? ["context: fork"] : []),
+			...(input.agent?.trim() ? [`agent: ${input.agent.trim().replace(/\r?\n/g, " ")}`] : []),
 			"---",
 			"",
 			input.body.trim(),
