@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { createRoot } from "react-dom/client";
+import { copyText } from "./clipboard.ts";
 import {
 	FolderOpen,
 	Plus,
@@ -586,8 +587,63 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			app.fail(error);
 		}
 	};
-	const handleBuiltinSlash = (action: BuiltinSlashAction) => {
-		if (action === "compact") {
+	const exportActive = () =>
+		void api
+			.exportConversation()
+			.then((path) => {
+				if (path) app.setNotice(`会话已导出：${path}`);
+			})
+			.catch(app.fail);
+	const handleBuiltinSlash = (action: BuiltinSlashAction, argument = "") => {
+		if (action === "theme") {
+			const wanted = argument.toLowerCase();
+			if (!wanted) void cycleTheme();
+			else if (wanted === "light" || wanted === "dark" || wanted === "grail" || wanted === "system") {
+				if (snapshot && !blocked)
+					void app.switchTo(() => api.saveSettings({ permission: snapshot.settings.permission, theme: wanted }));
+			} else app.fail(new Error("可选主题：light、dark、grail、system。"));
+		} else if (action === "rename") {
+			const id = snapshot?.active?.id;
+			if (!id) return;
+			if (argument) void app.switchTo(() => api.renameConversation(id, argument.slice(0, 200)));
+			else {
+				setRenameId(undefined);
+				setRename(snapshot.active?.title ?? "");
+			}
+		} else if (action === "copy") {
+			const nth = argument ? Number(argument) : 1;
+			if (!Number.isSafeInteger(nth) || nth < 1) {
+				app.fail(new Error("用法：/copy 复制最后一条回复，/copy 2 复制倒数第 2 条。"));
+				return;
+			}
+			const replies = history.messages
+				.filter((m) => m.role === "assistant")
+				.map((m) =>
+					m.content
+						.filter((b): b is Extract<typeof b, { type: "text" }> => b.type === "text")
+						.map((b) => b.text)
+						.join("\n\n")
+						.trim(),
+				)
+				.filter(Boolean);
+			const text = replies[replies.length - nth];
+			if (!text) {
+				app.setNotice(nth === 1 ? "还没有可复制的回复。" : `只有 ${replies.length} 条回复。`);
+				return;
+			}
+			void copyText(text).then((ok) => app.setNotice(ok ? "已复制回复到剪贴板。" : "复制失败，请手动选择文字复制。"));
+		} else if (action === "export") {
+			if (snapshot?.active && !blocked) exportActive();
+		} else if (action === "fork") {
+			const id = snapshot?.active?.id;
+			if (!id || blocked || changing) return;
+			void app.switchTo(async () => {
+				const result = await api.sessions.clone({ conversationId: id, activate: true });
+				if (!result.cancelled && argument && result.conversation)
+					return api.renameConversation(result.conversation.id, argument.slice(0, 200));
+				return result.snapshot;
+			});
+		} else if (action === "compact") {
 			if (!blocked && history.messages.length) void app.command({ type: "compact" });
 		} else if (action === "context") {
 			setMemoryTab("context");
@@ -1371,12 +1427,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											disabled={blocked || !snapshot.active}
 											onClick={() => {
 												setMoreMenuOpen(false);
-												void api
-													.exportConversation()
-													.then((path) => {
-														if (path) app.setNotice(`会话已导出：${path}`);
-													})
-													.catch(app.fail);
+												exportActive();
 											}}
 										>
 											<Download size={14} />
@@ -2204,6 +2255,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					project={snapshot.active?.project}
 					initialTab={controlsTab}
 					onNotice={(msg) => app.setNotice(msg)}
+					hooksDisabled={snapshot.settings.disableAllHooks === true}
 					close={() => setControlsTab(null)}
 					fail={app.fail}
 				/>

@@ -2499,6 +2499,19 @@
 .live-setting-toggle input {
 	accent-color: var(--cl-clay);
 }
+/* A dependent option: indented under its parent toggle, with its note below. */
+.live-setting-sub {
+	margin: -8px 0 16px 24px;
+}
+.live-setting-sub .live-setting-toggle {
+	margin-bottom: 4px;
+}
+.live-setting-sub small {
+	display: block;
+	font-size: 11px;
+	color: var(--secondary);
+	line-height: 1.6;
+}
 .live-routing {
 	border: 1px solid var(--cl-line-soft);
 	border-radius: var(--r-lg);

@@ -10,6 +10,7 @@ import type { ExtensionAPI, ModelRegistry, ProviderModelConfig, ToolDefinition }
 import type { ConnectionMode, ConnectionProtocol, Provider } from "./shared.ts";
 import { connectionDefaults, connectionMode } from "./model-connections.ts";
 import { providerModels } from "./provider-presets.ts";
+import { BALANCE_PROVIDER_NAMES, balanceFor, fetchBalance, formatBalance, validBalanceTarget } from "./provider-balance.ts";
 import { evaluatePermission, loadRuntimePermissionPolicy, redactSearchOutput } from "./permission-policy.ts";
 
 function shellQuote(value: string): string {
@@ -53,9 +54,15 @@ interface Connection {
 	baseUrl?: string;
 	modelId?: string;
 	envKey?: string;
+	/** Environment variable holding a shell command that prints the API key. */
+	keyCommandEnv?: string;
+	/** Environment variable holding a JSON object of extra request headers. */
+	headersEnv?: string;
 	api?: ConnectionProtocol;
 	mode?: ConnectionMode;
 	presetBaseUrl?: string;
+	/** Where the account balance of this connection can be queried. */
+	balance?: unknown;
 }
 
 
@@ -213,6 +220,44 @@ async function fetchPublic(url: URL, signal: AbortSignal): Promise<{ response: R
 		return { response, url: current };
 	}
 	throw new Error("Too many redirects.");
+}
+
+/** Header values are literal; escape Pi's "$VAR" and "!command" syntax. */
+function connectionHeaders(connection: Connection): Record<string, string> | undefined {
+	const raw = connection.headersEnv ? process.env[connection.headersEnv] : undefined;
+	if (!raw) return undefined;
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+		const headers: Record<string, string> = {};
+		for (const [name, value] of Object.entries(parsed))
+			if (typeof value === "string") headers[name] = escapeConfigValue(value);
+		return Object.keys(headers).length ? headers : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Pi reads "$$" as a literal dollar and a leading "$!" as a literal "!". */
+export function escapeConfigValue(value: string): string {
+	const dollar = String.fromCharCode(36);
+	const escaped = value.split(dollar).join(dollar + dollar);
+	return escaped.startsWith("!") ? dollar + escaped : escaped;
+}
+
+/** Session spend in USD from the entries Pi records, including subagent usage entries. */
+export function sessionCost(entries: readonly unknown[]): number {
+	let total = 0;
+	const add = (usage: unknown) => {
+		const value = (usage as { cost?: { total?: unknown } } | undefined)?.cost?.total;
+		if (typeof value === "number" && Number.isFinite(value) && value > 0) total += value;
+	};
+	for (const entry of entries as Array<{ type?: string; usage?: unknown; message?: { role?: string; usage?: unknown } }>) {
+		if (entry.type === "usage" || entry.type === "compaction" || entry.type === "branch_summary") add(entry.usage);
+		else if (entry.type === "message" && (entry.message?.role === "assistant" || entry.message?.role === "toolResult"))
+			add(entry.message.usage);
+	}
+	return total;
 }
 
 export default function permissions(pi: ExtensionAPI) {
@@ -484,7 +529,8 @@ export default function permissions(pi: ExtensionAPI) {
 	function registerConnection(provider: Provider, connection: Connection, registry?: ModelRegistry) {
 		const definition = connectionDefaults[provider];
 		if (!definition) return;
-		if (connection.envKey && connection.modelId) {
+		const keyCommand = connection.keyCommandEnv ? process.env[connection.keyCommandEnv] : undefined;
+		if ((connection.envKey || keyCommand) && connection.modelId) {
 			const mode = connectionMode({ ...connection, provider });
 			const ids = mode === "preset" ? providerModels[provider].map((model) => model.id) : [connection.modelId];
 			const models: ProviderModelConfig[] = ids.map((id) => {
@@ -518,7 +564,9 @@ export default function permissions(pi: ExtensionAPI) {
 				name: `${provider} (Desktop)`,
 				baseUrl: definition.baseUrl,
 				api: definition.api,
-				apiKey: `$${connection.envKey}`,
+				// Pi runs a value starting with "!" as a shell command and caches the output.
+				apiKey: connection.envKey ? `$${connection.envKey}` : `!${keyCommand}`,
+				...(connectionHeaders(connection) ? { headers: connectionHeaders(connection) } : {}),
 				models,
 			});
 		} else if (connection.baseUrl) pi.registerProvider(provider, { baseUrl: connection.baseUrl });
@@ -557,7 +605,7 @@ export default function permissions(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		// The registry is bound after initial loading and can include user-defined model capabilities.
 		for (const [provider, connection] of Object.entries(connections)) {
-			if (!connection.envKey || !connection.modelId) continue;
+			if ((!connection.envKey && !connection.keyCommandEnv) || !connection.modelId) continue;
 			registerConnection(provider as Provider, connection, ctx.modelRegistry);
 			if (ctx.model?.provider === `desktop-${provider}`) {
 				const refreshed = ctx.modelRegistry.find(`desktop-${provider}`, ctx.model.id);
@@ -606,6 +654,148 @@ export default function permissions(pi: ExtensionAPI) {
 			};
 		}
 	});
+	const maxCostRaw = Number(process.env.PI_DESKTOP_MAX_COST);
+	const maxCost = Number.isFinite(maxCostRaw) && maxCostRaw > 0 ? maxCostRaw : 0;
+	if (maxCost > 0) {
+		const costNotice = (spent: number) =>
+			isChild
+				? `子 Agent 已用完会话剩余的费用额度（$${spent.toFixed(2)}），已自动停止。`
+				: `本会话花费 $${spent.toFixed(2)}，已达到上限 $${maxCost.toFixed(2)}，已自动停止。可在设置中调高上限，或新建会话继续。`;
+		let costStopped = false;
+		let noticeShown = false;
+		pi.on("input", (_event, ctx) => {
+			const spent = sessionCost(ctx.sessionManager.getEntries());
+			if (spent < maxCost) return { action: "continue" };
+			ctx.ui.notify(costNotice(spent), "warning");
+			return { action: "handled" };
+		});
+		pi.on("before_agent_start", () => {
+			costStopped = false;
+		});
+		// Wakeups and follow-ups that bypass `input` are stopped before any paid request.
+		pi.on("before_provider_request", (_event, ctx) => {
+			const spent = sessionCost(ctx.sessionManager.getEntries());
+			if (spent < maxCost) {
+				noticeShown = false;
+				return undefined;
+			}
+			if (!noticeShown) {
+				noticeShown = true;
+				ctx.ui.notify(costNotice(spent), "warning");
+			}
+			costStopped = true;
+			ctx.abort();
+			return undefined;
+		});
+		pi.on("turn_end", (_event, ctx) => {
+			if (costStopped) return;
+			const spent = sessionCost(ctx.sessionManager.getEntries());
+			if (spent < maxCost) return;
+			costStopped = true;
+			ctx.abort();
+			return {
+				continue: false,
+				entries: [{ type: "custom_message", customType: "desktop_max_cost", content: costNotice(spent), display: true }],
+			};
+		});
+	}
+	const minBalanceRaw = Number(process.env.PI_DESKTOP_MIN_BALANCE);
+	const minBalance = Number.isFinite(minBalanceRaw) && minBalanceRaw > 0 ? minBalanceRaw : 0;
+	if (minBalance > 0 && !testingConnection) {
+		type BalanceState = { at: number; low: boolean; notice: string };
+		const cache = new Map<string, BalanceState>();
+		const pending = new Map<string, Promise<BalanceState | undefined>>();
+		const FRESH_MS = 30000;
+		/** The guard waits at most this long; a slower provider is treated like a failed lookup. */
+		const LOOKUP_TIMEOUT_MS = 5000;
+		const fresh = (state: BalanceState | undefined) => state !== undefined && Date.now() - state.at < FRESH_MS;
+		/**
+		 * Queries the active connection's balance; undefined when it has no balance API.
+		 * A failed lookup is cached as "not low" for FRESH_MS so it neither blocks work nor
+		 * makes every message wait on the timeout again.
+		 */
+		const refresh = (ctx: { model?: { provider: string }; modelRegistry: ModelRegistry }) => {
+			const model = ctx.model;
+			const provider = model?.provider.startsWith("desktop-") ? model.provider.slice(8) : undefined;
+			const target = provider ? validBalanceTarget(connections[provider as Provider]?.balance) : undefined;
+			if (!model || !provider || !target) return Promise.resolve(undefined);
+			const running = pending.get(provider);
+			if (running) return running;
+			const task = (async () => {
+				try {
+					const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model as never);
+					if (!auth.ok || !auth.apiKey) return undefined;
+					const result = await fetchBalance(target, auth.apiKey, { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) });
+					const item = balanceFor(result, target.currency);
+					const floor = formatBalance({ currency: item?.currency ?? target.currency, amount: minBalance });
+					const name = BALANCE_PROVIDER_NAMES[target.kind];
+					const low = !result.available || (item !== undefined && item.amount <= minBalance);
+					const state: BalanceState = {
+						at: Date.now(),
+						low,
+						notice: !result.available
+							? `${name} 账户余额已不足以调用模型，已自动停止。充值后再继续。`
+							: `${name} 账户余额 ${item ? formatBalance(item) : ""} 已到底线 ${floor}，已自动停止。可充值，或在设置中调低余额底线。`,
+					};
+					cache.set(provider, state);
+					return state;
+				} catch {
+					const state: BalanceState = { at: Date.now(), low: false, notice: "" };
+					cache.set(provider, state);
+					return state;
+				} finally {
+					pending.delete(provider);
+				}
+			})();
+			pending.set(provider, task);
+			return task;
+		};
+		const cached = (ctx: { model?: { provider: string } }) => {
+			const provider = ctx.model?.provider.startsWith("desktop-") ? ctx.model.provider.slice(8) : undefined;
+			return provider ? cache.get(provider) : undefined;
+		};
+		let balanceStopped = false;
+		let balanceNoticeShown = false;
+		pi.on("input", async (_event, ctx) => {
+			const known = cached(ctx);
+			const state = fresh(known) ? known : await refresh(ctx);
+			if (!state?.low) return { action: "continue" };
+			ctx.ui.notify(state.notice, "warning");
+			return { action: "handled" };
+		});
+		pi.on("before_agent_start", () => {
+			balanceStopped = false;
+		});
+		// Requests never wait on the lookup: a fresh low balance stops them, a stale one only triggers a refresh.
+		pi.on("before_provider_request", (_event, ctx) => {
+			const known = cached(ctx);
+			const state = fresh(known) ? known : undefined;
+			if (!state) void refresh(ctx);
+			if (!state?.low) {
+				balanceNoticeShown = false;
+				return undefined;
+			}
+			if (!balanceNoticeShown) {
+				balanceNoticeShown = true;
+				ctx.ui.notify(state.notice, "warning");
+			}
+			balanceStopped = true;
+			ctx.abort();
+			return undefined;
+		});
+		pi.on("turn_end", async (_event, ctx) => {
+			if (balanceStopped) return;
+			const known = cached(ctx);
+			const state = fresh(known) ? known : await refresh(ctx);
+			if (!state?.low) return;
+			balanceStopped = true;
+			ctx.abort();
+			return {
+				continue: false,
+				entries: [{ type: "custom_message", customType: "desktop_min_balance", content: state.notice, display: true }],
+			};
+		});
+	}
 	pi.on("session_before_compact", async (event) => {
 		if (testingConnection) return;
 		const hook = await callHost(

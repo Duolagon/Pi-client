@@ -405,9 +405,11 @@ function parseHookJsonOutput(rawText: string, event: HookEventName, fallbackEntr
 
 export class HooksService {
 	private agentDir: () => string;
+	private disabled: () => boolean;
 
-	constructor(options: { agentDir: () => string }) {
+	constructor(options: { agentDir: () => string; disabled?: () => boolean }) {
 		this.agentDir = options.agentDir;
+		this.disabled = options.disabled ?? (() => false);
 	}
 
 	private async editableFile(scope: "user" | "project", project: string | undefined, create: boolean) {
@@ -517,6 +519,7 @@ export class HooksService {
 	}
 
 	async run(event: HookEventName, context: HookRunContext): Promise<HookRunResult> {
+		if (this.disabled()) return { blocked: false, executedCount: 0 };
 		const all = [...(await this.list(context.project, context.projectTrusted)), ...(context.extraHooks ?? [])];
 		const matching = all.filter((entry) => entry.event === event && matchesEventContext(entry, context));
 		if (!matching.length) return { blocked: false, executedCount: 0 };

@@ -57,7 +57,12 @@ export type BuiltinSlashAction =
 	| "preview"
 	| "loop"
 	| "batch"
-	| "sandbox";
+	| "sandbox"
+	| "theme"
+	| "rename"
+	| "copy"
+	| "export"
+	| "fork";
 
 const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[] = [
 	{ name: "compact", description: "压缩上下文（支持 /compact <聚焦指令>）" },
@@ -81,7 +86,16 @@ const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[
 	{ name: "init", description: "AI 分析仓库并生成 AGENTS.md 项目指南" },
 	{ name: "preview", description: "打开本地应用网页预览面板" },
 	{ name: "cost", description: "查看当前会话 Token 与费用统计" },
+	{ name: "theme", description: "切换主题（/theme light|dark|grail|system）" },
+	{ name: "rename", description: "重命名当前会话（/rename <名称>）" },
+	{ name: "copy", description: "复制最后一条回复（/copy 2 复制倒数第 2 条）" },
+	{ name: "export", description: "把当前会话导出为文件" },
+	{ name: "fork", description: "复制当前会话为新分支继续（别名 /branch）" },
 ];
+
+/** Builtins that accept an argument after the name, plus Claude Code aliases. */
+const BUILTIN_WITH_ARGS = new Set<BuiltinSlashAction>(["theme", "rename", "copy", "export", "fork"]);
+const BUILTIN_ALIASES: Record<string, BuiltinSlashAction> = { branch: "fork" };
 
 /**
  * Claude Code built-in commands with no Pi Desktop equivalent. Sending them as
@@ -89,13 +103,13 @@ const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[
  * stops them instead. Pi commands, skills and templates with the same name win.
  */
 const CLAUDE_ONLY_COMMANDS = new Set([
-	"add-dir", "advisor", "agents-view", "autocompact", "background", "branch", "bug", "chrome", "copy",
-	"desktop", "diff", "doctor", "effort", "exit", "export", "fast", "feedback", "fork", "goal", "help", "ide",
+	"add-dir", "advisor", "agents-view", "autocompact", "background", "bug", "chrome",
+	"desktop", "diff", "doctor", "effort", "exit", "fast", "feedback", "goal", "help", "ide",
 	"insights", "install-github-app", "keybindings", "login", "logout", "mobile", "model", "output-style",
-	"plugin", "pr-comments", "privacy-settings", "quit", "recap", "release-notes", "remote-control", "rename",
-	"resume", "review", "run", "schedule", "security-review", "simplify", "stats", "statusline",
-	"subtask", "teleport", "terminal-setup", "theme", "upgrade", "usage", "verify", "vim", "voice", "workflows",
-	"config", "code-review",
+	"plugin", "pr-comments", "privacy-settings", "quit", "recap", "release-notes", "remote-control",
+	"resume", "run", "schedule", "stats", "statusline",
+	"subtask", "teleport", "terminal-setup", "upgrade", "usage", "verify", "vim", "voice", "workflows",
+	"config",
 ]);
 
 export function LiveComposer({
@@ -145,7 +159,7 @@ export function LiveComposer({
 	setSandboxOpen: (open: boolean) => void;
 	onUpdateSandbox: (next: { sandbox: boolean; sandboxOffline: boolean }) => Promise<void>;
 	openSettings: () => void;
-	onBuiltinSlash: (action: BuiltinSlashAction) => void;
+	onBuiltinSlash: (action: BuiltinSlashAction, argument?: string) => void;
 	onCompactInstructions?: (instructions: string) => void;
 	onBtw?: (question: string) => void;
 	onLoop?: (args: string) => void;
@@ -290,7 +304,19 @@ export function LiveComposer({
 				}
 				return;
 			}
-			const builtin = BUILTIN_SLASH_COMMANDS.find((c) => c.name === cmdName);
+			// The commands added after Pi skills existed yield to a Pi command or skill of the same name.
+			const shadowed = snapshot.commands.some(
+				(c) => c.name.toLowerCase() === cmdName || c.name.toLowerCase() === `skill:${cmdName}`,
+			);
+			const aliased = BUILTIN_ALIASES[cmdName];
+			const candidate = BUILTIN_SLASH_COMMANDS.find((c) => c.name === (aliased ?? cmdName));
+			const yields = Boolean(candidate && BUILTIN_WITH_ARGS.has(candidate.name) && shadowed);
+			const builtin = yields ? undefined : candidate;
+			if (builtin && BUILTIN_WITH_ARGS.has(builtin.name)) {
+				setDraft("");
+				onBuiltinSlash(builtin.name, argText);
+				return;
+			}
 			if (builtin && trimmed === `/${cmdName}`) {
 				setDraft("");
 				onBuiltinSlash(builtin.name);
@@ -365,7 +391,7 @@ export function LiveComposer({
 			// A command-shaped name that nothing recognises is probably a typo. Paths such as
 			// /Users/me/file contain a slash and are sent as normal text.
 			const known = piCommand || Boolean(skill) || Boolean(builtin) ||
-				["clear", "compact", "btw", "loop", "batch"].includes(cmdName);
+				["clear", "compact", "btw", "loop", "batch"].includes(cmdName) || (cmdName in BUILTIN_ALIASES && !yields);
 			if (!known && /^[a-z0-9][a-z0-9:_-]*$/i.test(cmdName) && unknownConfirmed.current !== trimmed) {
 				unknownConfirmed.current = trimmed;
 				fail(new Error(`没有 /${cmdName} 这个命令，未发送。输入 / 查看可用命令；再按一次 Enter 会把这段文字原样发给模型。`));
@@ -413,7 +439,7 @@ export function LiveComposer({
 	const activeSlashIndex = slashOptions.length ? Math.min(slashIndex, slashOptions.length - 1) : 0;
 	const selectSlash = (name: string) => {
 		const builtin = BUILTIN_SLASH_COMMANDS.find((c) => c.name === name);
-		if (builtin && name !== "plan" && name !== "btw") {
+		if (builtin && name !== "plan" && name !== "btw" && name !== "rename" && name !== "theme") {
 			setDraft("");
 			setSlashDismissed(false);
 			setSlashIndex(0);

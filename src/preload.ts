@@ -175,6 +175,7 @@ const api: DesktopAPI = {
 	exportClaudePermissions: () => ipcRenderer.invoke("pi:permissions:export-claude"),
 	saveSettings: (settings) => ipcRenderer.invoke("pi:settings", settings),
 	testConnection: (input) => ipcRenderer.invoke("pi:test-connection", input),
+	providerBalance: (input) => ipcRenderer.invoke("pi:provider-balance", input),
 	exportConversation: () => ipcRenderer.invoke("pi:export"),
 	onEvent: (listener) => listen("pi:event", listener),
 };
