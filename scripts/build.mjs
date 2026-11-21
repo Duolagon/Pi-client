@@ -64,6 +64,8 @@ await Promise.all([
 		platform: "node",
 		format: "esm",
 		target: "node22",
+		// Pi resolves its own package for extensions; bundling a second copy would duplicate it.
+		external: ["@earendil-works/pi-coding-agent"],
 	}),
 	build({
 		...common,

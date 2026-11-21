@@ -13,6 +13,7 @@ import type {
 	HookRunResult,
 	HookSaveInput,
 	HookScope,
+	HookSessionEndReason,
 } from "./hook-types.ts";
 
 export const hookEventNames: HookEventName[] = [
@@ -25,7 +26,9 @@ export const hookEventNames: HookEventName[] = [
 	"SubagentStart",
 	"SubagentStop",
 	"PreCompact",
+	"PostCompact",
 	"SessionStart",
+	"SessionEnd",
 	"Notification",
 ];
 
@@ -76,6 +79,8 @@ export interface HookRunContext {
 	lastAssistantMessage?: string;
 	trigger?: "manual" | "auto";
 	source?: "startup" | "resume" | "clear" | "compact";
+	reason?: HookSessionEndReason;
+	compactSummary?: string;
 	extraHooks?: HookEntry[];
 	env?: NodeJS.ProcessEnv;
 }
@@ -280,7 +285,9 @@ function matchesEventContext(entry: HookEntry, context: HookRunContext): boolean
 	}
 	if (entry.event === "SubagentStart" || entry.event === "SubagentStop")
 		return matcherMatches(entry.matcher, context.agentType);
-	if (entry.event === "PreCompact") return matcherMatches(entry.matcher, context.trigger ?? "manual");
+	if (entry.event === "PreCompact" || entry.event === "PostCompact")
+		return matcherMatches(entry.matcher, context.trigger ?? "manual");
+	if (entry.event === "SessionEnd") return matcherMatches(entry.matcher, context.reason ?? "other");
 	if (entry.event === "SessionStart") return matcherMatches(entry.matcher, context.source ?? "startup");
 	if (entry.event === "Notification") return matcherMatches(entry.matcher, context.notificationType ?? context.title);
 	return matcherMatches(entry.matcher, context.prompt ?? context.message ?? entry.event);
@@ -555,6 +562,8 @@ export class HooksService {
 			...(context.lastAssistantMessage !== undefined ? { last_assistant_message: context.lastAssistantMessage } : {}),
 			...(context.trigger !== undefined ? { trigger: context.trigger } : {}),
 			...(context.source !== undefined ? { source: context.source } : {}),
+			...(context.reason !== undefined ? { reason: context.reason } : {}),
+			...(context.compactSummary !== undefined ? { compact_summary: context.compactSummary } : {}),
 		};
 
 		for (let i = 0; i < matching.length; i++) {

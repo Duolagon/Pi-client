@@ -74,11 +74,14 @@ import { TasksDrawer } from "./TasksDrawer.tsx";
 import { SessionsDialog } from "./SessionsDialog.tsx";
 import { TerminalPanel } from "./TerminalPanel.tsx";
 import { MemoryStatusDialog } from "./MemoryStatusDialog.tsx";
+import { DoctorDialog } from "./DoctorDialog.tsx";
+import { UsageStatsDialog } from "./UsageStatsDialog.tsx";
 import { PreviewPanel } from "./PreviewPanel.tsx";
 import { CommandPalette, type PaletteAction } from "./CommandPalette.tsx";
 import { ProjectTrustDialog } from "./ProjectTrustDialog.tsx";
 import { AgentsDialog } from "./AgentsDialog.tsx";
 import { McpDialog } from "./McpDialog.tsx";
+import { resolveEditorPath } from "../editor-path.ts";
 import "../prototype/style.css";
 import "./style.css";
 import "./grail-theme.css";
@@ -167,6 +170,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [showJump, setShowJump] = useState(false);
 	const [sandboxStatus, setSandboxStatus] = useState<SandboxStatus | null>(null);
 	const [sandboxOpen, setSandboxOpen] = useState(false);
+	const [doctorOpen, setDoctorOpen] = useState(false);
+	const [usageOpen, setUsageOpen] = useState(false);
 	const [moreMenuOpen, setMoreMenuOpen] = useState(false);
 	const moreMenuRef = useRef<HTMLDivElement>(null);
 	const scroll = useRef<HTMLDivElement>(null);
@@ -478,7 +483,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		if (permission === "plan" && !planMode) setPlanMode(true);
 		await app.switchTo(() => api.saveSettings({ permission, theme: snapshot.settings.theme }));
 		if (permission === "auto" && snapshot.settings.permission !== "auto")
-			setFlash(snapshot.settings.sandbox ? "已切换为跳过确认，命令仍在 Seatbelt 沙箱中运行" : "已切换为跳过确认，Pi 将不经询问执行命令");
+			setFlash(snapshot.settings.sandbox ? "已切换为全部放行，命令仍在 Seatbelt 沙箱中运行" : "已切换为全部放行，Pi 将不经询问执行命令");
 	};
 	const saveSandbox = async (next: { sandbox: boolean; sandboxOffline: boolean }) => {
 		if (!snapshot) return;
@@ -594,7 +599,36 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				if (path) app.setNotice(`会话已导出：${path}`);
 			})
 			.catch(app.fail);
+	const openInEditor = (filePath: string, line?: number) => {
+		const target = resolveEditorPath(snapshot?.active?.project, filePath);
+		if (!target) {
+			app.fail(new Error("无法定位此文件路径。"));
+			return;
+		}
+		void api.openInEditor({ path: target, ...(line ? { line } : {}) }).catch(app.fail);
+	};
 	const handleBuiltinSlash = (action: BuiltinSlashAction, argument = "") => {
+		if (action === "output-style") {
+			if (!snapshot) return;
+			const wanted = argument.trim();
+			if (!wanted) {
+				setSettings(true);
+				void api
+					.outputStyles()
+					.then((styles) =>
+						app.setNotice(`当前输出风格：${snapshot.settings.outputStyle ?? "default"}。可选：${styles.map((style) => style.name).join("、")}；用 /output-style <名称> 切换，或在设置中选择。`),
+					)
+					.catch(app.fail);
+				return;
+			}
+			if (blocked) return;
+			void app.switchTo(async () => {
+				const next = await api.saveSettings({ permission: snapshot.settings.permission, theme: snapshot.settings.theme, outputStyle: wanted });
+				app.setNotice(`已切换输出风格为 ${next.settings.outputStyle ?? "default"}，下一轮对话生效。`);
+				return next;
+			});
+			return;
+		}
 		if (action === "theme") {
 			const wanted = argument.toLowerCase();
 			if (!wanted) void cycleTheme();
@@ -695,6 +729,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			}
 		} else if (action === "plan") {
 			void togglePlanMode();
+		} else if (action === "doctor") {
+			setDoctorOpen(true);
+		} else if (action === "stats") {
+			setUsageOpen(true);
 		}
 	};
 	useEffect(() => {
@@ -1584,6 +1622,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											onOpenTask={openSubagent}
 											onBackgroundTask={(id) => void backgroundSubagent(id)}
 											onStopTask={(id, kind) => void stopSubagent(id, kind)}
+											onOpenFile={openInEditor}
 											onRewindPrompt={(promptText) => {
 												setRewindQuery(promptText);
 												setCheckpointsOpen(true);
@@ -1823,7 +1862,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											title="除规则外不再询问；命令以本机权限运行"
 											onClick={() => void approvePlanAndExecute("auto")}
 										>
-											跳过确认（危险）
+											全部放行（危险）
 										</button>
 										<button type="button" className="cc-mini-btn" onClick={() => void togglePlanMode()}>
 											退出 Plan
@@ -1939,6 +1978,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							onLoop={(args) => void runLoop(args)}
 							onFocusSubagentPanel={() => subagentPanelRef.current?.focusFirst() ?? false}
 							inputRef={composerInputRef}
+							gitBranch={gitSummary?.isGit && gitSummary.branch ? gitSummary.branch : undefined}
 							fail={app.fail}
 						/>
 							</>
@@ -1974,6 +2014,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					revision={app.revision}
 					project={snapshot.active?.project}
 					readOnly={snapshot.settings.permission === "read" || snapshot.settings.permission === "plan"}
+					onOpenInEditor={openInEditor}
 					onReferenceFile={(filePath) => {
 						const ref = `@${/\s/.test(filePath) ? JSON.stringify(filePath) : filePath}`;
 						const already = app.draft.split(/\s+/).includes(ref);
@@ -2320,6 +2361,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					fail={app.fail}
 				/>
 			)}
+			{usageOpen && <UsageStatsDialog close={() => setUsageOpen(false)} />}
+			{doctorOpen && <DoctorDialog close={() => setDoctorOpen(false)} onNotice={(msg) => app.setNotice(msg)} />}
 			{paletteOpen && (
 				<CommandPalette
 					actions={paletteActions}

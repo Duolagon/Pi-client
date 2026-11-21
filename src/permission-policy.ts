@@ -14,7 +14,7 @@ import type {
 
 const readingTools = new Set(["read", "grep", "find", "ls"]);
 const editTools = new Set(["edit", "write", "NotebookEdit"]);
-const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite", "TodoCreate", "TodoGet", "TodoUpdate", "TodoList", "CronList", "StructuredOutput", "AskUserQuestion", "ExitPlanMode"]);
+const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite", "TodoCreate", "TodoGet", "TodoUpdate", "TodoList", "CronList", "BashOutput", "KillShell", "StructuredOutput", "AskUserQuestion", "ExitPlanMode"]);
 const pathTools = new Set([...readingTools, "edit", "write", "NotebookEdit"]);
 const wrappers = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", ".", "env", "sudo", "doas", "exec", "command", "xargs"]);
 /** Pass-through process wrappers that Claude Code strips before matching command rules. */
@@ -221,6 +221,7 @@ export async function loadRuntimePermissionPolicy(
 		return validateRuntimePolicy(JSON.parse(content));
 	}
 	const mode = env.PI_DESKTOP_PERMISSION_MODE ?? "ask";
+	if (mode === "dontAsk") return validateRuntimePolicy({ version: 1, mode: "ask", dontAsk: true, rules: [], disabledTools: [], project: cwd });
 	return validateRuntimePolicy({ version: 1, mode, rules: [], disabledTools: [], project: cwd });
 }
 
@@ -503,6 +504,11 @@ export async function evaluatePermission(
 		if (!allowedInPlan) {
 			return { action: "deny", reason: "Plan 模式下此工具不可执行，仅允许只读调研或编写计划文件（.pi/plans/）。", ...(targets.length ? { targets } : {}) };
 		}
+	}
+	// The bash tool's run_in_background path; it must never be weaker than a foreground bash call.
+	if (call.toolName === "BashBackground") {
+		if (typeof input.command !== "string" || !input.command.trim()) return { action: "deny", reason: "后台命令缺少 command。" };
+		return evaluatePermission(policy, { toolName: "bash", input: { command: input.command } });
 	}
 	if (call.toolName === "Monitor") {
 		if (typeof input.command === "string" && input.command.trim()) {

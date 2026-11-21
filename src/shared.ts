@@ -119,7 +119,8 @@ export interface DesktopWorktreeAPI {
 	merge(id: string): Promise<WorktreeMergeResult>;
 }
 
-export type PermissionMode = "ask" | "acceptEdits" | "auto" | "read" | "plan";
+/** "auto" is shown as 全部放行; "dontAsk" denies anything a rule or safe default would otherwise prompt for. */
+export type PermissionMode = "ask" | "acceptEdits" | "auto" | "read" | "plan" | "dontAsk";
 export type ProjectTrustDecision = "trusted" | "untrusted";
 export interface ProjectTrustState {
 	project: string;
@@ -273,6 +274,23 @@ export interface Settings {
 	minBalance?: number;
 	/** Skip every Claude-compatible and Pi hook (like Claude Code's disableAllHooks). */
 	disableAllHooks?: boolean;
+	/**
+	 * Model the conversation switches to once when the primary model stays overloaded,
+	 * rate limited or failing after Pi's retries; absent means no fallback.
+	 */
+	fallbackModel?: { provider: string; id: string };
+	/** Output style name for the main conversation (Claude Code compatible); absent means "default". */
+	outputStyle?: string;
+	/** Editor used by "在编辑器中打开"; absent means "vscode". */
+	editor?: EditorChoice;
+	/** Show the provider account balance in the composer status line; absent means true. */
+	statusBalance?: boolean;
+}
+export type EditorChoice = "vscode" | "cursor" | "system";
+export interface OutputStyleInfo {
+	name: string;
+	description: string;
+	source: "builtin" | "user" | "project";
 }
 export interface PlanFileState {
 	path: string;
@@ -284,6 +302,47 @@ export interface SandboxStatus {
 	enabled: boolean;
 	supported: boolean;
 	reason?: string;
+}
+/** Token and cost totals of one day, one model or the whole range (/stats). */
+export interface UsageBucket {
+	/** Local day "YYYY-MM-DD", "provider/model", or "total". */
+	key: string;
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	/** input + output + cacheRead + cacheWrite. */
+	tokens: number;
+	/** US dollars as reported by Pi (usage.cost.total); 0 when the provider reports no price. */
+	cost: number;
+	/** Assistant messages counted. */
+	messages: number;
+}
+export interface UsageStatsReport {
+	generatedAt: number;
+	rangeDays: number;
+	/** First local day included, "YYYY-MM-DD". */
+	since: string;
+	/** Session files read (including cached ones). */
+	files: number;
+	/** Session files that could not be read. */
+	skipped: number;
+	totals: Omit<UsageBucket, "key">;
+	/** Newest day first; days without usage are omitted. */
+	days: UsageBucket[];
+	/** Highest cost first. */
+	models: UsageBucket[];
+}
+export type DoctorStatus = "ok" | "warn" | "error";
+export interface DoctorCheck {
+	id: string;
+	label: string;
+	status: DoctorStatus;
+	detail: string;
+}
+export interface DoctorReport {
+	generatedAt: number;
+	checks: DoctorCheck[];
 }
 export interface BtwResult {
 	question: string;
@@ -468,6 +527,16 @@ export interface DesktopAPI {
 	probePreview(url: string): Promise<boolean>;
 	inspectCode(conversationId: string, path: string, at?: CodePosition): Promise<CodeIntelligence>;
 	sandboxStatus(): Promise<SandboxStatus>;
+	/** Local environment diagnosis (/doctor); no network or model requests. */
+	doctor(): Promise<DoctorReport>;
+	/** Token usage and cost by local day and model across all desktop sessions (/stats); local files only. */
+	usageStats(input?: { days?: number }): Promise<UsageStatsReport>;
+	/** Opens the local log directory in the system file manager, creating it if missing. */
+	openLogDirectory(): Promise<void>;
+	/** Built-in plus discovered custom output styles for the active project. */
+	outputStyles(): Promise<OutputStyleInfo[]>;
+	/** Opens an absolute path inside a known project or worktree in the configured editor. */
+	openInEditor(input: { path: string; line?: number }): Promise<void>;
 	importClaudePermissions(): Promise<ClaudePermissionsSyncResult>;
 	exportClaudePermissions(): Promise<ClaudePermissionsSyncResult>;
 	saveSettings(settings: {
@@ -492,6 +561,12 @@ export interface DesktopAPI {
 		maxCostUsd?: number | null;
 		minBalance?: number | null;
 		disableAllHooks?: boolean;
+		/** null clears the fallback model. */
+		fallbackModel?: { provider: string; id: string } | null;
+		/** null or "default" clears the style. */
+		outputStyle?: string | null;
+		editor?: EditorChoice;
+		statusBalance?: boolean;
 		provider?: Provider;
 		mode?: ConnectionMode;
 		apiKey?: string;

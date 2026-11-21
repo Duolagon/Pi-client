@@ -8,8 +8,13 @@ export type HookEventName =
 	| "SubagentStart"
 	| "SubagentStop"
 	| "PreCompact"
+	| "PostCompact"
 	| "SessionStart"
+	| "SessionEnd"
 	| "Notification";
+
+/** Why a conversation runtime ended; "close" means the app quit or closed it. */
+export type HookSessionEndReason = "close" | "other";
 
 export type HookHandlerType = "command" | "http";
 

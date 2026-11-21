@@ -708,13 +708,13 @@ export function TasksDrawer({
 									<div key={mon.id} className="cc-tool-ctrl-row">
 										<div className="cc-tool-ctrl-info">
 											<div className="cc-tool-ctrl-name">
-												<strong>[Monitor:{mon.kind}] {mon.description}</strong>
+												<strong>{mon.kind === "shell" ? "[后台 Bash]" : `[Monitor:${mon.kind}]`} {mon.description}</strong>
 												<span className={`cc-action-badge ${mon.status === "running" ? "ask" : mon.status === "exited" || mon.status === "stopped" ? "allow" : "deny"}`}>
 													{mon.status}
 												</span>
 											</div>
 											<p className="cc-tool-ctrl-desc">
-												id={mon.id} · 事件数={mon.eventCount} · {mon.target}
+												id={mon.id} · {mon.kind === "shell" ? `输出行数=${mon.eventCount}${mon.status !== "running" && mon.exitCode !== undefined ? ` · 退出码=${mon.exitCode ?? "无"}` : ""}` : `事件数=${mon.eventCount}`} · {mon.target}
 											</p>
 										</div>
 										<div className="cc-tool-ctrl-actions">
@@ -724,7 +724,7 @@ export function TasksDrawer({
 													className="cc-mini-btn danger"
 													onClick={() => void window.pi.monitors.stop(mon.id).then(refresh).catch(fail)}
 												>
-													<Square size={12} /> 停止监听
+													<Square size={12} /> {mon.kind === "shell" ? "停止命令" : "停止监听"}
 												</button>
 											)}
 										</div>

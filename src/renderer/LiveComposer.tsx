@@ -4,6 +4,7 @@ import type { Command, PermissionMode, Project, SandboxStatus, Snapshot, Thinkin
 import { WorkspacePicker } from "./WorkspacePicker.tsx";
 import { SandboxControl } from "./SandboxControl.tsx";
 import { CommandSealIcon } from "./GrailIcons.tsx";
+import { StatusLine } from "./StatusLine.tsx";
 
 type Image = NonNullable<Extract<Command, { type: "prompt" }>["images"]>[number];
 interface Attachment {
@@ -16,7 +17,8 @@ const PERMISSION_LABEL: Record<PermissionMode, string> = {
 	ask: "手动确认",
 	acceptEdits: "接受编辑",
 	plan: "计划模式",
-	auto: "跳过确认（危险）",
+	auto: "全部放行",
+	dontAsk: "不询问（未放行即拒绝）",
 	read: "只读模式",
 };
 // Keep attachment checks aligned with the main process prompt wire limits.
@@ -62,7 +64,10 @@ export type BuiltinSlashAction =
 	| "rename"
 	| "copy"
 	| "export"
-	| "fork";
+	| "fork"
+	| "doctor"
+	| "output-style"
+	| "stats";
 
 const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[] = [
 	{ name: "compact", description: "压缩上下文（支持 /compact <聚焦指令>）" },
@@ -86,6 +91,9 @@ const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[
 	{ name: "init", description: "AI 分析仓库并生成 AGENTS.md 项目指南" },
 	{ name: "preview", description: "打开本地应用网页预览面板" },
 	{ name: "cost", description: "查看当前会话 Token 与费用统计" },
+	{ name: "stats", description: "查看近 30 天各模型的 Token 用量与费用统计" },
+	{ name: "doctor", description: "诊断本机运行环境（模型连接、代理、沙箱、Git 等）" },
+	{ name: "output-style", description: "切换输出风格（/output-style explanatory|learning|default）" },
 	{ name: "theme", description: "切换主题（/theme light|dark|grail|system）" },
 	{ name: "rename", description: "重命名当前会话（/rename <名称>）" },
 	{ name: "copy", description: "复制最后一条回复（/copy 2 复制倒数第 2 条）" },
@@ -94,8 +102,10 @@ const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[
 ];
 
 /** Builtins that accept an argument after the name, plus Claude Code aliases. */
-const BUILTIN_WITH_ARGS = new Set<BuiltinSlashAction>(["theme", "rename", "copy", "export", "fork"]);
+const BUILTIN_WITH_ARGS = new Set<BuiltinSlashAction>(["theme", "rename", "copy", "export", "fork", "output-style"]);
 const BUILTIN_ALIASES: Record<string, BuiltinSlashAction> = { branch: "fork" };
+/** Argument-free builtins added later that also yield to a Pi command or skill of the same name. */
+const YIELDING_BUILTINS = new Set<BuiltinSlashAction>(["doctor", "stats"]);
 
 /**
  * Claude Code built-in commands with no Pi Desktop equivalent. Sending them as
@@ -104,10 +114,10 @@ const BUILTIN_ALIASES: Record<string, BuiltinSlashAction> = { branch: "fork" };
  */
 const CLAUDE_ONLY_COMMANDS = new Set([
 	"add-dir", "advisor", "agents-view", "autocompact", "background", "bug", "chrome",
-	"desktop", "diff", "doctor", "effort", "exit", "fast", "feedback", "goal", "help", "ide",
-	"insights", "install-github-app", "keybindings", "login", "logout", "mobile", "model", "output-style",
+	"desktop", "diff", "effort", "exit", "fast", "feedback", "goal", "help", "ide",
+	"insights", "install-github-app", "keybindings", "login", "logout", "mobile", "model",
 	"plugin", "pr-comments", "privacy-settings", "quit", "recap", "release-notes", "remote-control",
-	"resume", "run", "schedule", "stats", "statusline",
+	"resume", "run", "schedule", "statusline",
 	"subtask", "teleport", "terminal-setup", "upgrade", "usage", "verify", "vim", "voice", "workflows",
 	"config",
 ]);
@@ -138,6 +148,7 @@ export function LiveComposer({
 	onLoop,
 	onFocusSubagentPanel,
 	inputRef,
+	gitBranch,
 	fail,
 }: {
 	snapshot: Snapshot;
@@ -166,6 +177,8 @@ export function LiveComposer({
 	/** Focus the sub-agent panel above the composer when ArrowUp is pressed on an empty input. */
 	onFocusSubagentPanel?: () => boolean;
 	inputRef?: React.MutableRefObject<HTMLTextAreaElement | null>;
+	/** Workspace git branch; absent when the project is not a git repository. */
+	gitBranch?: string;
 	fail: (error: unknown) => void;
 }) {
 	const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -310,7 +323,7 @@ export function LiveComposer({
 			);
 			const aliased = BUILTIN_ALIASES[cmdName];
 			const candidate = BUILTIN_SLASH_COMMANDS.find((c) => c.name === (aliased ?? cmdName));
-			const yields = Boolean(candidate && BUILTIN_WITH_ARGS.has(candidate.name) && shadowed);
+			const yields = Boolean(candidate && (BUILTIN_WITH_ARGS.has(candidate.name) || YIELDING_BUILTINS.has(candidate.name)) && shadowed);
 			const builtin = yields ? undefined : candidate;
 			if (builtin && BUILTIN_WITH_ARGS.has(builtin.name)) {
 				setDraft("");
@@ -439,7 +452,13 @@ export function LiveComposer({
 	const activeSlashIndex = slashOptions.length ? Math.min(slashIndex, slashOptions.length - 1) : 0;
 	const selectSlash = (name: string) => {
 		const builtin = BUILTIN_SLASH_COMMANDS.find((c) => c.name === name);
-		if (builtin && name !== "plan" && name !== "btw" && name !== "rename" && name !== "theme") {
+		const shadowedBuiltin = Boolean(
+			builtin &&
+				// Same yield rule as the submit path, so the menu reaches a same-named Pi command or skill.
+				(BUILTIN_WITH_ARGS.has(builtin.name) || YIELDING_BUILTINS.has(builtin.name)) &&
+				snapshot.commands.some((c) => c.name.toLowerCase() === name || c.name.toLowerCase() === `skill:${name}`),
+		);
+		if (builtin && !shadowedBuiltin && name !== "plan" && name !== "btw" && name !== "rename" && name !== "theme") {
 			setDraft("");
 			setSlashDismissed(false);
 			setSlashIndex(0);
@@ -515,11 +534,6 @@ export function LiveComposer({
 		setSkillsOpen(false);
 		textarea.current?.focus();
 	};
-	const stats = snapshot.stats;
-	const contextPct =
-		stats?.contextUsage && typeof stats.contextUsage === "object" && "percent" in stats.contextUsage
-			? (stats.contextUsage as { percent?: number }).percent
-			: undefined;
 
 	return (
 		<div className="cl-composer">
@@ -635,7 +649,7 @@ export function LiveComposer({
 					onKeyDown={(event) => {
 						if (event.key === "Tab" && event.shiftKey && !changing && !running) {
 							event.preventDefault();
-							const order: PermissionMode[] = ["ask", "acceptEdits", "plan", "auto", "read"];
+							const order: PermissionMode[] = ["ask", "acceptEdits", "plan", "auto", "dontAsk", "read"];
 							const next = order[(order.indexOf(snapshot.settings.permission) + 1) % order.length];
 							setPermission(next);
 							return;
@@ -839,12 +853,7 @@ export function LiveComposer({
 					)}
 				</div>
 				<div className="cc-bar-right">
-					{stats && (stats.tokens.total > 0 || contextPct !== undefined) && (
-						<span className="cc-stats-pill" title={`输入 ${stats.tokens.input} · 输出 ${stats.tokens.output}`}>
-							{contextPct !== undefined ? `Ctx ${Math.round(contextPct)}%` : `${Math.round(stats.tokens.total / 1000)}k tok`}
-							{stats.cost > 0 ? ` · $${stats.cost.toFixed(3)}` : ""}
-						</span>
-					)}
+					<StatusLine snapshot={snapshot} running={running} gitBranch={gitBranch} />
 					{snapshot.commands.length > 0 && (
 						<div className="cl-skills" ref={skillsRef}>
 							<button

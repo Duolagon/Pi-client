@@ -397,6 +397,7 @@ export class WorkflowService {
 		if (mode === "auto" || this.alwaysApprovedRoots.has(record.rootConversationId)) {
 			return;
 		}
+		if (mode === "dontAsk") throw new Error("dontAsk 模式不弹出审批，已拒绝执行此工作流步骤");
 		const requestId = randomUUID();
 		record.status = "waiting_for_approval";
 		record.pendingApproval = {

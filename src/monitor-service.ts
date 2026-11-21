@@ -3,11 +3,53 @@ import { randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import type { Readable } from "node:stream";
+import { Script, createContext } from "node:vm";
 import { escapeMarkup } from "./delegation-format.ts";
 import type { DeliverCustomType, NotificationDelivery, NotificationDisposition } from "./tool-control-types.ts";
 import type { MonitorEvent, MonitorRecord, MonitorStartInput, MonitorStatus } from "./monitor-types.ts";
 
 export const MONITOR_EVENT_TYPE: DeliverCustomType = "desktop_monitor_event";
+export const SHELL_EVENT_TYPE: DeliverCustomType = "desktop_shell_event";
+/** Background shells (Bash run_in_background): limits per root conversation and per shell. */
+export const MAX_SHELLS_PER_ROOT = 8;
+export const MAX_SHELL_OUTPUT_CHARS = 1024 * 1024;
+const MAX_FINISHED_SHELLS_PER_ROOT = 16;
+const MAX_SHELL_LINE_CHARS = 16 * 1024;
+const MAX_SHELL_READ_CHARS = 256 * 1024;
+const SHELL_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const FILTER_TIMEOUT_MS = 500;
+export type ShellStatus = "running" | "completed" | "killed" | "failed";
+
+/** Claude Code's BashOutput status for a background shell record. */
+export function shellStatus(record: Pick<MonitorRecord, "status" | "exitCode">): ShellStatus {
+	if (record.status === "running") return "running";
+	if (record.status === "exited") return record.exitCode === 0 ? "completed" : "failed";
+	if (record.status === "error") return "failed";
+	return "killed";
+}
+
+export interface ShellReadResult {
+	shell_id: string;
+	status: ShellStatus;
+	exit_code: number | null;
+	stdout: string;
+	stderr: string;
+	/** Older output was dropped from the ring buffer before this read. */
+	truncated: boolean;
+	/** More buffered output remains; call BashOutput again. */
+	has_more: boolean;
+	filtered_out?: number;
+}
+
+interface ShellBuffer {
+	entries: { stream: "stdout" | "stderr"; text: string }[];
+	/** Sequence number of entries[0]. */
+	baseSeq: number;
+	/** Next sequence number BashOutput returns. */
+	cursor: number;
+	chars: number;
+	partial: { stdout: string; stderr: string };
+}
 const COALESCE_MS = 200;
 const RATE_WINDOW_MS = 1000;
 const MAX_MESSAGES_PER_SEC = 10;
@@ -140,6 +182,7 @@ interface LiveMonitor {
 	deliverySeq: number;
 	child?: ChildProcessByStdio<null, Readable, Readable>;
 	ws?: WebSocket;
+	shell?: ShellBuffer;
 }
 
 export class MonitorService {
@@ -198,7 +241,7 @@ export class MonitorService {
 			throw new Error("Monitor requires either 'command' or 'url' (exactly one)");
 		}
 		const activeForRoot = [...this.monitors.values()].filter(
-			(item) => item.record.rootConversationId === params.rootConversationId && item.record.status === "running",
+			(item) => item.record.rootConversationId === params.rootConversationId && item.record.status === "running" && !item.shell,
 		).length;
 		if (activeForRoot >= MAX_MONITORS_PER_ROOT) {
 			throw new Error(`Too many active monitors (limit ${MAX_MONITORS_PER_ROOT})`);
@@ -269,6 +312,151 @@ export class MonitorService {
 		return structuredClone(record);
 	}
 
+	/** Start a background shell whose output is buffered for BashOutput instead of streamed to the model. */
+	startShell(params: {
+		conversationId: string;
+		rootConversationId: string;
+		workingDirectory: string;
+		env?: NodeJS.ProcessEnv;
+		sandboxProfileFile?: string;
+		command: string;
+		description?: string;
+	}): MonitorRecord {
+		if (this.closing) throw new Error("Monitor service is shutting down");
+		const command = params.command.trim();
+		if (!command) throw new Error("Background Bash requires a command");
+		const running = [...this.monitors.values()].filter(
+			(item) => item.shell && item.record.rootConversationId === params.rootConversationId && item.record.status === "running",
+		).length;
+		if (running >= MAX_SHELLS_PER_ROOT) {
+			throw new Error(`Too many running background shells (limit ${MAX_SHELLS_PER_ROOT}); stop one with KillShell first`);
+		}
+		// Finished shells stay readable; keep only the newest ones so their buffers do not accumulate.
+		const finished = [...this.monitors.values()]
+			.filter((item) => item.shell && item.record.rootConversationId === params.rootConversationId && item.record.status !== "running")
+			.sort((a, b) => a.record.updatedAt - b.record.updatedAt);
+		for (const item of finished.slice(0, Math.max(0, finished.length - MAX_FINISHED_SHELLS_PER_ROOT + 1))) {
+			this.monitors.delete(item.record.id);
+			this.emit({ type: "monitor_removed", id: item.record.id, conversationId: item.record.conversationId });
+		}
+		const id = `shell_${randomBytes(6).toString("hex")}`;
+		const now = Date.now();
+		const record: MonitorRecord = {
+			id,
+			conversationId: params.conversationId,
+			rootConversationId: params.rootConversationId,
+			kind: "shell",
+			description: (params.description?.trim() || command.slice(0, 80)).slice(0, 160),
+			target: command.slice(0, 300),
+			status: "running",
+			persistent: false,
+			timeoutMs: SHELL_TIMEOUT_MS,
+			createdAt: now,
+			updatedAt: now,
+			eventCount: 0,
+			outputChars: 0,
+		};
+		const live: LiveMonitor = {
+			record,
+			pendingLines: [],
+			pendingChars: 0,
+			partialChunk: "",
+			recentSentAt: [],
+			flushing: false,
+			terminated: false,
+			terminationNotified: false,
+			deliverySeq: 0,
+			shell: { entries: [], baseSeq: 0, cursor: 0, chars: 0, partial: { stdout: "", stderr: "" } },
+		};
+		this.monitors.set(id, live);
+		live.timeoutTimer = setTimeout(() => {
+			void this.terminate(id, "timed_out", { reason: "timed_out", notify: true });
+		}, SHELL_TIMEOUT_MS);
+		live.timeoutTimer.unref?.();
+		this.startCommand(live, command, params.workingDirectory, params.env, params.sandboxProfileFile);
+		this.emit({ type: "monitor_updated", monitor: structuredClone(record) });
+		return structuredClone(record);
+	}
+
+	/**
+	 * Output a background shell produced since the previous read. `filter` is a regular
+	 * expression applied per line; lines that do not match are consumed, like Claude Code.
+	 */
+	readShell(id: string, filter?: string): ShellReadResult {
+		const live = this.monitors.get(id);
+		if (!live?.shell) throw new Error(`Background shell not found: ${id}`);
+		const buffer = live.shell;
+		let pattern: RegExp | undefined;
+		if (filter !== undefined) {
+			try {
+				pattern = new RegExp(filter);
+			} catch {
+				throw new Error("Invalid filter regular expression");
+			}
+		}
+		// Unterminated output (a prompt or progress text) is returned now instead of waiting for a newline.
+		for (const stream of ["stdout", "stderr"] as const) {
+			if (buffer.partial[stream]) {
+				const tail = buffer.partial[stream];
+				buffer.partial[stream] = "";
+				this.pushShellLine(live, stream, tail);
+			}
+		}
+		const truncated = buffer.cursor < buffer.baseSeq;
+		const start = Math.max(buffer.cursor, buffer.baseSeq);
+		const selected: { stream: "stdout" | "stderr"; text: string }[] = [];
+		let chars = 0;
+		let index = start - buffer.baseSeq;
+		for (; index < buffer.entries.length; index += 1) {
+			const entry = buffer.entries[index]!;
+			if (selected.length > 0 && chars + entry.text.length + 1 > MAX_SHELL_READ_CHARS) break;
+			selected.push(entry);
+			chars += entry.text.length + 1;
+		}
+		buffer.cursor = buffer.baseSeq + index;
+		const hasMore = index < buffer.entries.length;
+		let kept = selected;
+		if (pattern) {
+			const matches = matchLines(pattern, selected.map((entry) => entry.text));
+			kept = selected.filter((_entry, i) => matches[i]);
+		}
+		const join = (stream: "stdout" | "stderr") => kept.filter((entry) => entry.stream === stream).map((entry) => entry.text).join("\n");
+		return {
+			shell_id: id,
+			status: shellStatus(live.record),
+			exit_code: live.record.status === "running" ? null : (live.record.exitCode ?? null),
+			stdout: join("stdout"),
+			stderr: join("stderr"),
+			truncated,
+			has_more: hasMore,
+			...(pattern ? { filtered_out: selected.length - kept.length } : {}),
+		};
+	}
+
+	/** Stop the running background shells a conversation started (its runtime is stopping). */
+	async stopShellsForConversation(conversationId: string, reason = "runtime_stop"): Promise<number> {
+		const matching = [...this.monitors.values()].filter(
+			(item) => item.shell && item.record.status === "running" && item.record.conversationId === conversationId,
+		);
+		await Promise.all(matching.map((item) => this.terminate(item.record.id, "stopped", { reason, notify: false })));
+		return matching.length;
+	}
+
+	private pushShellLine(live: LiveMonitor, stream: "stdout" | "stderr", raw: string): void {
+		const buffer = live.shell!;
+		const text = raw.length > MAX_SHELL_LINE_CHARS ? `${raw.slice(0, MAX_SHELL_LINE_CHARS)}…` : raw;
+		buffer.entries.push({ stream, text });
+		buffer.chars += text.length;
+		while (buffer.chars > MAX_SHELL_OUTPUT_CHARS && buffer.entries.length > 1) {
+			const dropped = buffer.entries.shift()!;
+			buffer.chars -= dropped.text.length;
+			buffer.baseSeq += 1;
+		}
+		live.record.eventCount += 1;
+		live.record.outputChars = (live.record.outputChars ?? 0) + raw.length;
+		live.record.updatedAt = Date.now();
+	}
+
 	private startCommand(
 		live: LiveMonitor,
 		command: string,
@@ -288,6 +476,17 @@ export class MonitorService {
 		live.child = child;
 		const handleChunk = (source: "stdout" | "stderr", chunk: Buffer) => {
 			if (live.terminated) return;
+			if (live.shell) {
+				const text = chunk.toString("utf8").replace(/\0/g, "");
+				const parts = (live.shell.partial[source] + text).split(/\r?\n/);
+				live.shell.partial[source] = parts.pop() ?? "";
+				for (const line of parts) this.pushShellLine(live, source, line);
+				if (live.shell.partial[source].length >= MAX_SHELL_LINE_CHARS) {
+					this.pushShellLine(live, source, live.shell.partial[source]);
+					live.shell.partial[source] = "";
+				}
+				return;
+			}
 			const text = chunk.toString("utf8").replace(/\0/g, "");
 			if (!text) return;
 			const combined = live.partialChunk + text;
@@ -309,6 +508,12 @@ export class MonitorService {
 			void this.terminate(live.record.id, "error", { error: err.message, reason: "error", notify: true });
 		});
 		child.once("close", (code, signal) => {
+			if (live.shell && !live.terminated) {
+				for (const stream of ["stdout", "stderr"] as const) {
+					if (live.shell.partial[stream]) this.pushShellLine(live, stream, live.shell.partial[stream]);
+					live.shell.partial[stream] = "";
+				}
+			}
 			if (live.partialChunk.trim()) {
 				const tail = live.partialChunk.trim();
 				live.partialChunk = "";
@@ -498,7 +703,7 @@ export class MonitorService {
 				const pending = live.pendingTermination;
 				live.pendingTermination = undefined;
 				void this.deliver(live.record.conversationId, {
-					customType: MONITOR_EVENT_TYPE,
+					customType: live.shell ? SHELL_EVENT_TYPE : MONITOR_EVENT_TYPE,
 					key: pending.key,
 					content: pending.content,
 					details: pending.details,
@@ -571,6 +776,36 @@ export class MonitorService {
 		if (opts.error) live.record.error = opts.error;
 		this.emit({ type: "monitor_updated", monitor: structuredClone(live.record) });
 
+		if (live.shell && opts.notify && !live.terminationNotified && !this.closing) {
+			live.terminationNotified = true;
+			const status = shellStatus(live.record);
+			const summary = status === "completed"
+				? "后台命令已完成（exitCode=0）"
+				: status === "failed"
+					? `后台命令失败（${opts.error ? escapeMarkup(opts.error) : `exitCode=${opts.exitCode ?? "null"}${opts.reason.startsWith("signal:") ? `，${opts.reason}` : ""}`}）`
+					: opts.reason === "timed_out" ? "后台命令运行超过 24 小时，已终止" : "后台命令已被停止";
+			const content = `[SYSTEM NOTIFICATION - NOT USER INPUT] ${summary}（${escapeMarkup(live.record.description)}，shell_id=${id}）。如需查看剩余输出，请调用 BashOutput。`;
+			const details: Record<string, unknown> = {
+				shell_id: id,
+				description: live.record.description,
+				status,
+				exit_code: opts.exitCode ?? null,
+				reason: opts.reason,
+				terminal: true,
+			};
+			const key = `${id}:1`;
+			const disp = await this.deliver(live.record.conversationId, {
+				customType: SHELL_EVENT_TYPE,
+				key,
+				content,
+				details,
+				deliverAs: "followUp",
+				triggerTurn: true,
+				display: true,
+			}).catch(() => "unavailable" as const);
+			if (disp === "deferred" && !this.closing) live.pendingTermination = { key, content, details };
+			return;
+		}
 		if (opts.notify && !live.terminationNotified && !this.closing) {
 			live.terminationNotified = true;
 			const seq = ++live.deliverySeq;
@@ -615,5 +850,20 @@ export class MonitorService {
 		await Promise.all(ids.map((id) => this.terminate(id, "stopped", { reason: "service_close", notify: false })));
 		this.monitors.clear();
 		this.listeners.clear();
+	}
+}
+
+/**
+ * Test each line against a model-supplied pattern in a separate context with a time limit,
+ * so a catastrophic regular expression cannot block the main process.
+ */
+function matchLines(pattern: RegExp, lines: string[]): boolean[] {
+	const context = createContext({ source: pattern.source, flags: pattern.flags, lines });
+	try {
+		const result = new Script("(() => { const re = new RegExp(source, flags); return lines.map((line) => { re.lastIndex = 0; return re.test(line); }); })()")
+			.runInContext(context, { timeout: FILTER_TIMEOUT_MS });
+		return Array.from(result as ArrayLike<boolean>, Boolean);
+	} catch {
+		throw new Error("Filter regular expression took too long; use a simpler pattern");
 	}
 }

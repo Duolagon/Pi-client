@@ -1,6 +1,6 @@
 import { PullRequestPanel } from "./PullRequestPanel.tsx";
 import { useEffect, useState } from "react";
-import { ArrowLeft, Check, Columns2, FileCode2, Folder, Minus, Plus, RefreshCw, RotateCcw, X } from "lucide-react";
+import { ArrowLeft, Check, Columns2, ExternalLink, FileCode2, Folder, Minus, Plus, RefreshCw, RotateCcw, X } from "lucide-react";
 import { IconButton } from "../prototype/ui.tsx";
 import { CodeLines, UnifiedDiffView } from "./DiffView.tsx";
 import type { Change, CodeIntelligence, CodePosition, FileEntry, Workspace } from "../shared.ts";
@@ -17,6 +17,7 @@ export function WorkspacePanel({
 	onReferenceFile,
 	onWorkspaceMutated,
 	onNotice,
+	onOpenInEditor,
 }: {
 	pane: "files" | "changes";
 	setPane: (pane: "files" | "changes") => void;
@@ -29,6 +30,8 @@ export function WorkspacePanel({
 	onReferenceFile?: (path: string) => void;
 	onWorkspaceMutated?: () => void;
 	onNotice?: (message: string) => void;
+	/** Opens a project-relative path in the configured external editor. */
+	onOpenInEditor?: (relativePath: string, line?: number) => void;
 }) {
 	const [entries, setEntries] = useState<FileEntry[]>([]);
 	const [directory, setDirectory] = useState("");
@@ -196,6 +199,11 @@ export function WorkspacePanel({
 							</button>
 						)}
 						{pane === "files" && conversationId && <button type="button" className="cc-mini-btn" disabled={analyzing} onClick={() => void inspect()}>{analyzing ? "分析中…" : "代码分析"}</button>}
+						{onOpenInEditor && (
+							<button type="button" className="cc-mini-btn" onClick={() => onOpenInEditor(content.path)} title="在编辑器中打开">
+								<ExternalLink size={12} /> 编辑器
+							</button>
+						)}
 						{onReferenceFile && (
 							<button type="button" className="cc-mini-btn" onClick={() => onReferenceFile(content.path)} title="插入 @文件引用 到输入框">
 								@引用
@@ -314,6 +322,7 @@ export function WorkspacePanel({
 									<span className="file-name" title={change.path}>{change.path}</span>
 									<span>{change.status}</span>
 								</button>
+								{onOpenInEditor && <OpenInEditorButton path={change.path} open={onOpenInEditor} />}
 								{!readOnly && (
 									<button
 										type="button"
@@ -339,6 +348,7 @@ export function WorkspacePanel({
 									<span className="file-name" title={change.path}>{change.path}</span>
 									<span>{change.status}</span>
 								</button>
+								{onOpenInEditor && <OpenInEditorButton path={change.path} open={onOpenInEditor} />}
 								{!readOnly && (
 									<div className="cc-git-row-btns">
 										<button
@@ -377,5 +387,19 @@ export function WorkspacePanel({
 				</p>
 			)}
 		</aside>
+	);
+}
+
+function OpenInEditorButton({ path, open }: { path: string; open: (path: string) => void }) {
+	return (
+		<button
+			type="button"
+			className="cc-git-icon cc-open-editor-btn"
+			title="在编辑器中打开"
+			aria-label={`在编辑器中打开 ${path}`}
+			onClick={() => open(path)}
+		>
+			<ExternalLink size={12} />
+		</button>
 	);
 }

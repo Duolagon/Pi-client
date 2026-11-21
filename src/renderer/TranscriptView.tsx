@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { copyText } from "./clipboard.ts";
 import ReactMarkdown from "react-markdown";
-import { ArrowDownToLine, Check, Circle, CircleAlert, ChevronRight, Copy, Eye, GitFork, LoaderCircle, RotateCcw, Square } from "lucide-react";
+import { ArrowDownToLine, Check, Circle, CircleAlert, ChevronRight, Copy, ExternalLink, Eye, GitFork, LoaderCircle, RotateCcw, Square } from "lucide-react";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
 import type { DesktopTask, ExternalTask, Message, TaskProgress } from "../shared.ts";
 import type { Transcript, ToolProgress } from "./messages.ts";
@@ -236,6 +236,7 @@ export function TranscriptView({
 	onRewindPrompt,
 	onForkPrompt,
 	onOpenPreview,
+	onOpenFile,
 }: {
 	transcript: Transcript;
 	tasks?: DesktopTask[];
@@ -247,6 +248,8 @@ export function TranscriptView({
 	onRewindPrompt?: (text: string) => void;
 	onForkPrompt?: (text: string) => void;
 	onOpenPreview?: (url: string) => void;
+	/** Opens a tool's file path in the configured external editor. */
+	onOpenFile?: OpenFileHandler;
 }) {
 	return (
 		<div className="cl-transcript">
@@ -259,9 +262,11 @@ export function TranscriptView({
 					const customCardMeta: Record<string, { verb: string; label: string }> = {
 						desktop_task_result: { verb: "Subagent", label: "(后台任务结果回传)" },
 						desktop_monitor_event: { verb: "Monitor", label: "(后台监听事件)" },
+						desktop_shell_event: { verb: "Bash", label: "(后台命令结束)" },
 						desktop_cron_wakeup: { verb: "Schedule", label: "(定时唤醒提醒)" },
 						desktop_team_message: { verb: "Team", label: "(团队协作消息)" },
 						desktop_workflow_event: { verb: "Workflow", label: "(工作流事件)" },
+						desktop_model_fallback: { verb: "Model", label: "(已切换到备用模型)" },
 					};
 					const cardMeta = message.role === "custom" ? customCardMeta[message.customType] : undefined;
 					if (message.role === "custom" && cardMeta) {
@@ -390,6 +395,7 @@ export function TranscriptView({
 								onBackgroundTask={onBackgroundTask}
 								onStopTask={onStopTask}
 								onOpenPreview={onOpenPreview}
+								onOpenFile={onOpenFile}
 							/>
 						))}
 						{errorMessage && !aborted && (
@@ -437,6 +443,7 @@ function TurnBlocks({
 	onBackgroundTask,
 	onStopTask,
 	onOpenPreview,
+	onOpenFile,
 }: {
 	message: Assistant;
 	state: Transcript;
@@ -449,6 +456,7 @@ function TurnBlocks({
 	onBackgroundTask?: (taskId: string) => void;
 	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
 	onOpenPreview?: (url: string) => void;
+	onOpenFile?: OpenFileHandler;
 }) {
 	return message.content.map((block, part) => {
 		if (block.type === "text") {
@@ -497,6 +505,7 @@ function TurnBlocks({
 				onOpenTask={onOpenTask}
 				onBackgroundTask={onBackgroundTask}
 				onStopTask={onStopTask}
+				onOpenFile={onOpenFile}
 			/>
 		);
 	});
@@ -553,6 +562,19 @@ function summarizeDesktopJson(output: string | undefined, fallback: string): str
 		/* non-JSON text output */
 	}
 	return output.trim().split("\n")[0].slice(0, 110);
+}
+
+export type OpenFileHandler = (path: string, line?: number) => void;
+
+/** File path (and starting line, when the input carries one) of read/edit/write tool calls. */
+export function toolFileTarget(name: string, args: unknown): { path: string; line?: number } | undefined {
+	if (name !== "read" && name !== "edit" && name !== "write") return undefined;
+	const a = asRecord(args);
+	const path = typeof a.path === "string" ? a.path : typeof a.file_path === "string" ? a.file_path : "";
+	if (!path.trim()) return undefined;
+	const raw = name === "read" ? (a.offset ?? a.line) : a.line;
+	const line = typeof raw === "number" && Number.isSafeInteger(raw) && raw > 0 ? raw : undefined;
+	return { path: path.trim(), ...(line ? { line } : {}) };
 }
 
 function presentTool(name: string, args: unknown, output: string | undefined, status: string): ToolPresentation {
@@ -829,6 +851,7 @@ function ToolCard({
 	onOpenTask,
 	onBackgroundTask,
 	onStopTask,
+	onOpenFile,
 }: {
 	name: string;
 	args: unknown;
@@ -839,6 +862,7 @@ function ToolCard({
 	onOpenTask?: (taskId: string) => void;
 	onBackgroundTask?: (taskId: string) => void;
 	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
+	onOpenFile?: OpenFileHandler;
 }) {
 	const output = result
 		? result.content
@@ -869,6 +893,7 @@ function ToolCard({
 	const dotClass = effectiveStatus === "error" ? "err" : effectiveStatus === "done" ? "ok" : "run";
 	const [open, setOpen] = useState(false);
 	const isOpen = open || status === "running";
+	const fileTarget = onOpenFile ? toolFileTarget(name, args) : undefined;
 	const summaryLine = matchedTask
 		? formatMatchedTaskSummary(matchedTask, taskProgress)
 		: status === "running" && (name === "Agent" || name === "SendMessage") && progress?.output
@@ -876,7 +901,7 @@ function ToolCard({
 			: info.treeSummary;
 
 	return (
-		<div className={`cl-tool ${effectiveStatus} ${isOpen ? "is-open" : ""}`}>
+		<div className={`cl-tool ${effectiveStatus} ${isOpen ? "is-open" : ""} ${fileTarget && onOpenFile ? "has-open-editor" : ""}`}>
 			<button type="button" className="cc-tool-row" onClick={() => setOpen((v) => !v)} aria-expanded={isOpen}>
 				<span className={`cc-dot ${dotClass}`} />
 				<span className="cc-tool-head">
@@ -891,6 +916,17 @@ function ToolCard({
 				{!matchedTask && info.badge && <span className={`cc-tool-badge ${status === "error" ? "err" : ""}`}>{info.badge}</span>}
 				<ChevronRight size={13} className="cl-tool-chevron" />
 			</button>
+			{fileTarget && onOpenFile && (
+				<button
+					type="button"
+					className="cc-open-editor-btn cc-tool-open-editor"
+					title={`在编辑器中打开${fileTarget.line ? `（第 ${fileTarget.line} 行）` : ""}`}
+					aria-label={`在编辑器中打开 ${fileTarget.path}`}
+					onClick={() => onOpenFile(fileTarget.path, fileTarget.line)}
+				>
+					<ExternalLink size={12} />
+				</button>
+			)}
 			{summaryLine && (
 				<div className="cc-tree-summary">
 					<span className="cc-tree-arm">⎿</span>

@@ -2,7 +2,9 @@ import { createDraftPullRequest, readPullRequest, type DraftPullRequest } from "
 import { managedFile, writeManagedFile } from "./managed-path.ts";
 import { execFile } from "node:child_process";
 import { randomBytes, randomUUID, createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, writeFile, rename, realpath, stat, readdir, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, writeFile, rename, realpath, stat, readdir, rm } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { summarizeEngineError, tildify } from "./desktop-log.ts";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -97,6 +99,9 @@ import { providerModels, providerPresets } from "./provider-presets.ts";
 import { memoryLimit, memoryName, privateMemoryLabel } from "./project-memory.ts";
 import { codeIntelligence, type CodePosition } from "./language-service.ts";
 import { detectProjectTrustResources } from "./project-trust.ts";
+import { DEFAULT_OUTPUT_STYLE, discoverOutputStyles, findOutputStyle, outputStylePromptSection, validOutputStyleName } from "./output-styles.ts";
+import { EDITOR_CHOICES, type EditorChoice } from "./editor-open.ts";
+import { UsageStatsCollector } from "./usage-stats.ts";
 import { ToolSettingsStore } from "./tool-settings.ts";
 import { evaluatePermission, validatePermissionRule } from "./permission-policy.ts";
 import type { PermissionRule, RuntimePermissionPolicy } from "./permission-types.ts";
@@ -108,10 +113,10 @@ import { finalAssistantText, type DelegationMetadata, type ResumeOptions } from 
 import { AgentRegistry } from "./agent-definitions.ts";
 import { buildAgentListing } from "./agent-listing.ts";
 import type { AgentDefinition, AgentModelAlias, AgentPermissionMode, AgentRemoveInput, AgentSaveInput, ModelRouting, ModelRoutingRole } from "./agent-types.ts";
-import { parseModelRoutingUpdate, sanitizeModelRouting } from "./model-routing.ts";
+import { parseFallbackModelUpdate, parseModelRoutingUpdate, sanitizeFallbackModel, sanitizeModelRouting } from "./model-routing.ts";
 import { McpRegistry } from "./mcp-registry.ts";
 import type { McpRemoveInput, McpSaveInput, McpServerInfo } from "./mcp-types.ts";
-import { HooksService } from "./hooks-service.ts";
+import { HooksService, type HookRunContext } from "./hooks-service.ts";
 import type { HookEntry, HookRemoveInput, HookRunResult, HookSaveInput, HookTestInput } from "./hook-types.ts";
 import { BUNDLED_SKILLS, SkillRegistry, bundledSkillFile } from "./skill-registry.ts";
 import { balanceTarget, fetchBalance, type BalanceTarget } from "./provider-balance.ts";
@@ -120,7 +125,7 @@ import { rootCertificates } from "node:tls";
 import type { SkillDefinitionEntry, SkillRemoveInput, SkillSaveInput } from "./skill-registry.ts";
 import { TodoService } from "./todo-service.ts";
 import type { TodoCreateInput, TodoEvent, TodoGetInput, TodoListInput, TodoRecord, TodoUpdateInput } from "./todo-types.ts";
-import { MonitorService } from "./monitor-service.ts";
+import { MonitorService, shellStatus } from "./monitor-service.ts";
 import type { MonitorEvent, MonitorRecord, MonitorStartInput } from "./monitor-types.ts";
 import { CronService, parseLoopCommandArgs } from "./cron-service.ts";
 import { cronToolNames, type CronCreateInput, type CronEvent, type CronJobRecord, type ScheduleWakeupInput } from "./cron-types.ts";
@@ -133,7 +138,7 @@ import { buildContextReport, deleteProjectMemoryRule, writeProjectMemoryFile, ty
 import { buildSeatbeltProfile, probeSeatbeltSupport, resolveGitWorktreeWritablePaths } from "./sandbox.ts";
 import { readClaudeProjectPermissionsDetailed, writeClaudeProjectPermissions } from "./claude-settings-sync.ts";
 import { createForkedSessionSnapshot, findSessionFileById } from "./session-fork.ts";
-import type { BtwResult, ClaudePermissionsSyncResult, PlanFileState, SandboxStatus } from "./shared.ts";
+import type { BtwResult, ClaudePermissionsSyncResult, DoctorCheck, DoctorReport, OutputStyleInfo, PlanFileState, SandboxStatus, UsageStatsReport } from "./shared.ts";
 import { ExternalAgents } from "./external-agents.ts";
 import { CodexAdapter } from "./external-codex.ts";
 import { ClaudeAdapter } from "./external-claude.ts";
@@ -147,6 +152,7 @@ import type { RpcExtensionUIResponse, SessionStats } from "@earendil-works/pi-co
 import type { SlashCommand } from "./shared.ts";
 
 const exec = promisify(execFile);
+const DOCTOR_CHECK_TIMEOUT_MS = 4000;
 const providers: Provider[] = ["anthropic", "openai", "google", "openrouter", "deepseek"];
 const piBuiltinTools = new Set(["read", "write", "edit", "bash", "grep", "find", "ls", "powershell"]);
 
@@ -225,10 +231,18 @@ interface SessionRuntime {
 	stopping: boolean;
 	replacing?: boolean;
 	stopHookRanThisTurn?: boolean;
+	/** Set once SessionStart fired, so only a started runtime reports SessionEnd. */
+	sessionStarted?: boolean;
+	/** Permission mode the session started with, reported again by SessionEnd. */
+	sessionPermissionMode?: string;
 	navigation?: { directory: string; token: string; command: string };
 	controls?: { directory: string; token: string; command: string; hostToken: string; operation: Promise<void> };
 	policyFile?: string;
 	sandboxProfileFile?: string;
+	/** Environment of the Pi child, reused for its background shells. */
+	shellEnv?: NodeJS.ProcessEnv;
+	/** Output style prompt read by the permission extension each turn; main conversations only. */
+	outputStyleFile?: string;
 	metaWritten?: boolean;
 	controlWrites?: Promise<void>;
 	/**
@@ -272,6 +286,8 @@ interface OutboxItem {
  * tried again when the parent's run settles (or its runtime restarts), or on "立即交付".
  */
 const MAX_NOTIFY_ATTEMPTS = 5;
+/** Matches the hooks-service per-hook timeout ceiling. */
+const SESSION_END_HOOK_WAIT_MS = 60000;
 type FlushMode = "auto" | "settled" | "startup" | "now";
 export interface ServiceOptions {
 	dataDir: string;
@@ -302,6 +318,10 @@ export interface ServiceOptions {
 	childRuntimeReapIntervalMs?: number;
 	encrypt?: (value: string) => string;
 	decrypt?: (value: string) => string;
+	/** Local log directory shown by /doctor; the main process owns the log file. */
+	logDir?: string;
+	/** Receives content-free engine failure records for the local diagnostic log. */
+	onDiagnostic?: (level: "warn" | "error", event: string, details: Record<string, string>) => void;
 }
 
 /** Desktop session owner. Runtime injection keeps the real subprocess usable in isolated tests. */
@@ -321,6 +341,7 @@ export class DesktopService {
 	private worktrees: WorktreeService;
 	private history: SessionHistoryService;
 	private historyAvailable = false;
+	private readonly usage = new UsageStatsCollector();
 	private connectionCheck?: { agent: AgentProcess; cancel: (error: Error) => void };
 	private engineError?: string;
 	private closed = false;
@@ -331,6 +352,8 @@ export class DesktopService {
 	private scheduling = false;
 	private launches = new Map<string, number>();
 	private commands = new Set<Promise<unknown>>();
+	/** SessionEnd hooks still running; close() waits for them up to the hook timeout cap. */
+	private sessionEndHooks = new Set<Promise<unknown>>();
 	private operation: Promise<void> = Promise.resolve();
 	private persistence: Promise<void> = Promise.resolve();
 	private eventSequence = 0;
@@ -405,7 +428,7 @@ export class DesktopService {
 				const meta = await this.hookContextFor(context.conversationId);
 				const trusted = this.isProjectTrusted(conv.project);
 				const project = this.trustProjectFor(conv.project);
-				const permissionMode = this.permissionPolicy(context.conversationId).mode;
+				const permissionMode = this.hookPermissionMode(context.conversationId);
 				if (request.phase === "compact") {
 					return this.hooks.run("PreCompact", {
 						project,
@@ -524,7 +547,7 @@ export class DesktopService {
 			dataDir: () => this.options.dataDir,
 			callbacks: {
 				workerPath: () => this.options.workflowWorker ?? join(runtimeDir, "workflow-worker-entry.mjs"),
-				permissionMode: (conversationId) => this.permissionPolicy(conversationId).mode,
+				permissionMode: (conversationId) => this.hookPermissionMode(conversationId),
 				deliver: (id, params) => this.deliverToConversation(id, params),
 				cancelWorkflowTasks: async (workflowId) => {
 					const matching = this.store.tasks.filter(
@@ -1024,6 +1047,45 @@ export class DesktopService {
 		});
 	}
 
+	private discoverStyles(project: string | undefined) {
+		return discoverOutputStyles({
+			home: this.options.env?.HOME ?? homedir(),
+			project: project ? this.trustProjectFor(project) : undefined,
+			trusted: project ? this.isProjectTrusted(project) : false,
+		});
+	}
+
+	/** Built-in plus custom output styles visible to the active project. */
+	async outputStyles(): Promise<OutputStyleInfo[]> {
+		const styles = await this.discoverStyles(this.active()?.project);
+		return styles.map(({ name, description, source }) => ({ name, description, source }));
+	}
+
+	/** Writes the resolved style prompt (empty for default or a missing style) for a main conversation. */
+	private async writeOutputStyle(runtime: SessionRuntime): Promise<void> {
+		if (!runtime.outputStyleFile) return;
+		const name = this.store.settings.outputStyle;
+		const project = this.store.conversations.find((item) => item.id === runtime.conversationId)?.project;
+		const style = name ? findOutputStyle(await this.discoverStyles(project), name) : undefined;
+		const temporary = `${runtime.outputStyleFile}.${randomBytes(4).toString("hex")}.tmp`;
+		await writeFile(temporary, outputStylePromptSection(style), { mode: 0o600 });
+		await rename(temporary, runtime.outputStyleFile);
+	}
+
+	editorSetting(): EditorChoice | undefined {
+		return this.store.settings.editor;
+	}
+
+	/** Absolute directories whose files may be opened in an external editor. */
+	async editorRoots(): Promise<string[]> {
+		const worktrees = await this.worktrees.list().catch(() => []);
+		return [...new Set([
+			...this.store.projects.map((project) => project.path),
+			...this.store.conversations.map((conversation) => conversation.project),
+			...worktrees.map((tree) => tree.path),
+		])];
+	}
+
 	private isProjectTrusted(project: string): boolean {
 		return this.store.projectTrust?.[this.trustProjectFor(project)] === "trusted";
 	}
@@ -1189,7 +1251,7 @@ export class DesktopService {
 				project,
 				projectTrusted: this.isProjectTrusted(project),
 				conversationId: meta.parentConversationId ?? conversationId,
-				permissionMode: this.permissionPolicy(conversationId).mode,
+				permissionMode: this.hookPermissionMode(conversationId),
 				agentId: meta.agentId,
 				agentType: meta.agentType,
 				transcriptPath,
@@ -1204,7 +1266,7 @@ export class DesktopService {
 			project: this.trustProjectFor(conv.project),
 			projectTrusted: this.isProjectTrusted(conv.project),
 			conversationId: conv.id,
-			permissionMode: this.permissionPolicy(conv.id).mode,
+			permissionMode: this.hookPermissionMode(conv.id),
 			stopHookActive,
 			lastAssistantMessage,
 			extraHooks: meta.extraHooks,
@@ -1446,6 +1508,164 @@ export class DesktopService {
 		const fullPath = (await managedFile(conv.project, [".pi", "plans"], `${conv.id}.md`, true))!;
 		await writeManagedFile(fullPath, content);
 		return { path: fullPath, relativePath, content, exists: true };
+	}
+
+	/** Forwards a content-free failure summary to the main-process log; never throws. */
+	private diagnostic(level: "warn" | "error", event: string, conversationId: string, message: string): void {
+		try {
+			this.options.onDiagnostic?.(level, event, { conversation: conversationId, error: summarizeEngineError(message) });
+		} catch {
+			/* logging is best effort */
+		}
+	}
+
+	/**
+	 * Token usage and cost by local day and model (/stats). Reads only the session
+	 * files of known conversations, delegated child sessions included, inside the
+	 * app's own session directory. Read-only; does not wait for other operations.
+	 */
+	async usageStats(input: { days?: number } = {}): Promise<UsageStatsReport> {
+		if (this.closed) throw new Error("桌面服务已关闭。");
+		const sessionDir = join(this.options.dataDir, "sessions");
+		const canonicalDir = await realpath(sessionDir).catch(() => undefined);
+		if (!canonicalDir) return this.usage.collect([], input);
+		const byId = new Map<string, string>();
+		const names = await readdir(canonicalDir, { withFileTypes: true }).catch(() => []);
+		for (const entry of names) {
+			if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+			const match = /_([^_]+)\.jsonl$/.exec(entry.name);
+			if (match) byId.set(match[1], join(canonicalDir, entry.name));
+		}
+		const candidates = new Set<string>();
+		for (const conversation of this.store.conversations) {
+			const path =
+				conversation.sessionFile ?? this.runtimes.get(conversation.id)?.state?.sessionFile ?? byId.get(conversation.id);
+			if (path) candidates.add(path);
+		}
+		const files: string[] = [];
+		for (const path of candidates) {
+			const absolute = resolve(path);
+			if (!inside(sessionDir, absolute) && !inside(canonicalDir, absolute)) continue;
+			const actual = await realpath(absolute).catch(() => undefined);
+			if (actual && inside(canonicalDir, actual) && actual.endsWith(".jsonl")) files.push(actual);
+		}
+		return this.usage.collect(files, input);
+	}
+
+	/** Local environment checks for /doctor. Reads only local state; no network or model requests. */
+	async doctor(): Promise<DoctorReport> {
+		const env = { ...process.env, ...this.options.env };
+		const settings = this.store.settings;
+		const check = async (id: string, label: string, run: () => Promise<Omit<DoctorCheck, "id" | "label">>): Promise<DoctorCheck> => {
+			let timer: NodeJS.Timeout | undefined;
+			try {
+				const result = await Promise.race([
+					run(),
+					new Promise<never>((_, reject) => {
+						timer = setTimeout(() => reject(new Error("检查超时。")), DOCTOR_CHECK_TIMEOUT_MS);
+					}),
+				]);
+				return { id, label, ...result, detail: tildify(result.detail) };
+			} catch (error) {
+				return { id, label, status: "error", detail: tildify(error instanceof Error ? error.message : String(error)).slice(0, 300) };
+			} finally {
+				clearTimeout(timer);
+			}
+		};
+		const toolVersion = async (command: string, args: string[]) => {
+			const { stdout } = await exec(command, args, { env, timeout: 2000, maxBuffer: 64 * 1024 });
+			return stdout.trim().split("\n", 1)[0] ?? "";
+		};
+		const active = this.active();
+		const projectPath = active ? this.trustProjectFor(active.project) : undefined;
+		const checks = await Promise.all([
+			check("runtime", "Pi 运行时", async () => {
+				const runtimeDir = this.options.runtimeDir ?? (this.options.entry ? dirname(dirname(dirname(this.options.entry))) : undefined);
+				const version = runtimeDir
+					? await readFile(join(runtimeDir, "package.json"), "utf8").then((text) => String((JSON.parse(text) as { version?: unknown }).version ?? ""), () => "")
+					: "";
+				const host = [
+					process.versions.electron ? `Electron ${process.versions.electron}` : undefined,
+					`Node ${process.versions.node}`,
+					`${process.platform}-${process.arch}`,
+				].filter(Boolean).join(" · ");
+				return version
+					? { status: "ok", detail: `Pi ${version} · ${host}` }
+					: { status: "warn", detail: `无法读取 Pi 运行时版本 · ${host}` };
+			}),
+			check("data-dir", "数据目录可写", async () => {
+				const probe = join(this.options.dataDir, `.doctor-${randomBytes(6).toString("hex")}`);
+				await writeFile(probe, "ok", { mode: 0o600 });
+				await rm(probe, { force: true });
+				return { status: "ok", detail: this.options.dataDir };
+			}),
+			check("model", "模型连接", async () => {
+				const runtime = active ? this.runtimes.get(active.id) : undefined;
+				const model = runtime?.state?.model ?? settings.defaultModel;
+				if (!model?.provider || !model.id) return { status: "warn", detail: "尚未选择模型，请在设置中配置模型连接。" };
+				const name = `${model.provider}/${model.id}`;
+				const provider = model.provider.startsWith("desktop-") ? (model.provider.slice(8) as Provider) : undefined;
+				if (!provider || !providers.includes(provider)) return { status: "ok", detail: `${name}（由 Pi 配置提供）` };
+				if (!settings.connections[provider]) return { status: "error", detail: `${name}：桌面端没有此服务商的连接配置。` };
+				if (this.store.keys[provider]) return { status: "ok", detail: `${name} · 已保存 API Key` };
+				if (settings.connections[provider]?.keyCommand) return { status: "ok", detail: `${name} · 使用取 Key 命令` };
+				return { status: "error", detail: `${name}：未保存 API Key 或取 Key 命令。` };
+			}),
+			check("network", "代理与证书", async () => {
+				const proxy = settings.proxy || env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy;
+				const noProxy = settings.noProxy || env.NO_PROXY || env.no_proxy;
+				const caFile = settings.caFile || env.NODE_EXTRA_CA_CERTS;
+				const parts = [
+					proxy ? `代理 ${proxyLabel(proxy)}${settings.proxy ? "" : "（来自 shell）"}` : "未使用代理",
+					noProxy ? `NO_PROXY ${noProxy.slice(0, 200)}` : undefined,
+				];
+				if (caFile) {
+					const readable = await access(caFile, fsConstants.R_OK).then(() => true, () => false);
+					parts.push(`CA 证书 ${caFile}${readable ? "" : "（无法读取）"}`);
+					if (!readable) return { status: "error", detail: parts.filter(Boolean).join(" · ") };
+				}
+				return { status: "ok", detail: parts.filter(Boolean).join(" · ") };
+			}),
+			check("sandbox", "macOS 命令沙箱", async () => {
+				const status = await this.sandboxStatus();
+				if (status.supported) return { status: "ok", detail: status.enabled ? "已开启，环境支持 Seatbelt。" : "环境支持 Seatbelt，当前未开启。" };
+				return { status: status.enabled ? "error" : "warn", detail: `不可用：${status.reason ?? "未知原因"}` };
+			}),
+			check("git", "Git", async () => {
+				const version = await toolVersion("git", ["--version"]).catch(() => "");
+				return version ? { status: "ok", detail: version } : { status: "warn", detail: "未找到 git，检查点和 Worktree 不可用。" };
+			}),
+			check("gh", "GitHub CLI", async () => {
+				const version = await toolVersion("gh", ["--version"]).catch(() => "");
+				return version ? { status: "ok", detail: version } : { status: "warn", detail: "未找到 gh，PR 相关功能不可用。" };
+			}),
+			check("project", "当前项目", async () => {
+				if (!active || !projectPath) return { status: "warn", detail: "尚未打开项目。" };
+				const exists = await stat(active.project).then((info) => info.isDirectory(), () => false);
+				if (!exists) return { status: "error", detail: `${active.project} 不存在或不是文件夹。` };
+				const trusted = this.isProjectTrusted(active.project);
+				return trusted
+					? { status: "ok", detail: `${projectPath} · 已信任` }
+					: { status: "warn", detail: `${projectPath} · 未信任，项目级 Hooks、MCP 和配置不会加载。` };
+			}),
+			check("hooks", "Hooks", async () => {
+				const trusted = active ? this.isProjectTrusted(active.project) : false;
+				const hooks = await this.hooks.list(projectPath, trusted);
+				if (settings.disableAllHooks) return { status: "warn", detail: `共 ${hooks.length} 个，已停用全部 Hooks。` };
+				return { status: "ok", detail: hooks.length ? `共 ${hooks.length} 个，均已启用。` : "未配置 Hooks。" };
+			}),
+			check("mcp", "MCP 服务", async () => {
+				if (!projectPath) return { status: "ok", detail: "未打开项目，未统计 MCP 服务。" };
+				const servers = await this.mcp.list(projectPath);
+				const enabled = servers.filter((server) => server.enabled).length;
+				return { status: "ok", detail: `共 ${servers.length} 个，启用 ${enabled} 个。` };
+			}),
+			check("logs", "本地日志", async () => ({
+				status: "ok",
+				detail: this.options.logDir ? `${this.options.logDir}（仅保存在本机，不会上传）` : "未启用本地日志。",
+			})),
+		]);
+		return { generatedAt: Date.now(), checks };
 	}
 
 	async sandboxStatus(): Promise<SandboxStatus> {
@@ -2108,6 +2328,32 @@ export class DesktopService {
 			}
 			return this.delegation.handle(context, request.tool, input);
 		}
+		if (request.tool === "BashBackground") {
+			const conv = this.conversation(context.conversationId);
+			const task = this.store.tasks.find((item) => item.conversationId === conv.id);
+			const runtime = this.runtimes.get(conv.id);
+			const record = this.monitors.startShell({
+				conversationId: conv.id,
+				rootConversationId: this.rootConversationId(conv.id),
+				workingDirectory: task?.workingDirectory ?? conv.project,
+				env: runtime?.shellEnv ?? this.options.env,
+				sandboxProfileFile: runtime?.sandboxProfileFile,
+				command: String(input.command),
+				description: typeof input.description === "string" ? input.description : undefined,
+			});
+			return { shell_id: record.id, status: "running", description: record.description };
+		}
+		if (request.tool === "BashOutput" || request.tool === "KillShell") {
+			const id = String(request.tool === "BashOutput" ? input.bash_id : input.shell_id);
+			const record = this.monitors.get(id);
+			// Shells are shared within one root conversation (its subagents included), never across roots.
+			if (!record || record.kind !== "shell" || record.rootConversationId !== this.rootConversationId(context.conversationId))
+				throw new Error(`Background shell not found: ${id}`);
+			if (request.tool === "BashOutput") return this.monitors.readShell(id, typeof input.filter === "string" ? input.filter : undefined);
+			if (record.status === "running") await this.monitors.stop(id, undefined, "model_stop");
+			const stopped = this.monitors.get(id)!;
+			return { shell_id: id, status: shellStatus(stopped), exit_code: stopped.exitCode ?? null, message: record.status === "running" ? "Background shell stopped" : "Background shell had already finished" };
+		}
 		if (request.tool === "Monitor") {
 			const conv = this.conversation(context.conversationId);
 			const task = this.store.tasks.find((item) => item.conversationId === conv.id);
@@ -2325,6 +2571,7 @@ export class DesktopService {
 					project: active.project,
 					projectTrusted: this.isProjectTrusted(active.project),
 					conversationId: active.id,
+					permissionMode: this.hookPermissionMode(active.id),
 					prompt: command.message,
 					env: this.options.env,
 				});
@@ -2678,6 +2925,10 @@ export class DesktopService {
 		maxCostUsd?: number | null;
 		minBalance?: number | null;
 		disableAllHooks?: boolean;
+		fallbackModel?: { provider: string; id: string } | null;
+		outputStyle?: string | null;
+		editor?: EditorChoice;
+		statusBalance?: boolean;
 		provider?: Provider;
 		apiKey?: string;
 		keyCommand?: string;
@@ -2760,6 +3011,33 @@ export class DesktopService {
 				if (typeof settings.disableAllHooks !== "boolean") throw new Error("Hooks 开关设置无效。");
 				if (settings.disableAllHooks) next.settings.disableAllHooks = true;
 				else delete next.settings.disableAllHooks;
+			}
+			if (settings.fallbackModel !== undefined) {
+				const ref = parseFallbackModelUpdate(settings.fallbackModel);
+				if (ref) next.settings.fallbackModel = ref;
+				else delete next.settings.fallbackModel;
+			}
+			if (settings.outputStyle !== undefined) {
+				if (settings.outputStyle === null) delete next.settings.outputStyle;
+				else {
+					const name = validOutputStyleName(settings.outputStyle);
+					if (!name) throw new Error("输出风格名称无效。");
+					if (name.toLowerCase() === DEFAULT_OUTPUT_STYLE) delete next.settings.outputStyle;
+					else {
+						const style = findOutputStyle(await this.discoverStyles(this.active()?.project), name);
+						if (!style) throw new Error(`找不到输出风格：${name.slice(0, 100)}`);
+						next.settings.outputStyle = style.name;
+					}
+				}
+			}
+			if (settings.editor !== undefined) {
+				if (!EDITOR_CHOICES.includes(settings.editor)) throw new Error("编辑器设置无效。");
+				next.settings.editor = settings.editor;
+			}
+			if (settings.statusBalance !== undefined) {
+				if (typeof settings.statusBalance !== "boolean") throw new Error("状态栏余额开关设置无效。");
+				if (settings.statusBalance) delete next.settings.statusBalance;
+				else next.settings.statusBalance = false;
 			}
 			if (settings.proxy !== undefined) {
 				const value = validateProxyUrl(settings.proxy);
@@ -2861,10 +3139,15 @@ export class DesktopService {
 				next.settings.caFile !== this.store.settings.caFile ||
 				next.settings.maxCostUsd !== this.store.settings.maxCostUsd ||
 				next.settings.minBalance !== this.store.settings.minBalance ||
+				fallbackKey(next.settings.fallbackModel) !== fallbackKey(this.store.settings.fallbackModel) ||
 				Boolean(settings.provider);
+			const styleChanged = next.settings.outputStyle !== this.store.settings.outputStyle;
 			this.store = next;
 			await this.persist();
 			if (settings.cronEnabled !== undefined) this.cron.onEnabledChanged();
+			// Running main conversations pick up the new style on their next turn.
+			if (styleChanged && !needsRestart)
+				for (const runtime of this.runtimes.values()) await this.writeOutputStyle(runtime).catch(() => {});
 			if (needsRestart) {
 				for (const runtime of [...this.runtimes.values()]) await this.stopRuntime(runtime);
 				if (next.settings.permission === "read" || next.settings.permission === "plan") {
@@ -3232,8 +3515,11 @@ export class DesktopService {
 		if (isDelegatedChild || task?.quarantined) {
 			for (const name of ["WorktreeCreate", "WorktreeMerge", "WorktreeRemove"]) disabledTools.add(name);
 		}
-		const dontAsk = Boolean(inherited?.dontAsk || parent?.dontAsk);
-		const parentCeiling = parent?.mode ?? this.store.settings.permission;
+		// Global "dontAsk" is the ask policy with every remaining prompt turned into a denial.
+		const globalDontAsk = this.store.settings.permission === "dontAsk";
+		const globalMode: RuntimePermissionPolicy["mode"] = globalDontAsk ? "ask" : (this.store.settings.permission as RuntimePermissionPolicy["mode"]);
+		const dontAsk = Boolean(globalDontAsk || inherited?.dontAsk || parent?.dontAsk);
+		const parentCeiling = parent?.mode ?? globalMode;
 		let mode: RuntimePermissionPolicy["mode"];
 		if (task?.readOnly || task?.quarantined || parentCeiling === "read" || inherited?.mode === "read" || task?.permissionMode === "read") {
 			mode = "read";
@@ -3244,7 +3530,7 @@ export class DesktopService {
 		} else if (task?.permissionMode === "default") {
 			mode = "ask";
 		} else {
-			const modes = [this.store.settings.permission, inherited?.mode, parent?.mode].filter(
+			const modes = [globalMode, inherited?.mode, parent?.mode].filter(
 				(item): item is RuntimePermissionPolicy["mode"] => Boolean(item),
 			);
 			mode = modes.includes("ask") ? "ask" : modes.includes("acceptEdits") ? "acceptEdits" : "auto";
@@ -3497,7 +3783,7 @@ export class DesktopService {
 					project: rootProject,
 					projectTrusted: trusted,
 					conversationId: delegation.parentConversationId,
-					permissionMode: this.permissionPolicy(delegation.parentConversationId).mode,
+					permissionMode: this.hookPermissionMode(delegation.parentConversationId),
 					agentId,
 					agentType: delegation.subagentType,
 					prompt: input.message,
@@ -4335,6 +4621,18 @@ export class DesktopService {
 			await this.stopRuntime(runtime);
 		}
 		await Promise.allSettled([...this.commands]);
+		if (this.sessionEndHooks.size) {
+			// Shutdown waits for SessionEnd hooks no longer than the maximum hook timeout.
+			let timer: NodeJS.Timeout | undefined;
+			await Promise.race([
+				Promise.allSettled([...this.sessionEndHooks]),
+				new Promise<void>((resolve) => {
+					timer = setTimeout(resolve, SESSION_END_HOOK_WAIT_MS);
+					timer.unref?.();
+				}),
+			]);
+			if (timer) clearTimeout(timer);
+		}
 		await this.persist();
 		await this.persistence;
 		this.listeners.clear();
@@ -4563,6 +4861,11 @@ export class DesktopService {
 		};
 	}
 	private async stopRuntime(runtime: SessionRuntime, cursor: "capture" | "preserve" = "capture"): Promise<void> {
+		const endContext =
+			runtime.sessionStarted && !runtime.stopping
+				? this.sessionEndContext(runtime.conversationId, runtime.sessionPermissionMode)
+				: undefined;
+		runtime.sessionStarted = false;
 		runtime.stopping = true;
 		this.clearTaskProgressTimer(runtime);
 		if (cursor === "capture" && runtime.agent && runtime.engineStatus === "ready") {
@@ -4582,6 +4885,9 @@ export class DesktopService {
 		await runtime.loading;
 		await runtime.agent?.stop();
 		runtime.agent = undefined;
+		// Background shells end with the runtime that started them (they use its sandbox profile).
+		await this.monitors.stopShellsForConversation(runtime.conversationId, "runtime_stop");
+		runtime.shellEnv = undefined;
 		if (runtime.settling) await runtime.settling;
 		if (runtime.checkpointId) await this.finishRuntime(runtime, true);
 		runtime.pendingUI.clear();
@@ -4594,8 +4900,62 @@ export class DesktopService {
 		}
 		if (runtime.policyFile) await rm(runtime.policyFile, { force: true });
 		if (runtime.sandboxProfileFile) await rm(runtime.sandboxProfileFile, { force: true });
+		if (runtime.outputStyleFile) await rm(runtime.outputStyleFile, { force: true });
 		if (this.runtimes.get(runtime.conversationId) === runtime) this.runtimes.delete(runtime.conversationId);
+		if (endContext) this.fireSessionEnd(endContext);
 	}
+
+	/** PostCompact mirrors PreCompact's context; it never blocks the event stream. */
+	private firePostCompact(conversationId: string, reason: string, summary: string | undefined): void {
+		void (async () => {
+			const conversation = this.conversation(conversationId);
+			const meta = await this.hookContextFor(conversationId);
+			await this.hooks.run("PostCompact", {
+				project: this.trustProjectFor(conversation.project),
+				projectTrusted: this.isProjectTrusted(conversation.project),
+				conversationId,
+				permissionMode: this.hookPermissionMode(conversationId),
+				trigger: reason === "manual" ? "manual" : "auto",
+				...(typeof summary === "string" ? { compactSummary: summary.slice(0, 16384) } : {}),
+				agentId: meta.agentId,
+				agentType: meta.agentType,
+				extraHooks: meta.extraHooks,
+				env: this.options.env,
+			});
+		})().catch(() => {});
+	}
+
+	/** Capture hook context before the runtime goes away; a removed conversation yields nothing. */
+	private sessionEndContext(conversationId: string, permissionMode?: string): HookRunContext | undefined {
+		try {
+			const conversation = this.conversation(conversationId);
+			return {
+				project: this.trustProjectFor(conversation.project),
+				projectTrusted: this.isProjectTrusted(conversation.project),
+				conversationId,
+				permissionMode: permissionMode ?? this.hookPermissionMode(conversationId),
+				env: this.options.env,
+			};
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Fire-and-forget SessionEnd; "close" when the app is quitting, otherwise "other". */
+	private fireSessionEnd(context: HookRunContext): void {
+		const run = this.hooks
+			.run("SessionEnd", { ...context, reason: this.closed ? "close" : "other" })
+			.catch(() => undefined);
+		this.sessionEndHooks.add(run);
+		void run.finally(() => this.sessionEndHooks.delete(run));
+	}
+
+	/** Claude-compatible permission_mode for hooks: dontAsk is reported by name. */
+	private hookPermissionMode(conversationId: string): string {
+		const policy = this.permissionPolicy(conversationId);
+		return policy.dontAsk ? "dontAsk" : policy.mode;
+	}
+
 	private isSlotBorrower(task: DesktopTask): boolean {
 		if (!task.parentConversationId || task.runInBackground) return false;
 		const active = new Set(["running", "waiting_for_input"]);
@@ -4784,6 +5144,8 @@ export class DesktopService {
 			env.PI_DESKTOP_CONNECTIONS = JSON.stringify(this.connectionEnvironment(env, true));
 			delete env.PI_DESKTOP_MAX_COST;
 			delete env.PI_DESKTOP_MIN_BALANCE;
+			delete env.PI_DESKTOP_FALLBACK_MODEL;
+			if (this.store.settings.fallbackModel) env.PI_DESKTOP_FALLBACK_MODEL = JSON.stringify(this.store.settings.fallbackModel);
 			if (this.store.settings.minBalance) env.PI_DESKTOP_MIN_BALANCE = String(this.store.settings.minBalance);
 			runtime.policyFile = join(this.options.dataDir, `policy-${conversation.id}-${randomBytes(8).toString("hex")}.json`);
 			env.PI_DESKTOP_POLICY_FILE = runtime.policyFile;
@@ -4807,6 +5169,12 @@ export class DesktopService {
 			}
 			// Set these explicitly so an inherited shell environment cannot change a session's role.
 			env.PI_DESKTOP_CHILD = delegated ? "1" : "0";
+			delete env.PI_DESKTOP_OUTPUT_STYLE_FILE;
+			if (!delegated) {
+				runtime.outputStyleFile = join(this.options.dataDir, `style-${conversation.id}-${randomBytes(8).toString("hex")}.md`);
+				await this.writeOutputStyle(runtime);
+				env.PI_DESKTOP_OUTPUT_STYLE_FILE = runtime.outputStyleFile;
+			}
 			const costCap = await this.costCapFor(conversation.id, delegated);
 			if (costCap !== undefined) env.PI_DESKTOP_MAX_COST = String(costCap);
 			env.PI_DESKTOP_READ_ONLY_CHILD = delegated?.readOnly ? "1" : "0";
@@ -4900,6 +5268,8 @@ export class DesktopService {
 				const own = await stat(task.systemPromptFile).then((info) => info.isFile(), () => false);
 				if (own) args.push(...(discovered ? ["--append-system-prompt", discovered] : []), "--append-system-prompt", task.systemPromptFile);
 			}
+			// Background shells get the environment foreground bash inherits from this child.
+			runtime.shellEnv = env;
 			const agent = new AgentProcess({
 				executable: this.options.executable,
 				entry: this.options.entry ?? join(runtimeDir, "dist/bundle/rpc-entry.js"),
@@ -4923,11 +5293,13 @@ export class DesktopService {
 				reasoning,
 			}));
 			runtime.engineStatus = "ready";
+			runtime.sessionStarted = true;
+			runtime.sessionPermissionMode = this.hookPermissionMode(conversation.id);
 			void this.hooks.run("SessionStart", {
 				project: this.trustProjectFor(conversation.project),
 				projectTrusted: this.isProjectTrusted(conversation.project),
 				conversationId: conversation.id,
-				permissionMode: policyMode,
+				permissionMode: runtime.sessionPermissionMode ?? this.hookPermissionMode(conversation.id),
 				source: sessionFile ? "resume" : "startup",
 				env: this.options.env,
 			}).catch(() => {});
@@ -4951,6 +5323,7 @@ export class DesktopService {
 		} catch (error) {
 			runtime.engineStatus = "error";
 			runtime.engineError = error instanceof Error ? error.message : String(error);
+			this.diagnostic("error", "engine_start_failed", runtime.conversationId, runtime.engineError);
 			await runtime.agent?.stop();
 			runtime.agent = undefined;
 		}
@@ -5131,6 +5504,13 @@ export class DesktopService {
 			].includes(event.type)
 		)
 			runtime.transcriptRevision++;
+		// The extension switched to the fallback model mid-run; refresh the cached model state.
+		if (event.type === "entry_appended" && event.entry.type === "custom_message" && event.entry.customType === "desktop_model_fallback") {
+			runtime.transcriptRevision++;
+			// The run continues on the fallback model, so the primary's error is no longer the outcome.
+			runtime.lastError = undefined;
+			void this.syncState(runtime).catch(() => {});
+		}
 		const task = this.store.tasks.find((item) => item.conversationId === conversationId);
 		if (event.type === "extension_ui_request" && ["confirm", "select", "input", "editor"].includes(event.method)) {
 			runtime.pendingUI.set(event.id, event);
@@ -5144,7 +5524,7 @@ export class DesktopService {
 				project: this.trustProjectFor(conv.project),
 				projectTrusted: this.isProjectTrusted(conv.project),
 				conversationId,
-				permissionMode: this.permissionPolicy(conversationId).mode,
+				permissionMode: this.hookPermissionMode(conversationId),
 				notificationType: event.method === "confirm" ? "permission_prompt" : "elicitation_dialog",
 				title: "title" in event ? event.title : undefined,
 				message: "message" in event ? event.message : undefined,
@@ -5185,6 +5565,7 @@ export class DesktopService {
 		}
 		if (event.type === "compaction_start" && runtime.state) runtime.state.isCompacting = true;
 		if (event.type === "compaction_end" && runtime.state) runtime.state.isCompacting = false;
+		if (event.type === "compaction_end" && event.result && !event.aborted) this.firePostCompact(conversationId, event.reason, event.result.summary);
 		// Results deferred while an idle parent compacted are sent once compaction ends.
 		if (event.type === "compaction_end" && !runtime.busy) void this.flushNotifications(conversationId, "auto");
 		if (event.type === "message_end" && event.message.role === "assistant") {
@@ -5230,6 +5611,7 @@ export class DesktopService {
 			runtime.bashBusy = false;
 			runtime.engineStatus = "error";
 			runtime.engineError = event.message;
+			this.diagnostic("error", /^Pi 进程已退出/.test(event.message) ? "pi_process_exited" : "engine_error", conversationId, event.message);
 			runtime.pendingUI.clear();
 			this.syncTaskPendingApprovals(runtime, task);
 			runtime.settling = this.finishRuntime(runtime, false, event.message);
@@ -5507,6 +5889,16 @@ export function validateProxyUrl(raw: string): string | undefined {
  * inherited from the shell; both upper and lower case are set because undici
  * reads the lower-case names first.
  */
+/** Proxy URL without credentials, for display. */
+function proxyLabel(raw: string): string {
+	try {
+		const url = new URL(raw);
+		return `${url.protocol}//${url.host}`;
+	} catch {
+		return "（格式无法解析）";
+	}
+}
+
 export function networkEnvironment(settings: Pick<Settings, "proxy" | "noProxy" | "caFile">): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = {};
 	if (settings.proxy) {
@@ -5544,7 +5936,7 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 	)
 		throw new Error("会话配置格式错误。");
 	if (
-		!["ask", "acceptEdits", "read", "auto", "plan"].includes(value.settings.permission) ||
+		!["ask", "acceptEdits", "read", "auto", "plan", "dontAsk"].includes(value.settings.permission) ||
 		!["light", "dark", "grail", "system"].includes(value.settings.theme)
 	)
 		throw new Error("设置格式错误。");
@@ -5621,6 +6013,13 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 					? value.settings.minBalance
 					: undefined,
 			disableAllHooks: value.settings.disableAllHooks === true ? true : undefined,
+			fallbackModel: sanitizeFallbackModel(value.settings.fallbackModel),
+			outputStyle: (() => {
+				const name = validOutputStyleName(value.settings.outputStyle);
+				return name && name.toLowerCase() !== DEFAULT_OUTPUT_STYLE ? name : undefined;
+			})(),
+			editor: EDITOR_CHOICES.includes(value.settings.editor as EditorChoice) ? value.settings.editor : undefined,
+			statusBalance: value.settings.statusBalance === false ? false : undefined,
 			proxy: storedText(value.settings.proxy, 2048),
 			noProxy: storedText(value.settings.noProxy, 4096),
 			caFile: storedText(value.settings.caFile, 4096, true),
@@ -5642,6 +6041,10 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 		projectTrust,
 	};
 	return { state, dropped };
+}
+
+function fallbackKey(ref: { provider: string; id: string } | undefined): string {
+	return ref ? `${ref.provider}/${ref.id}` : "";
 }
 
 function summarizeToolActivity(toolName: string, args: unknown): string | undefined {
