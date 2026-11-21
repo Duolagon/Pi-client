@@ -119,6 +119,13 @@ export function CheckpointsDialog({
 				</div>
 
 				<div className="cc-rewind-detail">
+					{!loading && !checkpoints.length && (
+						<div className="cc-empty-state">
+							<History size={22} aria-hidden="true" />
+							<strong>还没有检查点</strong>
+							<p>Pi 每次修改文件或执行命令前，会自动记录一个 Git 检查点。之后可以在这里查看改动，并把文件恢复到当时的状态。</p>
+						</div>
+					)}
 					{activeCp && (
 						<div className="cc-rewind-head">
 							<div>

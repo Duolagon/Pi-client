@@ -11,15 +11,14 @@ import { _electron as electron } from "playwright";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const executableArgument = process.argv.indexOf("--executable");
-const executable =
-	executableArgument >= 0
-		? resolve(process.argv[executableArgument + 1])
-		: join(
-				repo,
-				"release/desktop",
-				process.arch === "arm64" ? "mac-arm64" : "mac",
-				"Pi Desktop.app/Contents/MacOS/Pi Desktop",
-			);
+const builtExecutable = join(
+	repo,
+	"release/desktop",
+	process.arch === "arm64" ? "mac-arm64" : "mac",
+	"Pi Desktop.app/Contents/MacOS/Pi Desktop",
+);
+// To test the installed copy, pass --executable "/Applications/Pi Desktop.app/Contents/MacOS/Pi Desktop".
+const executable = executableArgument >= 0 ? resolve(process.argv[executableArgument + 1]) : builtExecutable;
 const capture = process.argv.includes("--screenshots");
 async function until(check, label) {
 	const deadline = Date.now() + 20000;
@@ -32,6 +31,7 @@ async function until(check, label) {
 await access(executable).catch(() => {
 	throw new Error("Build the application first with npm run package, or pass --executable /path/to/application.");
 });
+console.log(`Verifying ${executable}`);
 const root = await mkdtemp(join(tmpdir(), "pi-client-ui-"));
 const project = join(root, "pi-client-demo");
 const agentDir = join(root, "agent");

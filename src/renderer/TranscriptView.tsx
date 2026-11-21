@@ -67,6 +67,10 @@ function countLines(text: string): number {
 	return text.replace(/\r?\n$/, "").split("\n").length;
 }
 
+function linesLabel(count: number): string {
+	return `${count} ${count === 1 ? "line" : "lines"}`;
+}
+
 /** Copies text, falling back to a hidden textarea when the async clipboard is unavailable. */
 async function copyText(text: string): Promise<boolean> {
 	try {
@@ -586,13 +590,13 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 		return {
 			verb: "Read",
 			target: path || "file",
-			badge: status === "done" && output ? `${lineCount} lines` : undefined,
+			badge: status === "done" && output ? linesLabel(lineCount) : undefined,
 			treeSummary:
 				status === "running"
 					? "正在读取文件…"
 					: status === "error"
 						? output?.split("\n")[0] || "读取失败"
-						: `Read ${lineCount} lines${offset > 1 ? ` (from line ${offset})` : ""}`,
+						: `Read ${linesLabel(lineCount)}${offset > 1 ? ` (from line ${offset})` : ""}`,
 			lineContent: output ? { content: output, startLine: offset } : undefined,
 		};
 	}
@@ -631,13 +635,13 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 		return {
 			verb: "Write",
 			target: path || "file",
-			badge: wroteLines && status !== "error" ? `${wroteLines} lines` : undefined,
+			badge: wroteLines && status !== "error" ? linesLabel(wroteLines) : undefined,
 			treeSummary:
 				status === "running"
 					? "正在写入文件…"
 					: status === "error"
 						? output?.split("\n")[0] || "写入失败"
-						: `Wrote ${wroteLines} lines to ${path || "file"}`,
+						: `Wrote ${linesLabel(wroteLines)} to ${path || "file"}`,
 			lineContent: content ? { content, startLine: 1 } : undefined,
 		};
 	}

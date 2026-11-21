@@ -26,6 +26,8 @@
 		"test:backend": "node --test test/*.test.ts",
 		"verify:client": "node scripts/verify-client.mjs",
 		"package": "node scripts/build.mjs && electron-builder --config desktop-builder.json --config.mac.identity=null --dir",
+		"install:app": "node scripts/install-mac.mjs",
+		"release:local": "npm run package && npm run verify:client && node scripts/install-mac.mjs",
 		"dist:mac": "node scripts/build.mjs && electron-builder --config desktop-builder.json --config.mac.identity=null --mac zip --publish never",
 		"dist:mac:signed": "node scripts/build.mjs && electron-builder --config desktop-builder.json --config.forceCodeSigning=true --config.mac.notarize=true --mac zip --publish never"
 	},

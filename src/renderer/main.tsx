@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { createRoot } from "react-dom/client";
 import {
 	FolderOpen,
@@ -16,6 +16,8 @@ import {
 	ShieldCheck,
 	ShieldAlert,
 	SquarePen,
+	ArrowDown,
+	Trash2,
 	Archive,
 	History,
 	ListTodo,
@@ -157,6 +159,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [externalTasksMap, setExternalTasksMap] = useState<Record<string, ExternalTask>>({});
 	const [gitSummary, setGitSummary] = useState<{ branch: string; count: number; isGit: boolean } | null>(null);
 	const [rename, setRename] = useState<string | null>(null);
+	const [renameId, setRenameId] = useState<string | undefined>();
+	const [convMenu, setConvMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+	/** Text the user sent while a run was active, per conversation; Pi only exposes a count. */
+	const [queued, setQueued] = useState<Record<string, string[]>>({});
+	const [showJump, setShowJump] = useState(false);
 	const [sandboxStatus, setSandboxStatus] = useState<SandboxStatus | null>(null);
 	const [sandboxOpen, setSandboxOpen] = useState(false);
 	const [moreMenuOpen, setMoreMenuOpen] = useState(false);
@@ -189,12 +196,46 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	}, [moreMenuOpen]);
 	useEffect(() => {
 		stickToEnd.current = true;
+		setShowJump(false);
 		setDeferredApproval(undefined);
 		setFocusedSubagentTaskId(null);
 	}, [snapshot?.active?.id]);
 	useEffect(() => {
 		setTrustOpen(false);
 	}, [snapshot?.active?.project]);
+	useEffect(() => {
+		const id = snapshot?.active?.id;
+		if (!id || snapshot?.state?.pendingMessageCount) return;
+		setQueued((prev) => (prev[id]?.length ? { ...prev, [id]: [] } : prev));
+	}, [snapshot?.active?.id, snapshot?.state?.pendingMessageCount, queued]);
+	const focusFirstMenuItem = useCallback((node: HTMLDivElement | null) => {
+		node?.querySelector<HTMLElement>('[role="menuitem"]:not([disabled])')?.focus();
+	}, []);
+	const sendPrompt: typeof app.send = async (value) => {
+		const id = snapshot?.active?.id;
+		const wasRunning = running;
+		const result = await app.send(value);
+		if (wasRunning && id && result?.disposition === "queued" && value.message.trim())
+			setQueued((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), value.message.trim()] }));
+		return result;
+	};
+	const withdrawQueued = async () => {
+		const id = snapshot?.active?.id;
+		if (!id) return;
+		try {
+			const result = (await api.command({ type: "clear_queue" }, id)) as { steering?: string[]; followUp?: string[] } | undefined;
+			const texts = [...(result?.steering ?? []), ...(result?.followUp ?? [])].filter((text) => text.trim());
+			const restored = texts.length ? texts : queued[id] ?? [];
+			if (restored.length) app.prependDraft(id, restored.join("\n\n"));
+			setQueued((prev) => ({ ...prev, [id]: [] }));
+			await app.refresh();
+			setFlash(restored.length ? "排队的指令已放回输入框" : "队列已清空");
+			composerInputRef.current?.focus();
+		} catch (error) {
+			app.fail(error);
+		}
+	};
+
 	useEffect(() => {
 		if (stickToEnd.current) scroll.current?.scrollTo({ top: scroll.current.scrollHeight });
 	}, [history, running]);
@@ -908,9 +949,16 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										<div key={session.id} className="cl-conv-wrap">
 											<div className={`cl-conv-row ${session.id === snapshot.active?.id ? "selected" : ""}`}>
 												<button
+													data-conv-id={session.id}
 													className={`cl-conv ${session.id === snapshot.active?.id ? "selected" : ""}`}
 													disabled={changing}
 													onClick={() => switchTo(() => api.selectConversation(session.id))}
+													onContextMenu={(event) => {
+														event.preventDefault();
+														const box = event.currentTarget.getBoundingClientRect();
+														const keyboard = event.clientX === 0 && event.clientY === 0;
+														setConvMenu({ id: session.id, x: keyboard ? box.left + 24 : event.clientX, y: keyboard ? box.bottom : event.clientY });
+													}}
 													aria-current={session.id === snapshot.active?.id ? "page" : undefined}
 												>
 													<span className="cl-conv-line">
@@ -1021,22 +1069,34 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				</aside>
 			)}
 			<main className="cl-main">
+				{flash && (
+					<div className="cc-flash" role="status" aria-live="polite">
+						<Check size={14} />
+						<span>{flash}</span>
+					</div>
+				)}
 				{isGrail && <MagicCircleBackdrop />}
 				<header className={`cl-top ${sidebar ? "" : "cl-top-collapsed"}`}>
 					<div className="cl-top-title">
-						{!sidebar && (
+						{(!sidebar || pane || previewUrl) && (
 							<>
 								<IconButton
 									icon={PanelLeftOpen}
 									label="展开侧栏"
+									className="cl-narrow-only"
 									onClick={() => {
-										setSidebar(true);
+										if (sidebar) {
+											// Narrow layout hid the sidebar for the side panel; close the panel to bring it back.
+											setPane(null);
+											setPreviewUrl(null);
+										} else setSidebar(true);
 										requestAnimationFrame(() => document.querySelector<HTMLElement>('[aria-label="收起侧栏"]')?.focus());
 									}}
 								/>
 								<IconButton
 									icon={SquarePen}
 									label="新建会话"
+									className="cl-narrow-only"
 									disabled={changing || !snapshot.active}
 									onClick={() => startNewConversation()}
 								/>
@@ -1057,7 +1117,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								<button
 									className="cl-title-button"
 									disabled={blocked}
-									onClick={() => setRename(snapshot.active?.title ?? "")}
+									onClick={() => { setRenameId(undefined); setRename(snapshot.active?.title ?? ""); }}
 									title="点击重命名会话"
 								>
 									{snapshot.active.title}
@@ -1322,11 +1382,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											<Download size={14} />
 											<span>导出会话</span>
 										</button>
-										{!sidebar && (
+										{(!sidebar || pane || previewUrl) && (
 											<button
 												type="button"
 												role="menuitem"
-												className="cc-more-item"
+												className="cc-more-item cl-narrow-only"
 												onClick={() => {
 													setMoreMenuOpen(false);
 													setSettings(true);
@@ -1460,6 +1520,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									onScroll={(event) => {
 										const element = event.currentTarget;
 										stickToEnd.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+										const far = element.scrollHeight - element.scrollTop - element.clientHeight > 240;
+										if (far !== showJump) setShowJump(far);
 									}}
 								>
 									{history.messages.length ? (
@@ -1590,12 +1652,25 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										<div className="cl-working" role="status">
 											{isGrail ? <MagicCircleLoader size={16} /> : <span className="cl-spinner" />}
 											{isGrail ? "从者正在咏唱与执行…" : "Pi 正在工作"}
-											{snapshot.state?.pendingMessageCount ? ` · ${snapshot.state.pendingMessageCount} 条指令待处理` : ""}
 										</div>
 									)}
-									{!running && !!snapshot.state?.pendingMessageCount && (
-										<div className="cl-working cc-queued-note" role="status">
-											已停止。还有 {snapshot.state.pendingMessageCount} 条指令在排队，会和你的下一条消息一起发送。
+									{!!snapshot.state?.pendingMessageCount && (
+										<div className="cc-queue" role="region" aria-label="排队的指令">
+											<div className="cc-queue-head">
+												<span>
+													{running
+														? `${snapshot.state.pendingMessageCount} 条指令排队中，当前步骤结束后发送`
+														: `已停止，${snapshot.state.pendingMessageCount} 条指令还在排队，会和下一条消息一起发送`}
+												</span>
+												<button type="button" className="cc-mini-btn" onClick={() => void withdrawQueued()}>
+													撤回到输入框
+												</button>
+											</div>
+											{(queued[snapshot.active?.id ?? ""] ?? []).map((text, index) => (
+												<p key={`${index}-${text.slice(0, 16)}`} className="cc-queue-item" title={text}>
+													{text}
+												</p>
+											))}
 										</div>
 									)}
 									{!running && isGrail && omenReveal && (
@@ -1603,6 +1678,20 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											<OmenGlyph omen={omenReveal.omen} width={17} height={17} />
 											<span>{omenReveal.label}</span>
 										</div>
+									)}
+									{showJump && (
+										<button
+											type="button"
+											className="cc-jump-latest"
+											onClick={() => {
+												stickToEnd.current = true;
+												setShowJump(false);
+												scroll.current?.scrollTo({ top: scroll.current.scrollHeight, behavior: "smooth" });
+											}}
+										>
+											<ArrowDown size={14} aria-hidden="true" />
+											{running ? "有新输出 · 跳到最新" : "跳到最新"}
+										</button>
 									)}
 								</div>
 						{latestTodos.length > 0 && (
@@ -1782,7 +1871,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							changing={changing || bashBusy}
 							planMode={inPlanMode}
 							onTogglePlanMode={() => void togglePlanMode()}
-							send={app.send}
+							send={sendPrompt}
 							stop={() => void app.command({ type: "abort" })}
 							command={app.command}
 							setPermission={(permission) => void savePermission(permission)}
@@ -1858,12 +1947,6 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					onReport={(report) => app.setDraft([app.draft, report].filter(Boolean).join("\n\n"))}
 					close={() => setPreviewUrl(null)}
 				/>
-			)}
-			{flash && (
-				<div className="cc-flash" role="status" aria-live="polite">
-					<Check size={14} />
-					<span>{flash}</span>
-				</div>
 			)}
 			{trustOpen && snapshot.trust && (
 				<ProjectTrustDialog
@@ -1974,15 +2057,90 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					</Modal>
 				);
 			})()}
+			{convMenu && (() => {
+				const target = snapshot.conversations.find((item) => item.id === convMenu.id);
+				if (!target) return null;
+				const closeMenu = (focusRow = true) => {
+					setConvMenu(null);
+					if (focusRow) requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-conv-id="${target.id}"]`)?.focus());
+				};
+				const busyHere = app.activity[target.id] === "running" || app.activity[target.id] === "approval";
+				return (
+					<div
+						className="cc-conv-menu-layer"
+						onMouseDown={(event) => {
+							if (event.target === event.currentTarget) closeMenu(false);
+						}}
+						onContextMenu={(event) => {
+							event.preventDefault();
+							closeMenu(false);
+						}}
+					>
+						<div
+							className="cc-conv-menu"
+							role="menu"
+							aria-label={`会话「${target.title}」操作`}
+							style={{ left: Math.min(convMenu.x, window.innerWidth - 188), top: Math.min(convMenu.y, window.innerHeight - 96) }}
+							onKeyDown={(event) => {
+								if (event.key === "Escape") {
+									event.preventDefault();
+									closeMenu();
+									return;
+								}
+								menuKeyNav(event);
+							}}
+							ref={focusFirstMenuItem}
+						>
+							<button
+								type="button"
+								role="menuitem"
+								className="cc-more-item"
+								disabled={blocked}
+								onClick={() => {
+									closeMenu(false);
+									setRenameId(target.id);
+									setRename(target.title);
+								}}
+							>
+								<SquarePen size={14} />
+								<span>重命名</span>
+							</button>
+							<button
+								type="button"
+								role="menuitem"
+								className="cc-more-item danger"
+								disabled={changing || busyHere}
+								title={busyHere ? "会话正在运行或等待审批，暂不能移除" : undefined}
+								onClick={() => {
+									closeMenu(false);
+									if (!window.confirm(`从列表中移除「${target.title}」？\n会话记录文件会保留在磁盘上。`)) return;
+									void api
+										.removeConversation(target.id)
+										.then((next) => {
+											app.apply(next);
+											setFlash("会话已移除");
+										})
+										.catch(app.fail);
+								}}
+							>
+								<Trash2 size={14} />
+								<span>从列表移除</span>
+							</button>
+						</div>
+					</div>
+				);
+			})()}
 			{rename !== null && (
-				<Modal title="重命名会话" close={() => setRename(null)}>
+				<Modal title="重命名会话" close={() => { setRename(null); setRenameId(undefined); }}>
 					<form
 						className="simple-dialog"
 						onSubmit={(event) => {
 							event.preventDefault();
-							if (snapshot.active && rename.trim()) {
-								void app.switchTo(() => api.renameConversation(snapshot.active!.id, rename.trim()));
+							const target = renameId ?? snapshot.active?.id;
+							if (target && rename.trim()) {
+								void app.switchTo(() => api.renameConversation(target, rename.trim()));
 								setRename(null);
+								setRenameId(undefined);
 							}
 						}}
 					>

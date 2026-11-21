@@ -179,3 +179,29 @@ test(
 		}
 	},
 );
+
+test("removing conversations keeps one active and survives restart", { timeout: 45000 }, async () => {
+	const data = await setup();
+	let current = data.service;
+	try {
+		const second = await current.newConversation();
+		const secondId = second.active!.id;
+		assert.notEqual(secondId, data.id);
+		const afterInactive = await current.removeConversation(data.id);
+		assert.equal(afterInactive.active?.id, secondId);
+		assert.deepEqual(afterInactive.conversations.map((item) => item.id), [secondId]);
+		const afterActive = await current.removeConversation(secondId);
+		assert.equal(afterActive.conversations.length, 1);
+		assert.ok(afterActive.active);
+		assert.notEqual(afterActive.active.id, secondId);
+		await assert.rejects(current.removeConversation(secondId), /会话不存在/);
+		const keptId = afterActive.active.id;
+		await current.close();
+		current = new DesktopService({ ...data.options, initialProject: undefined });
+		const restarted = await current.initialize();
+		assert.deepEqual(restarted.conversations.map((item) => item.id), [keptId]);
+	} finally {
+		await current.close();
+		await data.fixture.cleanup();
+	}
+});

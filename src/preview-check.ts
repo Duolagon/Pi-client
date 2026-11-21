@@ -15,6 +15,21 @@ export function localPreviewUrl(input: string): URL {
 	return url;
 }
 
+/** Cheap reachability check for the preview panel: does anything answer on this local address? */
+export async function probePreview(input: string): Promise<boolean> {
+	const url = localPreviewUrl(input);
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 2500);
+	try {
+		await fetch(url, { method: "HEAD", redirect: "manual", signal: controller.signal });
+		return true;
+	} catch {
+		return false;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 let checking = false;
 
 export async function checkPreview(input: string, mobile: boolean): Promise<PreviewCheck> {

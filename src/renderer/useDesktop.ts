@@ -20,6 +20,11 @@ export function useDesktop(api: DesktopAPI) {
 		if (id) drafts.current.set(id, value);
 		putDraft(value);
 	};
+	const prependDraft = (id: string, text: string) => {
+		const next = [text, drafts.current.get(id) ?? ""].filter((part) => part.trim()).join("\n\n");
+		drafts.current.set(id, next);
+		if (activeId.current === id) putDraft(next);
+	};
 	const [requests, setRequests] = useState<RpcExtensionUIRequest[]>([]);
 	const [revision, setRevision] = useState(0);
 	const activeId = useRef<string | undefined>(undefined);
@@ -244,6 +249,7 @@ export function useDesktop(api: DesktopAPI) {
 				setRunning(previous);
 				await refresh();
 			}
+			return result;
 		} catch (cause) {
 			if (activeId.current === id) {
 				fail(cause);
@@ -276,6 +282,7 @@ export function useDesktop(api: DesktopAPI) {
 		}
 	};
 	return {
+		prependDraft,
 		snapshot,
 		activity,
 		history,

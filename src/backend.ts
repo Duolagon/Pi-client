@@ -1315,6 +1315,43 @@ export class DesktopService {
 		return this.buildSnapshot();
 	}
 
+	/**
+	 * Removes a conversation from the sidebar. The Pi session file stays on disk.
+	 * Conversations that tasks or sub-agents still reference are refused, because task
+	 * lookups expect their conversation to exist.
+	 */
+	removeConversation(id: string): Promise<Snapshot> {
+		return this.serialize(async () => {
+			const conversation = this.conversation(id);
+			if (this.store.conversations.some((item) => item.parentConversationId === id))
+				throw new Error("此会话还有子 Agent 会话，暂不能移除。");
+			if (this.store.tasks.some((task) => task.conversationId === id || task.parentConversationId === id))
+				throw new Error("此会话关联了后台任务，暂不能移除。");
+			const runtime = this.runtimes.get(id);
+			if (runtime) {
+				this.assertRuntimeIdle(runtime);
+				if (runtime.pendingUI.size) throw new Error("请先处理此会话的审批，再移除。");
+			}
+			if (this.terminals.list(id).some((terminal) => terminal.status !== "exited"))
+				throw new Error("请先关闭此会话的终端，再移除。");
+			await this.monitors.stopForConversation([id], "user_stop", { includeRoot: true });
+			for (const job of await this.cron.list(id, conversation.project)) await this.cron.delete(job.id, id);
+			if (runtime) await this.stopRuntime(runtime);
+			await this.terminals.closeConversation(id);
+			this.viewing.delete(id);
+			this.store.conversations = this.store.conversations.filter((item) => item.id !== id);
+			if (this.store.activeId === id) {
+				const next =
+					this.store.conversations.find((item) => item.project === conversation.project && !item.parentConversationId) ??
+					this.createConversation(conversation.project);
+				await this.activate(next);
+			} else {
+				await this.persist();
+			}
+			return this.buildSnapshot();
+		});
+	}
+
 	forkSession(input: SessionForkInput): Promise<SessionCopyResult> {
 		return this.serialize(() => this.copySession(input, input.entryId));
 	}

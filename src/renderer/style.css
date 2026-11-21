@@ -4480,9 +4480,6 @@ button:disabled,
 .cl-attachments > span > button {
 	flex: none;
 }
-.cc-queued-note {
-	color: var(--cl-amber);
-}
 /* Resizable inspector */
 .live-app.has-inspector {
 	grid-template-columns: var(--cl-side-w) minmax(0, 1fr) var(--inspector-w, 400px);
@@ -4622,4 +4619,193 @@ body.cc-resizing iframe {
 	background: var(--cl-surface);
 	color: var(--cl-text);
 	box-shadow: var(--elev-1);
+}
+/* Sidebar conversation context menu */
+.cc-conv-menu-layer {
+	position: fixed;
+	inset: 0;
+	z-index: 80;
+}
+.cc-conv-menu {
+	position: fixed;
+	width: 180px;
+	padding: 4px;
+	background: var(--cl-surface);
+	border: 1px solid var(--cl-line);
+	border-radius: var(--r-lg);
+	box-shadow: var(--elev-3);
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+}
+.cc-more-item:hover:not(:disabled),
+.cc-more-item:focus-visible {
+	background: var(--cl-hover);
+	color: var(--cl-text);
+}
+.cc-more-item:disabled {
+	opacity: 0.45;
+}
+.cc-more-item.danger {
+	color: var(--cl-red);
+}
+.cc-more-item.danger:hover:not(:disabled) {
+	color: var(--cl-red);
+}
+/* Jump to latest while scrolled up */
+.cc-jump-latest {
+	position: sticky;
+	bottom: 12px;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	width: max-content;
+	margin: 8px auto 0;
+	height: 30px;
+	padding: 0 12px;
+	border-radius: var(--r-pill);
+	border: 1px solid var(--cl-line);
+	background: var(--cl-surface);
+	color: var(--cl-text);
+	font-size: var(--fs-sm);
+	box-shadow: var(--elev-2);
+	z-index: 5;
+}
+.cc-jump-latest:hover {
+	background: var(--cl-hover);
+}
+/* Queued instructions */
+.cc-queue {
+	max-width: 820px;
+	margin: 0 auto 12px;
+	padding: 10px 12px;
+	border: 1px solid var(--cl-line);
+	border-radius: var(--r-lg);
+	background: var(--cl-surface);
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+.cc-queue-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	font-size: var(--fs-sm);
+	color: var(--cl-amber);
+}
+.cc-queue-item {
+	margin: 0;
+	padding: 6px 10px;
+	border-radius: var(--r-md);
+	background: var(--cl-soft);
+	color: var(--cl-2);
+	font-size: var(--fs-md);
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	max-height: 4.8em;
+	overflow: hidden;
+}
+/* Selects hug their current value, so the chevron sits next to the text. */
+.cl-pill select {
+	field-sizing: content;
+	min-width: 2ch;
+}
+/* Composer controls stay on one row and shrink instead of wrapping one item alone. */
+.cl-composer-row-left {
+	flex: 1 1 auto;
+	flex-wrap: nowrap;
+	overflow-x: clip;
+	overflow-y: visible;
+}
+.cl-composer-row-left > * {
+	flex-shrink: 1;
+	min-width: 0;
+}
+.cl-composer-row-left > .cl-icon-btn {
+	flex-shrink: 0;
+}
+.cl-composer-row-left .cl-pill {
+	min-width: 0;
+	max-width: 100%;
+}
+.cl-composer-row-left .cl-pill select {
+	max-width: 100%;
+}
+@media (max-width: 1280px) {
+	.live-app.has-inspector .cl-composer-hint {
+		display: none;
+	}
+}
+/* Narrow windows: the side panel takes the sidebar's place instead of covering the composer. */
+@media (max-width: 1000px) {
+	.live-app.has-inspector,
+	.live-app.has-inspector.cl-side-hidden {
+		grid-template-columns: minmax(0, 1fr) clamp(300px, 44vw, var(--inspector-w, 400px));
+	}
+	.live-app.has-inspector > .cl-side {
+		display: none;
+	}
+	.live-app.has-inspector .cl-top {
+		padding-left: var(--traffic-clear);
+	}
+	.live-app.has-inspector .inspector {
+		position: relative;
+		top: auto;
+		right: auto;
+		bottom: auto;
+		width: auto;
+		max-width: none;
+		box-shadow: none;
+		z-index: 4;
+	}
+}
+/* Empty states */
+.cc-empty-state {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 8px;
+	height: 100%;
+	min-height: 220px;
+	padding: 24px;
+	text-align: center;
+	color: var(--cl-3);
+}
+.cc-empty-state strong {
+	color: var(--cl-text);
+	font-size: var(--fs-lg);
+	font-weight: 600;
+}
+.cc-empty-state p {
+	margin: 0;
+	max-width: 36ch;
+	font-size: var(--fs-md);
+	line-height: 1.6;
+}
+.cc-preview-stage {
+	position: relative;
+}
+.cc-preview-empty {
+	position: absolute;
+	inset: 0;
+	background: var(--cl-bg);
+	z-index: 1;
+}
+/* The toast centres on the conversation column, not the whole window. */
+.cl-main {
+	position: relative;
+}
+.cl-main > .cc-flash {
+	position: absolute;
+}
+/* Sidebar entry points stay reachable when the narrow layout hides the sidebar for a side panel. */
+.live-app:not(.cl-side-hidden):not(.has-inspector) .cl-narrow-only {
+	display: none;
+}
+@media (min-width: 1001px) {
+	.live-app:not(.cl-side-hidden) .cl-narrow-only {
+		display: none;
+	}
 }

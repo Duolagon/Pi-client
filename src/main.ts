@@ -8,7 +8,7 @@ import { installControlHandlers } from "./control-ipc.ts";
 import { installExternalHandlers } from "./external-ipc.ts";
 import { installP8Handlers } from "./p8-ipc.ts";
 import type { Command, ConnectionInput, DesktopAPI } from "./shared.ts";
-import { checkPreview } from "./preview-check.ts";
+import { checkPreview, probePreview } from "./preview-check.ts";
 import { captureToolPath } from "./tool-path.ts";
 import { MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS } from "./delegation-limits.ts";
 import { parseModelRoutingUpdate } from "./model-routing.ts";
@@ -158,6 +158,7 @@ function installHandlers() {
 			return action(...args);
 		});
 	handle("pi:preview:check", (url, mobile) => checkPreview(string(url, "预览地址", 4096), mobile === true));
+	handle("pi:preview:probe", (url) => probePreview(string(url, "预览地址", 4096)));
 	handle("pi:snapshot", () => service.snapshot());
 	handle("pi:open-project", async () => {
 		const result = await dialog.showOpenDialog(window!, { title: "打开项目文件夹", properties: ["openDirectory"] });
@@ -173,6 +174,7 @@ function installHandlers() {
 	});
 	handle("pi:new-conversation", () => service.newConversation());
 	handle("pi:select-conversation", (id) => service.selectConversation(string(id, "会话 ID", 200)));
+	handle("pi:remove-conversation", (id) => service.removeConversation(string(id, "会话 ID", 200)));
 	handle("pi:rename", (id, title) =>
 		service.renameConversation(string(id, "会话 ID", 200), string(title, "会话名称", 160)),
 	);

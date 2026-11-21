@@ -400,6 +400,8 @@ export interface DesktopAPI {
 	newConversation(): Promise<Snapshot>;
 	selectConversation(id: string): Promise<Snapshot>;
 	renameConversation(id: string, title: string): Promise<Snapshot>;
+	/** Removes the conversation from the list; its Pi session file stays on disk. */
+	removeConversation(id: string): Promise<Snapshot>;
 	command(command: Command, conversationId?: string): Promise<unknown>;
 	respond(response: RpcExtensionUIResponse, conversationId?: string): Promise<void>;
 	files(path: string): Promise<FileEntry[]>;
@@ -421,6 +423,8 @@ export interface DesktopAPI {
 	writePlan(content: string, conversationId?: string): Promise<PlanFileState>;
 	btw(question: string): Promise<BtwResult>;
 	checkPreview(url: string, mobile: boolean): Promise<PreviewCheck>;
+	/** True when something answers on the local preview address. */
+	probePreview(url: string): Promise<boolean>;
 	inspectCode(conversationId: string, path: string, at?: CodePosition): Promise<CodeIntelligence>;
 	sandboxStatus(): Promise<SandboxStatus>;
 	importClaudePermissions(): Promise<ClaudePermissionsSyncResult>;

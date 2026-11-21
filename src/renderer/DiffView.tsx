@@ -208,7 +208,7 @@ export function InlineEditDiff({ oldText, newText }: { oldText: string; newText:
 }
 
 export function CodeLines({ content, startLine = 1, activeLine }: { content: string; startLine?: number; activeLine?: number }) {
-	const lines = useMemo(() => content.split("\n"), [content]);
+	const lines = useMemo(() => content.replace(/\r?\n$/, "").split("\n"), [content]);
 	return (
 		<div className="cc-code-lines">
 			{lines.map((line, idx) => (

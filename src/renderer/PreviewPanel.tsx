@@ -1,5 +1,5 @@
 import type { PreviewCheck } from "../shared.ts";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ExternalLink, Globe, Monitor, RefreshCw, Smartphone, X } from "lucide-react";
 import { IconButton } from "../prototype/ui.tsx";
 
@@ -32,6 +32,22 @@ export function PreviewPanel({
 	const [error, setError] = useState("");
 	const [checking, setChecking] = useState(false);
 	const [result, setResult] = useState<PreviewCheck | null>(null);
+	const [reachable, setReachable] = useState<boolean | null>(null);
+	useEffect(() => {
+		let cancelled = false;
+		setReachable(null);
+		void window.pi
+			.probePreview(activeUrl)
+			.then((ok) => {
+				if (!cancelled) setReachable(ok);
+			})
+			.catch(() => {
+				if (!cancelled) setReachable(false);
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [activeUrl, reloadKey]);
 
 	const verify = async () => {
 		setChecking(true);
@@ -95,6 +111,13 @@ export function PreviewPanel({
 			</section>}
 			{error && <div className="live-error" role="alert">{error}</div>}
 			<div className="cc-preview-stage">
+				{reachable === false && (
+					<div className="cc-empty-state cc-preview-empty" role="status">
+						<Globe size={22} aria-hidden="true" />
+						<strong>{new URL(activeUrl).host} 无法连接</strong>
+						<p>先在终端启动本地开发服务器，再点右上角的刷新。</p>
+					</div>
+				)}
 				<iframe
 					key={`${activeUrl}-${reloadKey}`}
 					title="本地应用网页预览"

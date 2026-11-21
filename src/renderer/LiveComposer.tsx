@@ -134,7 +134,7 @@ export function LiveComposer({
 	changing: boolean;
 	planMode?: boolean;
 	onTogglePlanMode?: () => void;
-	send: (prompt: Extract<Command, { type: "prompt" }>) => Promise<void>;
+	send: (prompt: Extract<Command, { type: "prompt" }>) => Promise<unknown>;
 	stop: () => void;
 	command: (value: Command) => Promise<void>;
 	setPermission: (value: PermissionMode) => void;
@@ -246,6 +246,7 @@ export function LiveComposer({
 			if (active.current) fail(error);
 		}
 	};
+	const unknownConfirmed = useRef("");
 	const submit = async () => {
 		const trimmed = draft.trim();
 		if (trimmed.startsWith("/") && !attachments.length) {
@@ -361,7 +362,17 @@ export function LiveComposer({
 				fail(new Error(`/${cmdName} 是 Claude Code 命令，Pi Desktop 暂不支持，未发送给模型。输入 / 查看可用命令。`));
 				return;
 			}
+			// A command-shaped name that nothing recognises is probably a typo. Paths such as
+			// /Users/me/file contain a slash and are sent as normal text.
+			const known = piCommand || Boolean(skill) || Boolean(builtin) ||
+				["clear", "compact", "btw", "loop", "batch"].includes(cmdName);
+			if (!known && /^[a-z0-9][a-z0-9:_-]*$/i.test(cmdName) && unknownConfirmed.current !== trimmed) {
+				unknownConfirmed.current = trimmed;
+				fail(new Error(`没有 /${cmdName} 这个命令，未发送。输入 / 查看可用命令；再按一次 Enter 会把这段文字原样发给模型。`));
+				return;
+			}
 		}
+		unknownConfirmed.current = "";
 		if (disabled || (!trimmed && !attachments.length)) return;
 		let input: Extract<Command, { type: "prompt" }>;
 		try {
