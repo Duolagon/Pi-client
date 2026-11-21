@@ -474,7 +474,14 @@ export async function evaluatePermission(
 			typeof input.subagent_type === "string" &&
 			input.subagent_type !== "general-purpose" &&
 			input.subagent_type !== "fork");
-	if (policy.mode === "read" && !readingTools.has(call.toolName) && !harmlessDesktopTools.has(call.toolName) && call.toolName !== "WebSearch" && !readModeSafeDelegation)
+	const previewReadOnly =
+		call.toolName === "PreviewCheck" &&
+		(input.action === undefined ||
+			input.action === "list_configs" ||
+			input.action === "server_logs" ||
+			input.action === "stop_server" ||
+			input.action === "check");
+	if (policy.mode === "read" && !readingTools.has(call.toolName) && !harmlessDesktopTools.has(call.toolName) && call.toolName !== "WebSearch" && !previewReadOnly && !readModeSafeDelegation)
 		return { action: "deny", reason: "当前为只读模式，此工具不可执行。" };
 	let targets: string[] = [];
 	const rawPath =
@@ -506,6 +513,7 @@ export async function evaluatePermission(
 			harmlessDesktopTools.has(call.toolName) ||
 			call.toolName === "WebFetch" ||
 			call.toolName === "WebSearch" ||
+			previewReadOnly ||
 			writingPlanFile ||
 			isSafePlanAgent;
 		if (!allowedInPlan) {
@@ -614,6 +622,7 @@ export async function evaluatePermission(
 		return result("allow", "项目或附加目录内的读取工具。");
 	if (harmlessDesktopTools.has(call.toolName)) return result("allow", "只读任务状态或任务取消操作。");
 	if (call.toolName === "WebSearch") return result("allow", "网络搜索（只读）。");
+	if (previewReadOnly) return result("allow", "本机网页隔离预览与检查。");
 	if (call.toolName === "CronCreate" || call.toolName === "CronDelete" || call.toolName === "ScheduleWakeup") {
 		return result("allow", "定时唤醒日程管理。");
 	}

@@ -157,6 +157,39 @@ export const toolSchemas: Record<DesktopModelToolName, JsonSchema> = {
 		line: { type: "integer", minimum: 1, description: "1-based line number (used for goToDefinition)" },
 		character: { type: "integer", minimum: 1, description: "1-based column number (used for goToDefinition)" },
 	}, ["operation", "filePath"]),
+	PreviewCheck: schema({
+		action: {
+			type: "string",
+			enum: ["list_configs", "start_server", "stop_server", "server_logs", "check"],
+			description: "list_configs reads .claude/launch.json; start_server/stop_server/server_logs manage dev servers; check (default) opens the local URL in a headless browser to run actions, read DOM, capture errors, and take screenshots.",
+		},
+		name: { ...boundedText(100), description: "Configuration name from .claude/launch.json" },
+		server_id: { ...boundedText(200), description: "Running preview server ID returned by start_server" },
+		url: { ...boundedText(4096), description: "Local loopback URL (http://localhost:... or http://127.0.0.1:...)" },
+		mobile: { type: "boolean", description: "Use mobile viewport (390x844) instead of desktop (1280x820)" },
+		actions: {
+			type: "array",
+			maxItems: 20,
+			description: "Optional UI actions to run before reading DOM / taking screenshot",
+			items: {
+				type: "object",
+				properties: {
+					type: { type: "string", enum: ["click", "fill", "wait", "wait_for", "scroll"] },
+					selector: { ...boundedText(500) },
+					value: { type: "string", maxLength: 4096 },
+					ms: { type: "integer", minimum: 50, maximum: 5000 },
+					timeoutMs: { type: "integer", minimum: 200, maximum: 5000 },
+					y: { type: "number" },
+				},
+				required: ["type"],
+				additionalProperties: false,
+			},
+		},
+		selector: { ...boundedText(500), description: "Optional CSS selector to read specific DOM text and outerHTML" },
+		read_dom: { type: "boolean", description: "Include DOM text and interactive elements summary (default true)" },
+		screenshot: { type: "boolean", description: "Capture and return a PNG screenshot of the rendered page" },
+		wait_ms: { type: "integer", minimum: 500, maximum: 60000, description: "Max time to wait for start_server to become reachable (default 15000)" },
+	}),
 };
 const descriptions: Record<DesktopModelToolName, string> = {
 	Agent: [
@@ -196,6 +229,7 @@ const descriptions: Record<DesktopModelToolName, string> = {
 	WorkflowRun: "Execute a deterministic multi-step workflow script in an isolated utilityProcess/VM sandbox using allowlisted agent(), parallel(), pipeline(), phase(), log(), and budget() primitives with durable journal recovery.",
 	StructuredOutput: "Submit the structured JSON result matching the workflow step's schema.",
 	LSP: "Query a locally installed Language Server (TypeScript/JS, Python/pyright, Go/gopls, Rust/rust-analyzer) for diagnostics, document symbols, or go-to-definition. Requires the project to be trusted and the language server installed on PATH.",
+	PreviewCheck: "Verify local web apps end-to-end: read .claude/launch.json (list_configs), start/stop/inspect dev servers (start_server, stop_server, server_logs), and load localhost URLs in an isolated headless browser (check) to click, fill inputs, scroll, read DOM text/HTML/interactive elements, check console/network errors, and capture PNG screenshots.",
 };
 
 function hostConfig(): { url: string; token: string } | undefined {
@@ -354,6 +388,19 @@ export default function toolControl(pi: ExtensionAPI): void {
 					// into this session's statistics without changing its context usage.
 					const shaped = asModelToolResult(record.data);
 					if (shaped) return { content: [{ type: "text", text: shaped.text }], details: shaped.details, ...(shaped.usage ? { usage: shaped.usage } : {}) };
+					if (name === "PreviewCheck" && record.data && typeof record.data === "object") {
+						const data = record.data as { text?: unknown; screenshotBase64?: unknown };
+						if (typeof data.text === "string") {
+							const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [
+								{ type: "text", text: data.text },
+							];
+							if (typeof data.screenshotBase64 === "string" && data.screenshotBase64.length > 0) {
+								content.push({ type: "image", data: data.screenshotBase64, mimeType: "image/png" });
+							}
+							const { screenshotBase64: _omit, ...details } = data as Record<string, unknown>;
+							return { content, details };
+						}
+					}
 					return { content: [{ type: "text", text: JSON.stringify(record.data ?? null) }], details: record.data };
 				},
 			});

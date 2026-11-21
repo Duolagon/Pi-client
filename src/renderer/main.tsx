@@ -633,6 +633,15 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			});
 			return;
 		}
+		if (action === "verify") {
+			if (!snapshot?.active || blocked) return;
+			const target = argument.trim();
+			const prompt = target
+				? `请使用 PreviewCheck 工具验证本地网页（${target}）：如有需要可先读取 .claude/launch.json 并启动开发服务器，加载页面后检查控制台与网络报错、读取关键 DOM、执行必要的点击交互并截图确认，最后总结验证结果。`
+				: "请使用 PreviewCheck 工具验证当前项目的本地网页：先调用 PreviewCheck(action=\"list_configs\") 查看 .claude/launch.json 配置，如有需要启动开发服务器并等待就绪，随后检查页面渲染、控制台/网络报错、关键 DOM 与交互并截图，最后汇报验证结果。";
+			void app.send({ type: "prompt", message: prompt, images: [] });
+			return;
+		}
 		if (action === "goal") {
 			const id = snapshot?.active?.id;
 			if (!id || !snapshot) return;

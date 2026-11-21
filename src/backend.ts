@@ -99,6 +99,8 @@ import { providerModels, providerPresets } from "./provider-presets.ts";
 import { memoryLimit, memoryName, privateMemoryLabel } from "./project-memory.ts";
 import { codeIntelligence, formatCodeIntelligence, formatLspDiagnostics, isLspSupportedFile, type CodePosition } from "./language-service.ts";
 import { buildGoalInitialPrompt, DEFAULT_GOAL_MAX_TURNS, evaluateGoalContinuation, MAX_GOAL_TURNS } from "./goal-mode.ts";
+import { buildLaunchShellCommand, launchConfigUrl, readLaunchConfigurations, validateLocalPreviewUrl } from "./launch-config.ts";
+import { formatPreviewInspectSummary, type PreviewInspectInput, type PreviewInspectResult, type PreviewInteraction } from "./preview-check-types.ts";
 import { detectProjectTrustResources } from "./project-trust.ts";
 import { DEFAULT_OUTPUT_STYLE, discoverOutputStyles, findOutputStyle, outputStylePromptSection, validOutputStyleName } from "./output-styles.ts";
 import { EDITOR_CHOICES, type EditorChoice } from "./editor-open.ts";
@@ -307,6 +309,8 @@ export interface ServiceOptions {
 	ptyHelperPath?: string;
 	/** Moves a deleted conversation's session file to the OS Trash (defaults to dataDir/trash). */
 	trashItem?: (filePath: string) => Promise<void>;
+	/** Headless Electron browser verification handler for the PreviewCheck model tool. */
+	inspectPreview?: (input: PreviewInspectInput) => Promise<PreviewInspectResult>;
 	archiveEntry?: string;
 	historyEntry?: string;
 	navigationExtension?: string;
@@ -388,6 +392,8 @@ export class DesktopService {
 	private notificationCounts = new Map<string, number>();
 	/** Conversations the renderer shows outside the active one (e.g. a task detail view). */
 	private viewing = new Set<string>();
+	/** Running preview dev servers started via PreviewCheck(start_server), keyed by monitor shell ID. */
+	private previewServers = new Map<string, { serverId: string; name: string; url?: string; rootConversationId: string }>();
 	private reapTimer?: NodeJS.Timeout;
 
 	constructor(options: ServiceOptions) {
@@ -2302,9 +2308,206 @@ export class DesktopService {
 		return this.todos.update(this.rootConversationId(conv.id), input);
 	}
 
+	private async probeLocalUrl(url: string, timeoutMs = 1500): Promise<boolean> {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), timeoutMs);
+		try {
+			await fetch(url, { method: "HEAD", redirect: "manual", signal: controller.signal });
+			return true;
+		} catch {
+			return false;
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	private async handlePreviewCheckTool(input: Record<string, unknown>, context: ToolHostContext): Promise<unknown> {
+		const conv = this.conversation(context.conversationId);
+		const rootId = this.rootConversationId(conv.id);
+		const action = (typeof input.action === "string" ? input.action : "check") as
+			| "list_configs"
+			| "start_server"
+			| "stop_server"
+			| "server_logs"
+			| "check";
+
+		const activeServers = () => {
+			const list: Array<{ server_id: string; name: string; url?: string; status: string }> = [];
+			for (const [id, entry] of this.previewServers) {
+				if (entry.rootConversationId !== rootId) continue;
+				const rec = this.monitors.get(id);
+				if (!rec) {
+					this.previewServers.delete(id);
+					continue;
+				}
+				list.push({ server_id: id, name: entry.name, url: entry.url, status: shellStatus(rec) });
+			}
+			return list;
+		};
+
+		if (action === "list_configs") {
+			const configResult = await readLaunchConfigurations(conv.project);
+			const running = activeServers();
+			const lines: string[] = [];
+			if (!configResult.exists) {
+				lines.push("未找到 `.claude/launch.json`。可以直接传入 `url`（如 http://localhost:3000）执行 `PreviewCheck(action=\"check\")`，或创建 `.claude/launch.json` 配置开发服务器。");
+			} else if (configResult.configurations.length === 0) {
+				lines.push("`.claude/launch.json` 中没有有效的启动配置。");
+			} else {
+				lines.push("`.claude/launch.json` 可用配置：");
+				for (const cfg of configResult.configurations) {
+					const u = launchConfigUrl(cfg);
+					lines.push(`- ${cfg.name}${u ? ` (${u})` : ""}`);
+				}
+			}
+			if (configResult.warnings.length) {
+				lines.push("", "配置警告：", ...configResult.warnings.map((w) => `- ${w}`));
+			}
+			if (running.length) {
+				lines.push("", "当前运行中的预览服务器：", ...running.map((s) => `- ${s.name} [${s.status}] id=${s.server_id}${s.url ? ` ${s.url}` : ""}`));
+			}
+			return {
+				exists: configResult.exists,
+				configurations: configResult.configurations.map((c) => ({ name: c.name, url: launchConfigUrl(c), port: c.port })),
+				warnings: configResult.warnings,
+				runningServers: running,
+				text: lines.join("\n"),
+			};
+		}
+
+		if (action === "start_server") {
+			const trusted = this.store.projectTrust?.[this.trustProjectFor(conv.project)] === "trusted";
+			if (!trusted) throw new Error("请先信任此项目，再通过 .claude/launch.json 启动开发服务器。");
+			const configResult = await readLaunchConfigurations(conv.project);
+			if (!configResult.exists || !configResult.configurations.length) {
+				throw new Error("未找到可用的 `.claude/launch.json` 启动配置。");
+			}
+			const wantedName = typeof input.name === "string" ? input.name.trim() : undefined;
+			const config = wantedName
+				? configResult.configurations.find((c) => c.name === wantedName)
+				: configResult.configurations.length === 1
+					? configResult.configurations[0]
+					: undefined;
+			if (!config) {
+				const names = configResult.configurations.map((c) => c.name).join("、");
+				throw new Error(wantedName ? `未找到名为 "${wantedName}" 的启动配置（可用：${names}）。` : `存在多个启动配置，请指定 name：${names}`);
+			}
+			const url = launchConfigUrl(config);
+			const existing = activeServers().find((s) => s.name === config.name && s.status === "running");
+			if (existing) {
+				return {
+					server_id: existing.server_id,
+					name: existing.name,
+					url: existing.url,
+					ready: existing.url ? await this.probeLocalUrl(existing.url) : true,
+					reused: true,
+					text: `开发服务器 "${existing.name}" 已在运行中（server_id=${existing.server_id}${existing.url ? `，${existing.url}` : ""}）。`,
+				};
+			}
+			const command = buildLaunchShellCommand(config);
+			const task = this.store.tasks.find((item) => item.conversationId === conv.id);
+			const runtime = this.runtimes.get(conv.id);
+			const record = this.monitors.startShell({
+				conversationId: conv.id,
+				rootConversationId: rootId,
+				workingDirectory: config.cwd ?? task?.workingDirectory ?? conv.project,
+				env: runtime?.shellEnv ?? this.options.env,
+				sandboxProfileFile: runtime?.sandboxProfileFile,
+				command,
+				description: `Preview server: ${config.name}`,
+			});
+			this.previewServers.set(record.id, { serverId: record.id, name: config.name, url, rootConversationId: rootId });
+			let ready = false;
+			const waitMs = typeof input.wait_ms === "number" ? input.wait_ms : 15000;
+			if (url) {
+				const deadline = Date.now() + waitMs;
+				while (Date.now() < deadline) {
+					const live = this.monitors.get(record.id);
+					if (!live || live.status !== "running") break;
+					if (await this.probeLocalUrl(url, 1200)) {
+						ready = true;
+						break;
+					}
+					await new Promise((resolve) => setTimeout(resolve, 400));
+				}
+			}
+			const current = this.monitors.get(record.id);
+			const status = current ? shellStatus(current) : "exited";
+			return {
+				server_id: record.id,
+				name: config.name,
+				url,
+				status,
+				ready,
+				text: ready
+					? `开发服务器 "${config.name}" 已就绪：${url}（server_id=${record.id}）。`
+					: `开发服务器 "${config.name}" 已启动（status=${status}，server_id=${record.id}${url ? `，目标地址 ${url} 暂未响应，可用 server_logs 查看输出` : ""}）。`,
+			};
+		}
+
+		if (action === "stop_server" || action === "server_logs") {
+			const serverIdInput = typeof input.server_id === "string" ? input.server_id.trim() : undefined;
+			const nameInput = typeof input.name === "string" ? input.name.trim() : undefined;
+			const match = activeServers().find((s) => (serverIdInput ? s.server_id === serverIdInput : nameInput ? s.name === nameInput : true));
+			if (!match) throw new Error("未找到运行中的预览开发服务器。");
+			if (action === "server_logs") {
+				const out = this.monitors.readShell(match.server_id);
+				const combined = [out.stdout, out.stderr].filter(Boolean).join("\n").trim();
+				return {
+					server_id: match.server_id,
+					name: match.name,
+					...out,
+					text: `[Preview Server "${match.name}" (${out.status})]\n${combined || "(暂无新输出)"}`,
+				};
+			}
+			await this.monitors.stop(match.server_id, undefined, "model_stop");
+			this.previewServers.delete(match.server_id);
+			return {
+				server_id: match.server_id,
+				name: match.name,
+				status: "killed",
+				text: `已停止开发服务器 "${match.name}"（server_id=${match.server_id}）。`,
+			};
+		}
+
+		// action === "check"
+		let targetUrl = typeof input.url === "string" && input.url.trim() ? input.url.trim() : undefined;
+		if (!targetUrl) {
+			const serverIdInput = typeof input.server_id === "string" ? input.server_id.trim() : undefined;
+			const nameInput = typeof input.name === "string" ? input.name.trim() : undefined;
+			const running = activeServers().find((s) => (serverIdInput ? s.server_id === serverIdInput : nameInput ? s.name === nameInput : true));
+			if (running?.url) targetUrl = running.url;
+			else if (nameInput) {
+				const cfg = (await readLaunchConfigurations(conv.project)).configurations.find((c) => c.name === nameInput);
+				if (cfg) targetUrl = launchConfigUrl(cfg);
+			}
+		}
+		if (!targetUrl) throw new Error("请提供本机预览地址 `url`（例如 http://localhost:3000），或先通过 start_server 启动开发服务器。");
+		const validated = validateLocalPreviewUrl(targetUrl).href;
+		if (!this.options.inspectPreview) {
+			throw new Error("当前运行环境不支持无头浏览器预览检查（需在 Electron 桌面应用中运行）。");
+		}
+		const result = await this.options.inspectPreview({
+			url: validated,
+			mobile: input.mobile === true,
+			actions: Array.isArray(input.actions) ? (input.actions as PreviewInteraction[]) : undefined,
+			selector: typeof input.selector === "string" ? input.selector : undefined,
+			readDom: input.read_dom !== false,
+			screenshot: input.screenshot === true,
+			screenshotDir: join(this.options.dataDir, "preview-screenshots"),
+		});
+		return {
+			...result,
+			text: formatPreviewInspectSummary(result),
+		};
+	}
+
 	private async modelTool(request: DesktopToolInvocation, context: ToolHostContext): Promise<unknown> {
 		if (this.closed) throw new Error("桌面服务已关闭。");
 		const input = request.input;
+		if (request.tool === "PreviewCheck") {
+			return this.handlePreviewCheckTool(input, context);
+		}
 		if (request.tool === "LSP") {
 			const conv = this.conversation(context.conversationId);
 			const operation = String(input.operation) as "diagnostics" | "documentSymbol" | "goToDefinition" | "inspect";
