@@ -33,6 +33,9 @@
 	--dur: 180ms;
 	--dur-slow: 280ms;
 
+	/* Space reserved for the macOS window buttons (trafficLightPosition x=20). */
+	--traffic-clear: 96px;
+
 	/* 雾白 Mist palette */
 	--cl-bg: #fbfcfd;
 	--cl-side: #f3f5f8;
@@ -41,7 +44,7 @@
 	--cl-text: #161c26;
 	--cl-1: #161c26;
 	--cl-2: #4a5462;
-	--cl-3: #7d8696;
+	--cl-3: #5f6877;
 	--cl-line: #e1e5ec;
 	--cl-line-soft: #eceff4;
 	--cl-hover: #eaedf2;
@@ -77,7 +80,7 @@
 	--cl-text: #e6e9ee;
 	--cl-1: #e6e9ee;
 	--cl-2: #aab1bc;
-	--cl-3: #767e8b;
+	--cl-3: #9098a5;
 	--cl-line: #2a2f38;
 	--cl-line-soft: #22262e;
 	--cl-hover: #242932;
@@ -161,7 +164,7 @@
 	align-items: center;
 	justify-content: space-between;
 	gap: 8px;
-	padding: 0 10px 0 80px;
+	padding: 0 10px 0 var(--traffic-clear);
 	flex-shrink: 0;
 	-webkit-app-region: drag;
 }
@@ -511,7 +514,7 @@
 	-webkit-app-region: drag;
 }
 .cl-top.cl-top-collapsed {
-	padding-left: 80px;
+	padding-left: var(--traffic-clear);
 }
 .cl-top button,
 .cl-top .cc-ws-picker,
@@ -731,62 +734,57 @@
 }
 .cl-trust-banner {
 	display: flex;
-	align-items: flex-start;
+	align-items: center;
 	gap: 10px;
-	background: var(--cl-clay-soft);
-	border-left: 3px solid var(--cl-clay);
+	height: 40px;
+	padding: 0 8px 0 16px;
+	background: var(--cl-soft);
+	border-bottom: 1px solid var(--cl-line-soft);
 	color: var(--cl-2);
-	padding: 10px 16px;
 	font-size: var(--fs-sm);
-	line-height: 1.6;
 	flex-shrink: 0;
 }
 .cl-trust-banner > svg {
 	flex-shrink: 0;
-	margin-top: 2px;
 	color: var(--cl-clay);
 }
 .cl-trust-text {
 	display: flex;
+	align-items: baseline;
 	flex: 1;
 	min-width: 0;
-	flex-direction: column;
-	gap: 2px;
+	gap: 8px;
+	overflow: hidden;
+	white-space: nowrap;
 }
 .cl-trust-text strong {
 	color: var(--cl-text);
-	font-weight: 600;
+	font-weight: 500;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 .cl-trust-text span {
-	overflow-wrap: anywhere;
+	color: var(--cl-3);
+	flex-shrink: 0;
 }
 .cl-trust-banner > button {
 	flex-shrink: 0;
-	align-self: center;
-}
-.cl-auto-warning {
-	display: flex;
-	align-items: center;
-	gap: 10px;
-	background: var(--cl-remove);
-	border-left: 3px solid var(--cl-red);
-	color: var(--cl-2);
-	padding: 8px 16px;
+	height: 26px;
+	padding: 0 10px;
 	font-size: var(--fs-sm);
-	line-height: 1.6;
-	flex-shrink: 0;
 }
-.cl-auto-warning > svg {
-	flex-shrink: 0;
-	color: var(--cl-red);
+.cl-trust-banner > .cl-trust-close {
+	width: 26px;
+	padding: 0;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: var(--r-sm);
+	color: var(--cl-3);
 }
-.cl-auto-warning > span {
-	flex: 1;
-	min-width: 0;
-	overflow-wrap: anywhere;
-}
-.cl-auto-warning > button {
-	flex-shrink: 0;
+.cl-trust-banner > .cl-trust-close:hover {
+	background: var(--cl-hover);
+	color: var(--cl-text);
 }
 .cc-trust-dialog {
 	display: flex;
@@ -3932,7 +3930,6 @@ button.cc-review-line { border: 0; background: transparent; color: inherit; text
 .cc-interactive-terminal { padding: 4px 8px; height: min(42vh, 440px); background: #000; }
 .cc-interactive-terminal > .terminal { height: 100%; }
 .cc-return-approval { position: fixed; right: 22px; bottom: 22px; z-index: 12; }
-.cc-defer-approval { margin: 8px 16px 0; }
 
 /* Background sub-agent controls */
 .cc-task-stop-all {
@@ -4291,4 +4288,338 @@ button:disabled,
 }
 .cl-tool-name-free {
 	margin-left: 6px;
+}
+
+/* Attention dot on an icon button whose decision is still open. */
+.icon-button.cc-attn {
+	position: relative;
+}
+.icon-button.cc-attn::after {
+	content: "";
+	position: absolute;
+	top: 5px;
+	right: 5px;
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: var(--cl-amber);
+	box-shadow: 0 0 0 2px var(--cl-bg);
+}
+
+/* Transient confirmation toast, above the composer. */
+.cc-flash {
+	position: fixed;
+	left: 50%;
+	bottom: 196px;
+	z-index: 60;
+	transform: translateX(-50%);
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	max-width: min(520px, calc(100vw - 48px));
+	height: 34px;
+	padding: 0 14px;
+	border-radius: var(--r-pill);
+	background: var(--cl-surface);
+	border: 1px solid var(--cl-line);
+	box-shadow: var(--elev-3);
+	color: var(--cl-text);
+	font-size: var(--fs-sm);
+	white-space: nowrap;
+	animation: cc-flash-in var(--dur-slow) var(--ease-out) both;
+}
+.cc-flash > svg {
+	flex-shrink: 0;
+	color: var(--cl-green);
+}
+.cc-flash > span {
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+@keyframes cc-flash-in {
+	from {
+		opacity: 0;
+		transform: translate(-50%, 6px);
+	}
+	to {
+		opacity: 1;
+		transform: translate(-50%, 0);
+	}
+}
+
+/* Skip-confirm mode lives on the composer pill instead of a page-wide banner. */
+.cl-pill.cc-perm-auto {
+	color: var(--cl-red);
+	border-color: color-mix(in srgb, var(--cl-red) 40%, transparent);
+	background: color-mix(in srgb, var(--cl-red) 8%, var(--cl-surface));
+}
+.cl-pill.cc-perm-auto select {
+	color: inherit;
+}
+.cc-perm-dot.auto {
+	background: var(--cl-red);
+}
+
+/* ---- Interaction audit fixes (2026-11-21) ---- */
+.search-results > button.active {
+	background: var(--cl-hover);
+	color: var(--text);
+}
+.cc-search-empty {
+	margin: 0;
+	padding: 18px 12px;
+	text-align: center;
+	color: var(--cl-3);
+	font-size: var(--fs-sm);
+}
+.cc-search-current {
+	flex: none;
+	font-style: normal;
+	font-size: var(--fs-xs);
+	color: var(--cl-clay);
+}
+/* The terminal docks under the conversation at full width. */
+.cl-body {
+	flex-direction: column;
+}
+.cl-body > .terminal-panel {
+	height: clamp(180px, 34vh, 360px);
+}
+.terminal-panel header > button:not(.icon-button),
+.terminal-panel header > select {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	height: 26px;
+	padding: 0 8px;
+	border-radius: var(--r-sm);
+	font-size: var(--fs-sm);
+	color: var(--cl-2);
+	border: 1px solid var(--cl-line);
+	background: transparent;
+}
+.terminal-panel header > button:not(.icon-button):hover:not(:disabled) {
+	background: var(--cl-hover);
+	color: var(--cl-text);
+}
+.terminal-panel header > button:disabled {
+	opacity: 0.5;
+}
+.terminal-panel header > .terminal-demo {
+	text-align: right;
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+/* Dialog content scrolls inside the shell so footers and save buttons stay reachable. */
+.modal-shell > :not(header) {
+	min-height: 0;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+}
+.cc-agents {
+	min-height: min(460px, calc(100dvh - 160px));
+}
+/* Topbar: workspace chip and title shrink together instead of overlapping. */
+.cc-ws-picker-topbar {
+	flex: 0 1 auto;
+	min-width: 72px;
+}
+.cc-ws-picker-topbar .cc-ws-topbar-btn {
+	max-width: min(280px, 100%);
+	min-width: 0;
+}
+.cc-ws-picker-topbar .cc-ws-name {
+	min-width: 0;
+}
+.cc-ws-picker-topbar .cc-ws-branch {
+	flex: 0 1 auto;
+	min-width: 0;
+}
+.cl-top-title > .cl-title-button {
+	flex: 0 1 auto;
+	min-width: 48px;
+	max-width: none;
+}
+/* Diff panel change rows: left aligned, status badge separated from the path. */
+.cc-change-row .cc-change-open {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	text-align: left;
+	padding: 6px 8px;
+	border-radius: var(--r-sm);
+}
+.cc-change-row .cc-change-open .file-name {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.cc-change-row .cc-change-open > span:last-child {
+	flex: none;
+	min-width: 18px;
+	font-family: var(--mono);
+	font-size: var(--fs-xs);
+	color: var(--cl-3);
+	text-align: center;
+}
+/* Attachment chips: truncate the name, keep the remove button visible. */
+.cl-attachments > span {
+	overflow: visible;
+}
+.cl-attachment-name {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.cl-attachments > span > button {
+	flex: none;
+}
+.cc-queued-note {
+	color: var(--cl-amber);
+}
+/* Resizable inspector */
+.live-app.has-inspector {
+	grid-template-columns: var(--cl-side-w) minmax(0, 1fr) var(--inspector-w, 400px);
+	position: relative;
+}
+.live-app.has-inspector.cl-side-hidden {
+	grid-template-columns: minmax(0, 1fr) var(--inspector-w, 400px);
+}
+.cc-inspector-resize {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	right: calc(var(--inspector-w, 400px) - 3px);
+	width: 6px;
+	z-index: 6;
+	cursor: col-resize;
+	-webkit-app-region: no-drag;
+}
+.cc-inspector-resize::after {
+	content: "";
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	left: 2px;
+	width: 2px;
+	background: transparent;
+	transition: background var(--dur-fast) var(--ease);
+}
+.cc-inspector-resize:hover::after,
+.cc-inspector-resize:focus-visible::after,
+body.cc-resizing .cc-inspector-resize::after {
+	background: var(--cl-clay);
+}
+body.cc-resizing {
+	cursor: col-resize;
+	user-select: none;
+}
+body.cc-resizing iframe {
+	pointer-events: none;
+}
+@media (max-width: 1000px) {
+	.live-app.has-inspector {
+		grid-template-columns: var(--cl-side-w) minmax(0, 1fr);
+	}
+	.live-app.has-inspector.cl-side-hidden {
+		grid-template-columns: minmax(0, 1fr);
+	}
+	.cc-inspector-resize {
+		display: none;
+	}
+}
+/* Sub-agent fold control sits inside the parent row card. */
+.cl-conv-row {
+	position: relative;
+}
+.cl-conv-row > .cl-conv-fold {
+	position: absolute;
+	right: 8px;
+	bottom: 6px;
+	height: 18px;
+}
+.cl-conv-row:has(> .cl-conv-fold) > .cl-conv .cl-conv-sub {
+	padding-right: 40px;
+}
+.cl-skills-list button.active {
+	background: var(--cl-hover);
+}
+/* "稍后处理" sits with the dialog actions as a quiet text button. */
+.cc-defer-approval {
+	margin: 0;
+	border: 0;
+	background: transparent;
+	color: var(--cl-3);
+	padding: 0 6px;
+}
+.cc-defer-approval:hover:not(:disabled) {
+	color: var(--cl-text);
+	background: var(--cl-hover);
+}
+.permission-dialog .dialog-actions .cc-defer-approval {
+	margin-right: auto;
+}
+.cc-defer-approval.cc-defer-top {
+	align-self: flex-end;
+	margin: 8px 16px 0;
+}
+.cc-filter-input {
+	flex-shrink: 0;
+	min-height: 32px;
+}
+/* Long start-screen paths keep their tail (the project folder) visible. */
+.cc-empty-ws-path {
+	direction: rtl;
+	text-align: left;
+}
+.cc-empty-ws-path > bdi {
+	direction: ltr;
+	unicode-bidi: isolate;
+}
+.cc-rule-create-bar input {
+	height: 30px;
+	padding: 0 10px;
+	border: 1px solid var(--cl-line);
+	border-radius: var(--r-sm);
+	background: var(--cl-surface);
+	color: var(--cl-text);
+	font-size: var(--fs-md);
+}
+/* Narrow windows: show only the π mark rather than a clipped brand name. */
+@media (max-width: 1000px) {
+	.cl-side-title {
+		display: none;
+	}
+}
+/* Inspector tabs: clear selected state inside a padded segmented control. */
+.inspector-header [role="tablist"] {
+	display: inline-flex;
+	align-items: center;
+	gap: 2px;
+	padding: 2px;
+	border-radius: var(--r-md);
+	background: var(--cl-soft);
+}
+.inspector-header [role="tab"] {
+	height: 26px;
+	padding: 0 10px;
+	border-radius: var(--r-sm);
+	font-size: var(--fs-sm);
+	color: var(--cl-3);
+	font-weight: 500;
+	background: transparent;
+}
+.inspector-header [role="tab"]:hover {
+	color: var(--cl-text);
+}
+.inspector-header [role="tab"][aria-selected="true"] {
+	background: var(--cl-surface);
+	color: var(--cl-text);
+	box-shadow: var(--elev-1);
 }

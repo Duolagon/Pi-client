@@ -46,7 +46,11 @@ function createWindow() {
 		if (["http:", "https:"].includes(target.protocol)) void shell.openExternal(url);
 		return { action: "deny" };
 	});
-	window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+	// Only allow writing text to the clipboard (copy buttons); every other permission stays denied.
+	window.webContents.session.setPermissionRequestHandler((_contents, permission, callback) =>
+		callback(permission === "clipboard-sanitized-write"),
+	);
+	window.webContents.session.setPermissionCheckHandler((_contents, permission) => permission === "clipboard-sanitized-write");
 	window.on("closed", () => {
 		window = null;
 	});

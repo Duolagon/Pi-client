@@ -431,7 +431,7 @@ function App() {
 					<div className="search-dialog-input">
 						<Search size={18} />
 						<input
-							autoFocus
+							autoFocus data-autofocus
 							aria-label="搜索会话标题或项目"
 							placeholder="搜索标题或项目…"
 							value={searchQuery}
@@ -525,7 +525,7 @@ function App() {
 						<label className="field-label">
 							会话名称
 							<input
-								autoFocus
+								autoFocus data-autofocus
 								aria-label="会话名称"
 								value={rename}
 								onChange={(event) => setRename(event.target.value)}
@@ -559,7 +559,7 @@ function App() {
 						<label className="field-label">
 							提交说明
 							<textarea
-								autoFocus
+								autoFocus data-autofocus
 								rows={3}
 								value={commitMessage}
 								onChange={(event) => setCommitMessage(event.target.value)}

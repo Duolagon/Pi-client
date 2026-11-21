@@ -341,6 +341,7 @@ export function ControlsDialog({
 					<div className="cc-controls-body">
 						<input
 							className="cc-filter-input"
+							aria-label="过滤工具"
 							placeholder="过滤工具名称、MCP 服务或描述…"
 							value={filter}
 							onChange={(e) => setFilter(e.target.value)}

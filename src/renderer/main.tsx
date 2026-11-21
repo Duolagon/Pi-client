@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { createRoot } from "react-dom/client";
 import {
 	FolderOpen,
@@ -51,7 +51,7 @@ import type {
 	TodoRecord,
 	WorkflowRecord,
 } from "../shared.ts";
-import { IconButton, Modal, PiMark } from "../prototype/ui.tsx";
+import { IconButton, Modal, PiMark, menuKeyNav } from "../prototype/ui.tsx";
 import { useDesktop } from "./useDesktop.ts";
 import { TranscriptView, type TodoItem } from "./TranscriptView.tsx";
 import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
@@ -88,6 +88,11 @@ function projectName(snapshot: Snapshot, path: string): string {
 	return found?.name ?? path.split("/").filter(Boolean).pop() ?? path;
 }
 
+function clampInspector(width: number): number {
+	const max = Math.max(320, Math.min(1000, window.innerWidth - 560));
+	return Math.round(Math.min(max, Math.max(320, width)));
+}
+
 function Desktop({ api }: { api: DesktopAPI }) {
 	const app = useDesktop(api);
 	const { snapshot, history, running, changing, bashBusy } = app;
@@ -95,6 +100,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [settings, setSettings] = useState(false);
 	const [searching, setSearching] = useState(false);
 	const [query, setQuery] = useState("");
+	const [searchIndex, setSearchIndex] = useState(0);
+	const [inspectorWidth, setInspectorWidth] = useState(() => {
+		const stored = Number(localStorage.getItem("pi.inspectorWidth"));
+		return Number.isFinite(stored) && stored >= 320 ? stored : 400;
+	});
 	const [pane, setPane] = useState<"changes" | "files" | null>(null);
 	const [terminalOpen, setTerminalOpen] = useState(false);
 	const [deferredApproval, setDeferredApproval] = useState<string>();
@@ -118,6 +128,15 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [findQuery, setFindQuery] = useState("");
 	const [findIndex, setFindIndex] = useState(0);
 	const [trustOpen, setTrustOpen] = useState(false);
+	// Projects whose trust prompt the user postponed in this session; the topbar shield keeps a dot.
+	const [trustLater, setTrustLater] = useState<Record<string, true>>({});
+	// Short confirmations that should not stay on screen.
+	const [flash, setFlash] = useState("");
+	useEffect(() => {
+		if (!flash) return;
+		const timer = setTimeout(() => setFlash(""), 3200);
+		return () => clearTimeout(timer);
+	}, [flash]);
 	const [trustBusy, setTrustBusy] = useState(false);
 	const [agentsOpen, setAgentsOpen] = useState(false);
 	const [mcpOpen, setMcpOpen] = useState(false);
@@ -416,6 +435,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		if (permission !== "plan" && planMode) setPlanMode(false);
 		if (permission === "plan" && !planMode) setPlanMode(true);
 		await app.switchTo(() => api.saveSettings({ permission, theme: snapshot.settings.theme }));
+		if (permission === "auto" && snapshot.settings.permission !== "auto")
+			setFlash(snapshot.settings.sandbox ? "已切换为跳过确认，命令仍在 Seatbelt 沙箱中运行" : "已切换为跳过确认，Pi 将不经询问执行命令");
 	};
 	const saveSandbox = async (next: { sandbox: boolean; sandboxOffline: boolean }) => {
 		if (!snapshot) return;
@@ -457,7 +478,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		setTrustBusy(true);
 		try {
 			app.apply(await api.setProjectTrust({ project: snapshot.trust.project, decision }));
-			app.setNotice(decision === "trusted" ? "项目配置已加载。" : "项目配置已禁用。");
+			setFlash(decision === "trusted" ? "项目配置已加载" : "项目配置保持禁用");
 			setTrustOpen(false);
 		} catch (error) {
 			app.fail(error);
@@ -465,17 +486,27 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			setTrustBusy(false);
 		}
 	};
+	/** Reuses the current session when it is still empty, instead of stacking blank "新会话" rows. */
+	const startNewConversation = () => {
+		if (snapshot?.active && !running && history.messages.length === 0 && !app.draft.trim()) {
+			composerInputRef.current?.focus();
+			return;
+		}
+		switchTo(() => api.newConversation());
+	};
+	const PLAN_TEMPLATE = "请先调研相关代码并将实施计划写入 .pi/plans/，完成后调用 ExitPlanMode 提交审批：\n";
 	const togglePlanMode = async () => {
 		if (!snapshot) return;
 		const inPlan = planMode || snapshot.settings.permission === "plan";
 		if (inPlan) {
 			setPlanMode(false);
 			setPlanEditorOpen(false);
+			if (app.draft.trim() === PLAN_TEMPLATE.trim()) app.setDraft("");
 			await savePermission("ask");
 		} else {
 			setPlanMode(true);
 			if (snapshot.settings.permission !== "plan") await savePermission("plan");
-			if (!app.draft.trim()) app.setDraft("请先调研相关代码并将实施计划写入 .pi/plans/，完成后调用 ExitPlanMode 提交审批：\n");
+			if (!app.draft.trim()) app.setDraft(PLAN_TEMPLATE);
 		}
 	};
 	const approvePlanAndExecute = async (mode: PermissionMode) => {
@@ -532,7 +563,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		} else if (action === "sandbox") {
 			setSandboxOpen(true);
 		} else if (action === "new") {
-			if (!changing && snapshot?.active) switchTo(() => api.newConversation());
+			if (!changing && snapshot?.active) startNewConversation();
 		} else if (action === "permissions") {
 			setControlsTab("permissions");
 		} else if (action === "mcp") {
@@ -611,6 +642,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			if (lower === "k") {
 				event.preventDefault();
 				setQuery("");
+				setSearchIndex(0);
 				setSearching(true);
 			}
 			if (lower === "p") {
@@ -623,7 +655,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			}
 			if (lower === "n" && snapshot?.active && !changing) {
 				event.preventDefault();
-				switchTo(() => api.newConversation());
+				startNewConversation();
 			}
 		};
 		window.addEventListener("keydown", onKey);
@@ -704,8 +736,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		hits[clamped].scrollIntoView({ behavior: "smooth", block: "center" });
 	};
 	const paletteActions: PaletteAction[] = [
-		{ id: "new", label: "新建会话", shortcut: "⌘N", keywords: "new session clear", disabled: changing || !snapshot.active, run: () => switchTo(() => api.newConversation()) },
-		{ id: "search", label: "搜索历史会话", shortcut: "⌘K", keywords: "search find", run: () => { setQuery(""); setSearching(true); } },
+		{ id: "new", label: "新建会话", shortcut: "⌘N", keywords: "new session clear", disabled: changing || !snapshot.active, run: () => startNewConversation() },
+		{ id: "search", label: "搜索历史会话", shortcut: "⌘K", keywords: "search find", run: () => { setQuery(""); setSearchIndex(0); setSearching(true); } },
 		{ id: "find", label: "会话内关键词搜索", shortcut: "⌘F", keywords: "find in transcript", disabled: !snapshot.active, run: () => setFindOpen(true) },
 		{ id: "open", label: "打开项目文件夹", keywords: "open project folder", disabled: changing, run: () => openWorkspace() },
 		{ id: "sandbox", label: "命令沙箱设置 (/sandbox)", keywords: "sandbox seatbelt offline isolation", run: () => setSandboxOpen(true) },
@@ -734,7 +766,55 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const isGrail = snapshot.settings.theme === "grail";
 	const servant = isGrail ? getServantInfo(snapshot.state?.model?.id) : null;
 	return (
-		<div className={`desktop-app live-app ${sidebar ? "" : "cl-side-hidden"} ${pane || previewUrl ? "has-inspector" : ""}`}>
+		<div
+			className={`desktop-app live-app ${sidebar ? "" : "cl-side-hidden"} ${pane || previewUrl ? "has-inspector" : ""}`}
+			style={{ "--inspector-w": `${inspectorWidth}px` } as CSSProperties}
+		>
+			{(pane || previewUrl) && (
+				<div
+					className="cc-inspector-resize"
+					role="separator"
+					aria-orientation="vertical"
+					aria-label="调整右侧面板宽度"
+					aria-valuemin={320}
+					aria-valuemax={1000}
+					aria-valuenow={inspectorWidth}
+					tabIndex={0}
+					onKeyDown={(event) => {
+						if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+						event.preventDefault();
+						const next = clampInspector(inspectorWidth + (event.key === "ArrowLeft" ? 32 : -32));
+						setInspectorWidth(next);
+						localStorage.setItem("pi.inspectorWidth", String(next));
+					}}
+					onDoubleClick={() => {
+						setInspectorWidth(400);
+						localStorage.setItem("pi.inspectorWidth", "400");
+					}}
+					onPointerDown={(event) => {
+						event.preventDefault();
+						const handle = event.currentTarget;
+						handle.setPointerCapture(event.pointerId);
+						document.body.classList.add("cc-resizing");
+						let latest = inspectorWidth;
+						const move = (e: PointerEvent) => {
+							latest = clampInspector(window.innerWidth - e.clientX);
+							setInspectorWidth(latest);
+						};
+						const up = () => {
+							handle.removeEventListener("pointermove", move);
+							handle.removeEventListener("pointerup", up);
+							handle.removeEventListener("pointercancel", up);
+							document.body.classList.remove("cc-resizing");
+							localStorage.setItem("pi.inspectorWidth", String(latest));
+						};
+						handle.addEventListener("pointermove", move);
+						handle.addEventListener("pointerup", up);
+						handle.addEventListener("pointercancel", up);
+					}}
+					title="拖动调整宽度，双击恢复默认"
+				/>
+			)}
 			{sidebar && (
 				<aside className="cl-side" aria-label="项目与会话">
 					<div className="cl-side-head">
@@ -742,7 +822,14 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							{isGrail ? <HolyGrailIcon width={18} height={18} /> : <PiMark />}
 							<span className="cl-side-title">{isGrail ? "Pi Grail" : "Pi Code"}</span>
 						</span>
-						<IconButton icon={PanelLeftClose} label="收起侧栏" onClick={() => setSidebar(false)} />
+						<IconButton
+							icon={PanelLeftClose}
+							label="收起侧栏"
+							onClick={() => {
+								setSidebar(false);
+								requestAnimationFrame(() => document.querySelector<HTMLElement>('[aria-label="展开侧栏"]')?.focus());
+							}}
+						/>
 					</div>
 					<div className="cl-side-actions">
 						<button
@@ -750,7 +837,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							className="cl-side-new"
 							aria-label="新建会话"
 							disabled={changing || !snapshot.active}
-							onClick={() => switchTo(() => api.newConversation())}
+							onClick={() => startNewConversation()}
 						>
 							<Plus size={15} />
 							<span>{isGrail ? "召唤新会话" : "新建会话"}</span>
@@ -763,6 +850,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								aria-label="搜索会话"
 								onClick={() => {
 									setQuery("");
+									setSearchIndex(0);
 									setSearching(true);
 								}}
 							>
@@ -831,7 +919,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 															<span className="cl-conv-status warn">待确认</span>
 														) : childWaiting > 0 ? (
 															<span className="cl-conv-status warn" title={`${childWaiting} 个子 Agent 待确认`}>
-																子 Agent 待确认 {childWaiting}
+																待确认 {childWaiting}
 															</span>
 														) : app.activity[session.id] === "running" ? (
 															<span className="cl-conv-status run">运行中</span>
@@ -938,12 +1026,19 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					<div className="cl-top-title">
 						{!sidebar && (
 							<>
-								<IconButton icon={PanelLeftOpen} label="展开侧栏" onClick={() => setSidebar(true)} />
+								<IconButton
+									icon={PanelLeftOpen}
+									label="展开侧栏"
+									onClick={() => {
+										setSidebar(true);
+										requestAnimationFrame(() => document.querySelector<HTMLElement>('[aria-label="收起侧栏"]')?.focus());
+									}}
+								/>
 								<IconButton
 									icon={SquarePen}
 									label="新建会话"
 									disabled={changing || !snapshot.active}
-									onClick={() => switchTo(() => api.newConversation())}
+									onClick={() => startNewConversation()}
 								/>
 							</>
 						)}
@@ -982,6 +1077,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											: "项目配置：待决定"
 								}
 								active={trustOpen}
+								className={snapshot.trust.required && !snapshot.trust.decision ? "cc-attn" : ""}
 								onClick={() => setTrustOpen(true)}
 							/>
 						)}
@@ -1058,7 +1154,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								</>
 							)}
 						</button>
-						<div className="cc-more-wrap" ref={moreMenuRef}>
+						<div className="cc-more-wrap" ref={moreMenuRef} onKeyDown={menuKeyNav}>
 							<button
 								type="button"
 								className={`cc-top-btn cc-more-btn ${moreMenuOpen ? "active" : ""}`}
@@ -1189,7 +1285,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											disabled={blocked}
 											onClick={() => {
 												setMoreMenuOpen(false);
-												void app.refresh();
+												void app.refresh().then(() => setFlash("会话已刷新"));
 											}}
 										>
 											<RefreshCw size={14} />
@@ -1268,14 +1364,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						</button>
 					</div>
 				)}
-				{snapshot.trust?.required && !snapshot.trust.decision && (
-					<div className="cl-trust-banner" role="alert">
-						<ShieldCheck size={16} />
-						<div className="cl-trust-text">
-							<strong>项目配置尚未加载</strong>
-							<span>
-								检测到 {snapshot.trust.resources.join("、")}。信任后才会加载项目 MCP、Skills 与设置。
-							</span>
+				{snapshot.trust?.required && !snapshot.trust.decision && !trustLater[snapshot.trust.project] && (
+					<div className="cl-trust-banner" role="region" aria-label="项目配置">
+						<ShieldCheck size={15} />
+						<div className="cl-trust-text" title={`检测到 ${snapshot.trust.resources.join("、")}`}>
+							<strong>此项目带有自己的 MCP、Skills 与设置</strong>
+							<span>信任后才会加载</span>
 						</div>
 						<button
 							type="button"
@@ -1293,16 +1387,14 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						>
 							保持禁用
 						</button>
-					</div>
-				)}
-				{snapshot.settings.permission === "auto" && (
-					<div className="cl-auto-warning" role="status">
-						<ShieldAlert size={16} />
-						<span>
-							<strong>跳过确认模式</strong>：Pi 可在不询问的情况下执行命令；{snapshot.settings.sandbox ? "已开启 macOS Seatbelt 命令沙箱。" : "当前没有 OS 沙箱。"}
-						</span>
-						<button type="button" className="secondary-button" disabled={blocked} onClick={() => void savePermission("ask")}>
-							切回手动确认
+						<button
+							type="button"
+							className="cl-trust-close"
+							aria-label="稍后决定"
+							title="稍后决定（可从顶栏盾牌图标再次打开）"
+							onClick={() => snapshot.trust && setTrustLater((prev) => ({ ...prev, [snapshot.trust!.project]: true }))}
+						>
+							<X size={14} />
 						</button>
 					</div>
 				)}
@@ -1329,7 +1421,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								}}
 								onMainClear={() => {
 									setFocusedSubagentTaskId(null);
-									if (!changing && snapshot.active) switchTo(() => api.newConversation());
+									if (!changing && snapshot.active) startNewConversation();
 								}}
 								onNotice={(msg) => app.setNotice(msg)}
 								fail={app.fail}
@@ -1340,7 +1432,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									<div className="cc-find-bar" role="search" aria-label="会话内查找">
 										<Search size={14} />
 										<input
-											autoFocus
+											autoFocus data-autofocus
 											aria-label="查找会话内容"
 											placeholder="输入关键词按回车定位…"
 											value={findQuery}
@@ -1435,7 +1527,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 													<div className="cc-empty-workspace">
 														<Folder size={14} />
 														<span className="cc-empty-ws-path" title={snapshot.active.project}>
-															{snapshot.active.project}
+															<bdi>{snapshot.active.project}</bdi>
 														</span>
 														<button type="button" className="cc-empty-ws-btn" disabled={changing} onClick={openWorkspace}>
 															切换目录
@@ -1499,6 +1591,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											{isGrail ? <MagicCircleLoader size={16} /> : <span className="cl-spinner" />}
 											{isGrail ? "从者正在咏唱与执行…" : "Pi 正在工作"}
 											{snapshot.state?.pendingMessageCount ? ` · ${snapshot.state.pendingMessageCount} 条指令待处理` : ""}
+										</div>
+									)}
+									{!running && !!snapshot.state?.pendingMessageCount && (
+										<div className="cl-working cc-queued-note" role="status">
+											已停止。还有 {snapshot.state.pendingMessageCount} 条指令在排队，会和你的下一条消息一起发送。
 										</div>
 									)}
 									{!running && isGrail && omenReveal && (
@@ -1738,8 +1835,18 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					project={snapshot.active?.project}
 					readOnly={snapshot.settings.permission === "read" || snapshot.settings.permission === "plan"}
 					onReferenceFile={(filePath) => {
-						const prefix = app.draft && !app.draft.endsWith(" ") && !app.draft.endsWith("\n") ? `${app.draft} ` : app.draft;
-						app.setDraft(`${prefix}@${/\s/.test(filePath) ? JSON.stringify(filePath) : filePath} `);
+						const ref = `@${/\s/.test(filePath) ? JSON.stringify(filePath) : filePath}`;
+						const already = app.draft.split(/\s+/).includes(ref);
+						if (!already) {
+							const prefix = app.draft && !app.draft.endsWith(" ") && !app.draft.endsWith("\n") ? `${app.draft} ` : app.draft;
+							app.setDraft(`${prefix}${ref} `);
+						}
+						requestAnimationFrame(() => {
+							const input = composerInputRef.current;
+							if (!input) return;
+							input.focus();
+							input.setSelectionRange(input.value.length, input.value.length);
+						});
 					}}
 					onWorkspaceMutated={() => void app.refresh()}
 					onNotice={(msg) => app.setNotice(msg)}
@@ -1751,6 +1858,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					onReport={(report) => app.setDraft([app.draft, report].filter(Boolean).join("\n\n"))}
 					close={() => setPreviewUrl(null)}
 				/>
+			)}
+			{flash && (
+				<div className="cc-flash" role="status" aria-live="polite">
+					<Check size={14} />
+					<span>{flash}</span>
+				</div>
 			)}
 			{trustOpen && snapshot.trust && (
 				<ProjectTrustDialog
@@ -1791,40 +1904,76 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					models={snapshot.models}
 					busy={blocked}
 					close={() => setSettings(false)}
+					onSaved={() => setFlash("设置已保存")}
 					apply={app.apply}
 					fail={app.fail}
 				/>
 			)}
-			{searching && (
-				<Modal title="搜索会话" close={() => setSearching(false)}>
-					<div className="search-dialog-input">
-						<Search size={17} />
-						<input
-							autoFocus
-							aria-label="搜索会话标题或项目"
-							value={query}
-							onChange={(event) => setQuery(event.target.value)}
-							placeholder="搜索标题或项目路径…"
-						/>
-					</div>
-					<div className="search-results">
-						{snapshot.conversations
-							.filter((session) => `${session.title} ${session.project}`.toLowerCase().includes(query.toLowerCase()))
-							.map((session) => (
+			{searching && (() => {
+				const needle = query.trim().toLowerCase();
+				const results = snapshot.conversations.filter((session) =>
+					`${session.title} ${projectName(snapshot, session.project)}`.toLowerCase().includes(needle),
+				);
+				const current = Math.min(searchIndex, Math.max(results.length - 1, 0));
+				const open = (id: string) => switchTo(() => api.selectConversation(id));
+				return (
+					<Modal title="搜索会话" close={() => setSearching(false)}>
+						<div className="search-dialog-input">
+							<Search size={17} />
+							<input
+								autoFocus data-autofocus
+								role="combobox"
+								aria-expanded="true"
+								aria-controls="cc-search-results"
+								aria-activedescendant={results[current] ? `cc-search-${results[current].id}` : undefined}
+								aria-label="搜索会话标题或项目"
+								value={query}
+								onChange={(event) => {
+									setQuery(event.target.value);
+									setSearchIndex(0);
+								}}
+								onKeyDown={(event) => {
+									if (event.nativeEvent.isComposing) return;
+									if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+										event.preventDefault();
+										if (!results.length) return;
+										const next = (current + (event.key === "ArrowDown" ? 1 : -1) + results.length) % results.length;
+										setSearchIndex(next);
+										document.getElementById(`cc-search-${results[next].id}`)?.scrollIntoView({ block: "nearest" });
+									} else if (event.key === "Enter" && results[current] && !changing) {
+										event.preventDefault();
+										open(results[current].id);
+									}
+								}}
+								placeholder="搜索标题或项目…"
+							/>
+						</div>
+						<div className="search-results" id="cc-search-results" role="listbox" aria-label="搜索结果">
+							{results.length === 0 && <p className="cc-search-empty">没有匹配的会话</p>}
+							{results.map((session, index) => (
 								<button
+									id={`cc-search-${session.id}`}
+									role="option"
+									aria-selected={index === current}
+									aria-current={session.id === snapshot.active?.id ? "true" : undefined}
+									className={index === current ? "active" : undefined}
 									disabled={changing}
 									key={session.id}
-									onClick={() => switchTo(() => api.selectConversation(session.id))}
+									tabIndex={-1}
+									onMouseEnter={() => setSearchIndex(index)}
+									onClick={() => open(session.id)}
 								>
 									<div>
 										<strong>{session.title}</strong>
-										<span>{session.project}</span>
+										<span title={session.project}>{projectName(snapshot, session.project)}</span>
 									</div>
+									{session.id === snapshot.active?.id && <em className="cc-search-current">当前</em>}
 								</button>
 							))}
-					</div>
-				</Modal>
-			)}
+						</div>
+					</Modal>
+				);
+			})()}
 			{rename !== null && (
 				<Modal title="重命名会话" close={() => setRename(null)}>
 					<form
@@ -1840,7 +1989,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						<label className="field-label">
 							会话名称
 							<input
-								autoFocus
+								autoFocus data-autofocus
 								aria-label="会话名称"
 								value={rename}
 								onChange={(event) => setRename(event.target.value)}

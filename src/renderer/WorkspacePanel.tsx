@@ -213,7 +213,7 @@ export function WorkspacePanel({
 								setNote("");
 							}}>
 								<label>第 {review.line} 行的反馈
-									<textarea aria-label="逐行评审反馈" value={note} onChange={(event) => setNote(event.target.value)} autoFocus />
+									<textarea aria-label="逐行评审反馈" value={note} onChange={(event) => setNote(event.target.value)} autoFocus data-autofocus />
 								</label>
 								<button className="cc-mini-btn" type="submit" disabled={!note.trim()}>加入会话草稿</button>
 								<button className="cc-mini-btn" type="button" onClick={() => setReview(null)}>取消</button>

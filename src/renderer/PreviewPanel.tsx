@@ -8,7 +8,8 @@ function normalizeLocalUrl(raw: string): string | null {
 		const url = new URL(raw.trim().startsWith("http") ? raw.trim() : `http://${raw.trim()}`);
 		if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password) return null;
 		const host = url.hostname.toLowerCase();
-		if (host !== "localhost" && host !== "127.0.0.1" && host !== "::1" && host !== "[::1]") return null;
+		// CSP frame-src cannot express IPv6 hosts with a port wildcard, so only these two are previewable.
+		if (host !== "localhost" && host !== "127.0.0.1") return null;
 		return url.toString();
 	} catch {
 		return null;

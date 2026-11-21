@@ -325,7 +325,7 @@ try {
 	await until(async () => (await page.getByRole("dialog", { name: /设置/ }).count()) === 0, "settings dialog closed");
 	checks.push("P6/P7 settings dialog controls and persistence");
 	await page.getByRole("button", { name: "搜索会话", exact: true }).click();
-	await page.getByRole("textbox", { name: "搜索会话标题或项目", exact: true }).fill("实现问候函数");
+	await page.getByRole("combobox", { name: "搜索会话标题或项目", exact: true }).fill("实现问候函数");
 	await page.locator(".search-results button").filter({ hasText: "实现问候函数与测试" }).click();
 	await page.getByRole("button", { name: "收起侧栏", exact: true }).click();
 	await page.getByRole("button", { name: "展开侧栏", exact: true }).click();
@@ -517,7 +517,7 @@ try {
 
 	await openMore("命令面板");
 	await page.getByRole("dialog", { name: "命令面板 (⌘P)", exact: true }).waitFor();
-	await page.getByRole("textbox", { name: "搜索客户端命令", exact: true }).fill("AGENTS.md");
+	await page.getByRole("combobox", { name: "搜索客户端命令", exact: true }).fill("AGENTS.md");
 	await page.locator(".search-results button").filter({ hasText: "/memory" }).waitFor();
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 

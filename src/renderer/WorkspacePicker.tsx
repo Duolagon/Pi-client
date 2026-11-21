@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Folder, FolderPlus, GitBranch } from "lucide-react";
+import { menuKeyNav } from "../prototype/ui.tsx";
 import type { Project } from "../shared.ts";
 
 function shortenPath(path: string): string {
@@ -49,7 +50,7 @@ export function WorkspacePicker({
 	const triggerLabel = variant === "topbar" ? "切换工作目录" : "工作目录";
 
 	return (
-		<div className={`cc-ws-picker cc-ws-picker-${variant}`} ref={rootRef}>
+		<div className={`cc-ws-picker cc-ws-picker-${variant}`} ref={rootRef} onKeyDown={menuKeyNav}>
 			<button
 				type="button"
 				className={`cc-ws-trigger ${variant === "composer" ? "cl-pill" : "cc-ws-topbar-btn"} ${open ? "open" : ""} ${!activeProject ? "empty" : ""}`}

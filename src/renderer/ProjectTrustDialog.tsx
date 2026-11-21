@@ -43,12 +43,25 @@ export function ProjectTrustDialog({
 					更改信任会重启该项目的会话；请先停止运行中的任务。未信任时，只有项目外的用户配置、AGENTS.md 与 CLAUDE.md 会加载。
 				</p>
 				<div className="dialog-actions">
-					<button type="button" className="secondary-button" disabled={busy} onClick={() => decide("untrusted")}>
-						保持禁用
-					</button>
-					<button type="button" className="primary-button" disabled={busy} onClick={() => decide("trusted")}>
-						信任并加载
-					</button>
+					{trust.decision === "trusted" ? (
+						<>
+							<button type="button" className="secondary-button" disabled={busy} onClick={() => decide("untrusted")}>
+								撤销信任
+							</button>
+							<button type="button" className="primary-button" disabled>
+								已信任
+							</button>
+						</>
+					) : (
+						<>
+							<button type="button" className="secondary-button" disabled={busy || trust.decision === "untrusted"} onClick={() => decide("untrusted")}>
+								{trust.decision === "untrusted" ? "已禁用" : "保持禁用"}
+							</button>
+							<button type="button" className="primary-button" disabled={busy} onClick={() => decide("trusted")}>
+								信任并加载
+							</button>
+						</>
+					)}
 				</div>
 			</div>
 		</Modal>

@@ -93,9 +93,9 @@ test("model error = problem", () => {
 	assert.equal(scoreTurn([assistant(null, { stopReason: "error" })]).omen, "problem");
 });
 
-test("aborted = problem", () => {
+test("aborted by the user = no omen", () => {
 	assert.equal(scoreTurn([assistant(null, { tools: [edit()] }, )]).omen, "unverified");
-	assert.equal(scoreTurn([assistant(null, { stopReason: "aborted", tools: [edit()] })]).omen, "problem");
+	assert.equal(scoreTurn([assistant(null, { stopReason: "aborted", tools: [edit()] })]).omen, "none");
 });
 
 test("non-verify bash command does not count as verification", () => {
@@ -151,4 +151,16 @@ test("Pi lowercase tool names: failing bash verify = problem", () => {
 test("read-only Pi turn yields no omen", () => {
 	const msgs: Message[] = [assistant(null, { tools: [{ id: "r1", name: "read", arguments: { path: "a.ts" } }] }), toolResult("r1", false)];
 	assert.equal(scoreTurn(msgs).omen, "none");
+});
+
+test("a write the user denied is not a tool error", () => {
+	const denied = {
+		role: "toolResult",
+		toolCallId: "e1",
+		toolName: "write",
+		content: [{ type: "text", text: "用户未批准此操作。" }],
+		isError: true,
+		timestamp: at(),
+	} as unknown as Message;
+	assert.equal(scoreTurn([assistant(null, { tools: [edit()] }), denied]).omen, "unverified");
 });

@@ -43,6 +43,8 @@ export function TerminalPanel({
 	const [sshPi, setSshPi] = useState(true);
 	const [creating, setCreating] = useState(false);
 	const [shellInput, setShellInput] = useState("");
+	const shellHistory = useRef<string[]>([]);
+	const historyAt = useRef(-1);
 	const [ptyInput, setPtyInput] = useState("");
 	const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
 	const [activeId, setActiveId] = useState<string | null>(null);
@@ -58,7 +60,7 @@ export function TerminalPanel({
 		void window.pi.terminals.list(conversationId).then(async (list) => {
 			setTerminals(list);
 			const live = list.find((t) => t.id === focusId) ?? [...list].reverse().find((t) => t.status === "running" || t.status === "starting") ?? list[list.length - 1];
-			if (focusId) setMode("pty");
+			if (focusId || list.some((t) => t.status === "running" || t.status === "starting")) setMode("pty");
 			if (live) {
 				setActiveId(live.id);
 				try {
@@ -169,7 +171,7 @@ export function TerminalPanel({
 				{mode === "bash" && bashBusy && <button onClick={onAbortBash}>停止命令</button>}
 				{mode === "pty" && (
 					<>
-						<button type="button" disabled={readOnly || creating} onClick={() => void createPty()} title="新建 PTY">
+						<button type="button" disabled={readOnly || creating} onClick={() => void createPty()} title="新建 PTY" aria-label="新建 PTY">
 							<Plus size={13} />
 						</button>
 						{activePty && activePty.status === "running" && (
@@ -206,7 +208,10 @@ export function TerminalPanel({
 						onSubmit={(event) => {
 							event.preventDefault();
 							if (shellInput.trim()) {
-								void onRunBash(shellInput.trim());
+								const cmd = shellInput.trim();
+								if (shellHistory.current[shellHistory.current.length - 1] !== cmd) shellHistory.current.push(cmd);
+								historyAt.current = -1;
+								void onRunBash(cmd);
 								setShellInput("");
 							}
 						}}
@@ -217,6 +222,20 @@ export function TerminalPanel({
 							aria-label="终端命令"
 							value={shellInput}
 							onChange={(event) => setShellInput(event.target.value)}
+							onKeyDown={(event) => {
+								const list = shellHistory.current;
+								if (!list.length || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return;
+								event.preventDefault();
+								let at = historyAt.current === -1 ? list.length : historyAt.current;
+								at = event.key === "ArrowUp" ? Math.max(0, at - 1) : at + 1;
+								if (at >= list.length) {
+									historyAt.current = -1;
+									setShellInput("");
+								} else {
+									historyAt.current = at;
+									setShellInput(list[at]);
+								}
+							}}
 							disabled={blocked || !ready || !conversationId || readOnly}
 							placeholder={readOnly ? "只读模式下不可执行命令" : "输入命令后按 Enter"}
 						/>

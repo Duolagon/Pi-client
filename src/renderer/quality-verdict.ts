@@ -64,6 +64,17 @@ function isVerifyCommand(command: string): boolean {
 	return VERIFY_PATTERN.test(text) || SCRIPT_VERIFY_PATTERN.test(text) || RUNNER_VERIFY_PATTERN.test(text);
 }
 
+const USER_DENIAL_TEXT = "用户未批准此操作。";
+
+function isUserDenial(result: ToolResult): boolean {
+	const content = (result as { content?: unknown }).content;
+	if (typeof content === "string") return content.trim() === USER_DENIAL_TEXT;
+	if (!Array.isArray(content)) return false;
+	return content.some(
+		(part) => part && typeof part === "object" && (part as { type?: unknown }).type === "text" && String((part as { text?: unknown }).text ?? "").trim() === USER_DENIAL_TEXT,
+	);
+}
+
 /** A Bash tool call's command string, from its finalized arguments. */
 function bashCommandOf(call: Extract<Assistant["content"][number], { type: "toolCall" }>): string | null {
 	if (toolName(call) !== "bash") return null;
@@ -90,7 +101,8 @@ export function scoreTurn(turnMessages: Message[]): QualityVerdict {
 	const edited = toolCalls.some((c) => EDIT_TOOLS.has(toolName(c)));
 	const aborted = assistants.some((m) => m.stopReason === "aborted");
 	const modelError = assistants.some((m) => m.stopReason === "error");
-	const toolErrors = toolResults.filter((r) => r.isError).length;
+	// A write the user declined in the approval dialog is their choice, not a tool failure.
+	const toolErrors = toolResults.filter((r) => r.isError && !isUserDenial(r)).length;
 
 	// Verify commands come from both the agent's Bash tool calls (matched to their
 	// toolResult by toolCallId) and user `!` bashExecution messages (own exit code).
@@ -116,7 +128,8 @@ export function scoreTurn(turnMessages: Message[]): QualityVerdict {
 
 	const signals = { edited, verifyRan, verifyPassed, toolErrors, modelError, aborted };
 
-	if (aborted) return { omen: "problem", label: "愿未达成", reason: "本次回复被中断", signals };
+	// The user pressed stop: neither success nor failure, so no omen.
+	if (aborted) return { omen: "none", label: "", reason: "本次回复已停止", signals };
 	if (modelError) return { omen: "problem", label: "愿未达成", reason: "模型返回错误", signals };
 	if (toolErrors > 0 || verifyFailed) {
 		const bits: string[] = [];

@@ -182,10 +182,11 @@ export function PermissionDialog({
 	const queueTag = queuePosition && queuePosition.total > 1 ? ` [${queuePosition.index + 1}/${queuePosition.total}]` : "";
 	const modalTitle = subagentLabel ? `${subagentLabel} 请求：${title}${queueTag}` : `${title}${queueTag}`;
 
+	const canDefer = Boolean(defer) && !("timeout" in request && request.timeout);
 	return (
 		<Modal title={modalTitle} close={cancel}>
-			{defer && !("timeout" in request && request.timeout) && (
-				<button type="button" className="cc-mini-btn cc-defer-approval" disabled={pending} onClick={defer}>稍后处理</button>
+			{canDefer && request.method !== "confirm" && (
+				<button type="button" className="cc-mini-btn cc-defer-approval cc-defer-top" disabled={pending} onClick={defer}>稍后处理</button>
 			)}
 			<div className="simple-dialog permission-dialog">
 				<div className="live-permission-note">
@@ -229,6 +230,11 @@ export function PermissionDialog({
 							<pre className="permission-detail">{request.message}</pre>
 						)}
 						<div className="dialog-actions">
+							{canDefer && (
+								<button type="button" className="cc-mini-btn cc-defer-approval" disabled={pending} onClick={defer}>
+									稍后处理
+								</button>
+							)}
 							<button
 								disabled={pending}
 								onClick={() => void answer({ type: "extension_ui_response", id: request.id, confirmed: false })}
@@ -251,7 +257,7 @@ export function PermissionDialog({
 								</button>
 							)}
 							<button
-								autoFocus
+								autoFocus data-autofocus
 								disabled={pending}
 								onClick={() => void answer({ type: "extension_ui_response", id: request.id, confirmed: true })}
 								className="primary-button"
@@ -358,7 +364,7 @@ export function PermissionDialog({
 						<label className="field-label">
 							{request.method === "editor" ? (
 								<textarea
-									autoFocus
+									autoFocus data-autofocus
 									rows={9}
 									aria-label="扩展编辑器"
 									value={value}
@@ -366,7 +372,7 @@ export function PermissionDialog({
 								/>
 							) : (
 								<input
-									autoFocus
+									autoFocus data-autofocus
 									aria-label="扩展输入"
 									placeholder={request.placeholder}
 									value={value}

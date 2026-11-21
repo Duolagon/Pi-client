@@ -163,6 +163,7 @@ export function LiveComposer({
 	const [projectFiles, setProjectFiles] = useState<string[]>([]);
 	const [skillsOpen, setSkillsOpen] = useState(false);
 	const [skillsFilter, setSkillsFilter] = useState("");
+	const [skillsIndex, setSkillsIndex] = useState(0);
 	const skillsRef = useRef<HTMLDivElement>(null);
 	const promptHistory = useRef<string[]>([]);
 	const historyCursor = useRef<number>(-1);
@@ -178,7 +179,10 @@ export function LiveComposer({
 			}
 		};
 		const onKey = (event: KeyboardEvent) => {
-			if (event.key === "Escape") setSkillsOpen(false);
+			if (event.key === "Escape") {
+				setSkillsOpen(false);
+				textarea.current?.focus();
+			}
 		};
 		window.addEventListener("mousedown", onDown);
 		window.addEventListener("keydown", onKey);
@@ -393,7 +397,7 @@ export function LiveComposer({
 		...snapshot.commands.filter((c) => !BUILTIN_SLASH_COMMANDS.some((b) => b.name === c.name)),
 	];
 	const slashOptions = slashMatch
-		? mergedCommands.filter((item) => item.name.toLowerCase().includes(slashQuery)).slice(0, 8)
+		? mergedCommands.filter((item) => item.name.toLowerCase().includes(slashQuery))
 		: [];
 	const activeSlashIndex = slashOptions.length ? Math.min(slashIndex, slashOptions.length - 1) : 0;
 	const selectSlash = (name: string) => {
@@ -452,9 +456,26 @@ export function LiveComposer({
 	const selectAtFile = (path: string) => {
 		if (!atMatch) return;
 		const prefixLen = draft.length - atMatch[1].length - 1;
-		setDraft(`${draft.slice(0, prefixLen)}@${path} `);
+		// A folder stays open (no trailing space) so the menu lists its files next.
+		setDraft(`${draft.slice(0, prefixLen)}@${path}${path.endsWith("/") ? "" : " "}`);
 		setAtDismissed(false);
 		setAtIndex(0);
+		textarea.current?.focus();
+	};
+	useEffect(() => {
+		if (slashOptions.length) document.getElementById(`cc-slash-${activeSlashIndex}`)?.scrollIntoView({ block: "nearest" });
+	}, [activeSlashIndex, slashOptions.length]);
+	useEffect(() => {
+		if (atOptions.length) document.getElementById(`cc-at-${activeAtIndex}`)?.scrollIntoView({ block: "nearest" });
+	}, [activeAtIndex, atOptions.length]);
+	const skillNeedle = skillsFilter.trim().toLowerCase();
+	const skillMatches = snapshot.commands.filter((item) =>
+		`${item.name} ${item.description ?? ""}`.toLowerCase().includes(skillNeedle),
+	);
+	const activeSkill = skillMatches.length ? Math.min(skillsIndex, skillMatches.length - 1) : 0;
+	const pickSkill = (name: string) => {
+		setDraft(`/${name} `);
+		setSkillsOpen(false);
 		textarea.current?.focus();
 	};
 	const stats = snapshot.stats;
@@ -473,7 +494,9 @@ export function LiveComposer({
 							key={`${item.source}-${item.name}`}
 							role="option"
 							aria-selected={idx === activeSlashIndex}
+							id={`cc-slash-${idx}`}
 							className={`cc-slash-item ${idx === activeSlashIndex ? "active" : ""}`}
+							onMouseEnter={() => setSlashIndex(idx)}
 							onMouseDown={(event) => {
 								event.preventDefault();
 								selectSlash(item.name);
@@ -493,7 +516,9 @@ export function LiveComposer({
 							key={filePath}
 							role="option"
 							aria-selected={idx === activeAtIndex}
+							id={`cc-at-${idx}`}
 							className={`cc-slash-item ${idx === activeAtIndex ? "active" : ""}`}
+							onMouseEnter={() => setAtIndex(idx)}
 							onMouseDown={(event) => {
 								event.preventDefault();
 								selectAtFile(filePath);
@@ -519,12 +544,15 @@ export function LiveComposer({
 				{attachments.length > 0 && (
 					<div className="cl-attachments">
 						{attachments.map((item, index) => (
-							<span key={`${item.name}-${index}`}>
-								{item.name}
+							<span key={`${item.name}-${index}`} title={item.name}>
+								<span className="cl-attachment-name">{item.name}</span>
 								<button
 									type="button"
 									aria-label={`移除附件 ${item.name}`}
-										onClick={() => updateAttachments(attachmentList.current.filter((_, at) => at !== index))}
+									onClick={() => {
+										updateAttachments(attachmentList.current.filter((_, at) => at !== index));
+										textarea.current?.focus();
+									}}
 								>
 									<X size={13} />
 								</button>
@@ -539,6 +567,11 @@ export function LiveComposer({
 					}}
 					aria-label="输入任务"
 					value={draft}
+					onBlur={() => {
+						// Menu items use onMouseDown + preventDefault, so this only fires for clicks elsewhere.
+						if (slashOptions.length) setSlashDismissed(true);
+						if (atOptions.length) setAtDismissed(true);
+					}}
 					style={{ minHeight: "62px", maxHeight: "200px" }}
 					placeholder={
 						snapshot.active
@@ -759,6 +792,7 @@ export function LiveComposer({
 						<button
 							type="button"
 							className={`cl-pill cc-plan-pill ${planMode ? "active" : ""}`}
+							aria-pressed={planMode}
 							onClick={onTogglePlanMode}
 							disabled={changing || running}
 							title="切换 Plan 计划模式（先只读调研与出方案，确认后再执行）"
@@ -782,6 +816,7 @@ export function LiveComposer({
 								aria-expanded={skillsOpen}
 								onClick={() => {
 									setSkillsFilter("");
+									setSkillsIndex(0);
 									setSkillsOpen((open) => !open);
 								}}
 							>
@@ -794,23 +829,36 @@ export function LiveComposer({
 										placeholder="搜索技能或命令…"
 										aria-label="搜索技能或命令"
 										value={skillsFilter}
-										autoFocus
-										onChange={(event) => setSkillsFilter(event.target.value)}
+										autoFocus data-autofocus
+										onChange={(event) => {
+											setSkillsFilter(event.target.value);
+											setSkillsIndex(0);
+										}}
+										onKeyDown={(event) => {
+											if (event.nativeEvent.isComposing || !skillMatches.length) return;
+											if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+												event.preventDefault();
+												const next = (activeSkill + (event.key === "ArrowDown" ? 1 : -1) + skillMatches.length) % skillMatches.length;
+												setSkillsIndex(next);
+												document.getElementById(`cc-skill-${next}`)?.scrollIntoView({ block: "nearest" });
+											} else if (event.key === "Enter") {
+												event.preventDefault();
+												pickSkill(skillMatches[activeSkill].name);
+											}
+										}}
 									/>
-									<div className="cc-skills-items">
-										{snapshot.commands
-											.filter((item) =>
-												`${item.name} ${item.description ?? ""}`.toLowerCase().includes(skillsFilter.trim().toLowerCase()),
-											)
-											.map((item) => (
+									<div className="cc-skills-items" role="listbox" aria-label="技能与命令">
+										{skillMatches.length === 0 && <p className="cc-search-empty">没有匹配的技能或命令</p>}
+										{skillMatches.map((item, idx) => (
 												<button
 													type="button"
 													key={`${item.source}-${item.name}`}
-													onClick={() => {
-														setDraft(`/${item.name} `);
-														setSkillsOpen(false);
-														textarea.current?.focus();
-													}}
+													id={`cc-skill-${idx}`}
+													role="option"
+													aria-selected={idx === activeSkill}
+													className={idx === activeSkill ? "active" : undefined}
+													onMouseEnter={() => setSkillsIndex(idx)}
+													onClick={() => pickSkill(item.name)}
 													title={item.description}
 												>
 													<span className="cc-skill-name">/{item.name}</span>

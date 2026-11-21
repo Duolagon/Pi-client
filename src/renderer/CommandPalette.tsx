@@ -29,6 +29,10 @@ export function CommandPalette({
 	useEffect(() => {
 		setIndex(0);
 	}, [query]);
+	useEffect(() => {
+		const item = filtered[activeIdx];
+		if (item) document.getElementById(`cc-cmd-${item.id}`)?.scrollIntoView({ block: "nearest" });
+	}, [activeIdx, filtered]);
 
 	return (
 		<Modal title="命令面板 (⌘P)" close={close}>
@@ -36,7 +40,11 @@ export function CommandPalette({
 				<div className="search-dialog-input">
 					<CommandIcon size={16} />
 					<input
-						autoFocus
+						autoFocus data-autofocus
+						role="combobox"
+						aria-expanded="true"
+						aria-controls="cc-cmd-results"
+						aria-activedescendant={filtered[activeIdx] ? `cc-cmd-${filtered[activeIdx].id}` : undefined}
 						aria-label="搜索客户端命令"
 						value={query}
 						onChange={(e) => setQuery(e.target.value)}
@@ -47,7 +55,7 @@ export function CommandPalette({
 							} else if (e.key === "ArrowUp" && filtered.length) {
 								e.preventDefault();
 								setIndex((i) => (i - 1 + filtered.length) % filtered.length);
-							} else if (e.key === "Enter" && filtered.length) {
+							} else if (e.key === "Enter" && filtered.length && !e.nativeEvent.isComposing) {
 								e.preventDefault();
 								filtered[activeIdx].run();
 								close();
@@ -56,12 +64,17 @@ export function CommandPalette({
 						placeholder="输入命令名或快捷键搜索…"
 					/>
 				</div>
-				<div className="search-results">
+				<div className="search-results" id="cc-cmd-results" role="listbox" aria-label="命令">
 					{filtered.map((item, idx) => (
 						<button
 							type="button"
 							key={item.id}
+							id={`cc-cmd-${item.id}`}
+							role="option"
+							aria-selected={idx === activeIdx}
+							tabIndex={-1}
 							className={idx === activeIdx ? "active" : ""}
+							onMouseEnter={() => setIndex(idx)}
 							onClick={() => {
 								item.run();
 								close();

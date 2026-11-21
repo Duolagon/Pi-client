@@ -62,16 +62,51 @@ function formatTokens(count: number): string {
 	return String(count);
 }
 
+/** Line count that ignores a single trailing newline, so a 3-line file reads "3 lines". */
+function countLines(text: string): number {
+	return text.replace(/\r?\n$/, "").split("\n").length;
+}
+
+/** Copies text, falling back to a hidden textarea when the async clipboard is unavailable. */
+async function copyText(text: string): Promise<boolean> {
+	try {
+		if (!navigator.clipboard) throw new Error("no clipboard");
+		await navigator.clipboard.writeText(text);
+		return true;
+	} catch {
+		const area = document.createElement("textarea");
+		area.value = text;
+		area.setAttribute("readonly", "");
+		area.style.position = "fixed";
+		area.style.opacity = "0";
+		const previous = document.activeElement as HTMLElement | null;
+		document.body.append(area);
+		area.select();
+		let ok = false;
+		try {
+			ok = document.execCommand("copy");
+		} catch {
+			ok = false;
+		}
+		area.remove();
+		previous?.focus?.();
+		return ok;
+	}
+}
+
+type CopyState = "idle" | "done" | "failed";
+const copyLabel: Record<CopyState, string> = { idle: "复制", done: "已复制", failed: "复制失败" };
+
 function CodeBlock({ className, children }: { className?: string; children?: ReactNode }) {
-	const [copied, setCopied] = useState(false);
+	const [copied, setCopied] = useState<CopyState>("idle");
 	const match = /language-([^\s]+)/.exec(className || "");
 	const lang = match?.[1] || "text";
 	const raw = String(children ?? "").replace(/\n$/, "");
 
 	const copy = () => {
-		void navigator.clipboard?.writeText(raw).then(() => {
-			setCopied(true);
-			setTimeout(() => setCopied(false), 1500);
+		void copyText(raw).then((ok) => {
+			setCopied(ok ? "done" : "failed");
+			setTimeout(() => setCopied("idle"), 1500);
 		});
 	};
 
@@ -80,8 +115,8 @@ function CodeBlock({ className, children }: { className?: string; children?: Rea
 			<div className="cc-codeblock-head">
 				<span className="cc-codeblock-lang">{lang}</span>
 				<button type="button" className="cc-codeblock-copy" onClick={copy} aria-label="复制代码">
-					{copied ? <Check size={12} /> : <Copy size={12} />}
-					<span>{copied ? "已复制" : "复制"}</span>
+					{copied === "done" ? <Check size={12} /> : <Copy size={12} />}
+					<span role={copied === "failed" ? "alert" : undefined}>{copyLabel[copied]}</span>
 				</button>
 			</div>
 			<pre>
@@ -121,7 +156,7 @@ function MarkdownContent({ text, onOpenPreview }: { text: string; onOpenPreview?
 							</a>
 						);
 					},
-					code({ className, children, ...props }) {
+					code({ className, children, node: _node, ...props }) {
 						const isBlock = Boolean(className) || String(children).includes("\n");
 						if (isBlock) {
 							return <CodeBlock className={className}>{children}</CodeBlock>;
@@ -141,22 +176,22 @@ function MarkdownContent({ text, onOpenPreview }: { text: string; onOpenPreview?
 }
 
 function CopyTurnButton({ text }: { text: string }) {
-	const [copied, setCopied] = useState(false);
+	const [copied, setCopied] = useState<CopyState>("idle");
 	if (!text.trim()) return null;
 	return (
 		<button
 			type="button"
 			className="cc-meta-action"
 			onClick={() => {
-				void navigator.clipboard?.writeText(text).then(() => {
-					setCopied(true);
-					setTimeout(() => setCopied(false), 1400);
+				void copyText(text).then((ok) => {
+					setCopied(ok ? "done" : "failed");
+					setTimeout(() => setCopied("idle"), 1400);
 				});
 			}}
 			title="复制回复 Markdown"
 		>
-			{copied ? <Check size={11} /> : <Copy size={11} />}
-			<span>{copied ? "已复制" : "复制"}</span>
+			{copied === "done" ? <Check size={11} /> : <Copy size={11} />}
+			<span role={copied === "failed" ? "alert" : undefined}>{copyLabel[copied]}</span>
 		</button>
 	);
 }
@@ -378,7 +413,7 @@ export function TranscriptView({
 								onOpenPreview={onOpenPreview}
 							/>
 						))}
-						{errorMessage && (
+						{errorMessage && !aborted && (
 							<div className="cl-msg-error" role="alert">
 								<CircleAlert size={15} />
 								<span>{errorMessage}</span>
@@ -396,7 +431,7 @@ export function TranscriptView({
 								)}
 								<span>{formatTime(last.timestamp)}</span>
 								{verdict && verdict.omen !== "none" && (
-									<span className={`cc-omen cc-omen-${verdict.omen}`} title={`${verdict.label}：${verdict.reason}`}>
+									<span className={`cc-omen cc-omen-${verdict.omen}`} title={`${verdict.label}：${verdict.reason}`} tabIndex={0} role="img" aria-label={`${verdict.label}：${verdict.reason}`}>
 										<OmenGlyph omen={verdict.omen} width={13} height={13} />
 										<span className="cc-omen-label">{verdict.label}</span>
 									</span>
@@ -544,7 +579,7 @@ function summarizeDesktopJson(output: string | undefined, fallback: string): str
 function presentTool(name: string, args: unknown, output: string | undefined, status: string): ToolPresentation {
 	const a = asRecord(args);
 	const path = typeof a.path === "string" ? a.path : typeof a.file_path === "string" ? a.file_path : "";
-	const lineCount = output ? output.split("\n").length : 0;
+	const lineCount = output ? countLines(output) : 0;
 
 	if (name === "read") {
 		const offset = typeof a.offset === "number" ? a.offset : 1;
@@ -592,11 +627,11 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 
 	if (name === "write") {
 		const content = typeof a.content === "string" ? a.content : "";
-		const wroteLines = content ? content.split("\n").length : 0;
+		const wroteLines = content ? countLines(content) : 0;
 		return {
 			verb: "Write",
 			target: path || "file",
-			badge: wroteLines ? `${wroteLines} lines` : undefined,
+			badge: wroteLines && status !== "error" ? `${wroteLines} lines` : undefined,
 			treeSummary:
 				status === "running"
 					? "正在写入文件…"

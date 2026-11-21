@@ -66,6 +66,7 @@ export function SettingsDialog({
 	busy,
 	close,
 	apply,
+	onSaved,
 }: {
 	settings: Settings;
 	presets: ProviderPreset[];
@@ -75,6 +76,7 @@ export function SettingsDialog({
 	close: () => void;
 	apply: (snapshot: Snapshot) => void;
 	fail: (error: unknown) => void;
+	onSaved?: () => void;
 }) {
 	const initialProvider =
 		presets.find((item) => settings.defaultModel?.provider === `desktop-${item.provider}`)?.provider ??
@@ -119,6 +121,10 @@ export function SettingsDialog({
 		return () => { mounted = false; };
 	}, []);
 	const preset = presets.find((item) => item.provider === provider)!;
+	const externalModel =
+		settings.defaultModel && !settings.defaultModel.provider.startsWith("desktop-")
+			? `${settings.defaultModel.provider}/${settings.defaultModel.id}`
+			: undefined;
 	const original = connectionValues(settings, preset);
 	const model = preset.models.find((item) => item.id === modelId);
 	const pending = saving || testing;
@@ -185,7 +191,11 @@ export function SettingsDialog({
 			setError("请填写自定义接口的模型 ID，或恢复官方预设。");
 			return;
 		}
-		if (!hasKey && mode === "preset" && (connectionChanged || !generalSettingsChanged)) {
+		if (!connectionChanged && !generalSettingsChanged) {
+			close();
+			return;
+		}
+		if (!hasKey && mode === "preset" && connectionChanged) {
 			setError(`请填写 ${preset.name} 的 API Key。`);
 			return;
 		}
@@ -236,6 +246,7 @@ export function SettingsDialog({
 				setError(`设置已保存，但模型暂不可用：${next.engineError}`);
 				return;
 			}
+			onSaved?.();
 			close();
 		} catch (error) {
 			setError(error instanceof Error ? error.message : String(error));
@@ -264,7 +275,9 @@ export function SettingsDialog({
 		<Modal
 			title="设置与模型连接"
 			close={() => {
-				if (!pending) close();
+				if (pending) return;
+				if ((generalSettingsChanged || connectionChanged) && !window.confirm("有未保存的设置更改，确定放弃吗？")) return;
+				close();
 			}}
 		>
 			<form
@@ -277,6 +290,11 @@ export function SettingsDialog({
 				<div className="live-settings-intro">
 					<h3>连接模型服务</h3>
 					<p className="subtle-note">选择服务商并填写 API Key，即可使用预设模型。已有 Pi 配置会自动读取。</p>
+					{externalModel && (
+						<p className="subtle-note cc-settings-current">
+							当前使用 Pi 配置中的模型 {externalModel}。不填 API Key 时，保存只更新下面的设置，模型保持不变。
+						</p>
+					)}
 				</div>
 				<label className="field-label">
 					模型服务商
@@ -671,7 +689,7 @@ export function SettingsDialog({
 						取消
 					</button>
 					<button disabled={pending || busy} className="primary-button">
-						{saving ? "正在保存…" : !hasKey && generalSettingsChanged && !connectionChanged ? "保存设置" : "保存并使用"}
+						{saving ? "正在保存…" : connectionChanged ? "保存并使用" : "保存设置"}
 					</button>
 				</div>
 			</form>

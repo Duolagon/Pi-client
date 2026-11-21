@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useRef, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { X, type LucideIcon } from "lucide-react";
 
 export function IconButton({
@@ -49,10 +49,32 @@ export function Modal({
 	wide?: boolean;
 }) {
 	const dialog = useRef<HTMLDialogElement>(null);
+	// Captured during the first render, before any child autoFocus runs, so it is the control that opened the dialog.
+	const opener = useRef<Element | null>(typeof document === "undefined" ? null : document.activeElement);
 	useEffect(() => {
 		const node = dialog.current;
-		node?.showModal();
-		return () => node?.close();
+		if (!node) return;
+		// Children marked with autoFocus cannot take focus while the dialog is still closed, and showModal()
+		// would otherwise focus the header close button. Pick the intended target explicitly after opening.
+		node.showModal();
+		const target =
+			node.querySelector<HTMLElement>("[data-autofocus]:not([disabled])") ??
+			node.querySelector<HTMLElement>(
+				".modal-shell > :not(header) :is(input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([disabled]), textarea:not([disabled]))",
+			);
+		if (target) {
+			target.focus();
+			if (target instanceof HTMLInputElement && (target.type === "text" || target.type === "search")) target.select();
+		}
+		const returnTo = opener.current;
+		return () => {
+			node.close();
+			if (returnTo instanceof HTMLElement && returnTo.isConnected && returnTo !== document.body) {
+				requestAnimationFrame(() => {
+					if (returnTo.isConnected && (document.activeElement === document.body || !document.activeElement)) returnTo.focus();
+				});
+			}
+		};
 	}, []);
 	return (
 		<dialog
@@ -106,4 +128,21 @@ export function highlightCode(text: string): ReactNode[] {
 				{part}
 			</span>
 		));
+}
+
+/** Arrow / Home / End navigation between the enabled menu items inside a role="menu" container. */
+export function menuKeyNav(event: ReactKeyboardEvent<HTMLElement>) {
+	if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+	const items = Array.from(
+		event.currentTarget.querySelectorAll<HTMLElement>('[role^="menuitem"]:not([disabled])'),
+	);
+	if (!items.length) return;
+	event.preventDefault();
+	const at = items.indexOf(document.activeElement as HTMLElement);
+	const next =
+		event.key === "Home" ? 0
+		: event.key === "End" ? items.length - 1
+		: event.key === "ArrowDown" ? (at + 1) % items.length
+		: (at - 1 + items.length) % items.length;
+	items[next].focus();
 }

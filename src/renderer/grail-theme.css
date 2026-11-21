@@ -14,7 +14,7 @@
 	--cl-text: #eef1ff;
 	--cl-1: #eef1ff;
 	--cl-2: #b8c0e6;
-	--cl-3: #7f89b6;
+	--cl-3: #8f99c6;
 	--cl-line: rgba(160, 175, 255, 0.16);
 	--cl-line-soft: rgba(160, 175, 255, 0.1);
 	--cl-hover: rgba(120, 150, 255, 0.12);
@@ -109,8 +109,7 @@
 :root[data-theme="grail"] .cl-body,
 :root[data-theme="grail"] .cl-banner,
 :root[data-theme="grail"] .cl-connect,
-:root[data-theme="grail"] .cl-trust-banner,
-:root[data-theme="grail"] .cl-auto-warning {
+:root[data-theme="grail"] .cl-trust-banner {
 	position: relative;
 	z-index: 1;
 }
