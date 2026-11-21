@@ -16,7 +16,7 @@ export const desktopModelToolNames = [
 	"Monitor", "BashOutput", "KillShell",
 	"ScheduleWakeup", "CronCreate", "CronList", "CronDelete",
 	"TeamCreate", "TeamDelete",
-	"WorkflowRun", "StructuredOutput", "LSP",
+	"WorkflowRun", "StructuredOutput", "LSP", "PreviewCheck",
 ] as const;
 export type DesktopModelToolName = (typeof desktopModelToolNames)[number];
 /**
@@ -259,6 +259,7 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 		WorkflowRun: ["title", "script", "budget", "run_in_background"],
 		StructuredOutput: ["data"],
 		LSP: ["operation", "filePath", "line", "character", "silent"],
+		PreviewCheck: ["action", "name", "server_id", "url", "mobile", "actions", "selector", "read_dom", "screenshot", "wait_ms"],
 	};
 	if (Object.keys(input).some((key) => !allowed[tool].includes(key))) throw new Error("Unknown tool input field");
 	if (tool === "Agent") {
@@ -399,6 +400,54 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 			throw new Error("LSP character must be a positive integer");
 		}
 		optionalBoolean(input.silent, "silent");
+	} else if (tool === "PreviewCheck") {
+		const validActions = ["list_configs", "start_server", "stop_server", "server_logs", "check"];
+		if (input.action !== undefined && (typeof input.action !== "string" || !validActions.includes(input.action))) {
+			throw new Error("PreviewCheck action must be list_configs, start_server, stop_server, server_logs, or check");
+		}
+		if (input.name !== undefined) text(input.name, "name", 100);
+		if (input.server_id !== undefined) text(input.server_id, "server_id", 200);
+		if (input.url !== undefined) text(input.url, "url", 4096);
+		optionalBoolean(input.mobile, "mobile");
+		optionalBoolean(input.read_dom, "read_dom");
+		optionalBoolean(input.screenshot, "screenshot");
+		if (input.selector !== undefined) text(input.selector, "selector", 500);
+		if (input.wait_ms !== undefined && (!Number.isSafeInteger(input.wait_ms) || Number(input.wait_ms) < 500 || Number(input.wait_ms) > 60000)) {
+			throw new Error("PreviewCheck wait_ms must be between 500 and 60000");
+		}
+		if (input.actions !== undefined) {
+			if (!Array.isArray(input.actions) || input.actions.length > 20) {
+				throw new Error("PreviewCheck actions must be an array of at most 20 steps");
+			}
+			for (const step of input.actions) {
+				const rec = object(step);
+				const kind = rec.type;
+				if (kind === "click") {
+					text(rec.selector, "actions[].selector", 500);
+				} else if (kind === "fill") {
+					text(rec.selector, "actions[].selector", 500);
+					if (typeof rec.value !== "string" || rec.value.length > 4096 || rec.value.includes("\0")) {
+						throw new Error("Invalid actions[].value");
+					}
+				} else if (kind === "wait") {
+					if (typeof rec.ms !== "number" || !Number.isFinite(rec.ms) || rec.ms < 50 || rec.ms > 5000) {
+						throw new Error("Invalid actions[].ms (expected 50–5000)");
+					}
+				} else if (kind === "wait_for") {
+					text(rec.selector, "actions[].selector", 500);
+					if (rec.timeoutMs !== undefined && (typeof rec.timeoutMs !== "number" || !Number.isFinite(rec.timeoutMs) || rec.timeoutMs < 200 || rec.timeoutMs > 5000)) {
+						throw new Error("Invalid actions[].timeoutMs (expected 200–5000)");
+					}
+				} else if (kind === "scroll") {
+					if (rec.selector !== undefined) text(rec.selector, "actions[].selector", 500);
+					if (rec.y !== undefined && (typeof rec.y !== "number" || !Number.isFinite(rec.y))) {
+						throw new Error("Invalid actions[].y");
+					}
+				} else {
+					throw new Error("PreviewCheck action step type must be click, fill, wait, wait_for, or scroll");
+				}
+			}
+		}
 	}
 	return { ...input };
 }

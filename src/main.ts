@@ -9,7 +9,7 @@ import { installControlHandlers } from "./control-ipc.ts";
 import { installExternalHandlers } from "./external-ipc.ts";
 import { installP8Handlers } from "./p8-ipc.ts";
 import type { Command, ConnectionInput, DesktopAPI } from "./shared.ts";
-import { checkPreview, probePreview } from "./preview-check.ts";
+import { checkPreview, probePreview, runPreviewCheck } from "./preview-check.ts";
 import { captureShellEnvironment, mergeNetworkEnvironment } from "./tool-path.ts";
 import { MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS } from "./delegation-limits.ts";
 import { parseFallbackModelUpdate, parseModelRoutingUpdate } from "./model-routing.ts";
@@ -456,6 +456,7 @@ void app.whenReady().then(() => {
 		env: environment,
 		initialProject: process.env.PI_DESKTOP_WORKSPACE,
 		trashItem: (filePath) => shell.trashItem(filePath),
+		inspectPreview: (input) => runPreviewCheck(input),
 		encrypt: (value) => {
 			if (!safeStorage.isEncryptionAvailable()) throw new Error("系统安全存储不可用。");
 			return safeStorage.encryptString(value).toString("base64");
