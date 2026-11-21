@@ -39,6 +39,7 @@ import {
 	WifiOff,
 	Moon,
 	Sun,
+	Pin,
 } from "lucide-react";
 import type {
 	Conversation,
@@ -58,6 +59,7 @@ import { IconButton, Modal, PiMark, menuKeyNav } from "../prototype/ui.tsx";
 import { useDesktop } from "./useDesktop.ts";
 import { TranscriptView, type TodoItem } from "./TranscriptView.tsx";
 import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
+import { parseGoalCommand } from "../goal-mode.ts";
 import { WorkspacePicker } from "./WorkspacePicker.tsx";
 import { GrailEmblem, HolyGrailIcon, MagicCircleBackdrop, MagicCircleLoader, OmenGlyph, getServantInfo } from "./GrailIcons.tsx";
 import { scoreTurn, type QualityVerdict } from "./quality-verdict.ts";
@@ -164,6 +166,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [gitSummary, setGitSummary] = useState<{ branch: string; count: number; isGit: boolean } | null>(null);
 	const [rename, setRename] = useState<string | null>(null);
 	const [renameId, setRenameId] = useState<string | undefined>();
+	const [groupEdit, setGroupEdit] = useState<{ id: string; value: string } | null>(null);
+	const [archivedOpen, setArchivedOpen] = useState(false);
 	const [convMenu, setConvMenu] = useState<{ id: string; x: number; y: number } | null>(null);
 	/** Text the user sent while a run was active, per conversation; Pi only exposes a count. */
 	const [queued, setQueued] = useState<Record<string, string[]>>({});
@@ -625,6 +629,73 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			void app.switchTo(async () => {
 				const next = await api.saveSettings({ permission: snapshot.settings.permission, theme: snapshot.settings.theme, outputStyle: wanted });
 				app.setNotice(`已切换输出风格为 ${next.settings.outputStyle ?? "default"}，下一轮对话生效。`);
+				return next;
+			});
+			return;
+		}
+		if (action === "goal") {
+			const id = snapshot?.active?.id;
+			if (!id || !snapshot) return;
+			try {
+				const parsed = parseGoalCommand(argument);
+				if (parsed.action === "status") {
+					const g = snapshot.active?.goal;
+					app.setNotice(
+						g
+							? `目标模式（${g.active ? "进行中" : g.status} · ${g.turnsUsed}/${g.maxTurns} 轮${g.maxCostUsd ? ` · 上限 $${g.maxCostUsd}` : ""}）：${g.objective}${g.stopReason ? `（${g.stopReason}）` : ""}`
+							: "用法：/goal [--max-turns 8] [--max-cost 2] <目标描述>；用 /goal stop 停止。",
+					);
+					return;
+				}
+				if (parsed.action === "stop") {
+					void app.switchTo(async () => {
+						const next = await api.stopGoal(id);
+						app.setNotice("已停止目标模式。");
+						return next;
+					});
+					return;
+				}
+				if (blocked) return;
+				void app.switchTo(async () => {
+					const next = await api.startGoal(id, {
+						objective: parsed.objective,
+						maxTurns: parsed.maxTurns,
+						maxCostUsd: parsed.maxCostUsd,
+					});
+					app.setNotice(`目标模式已启动（最多 ${parsed.maxTurns} 轮${parsed.maxCostUsd ? `，上限 $${parsed.maxCostUsd}` : ""}）。`);
+					return next;
+				});
+			} catch (cause) {
+				app.fail(cause);
+			}
+			return;
+		}
+		if (action === "add-dir") {
+			const id = snapshot?.active?.id;
+			if (!id || !snapshot) return;
+			const trimmed = argument.trim();
+			if (!trimmed) {
+				const dirs = snapshot.active?.additionalDirs ?? [];
+				app.setNotice(
+					dirs.length > 0
+						? `当前已附加目录：${dirs.join("、")}（用 /add-dir <目录> 添加，/add-dir rm <目录> 移除）`
+						: "当前未附加其他目录。用法：/add-dir <目录路径>",
+				);
+				return;
+			}
+			const rmMatch = /^(?:rm|remove)\s+(.+)$/i.exec(trimmed);
+			if (rmMatch) {
+				const targetPath = rmMatch[1].trim();
+				void app.switchTo(async () => {
+					const next = await api.removeDir(id, targetPath);
+					app.setNotice(`已移除附加目录：${targetPath}`);
+					return next;
+				});
+				return;
+			}
+			void app.switchTo(async () => {
+				const { snapshot: next, added } = await api.addDir(id, trimmed);
+				app.setNotice(`已附加目录（读写与沙箱已同步放行）：${added}`);
 				return next;
 			});
 			return;
@@ -1116,6 +1187,46 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								})}
 							</section>
 						))}
+						{sidebarGroups.archived.length > 0 && (
+							<section className="cl-group cl-group-archived">
+								<button
+									type="button"
+									className="cl-group-label"
+									style={{ background: "none", border: "none", padding: 0, cursor: "pointer", display: "flex", alignItems: "center", gap: "4px", width: "100%", textAlign: "left" }}
+									aria-expanded={archivedOpen}
+									onClick={() => setArchivedOpen((v) => !v)}
+								>
+									<ChevronRight size={11} className={`cl-conv-fold-icon ${archivedOpen ? "open" : ""}`} aria-hidden="true" />
+									<span>已归档 ({sidebarGroups.archived.length})</span>
+								</button>
+								{archivedOpen && sidebarGroups.archived.map((session) => (
+									<div key={session.id} className="cl-conv-wrap">
+										<div className={`cl-conv-row ${session.id === snapshot.active?.id ? "selected" : ""}`}>
+											<button
+												data-conv-id={session.id}
+												className={`cl-conv ${session.id === snapshot.active?.id ? "selected" : ""}`}
+												disabled={changing}
+												onClick={() => switchTo(() => api.selectConversation(session.id))}
+												onContextMenu={(event) => {
+													event.preventDefault();
+													const box = event.currentTarget.getBoundingClientRect();
+													const keyboard = event.clientX === 0 && event.clientY === 0;
+													setConvMenu({ id: session.id, x: keyboard ? box.left + 24 : event.clientX, y: keyboard ? box.bottom : event.clientY });
+												}}
+												aria-current={session.id === snapshot.active?.id ? "page" : undefined}
+											>
+												<span className="cl-conv-line">
+													<span className="cl-conv-title">{session.title}</span>
+												</span>
+												<span className="cl-conv-sub">
+													{projectName(snapshot, session.project)} · {formatTime(session.updatedAt)}
+												</span>
+											</button>
+										</div>
+									</div>
+								))}
+							</section>
+						)}
 						{!snapshot.conversations.length && <p className="cl-side-empty">还没有会话。选择一个工作目录开始编码。</p>}
 					</div>
 					<div className="cl-side-foot">
@@ -1951,6 +2062,29 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							}}
 							onReturnToComposer={() => composerInputRef.current?.focus()}
 						/>
+						{snapshot.active?.goal?.active && (
+							<div className="cc-goal-banner" role="status" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", padding: "6px 12px", margin: "0 16px 6px", borderRadius: "8px", border: "1px solid var(--border)", background: "var(--bg-elevated, var(--surface))", fontSize: "12px" }}>
+								<span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+									<strong>目标模式</strong>（{snapshot.active.goal.turnsUsed}/{snapshot.active.goal.maxTurns} 轮
+									{snapshot.active.goal.maxCostUsd ? ` · 上限 $${snapshot.active.goal.maxCostUsd}` : ""}）：
+									{snapshot.active.goal.objective}
+								</span>
+								<button
+									type="button"
+									className="cc-mini-btn"
+									onClick={() => {
+										if (!snapshot.active) return;
+										void app.switchTo(async () => {
+											const next = await api.stopGoal(snapshot.active!.id);
+											app.setNotice("已停止目标模式。");
+											return next;
+										});
+									}}
+								>
+									停止目标
+								</button>
+							</div>
+						)}
 						<LiveComposer
 							key={snapshot.active?.id ?? "no-conversation"}
 							snapshot={snapshot}
@@ -2190,6 +2324,57 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								disabled={blocked}
 								onClick={() => {
 									closeMenu(false);
+									void api
+										.updateConversationMeta(target.id, { pinned: !target.pinned })
+										.then((next) => {
+											app.apply(next);
+											setFlash(target.pinned ? "已取消置顶" : "已置顶会话");
+										})
+										.catch(app.fail);
+								}}
+							>
+								<Pin size={14} />
+								<span>{target.pinned ? "取消置顶" : "置顶"}</span>
+							</button>
+							<button
+								type="button"
+								role="menuitem"
+								className="cc-more-item"
+								disabled={blocked}
+								onClick={() => {
+									closeMenu(false);
+									setGroupEdit({ id: target.id, value: target.group ?? "" });
+								}}
+							>
+								<Folder size={14} />
+								<span>{target.group ? `分组：${target.group}` : "设置分组…"}</span>
+							</button>
+							<button
+								type="button"
+								role="menuitem"
+								className="cc-more-item"
+								disabled={blocked}
+								onClick={() => {
+									closeMenu(false);
+									void api
+										.updateConversationMeta(target.id, { archived: !target.archived })
+										.then((next) => {
+											app.apply(next);
+											setFlash(target.archived ? "已取消归档" : "会话已归档");
+										})
+										.catch(app.fail);
+								}}
+							>
+								<Archive size={14} />
+								<span>{target.archived ? "取消归档" : "归档"}</span>
+							</button>
+							<button
+								type="button"
+								role="menuitem"
+								className="cc-more-item"
+								disabled={blocked}
+								onClick={() => {
+									closeMenu(false);
 									setRenameId(target.id);
 									setRename(target.title);
 								}}
@@ -2202,26 +2387,61 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								role="menuitem"
 								className="cc-more-item danger"
 								disabled={changing || busyHere}
-								title={busyHere ? "会话正在运行或等待审批，暂不能移除" : undefined}
+								title={busyHere ? "会话正在运行或等待审批，暂不能删除" : undefined}
 								onClick={() => {
 									closeMenu(false);
-									if (!window.confirm(`从列表中移除「${target.title}」？\n会话记录文件会保留在磁盘上。`)) return;
+									if (!window.confirm(`删除「${target.title}」？\n会话记录文件将移到废纸篓。`)) return;
 									void api
 										.removeConversation(target.id)
 										.then((next) => {
 											app.apply(next);
-											setFlash("会话已移除");
+											setFlash("会话已移到废纸篓");
 										})
 										.catch(app.fail);
 								}}
 							>
 								<Trash2 size={14} />
-								<span>从列表移除</span>
+								<span>删除（移到废纸篓）</span>
 							</button>
 						</div>
 					</div>
 				);
 			})()}
+			{groupEdit !== null && (
+				<Modal title="设置会话分组" close={() => setGroupEdit(null)}>
+					<form
+						className="simple-dialog"
+						onSubmit={(event) => {
+							event.preventDefault();
+							const nextGroup = groupEdit.value.trim();
+							void api
+								.updateConversationMeta(groupEdit.id, { group: nextGroup || null })
+								.then((next) => {
+									app.apply(next);
+									setFlash(nextGroup ? `已分组到「${nextGroup}」` : "已清除分组");
+								})
+								.catch(app.fail);
+							setGroupEdit(null);
+						}}
+					>
+						<label className="field-label">
+							分组名称（留空则移回时间分组）
+							<input
+								autoFocus data-autofocus
+								aria-label="分组名称"
+								maxLength={60}
+								placeholder="例如：后端重构、Bug 排查"
+								value={groupEdit.value}
+								onChange={(event) => setGroupEdit({ ...groupEdit, value: event.target.value })}
+							/>
+						</label>
+						<div className="dialog-actions">
+							<button type="button" className="btn-secondary" onClick={() => setGroupEdit(null)}>取消</button>
+							<button type="submit" className="btn-primary">保存</button>
+						</div>
+					</form>
+				</Modal>
+			)}
 			{rename !== null && (
 				<Modal title="重命名会话" close={() => { setRename(null); setRenameId(undefined); }}>
 					<form

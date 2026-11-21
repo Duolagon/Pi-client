@@ -12,6 +12,7 @@ import { connectionDefaults, connectionMode } from "./model-connections.ts";
 import { providerModels } from "./provider-presets.ts";
 import { BALANCE_PROVIDER_NAMES, balanceFor, fetchBalance, formatBalance, validBalanceTarget } from "./provider-balance.ts";
 import { evaluatePermission, loadRuntimePermissionPolicy, redactSearchOutput } from "./permission-policy.ts";
+import { formatWebSearchResults, injectDeepSeekBuiltinSearch, isDeepSeekModel, searchWithDeepSeekApi } from "./web-search.ts";
 
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
@@ -409,6 +410,54 @@ export default function permissions(pi: ExtensionAPI) {
 				}
 			},
 		});
+		if (process.env.PI_DESKTOP_WEB_SEARCH_ENABLED !== "0") {
+			pi.registerTool({
+				name: "WebSearch",
+				label: "WebSearch",
+				description:
+					"Search the web using DeepSeek Search API ($0.75/1000 calls) and return titles, URLs, snippets, and optional page content. When using a DeepSeek model, DeepSeek's built-in free search is used automatically.",
+				promptSnippet: "Search the web for up-to-date information",
+				parameters: {
+					type: "object",
+					additionalProperties: false,
+					required: ["query"],
+					properties: {
+						query: { type: "string", minLength: 1, maxLength: 128 },
+						count: { type: "integer", minimum: 1, maximum: 50 },
+						need_content: { type: "boolean" },
+					},
+				} as ToolDefinition["parameters"],
+				exposure: "model-only",
+				defaultActive: true,
+				executionMode: "parallel",
+				async execute(_toolCallId, input, signal) {
+					const rec = input as { query?: string; count?: number; need_content?: boolean };
+					const apiKey = process.env.PI_DESKTOP_WEB_SEARCH_KEY ?? "";
+					const result = await searchWithDeepSeekApi({
+						query: String(rec?.query ?? ""),
+						count: typeof rec?.count === "number" ? rec.count : undefined,
+						needContent: rec?.need_content === true,
+						apiKey,
+						endpoint: process.env.PI_DESKTOP_WEB_SEARCH_ENDPOINT,
+						signal,
+					});
+					return {
+						content: [{ type: "text", text: formatWebSearchResults(result) }],
+						details: { query: result.query, count: result.results.length, total: result.total },
+					};
+				},
+			});
+			pi.on("before_provider_request", async (event, ctx) => {
+				if (!isDeepSeekModel(ctx.model as { provider?: string; id?: string; baseUrl?: string } | undefined)) return undefined;
+				try {
+					const policy = await loadRuntimePermissionPolicy();
+					if (policy.disabledTools.includes("WebSearch")) return undefined;
+				} catch {
+					// If policy file isn't readable, proceed cleanly.
+				}
+				return injectDeepSeekBuiltinSearch(event.payload);
+			});
+		}
 		pi.registerTool({
 			name: "AskUserQuestion",
 			label: "AskUserQuestion",

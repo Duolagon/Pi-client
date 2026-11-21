@@ -215,6 +215,43 @@ function installHandlers() {
 	handle("pi:rename", (id, title) =>
 		service.renameConversation(string(id, "会话 ID", 200), string(title, "会话名称", 160)),
 	);
+	handle("pi:conversation:meta", (id, input) => {
+		const record = object(input);
+		const patch: { pinned?: boolean; archived?: boolean; group?: string | null } = {};
+		if (record.pinned !== undefined) {
+			if (typeof record.pinned !== "boolean") throw new Error("置顶参数无效。");
+			patch.pinned = record.pinned;
+		}
+		if (record.archived !== undefined) {
+			if (typeof record.archived !== "boolean") throw new Error("归档参数无效。");
+			patch.archived = record.archived;
+		}
+		if (record.group !== undefined) {
+			if (record.group !== null && typeof record.group !== "string") throw new Error("分组名称无效。");
+			patch.group = record.group === null ? null : string(record.group, "分组名称", 60);
+		}
+		return service.updateConversationMeta(string(id, "会话 ID", 200), patch);
+	});
+	handle("pi:conversation:add-dir", (id, dirPath) =>
+		service.addDir(string(id, "会话 ID", 200), string(dirPath, "目录路径", 4096)),
+	);
+	handle("pi:conversation:remove-dir", (id, dirPath) =>
+		service.removeDir(string(id, "会话 ID", 200), string(dirPath, "目录路径", 4096)),
+	);
+	handle("pi:goal:start", (id, input) => {
+		const record = object(input);
+		const objective = string(record.objective, "目标描述", 4000);
+		if (record.maxTurns !== undefined && (!Number.isSafeInteger(record.maxTurns) || (record.maxTurns as number) < 1 || (record.maxTurns as number) > 50))
+			throw new Error("目标轮数上限需为 1–50 的整数。");
+		if (record.maxCostUsd !== undefined && (typeof record.maxCostUsd !== "number" || !Number.isFinite(record.maxCostUsd) || record.maxCostUsd < 0.01 || record.maxCostUsd > 100000))
+			throw new Error("目标费用上限需为 0.01–100000 美元。");
+		return service.startGoal(string(id, "会话 ID", 200), {
+			objective,
+			maxTurns: record.maxTurns as number | undefined,
+			maxCostUsd: record.maxCostUsd as number | undefined,
+		});
+	});
+	handle("pi:goal:stop", (id) => service.stopGoal(string(id, "会话 ID", 200)));
 	handle("pi:command", (input, id) => service.command(command(input), id === undefined ? undefined : string(id, "会话 ID", 200)));
 	handle("pi:respond", async (input, id) => {
 		const record = object(input);
@@ -247,6 +284,17 @@ function installHandlers() {
 		if (number !== undefined && (typeof number !== "number" || !Number.isSafeInteger(number) || number < 1))
 			throw new Error("PR 编号无效。");
 		return service.pullRequest(string(id, "会话 ID", 200), number);
+	});
+	handle("pi:pull-request:auto-merge", (id, number, enabled, method) => {
+		if (typeof number !== "number" || !Number.isSafeInteger(number) || number < 1) throw new Error("PR 编号无效。");
+		if (typeof enabled !== "boolean") throw new Error("自动合并参数无效。");
+		if (method !== undefined && method !== "merge" && method !== "squash" && method !== "rebase")
+			throw new Error("合并方式无效。");
+		return service.setPullRequestAutoMerge(string(id, "会话 ID", 200), number, enabled, method);
+	});
+	handle("pi:pull-request:comments", (id, number) => {
+		if (typeof number !== "number" || !Number.isSafeInteger(number) || number < 1) throw new Error("PR 编号无效。");
+		return service.pullRequestComments(string(id, "会话 ID", 200), number);
 	});
 	handle("pi:diff", (path) => service.diff(string(path, "文件路径")));
 	handle("pi:settings", (input) => {
@@ -317,6 +365,9 @@ function installHandlers() {
 			throw new Error("编辑器设置格式错误。");
 		if (settings.statusBalance !== undefined && typeof settings.statusBalance !== "boolean")
 			throw new Error("状态栏余额开关格式错误。");
+		if (settings.webSearchEnabled !== undefined && typeof settings.webSearchEnabled !== "boolean")
+			throw new Error("网络搜索开关格式错误。");
+		if (settings.webSearchApiKey !== undefined) string(settings.webSearchApiKey, "WebSearch API Key", 4096);
 		if (settings.provider !== undefined) connection(settings);
 		if (settings.agentDir !== undefined) string(settings.agentDir, "Pi 配置目录", 16384);
 		return service.saveSettings(settings as Parameters<DesktopAPI["saveSettings"]>[0]);
@@ -404,6 +455,7 @@ void app.whenReady().then(() => {
 		executable: process.execPath,
 		env: environment,
 		initialProject: process.env.PI_DESKTOP_WORKSPACE,
+		trashItem: (filePath) => shell.trashItem(filePath),
 		encrypt: (value) => {
 			if (!safeStorage.isEncryptionAvailable()) throw new Error("系统安全存储不可用。");
 			return safeStorage.encryptString(value).toString("base64");

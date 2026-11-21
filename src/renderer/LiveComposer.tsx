@@ -67,7 +67,9 @@ export type BuiltinSlashAction =
 	| "fork"
 	| "doctor"
 	| "output-style"
-	| "stats";
+	| "stats"
+	| "add-dir"
+	| "goal";
 
 const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[] = [
 	{ name: "compact", description: "压缩上下文（支持 /compact <聚焦指令>）" },
@@ -99,10 +101,12 @@ const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[
 	{ name: "copy", description: "复制最后一条回复（/copy 2 复制倒数第 2 条）" },
 	{ name: "export", description: "把当前会话导出为文件" },
 	{ name: "fork", description: "复制当前会话为新分支继续（别名 /branch）" },
+	{ name: "add-dir", description: "附加工作目录并放行读写与沙箱（/add-dir <目录> 或 /add-dir rm <目录>）" },
+	{ name: "goal", description: "设定目标自动续跑（/goal [--max-turns 8] [--max-cost 2] <目标>，/goal stop 停止）" },
 ];
 
 /** Builtins that accept an argument after the name, plus Claude Code aliases. */
-const BUILTIN_WITH_ARGS = new Set<BuiltinSlashAction>(["theme", "rename", "copy", "export", "fork", "output-style"]);
+const BUILTIN_WITH_ARGS = new Set<BuiltinSlashAction>(["theme", "rename", "copy", "export", "fork", "output-style", "add-dir", "goal"]);
 const BUILTIN_ALIASES: Record<string, BuiltinSlashAction> = { branch: "fork" };
 /** Argument-free builtins added later that also yield to a Pi command or skill of the same name. */
 const YIELDING_BUILTINS = new Set<BuiltinSlashAction>(["doctor", "stats"]);
@@ -113,8 +117,8 @@ const YIELDING_BUILTINS = new Set<BuiltinSlashAction>(["doctor", "stats"]);
  * stops them instead. Pi commands, skills and templates with the same name win.
  */
 const CLAUDE_ONLY_COMMANDS = new Set([
-	"add-dir", "advisor", "agents-view", "autocompact", "background", "bug", "chrome",
-	"desktop", "diff", "effort", "exit", "fast", "feedback", "goal", "help", "ide",
+	"advisor", "agents-view", "autocompact", "background", "bug", "chrome",
+	"desktop", "diff", "effort", "exit", "fast", "feedback", "help", "ide",
 	"insights", "install-github-app", "keybindings", "login", "logout", "mobile", "model",
 	"plugin", "pr-comments", "privacy-settings", "quit", "recap", "release-notes", "remote-control",
 	"resume", "run", "schedule", "statusline",

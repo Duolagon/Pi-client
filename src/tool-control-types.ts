@@ -16,7 +16,7 @@ export const desktopModelToolNames = [
 	"Monitor", "BashOutput", "KillShell",
 	"ScheduleWakeup", "CronCreate", "CronList", "CronDelete",
 	"TeamCreate", "TeamDelete",
-	"WorkflowRun", "StructuredOutput",
+	"WorkflowRun", "StructuredOutput", "LSP",
 ] as const;
 export type DesktopModelToolName = (typeof desktopModelToolNames)[number];
 /**
@@ -258,6 +258,7 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 		TeamDelete: ["team_name"],
 		WorkflowRun: ["title", "script", "budget", "run_in_background"],
 		StructuredOutput: ["data"],
+		LSP: ["operation", "filePath", "line", "character", "silent"],
 	};
 	if (Object.keys(input).some((key) => !allowed[tool].includes(key))) throw new Error("Unknown tool input field");
 	if (tool === "Agent") {
@@ -385,6 +386,19 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 		}
 	} else if (tool === "StructuredOutput") {
 		if (!("data" in input)) throw new Error("StructuredOutput requires 'data'");
+	} else if (tool === "LSP") {
+		const validOps = ["diagnostics", "documentSymbol", "goToDefinition", "inspect"];
+		if (typeof input.operation !== "string" || !validOps.includes(input.operation)) {
+			throw new Error("LSP operation must be diagnostics, documentSymbol, goToDefinition, or inspect");
+		}
+		text(input.filePath, "filePath", 4096);
+		if (input.line !== undefined && (!Number.isSafeInteger(input.line) || Number(input.line) < 1)) {
+			throw new Error("LSP line must be a positive integer");
+		}
+		if (input.character !== undefined && (!Number.isSafeInteger(input.character) || Number(input.character) < 1)) {
+			throw new Error("LSP character must be a positive integer");
+		}
+		optionalBoolean(input.silent, "silent");
 	}
 	return { ...input };
 }

@@ -203,7 +203,9 @@ function dayLabel(timestamp: number, now: number): string {
 }
 
 export interface SidebarConversationGroups {
-	groups: { label: string; items: Conversation[] }[];
+	groups: { label: string; items: Conversation[]; kind?: "pinned" | "custom" | "date" }[];
+	/** Archived top-level conversations, sorted newest first. */
+	archived: Conversation[];
 	/** Sub-agent conversations grouped by their live parent conversation id. */
 	childrenByParent: Map<string, Conversation[]>;
 	/** Sub-agent conversations whose parent conversation no longer exists. */
@@ -214,13 +216,17 @@ export interface SidebarConversationGroups {
 
 /**
  * Partition conversations for the sidebar:
- * - Top-level conversations stay in date groups.
+ * - Archived top-level conversations go into `archived`.
+ * - Pinned active conversations go first into a "置顶" group.
+ * - Active conversations with a custom `group` go into named custom groups.
+ * - Remaining active top-level conversations stay in date groups.
  * - Delegated sub-agent conversations (`kind === "subagent"`) fold under their parent (`(+N)`).
  * - Orphaned sub-agents (parent deleted) move out of the sidebar into SessionsDialog's sub-agent group.
  */
 export function groupSidebarConversations(conversations: Conversation[], now = Date.now()): SidebarConversationGroups {
 	const presentIds = new Set(conversations.map((item) => item.id));
 	const topLevel: Conversation[] = [];
+	const archived: Conversation[] = [];
 	const childrenByParent = new Map<string, Conversation[]>();
 	const orphanedSubagents: Conversation[] = [];
 	const allSubagents: Conversation[] = [];
@@ -238,19 +244,45 @@ export function groupSidebarConversations(conversations: Conversation[], now = D
 			}
 			continue;
 		}
-		topLevel.push(conv);
+		if (conv.archived) {
+			archived.push(conv);
+		} else {
+			topLevel.push(conv);
+		}
 	}
 
-	const order = ["今天", "昨天", "近 7 天", "近 30 天", "更早"];
-	const buckets = new Map<string, Conversation[]>();
+	const pinned: Conversation[] = [];
+	const customBuckets = new Map<string, Conversation[]>();
+	const dateBuckets = new Map<string, Conversation[]>();
 	for (const session of topLevel) {
+		if (session.pinned) {
+			pinned.push(session);
+			continue;
+		}
+		const groupName = session.group?.trim();
+		if (groupName) {
+			const list = customBuckets.get(groupName) ?? [];
+			list.push(session);
+			customBuckets.set(groupName, list);
+			continue;
+		}
 		const label = dayLabel(session.updatedAt, now);
-		const list = buckets.get(label) ?? [];
+		const list = dateBuckets.get(label) ?? [];
 		list.push(session);
-		buckets.set(label, list);
+		dateBuckets.set(label, list);
 	}
-	const groups = order.filter((label) => buckets.has(label)).map((label) => ({ label, items: buckets.get(label)! }));
-	return { groups, childrenByParent, orphanedSubagents, allSubagents };
+
+	const groups: { label: string; items: Conversation[]; kind?: "pinned" | "custom" | "date" }[] = [];
+	if (pinned.length > 0) groups.push({ label: "置顶", items: pinned, kind: "pinned" });
+	for (const name of [...customBuckets.keys()].sort((a, b) => a.localeCompare(b, "zh-Hans-CN"))) {
+		groups.push({ label: name, items: customBuckets.get(name)!, kind: "custom" });
+	}
+	const order = ["今天", "昨天", "近 7 天", "近 30 天", "更早"];
+	for (const label of order) {
+		const items = dateBuckets.get(label);
+		if (items?.length) groups.push({ label, items, kind: "date" });
+	}
+	return { groups, archived, childrenByParent, orphanedSubagents, allSubagents };
 }
 
 export type SubagentViewSlashDecision =

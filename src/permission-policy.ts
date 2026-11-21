@@ -14,7 +14,7 @@ import type {
 
 const readingTools = new Set(["read", "grep", "find", "ls"]);
 const editTools = new Set(["edit", "write", "NotebookEdit"]);
-const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite", "TodoCreate", "TodoGet", "TodoUpdate", "TodoList", "CronList", "BashOutput", "KillShell", "StructuredOutput", "AskUserQuestion", "ExitPlanMode"]);
+const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite", "TodoCreate", "TodoGet", "TodoUpdate", "TodoList", "CronList", "BashOutput", "KillShell", "StructuredOutput", "AskUserQuestion", "ExitPlanMode", "LSP"]);
 const pathTools = new Set([...readingTools, "edit", "write", "NotebookEdit"]);
 const wrappers = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", ".", "env", "sudo", "doas", "exec", "command", "xargs"]);
 /** Pass-through process wrappers that Claude Code strips before matching command rules. */
@@ -449,6 +449,12 @@ export async function evaluatePermission(
 	call: PermissionToolCall,
 ): Promise<PermissionDecision> {
 	const project = await canonicalPermissionPath(policy.project, policy.project);
+	const extraDirs = policy.additionalDirs?.length
+		? await Promise.all(policy.additionalDirs.map((dir) => canonicalPermissionPath(dir, project)))
+		: [];
+	const allowedRoots = [project, ...extraDirs];
+	const inAllowedRoots = (target: string) => allowedRoots.some((root) => contained(root, target));
+	const inExtraDirs = (target: string) => extraDirs.some((root) => contained(root, target));
 	if (policy.disabledTools.includes(call.toolName)) return { action: "deny", reason: "该工具已停用。" };
 	if (policy.allowedMcpServers !== undefined && call.toolName.startsWith("mcp__")) {
 		const rest = call.toolName.slice(5);
@@ -468,7 +474,7 @@ export async function evaluatePermission(
 			typeof input.subagent_type === "string" &&
 			input.subagent_type !== "general-purpose" &&
 			input.subagent_type !== "fork");
-	if (policy.mode === "read" && !readingTools.has(call.toolName) && !harmlessDesktopTools.has(call.toolName) && !readModeSafeDelegation)
+	if (policy.mode === "read" && !readingTools.has(call.toolName) && !harmlessDesktopTools.has(call.toolName) && call.toolName !== "WebSearch" && !readModeSafeDelegation)
 		return { action: "deny", reason: "当前为只读模式，此工具不可执行。" };
 	let targets: string[] = [];
 	const rawPath =
@@ -499,6 +505,7 @@ export async function evaluatePermission(
 			readingTools.has(call.toolName) ||
 			harmlessDesktopTools.has(call.toolName) ||
 			call.toolName === "WebFetch" ||
+			call.toolName === "WebSearch" ||
 			writingPlanFile ||
 			isSafePlanAgent;
 		if (!allowedInPlan) {
@@ -598,12 +605,15 @@ export async function evaluatePermission(
 			return result("allow", "Plan 模式：允许只读探索/规划子 Agent。");
 	}
 	if (policy.mode === "auto") return result("allow", "自动执行模式。");
-	if (policy.mode === "acceptEdits" && editTools.has(call.toolName) && targets.length && targets.every((target) => contained(project, target)))
-		return result("allow", "接受编辑模式：项目内文件编辑自动允许。");
+	if (policy.mode === "acceptEdits" && editTools.has(call.toolName) && targets.length && targets.every(inAllowedRoots))
+		return result("allow", "接受编辑模式：项目及附加目录内文件编辑自动允许。");
+	if (editTools.has(call.toolName) && targets.length && extraDirs.length > 0 && targets.every(inExtraDirs))
+		return result("allow", "附加目录（/add-dir）已放行读写。");
 	if (shell && (shell.compound || shell.opaque)) return result("ask", "复杂 Shell 命令需要单次确认。不能通过字面命令授权推断其副作用。");
-	if (readingTools.has(call.toolName) && targets.every((target) => contained(project, target)))
-		return result("allow", "项目目录内的读取工具。");
+	if (readingTools.has(call.toolName) && targets.every(inAllowedRoots))
+		return result("allow", "项目或附加目录内的读取工具。");
 	if (harmlessDesktopTools.has(call.toolName)) return result("allow", "只读任务状态或任务取消操作。");
+	if (call.toolName === "WebSearch") return result("allow", "网络搜索（只读）。");
 	if (call.toolName === "CronCreate" || call.toolName === "CronDelete" || call.toolName === "ScheduleWakeup") {
 		return result("allow", "定时唤醒日程管理。");
 	}
@@ -613,5 +623,5 @@ export async function evaluatePermission(
 	if (call.toolName === "WorkflowRun") {
 		return result("allow", "工作流引擎执行（受工作流审批卡片与沙箱控制）。");
 	}
-	return result("ask", targets.some((target) => !contained(project, target)) ? "访问项目目录外的路径需要确认。" : "此工具操作需要确认。");
+	return result("ask", targets.some((target) => !inAllowedRoots(target)) ? "访问项目目录外的路径需要确认。" : "此工具操作需要确认。");
 }

@@ -40,6 +40,8 @@ export interface RuntimePermissionPolicy {
 	/** When set, restricts `mcp__<server>__*` tool calls to these MCP server names. */
 	allowedMcpServers?: string[];
 	project: string;
+	/** Additional directories granted read/write access via /add-dir. */
+	additionalDirs?: string[];
 }
 
 export interface PermissionToolCall {

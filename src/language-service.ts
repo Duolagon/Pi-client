@@ -22,6 +22,63 @@ const servers: Record<string, [string, string[], string]> = {
 	".rs": ["rust-analyzer", [], "rust"],
 };
 
+export const LSP_SUPPORTED_EXTENSIONS = new Set(Object.keys(servers));
+
+export function isLspSupportedFile(filePath: string): boolean {
+	return LSP_SUPPORTED_EXTENSIONS.has(extname(filePath).toLowerCase());
+}
+
+const SEVERITY_LABELS: Record<number, string> = {
+	1: "Error",
+	2: "Warning",
+	3: "Info",
+	4: "Hint",
+};
+
+export function formatLspDiagnostics(filePath: string, intel: Pick<CodeIntelligence, "server" | "diagnostics">): string {
+	if (!intel.diagnostics.length) return "";
+	const lines = [`[LSP 诊断 (${intel.server}) ${filePath}]:`];
+	for (const d of intel.diagnostics.slice(0, 30)) {
+		const level = SEVERITY_LABELS[d.severity] ?? "Diagnostic";
+		lines.push(`- L${d.line}:${d.column} [${level}] ${d.message}`);
+	}
+	if (intel.diagnostics.length > 30) lines.push(`…另有 ${intel.diagnostics.length - 30} 条诊断。`);
+	return lines.join("\n");
+}
+
+export function formatCodeIntelligence(
+	filePath: string,
+	intel: CodeIntelligence,
+	operation: "diagnostics" | "documentSymbol" | "goToDefinition" | "inspect" = "inspect",
+): string {
+	const sections: string[] = [];
+	if (operation === "diagnostics" || operation === "inspect") {
+		const diag = formatLspDiagnostics(filePath, intel);
+		sections.push(diag || `[LSP 诊断 (${intel.server}) ${filePath}]: 无诊断问题。`);
+	}
+	if (operation === "documentSymbol" || operation === "inspect") {
+		if (intel.symbols.length) {
+			sections.push(
+				`[LSP 符号 (${intel.server}) ${filePath}]:\n` +
+					intel.symbols.slice(0, 60).map((s) => `- ${s.name} (L${s.line}:${s.column})`).join("\n"),
+			);
+		} else if (operation === "documentSymbol") {
+			sections.push(`[LSP 符号 (${intel.server}) ${filePath}]: 未找到符号。`);
+		}
+	}
+	if (operation === "goToDefinition" || (operation === "inspect" && intel.definitions.length > 0)) {
+		if (intel.definitions.length) {
+			sections.push(
+				`[LSP 定义位置 (${intel.server})]:\n` +
+					intel.definitions.map((loc) => `- ${loc.path}:${loc.line}:${loc.column}`).join("\n"),
+			);
+		} else if (operation === "goToDefinition") {
+			sections.push(`[LSP 定义位置 (${intel.server})]: 未找到定义位置。`);
+		}
+	}
+	return sections.join("\n\n");
+}
+
 function within(project: string, file: string): string | undefined {
 	const path = relative(project, file);
 	if (path && !isAbsolute(path) && path !== ".." && !path.startsWith(`..${sep}`)) return path.split(sep).join("/");

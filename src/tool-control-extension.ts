@@ -17,6 +17,7 @@ import { teamMessageTypes, teamToolNames } from "./team-types.ts";
 import { formatAgentListing, parseAgentListing } from "./agent-listing.ts";
 import { TASK_NOTIFICATION_TYPE, formatTaskProgressSummary } from "./delegation-format.ts";
 import { postLoopbackJson, postLoopbackNdjson } from "./loopback-request.ts";
+import { isLspSupportedFile } from "./language-service.ts";
 import type { TaskProgress } from "./task-types.ts";
 
 const NOTIFICATION_ACK = "desktop_notification_ack";
@@ -24,7 +25,7 @@ const NOTIFICATION_WAKE = "desktop_task_notification_wake";
 /** Name of the structured system prompt section that lists agent types (see Pi's section names). */
 export const AGENT_LISTING_SECTION = "agent_types";
 const nativeTools = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"]);
-const safeChildTools = new Set(["read", "grep", "find", "ls", "AgentExecutors", "TaskOutput", "TaskStop", "TaskList", "WorktreeList", "TodoGet", "TodoList"]);
+const safeChildTools = new Set(["read", "grep", "find", "ls", "AgentExecutors", "TaskOutput", "TaskStop", "TaskList", "WorktreeList", "TodoGet", "TodoList", "LSP"]);
 const worktreeMutationTools = new Set(["WorktreeCreate", "WorktreeMerge", "WorktreeRemove"]);
 const cronChildBlockedTools = new Set<string>(cronToolNames);
 const teamTools = new Set<string>(teamToolNames);
@@ -150,6 +151,12 @@ export const toolSchemas: Record<DesktopModelToolName, JsonSchema> = {
 	StructuredOutput: schema({
 		data: { description: "JSON value matching the required StructuredOutput JSON Schema" },
 	}, ["data"]),
+	LSP: schema({
+		operation: { type: "string", enum: ["diagnostics", "documentSymbol", "goToDefinition", "inspect"], description: "LSP operation to run on the file" },
+		filePath: { ...boundedText(4096), description: "Project-relative or absolute path to a JS, TS, Python, Go, or Rust file" },
+		line: { type: "integer", minimum: 1, description: "1-based line number (used for goToDefinition)" },
+		character: { type: "integer", minimum: 1, description: "1-based column number (used for goToDefinition)" },
+	}, ["operation", "filePath"]),
 };
 const descriptions: Record<DesktopModelToolName, string> = {
 	Agent: [
@@ -188,6 +195,7 @@ const descriptions: Record<DesktopModelToolName, string> = {
 	TeamDelete: "Delete the active Agent Team directory after active teammates have stopped or shut down.",
 	WorkflowRun: "Execute a deterministic multi-step workflow script in an isolated utilityProcess/VM sandbox using allowlisted agent(), parallel(), pipeline(), phase(), log(), and budget() primitives with durable journal recovery.",
 	StructuredOutput: "Submit the structured JSON result matching the workflow step's schema.",
+	LSP: "Query a locally installed Language Server (TypeScript/JS, Python/pyright, Go/gopls, Rust/rust-analyzer) for diagnostics, document symbols, or go-to-definition. Requires the project to be trusted and the language server installed on PATH.",
 };
 
 function hostConfig(): { url: string; token: string } | undefined {
@@ -248,6 +256,34 @@ export default function toolControl(pi: ExtensionAPI): void {
 		});
 	}
 	if (host) {
+		pi.on("tool_result", async (event) => {
+			if (event.isError || (event.toolName !== "edit" && event.toolName !== "write")) return undefined;
+			const filePath = typeof (event.input as { path?: unknown })?.path === "string"
+				? (event.input as { path: string }).path
+				: undefined;
+			if (!filePath || !isLspSupportedFile(filePath)) return undefined;
+			try {
+				const response = await postLoopbackJson(
+					host.url,
+					"/invoke",
+					host.token,
+					{
+						tool: "LSP",
+						toolCallId: `auto-lsp-${Date.now()}`,
+						input: { operation: "diagnostics", filePath, silent: true },
+					},
+					AbortSignal.timeout(4500),
+				);
+				const record = response.body as { ok?: boolean; data?: { diagnostics?: unknown[]; formatted?: string } } | undefined;
+				if (!record?.ok || !record.data?.diagnostics?.length || !record.data.formatted) return undefined;
+				const content = Array.isArray(event.content) ? [...event.content] : [];
+				content.push({ type: "text", text: `\n\n${record.data.formatted}` });
+				return { content };
+			} catch {
+				// Auto-diagnostics are strictly best-effort and must never fail an edit/write.
+				return undefined;
+			}
+		});
 		for (const name of desktopModelToolNames) {
 			pi.registerTool({
 				name, label: name, description: descriptions[name], promptSnippet: descriptions[name].split(". ")[0],
