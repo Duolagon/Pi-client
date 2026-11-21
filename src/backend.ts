@@ -385,6 +385,10 @@ export class DesktopService {
 	private worktreeOperationOwner?: string;
 	private external: ExternalAgents;
 	private waiters = new TaskWaiters();
+	/** Workflow steps waiting for a free subagent slot; woken on every task status change. */
+	private slotWaiters = new Set<() => void>();
+	/** Slots claimed by workflow steps whose task is not yet in the store, per parent conversation. */
+	private reservedSlots = new Map<string, number>();
 	/** Consecutive delivery failures per outbox key; memory only, reset by a manual delivery. */
 	private notifyAttempts = new Map<string, number>();
 	private notifyTimers = new Map<string, NodeJS.Timeout>();
@@ -568,13 +572,19 @@ export class DesktopService {
 				},
 				runAgentStep: async (req, signal) => {
 					const conv = this.conversation(req.conversationId);
-					const maxConcurrent = this.store.settings.maxConcurrentSubagents ?? DEFAULT_MAX_CONCURRENT_SUBAGENTS;
-					const activeCount = this.store.tasks.filter(
-						(item) => item.parentConversationId === conv.id && ["queued", "running", "waiting_for_input"].includes(item.status),
-					).length;
-					if (activeCount >= maxConcurrent) {
-						throw new Error(`Concurrent subagent limit reached (${activeCount}/${maxConcurrent})`);
-					}
+					// Wait for a free slot instead of failing, so parallel() wider than the
+					// concurrency cap runs in waves rather than erroring.
+					await this.acquireSubagentSlot(conv.id, signal);
+					let slotHeld = true;
+					const releaseSlot = () => {
+						if (!slotHeld) return;
+						slotHeld = false;
+						const left = (this.reservedSlots.get(conv.id) ?? 1) - 1;
+						if (left > 0) this.reservedSlots.set(conv.id, left);
+						else this.reservedSlots.delete(conv.id);
+						this.wakeSlotWaiters();
+					};
+					try {
 					const trustProj = this.trustProjectFor(conv.project);
 					const definition = req.subagentType
 						? await this.agents.resolve(trustProj, req.subagentType, this.projectTrusted(trustProj)).catch(() => undefined)
@@ -617,12 +627,10 @@ export class DesktopService {
 							workflowId: req.workflowId,
 						},
 					);
-					const finished = await this.waiters.wait(
+					// The task is now in the store and counts toward the cap by its own status.
+					releaseSlot();
+					const finished = await this.waitTaskSettled(
 						task.id,
-						() => {
-							const item = this.store.tasks.find((t) => t.id === task.id);
-							return item && structuredClone(item);
-						},
 						(t) => !["queued", "running", "waiting_for_input"].includes(t.status),
 						signal,
 					);
@@ -637,18 +645,17 @@ export class DesktopService {
 						...(finished.structuredOutput !== undefined ? { structuredOutput: finished.structuredOutput } : {}),
 						...(finished.stats ? { usage: { totalTokens: finished.stats.tokens.total, cost: finished.stats.cost } } : {}),
 					};
+					} finally {
+						releaseSlot();
+					}
 				},
 				resumeStructuredStep: async (taskId, feedback, signal) => {
 					const existing = this.task(taskId);
 					delete existing.structuredOutput;
 					const expectedTurn = (existing.turn ?? 1) + 1;
 					await this.resumeTask(taskId, feedback, { source: "model", background: true });
-					const finished = await this.waiters.wait(
+					const finished = await this.waitTaskSettled(
 						taskId,
-						() => {
-							const item = this.store.tasks.find((t) => t.id === taskId);
-							return item && structuredClone(item);
-						},
 						(t) => (t.turn ?? 1) >= expectedTurn && !["queued", "running", "waiting_for_input"].includes(t.status),
 						signal,
 					);
@@ -3832,6 +3839,53 @@ export class DesktopService {
 		}
 	}
 
+	/** Wait until a task satisfies `predicate` with no overall deadline; `TaskWaiters.wait` with timeout 0 returns at once. */
+	private async waitTaskSettled(
+		id: string,
+		predicate: (task: DesktopTask) => boolean,
+		signal?: AbortSignal,
+	): Promise<DesktopTask | undefined> {
+		const read = () => {
+			const item = this.store.tasks.find((t) => t.id === id);
+			return item && structuredClone(item);
+		};
+		for (;;) {
+			const task = await this.waiters.wait(id, read, predicate, signal, 60000);
+			if (!task || predicate(task) || this.closed) return task;
+		}
+	}
+
+	private wakeSlotWaiters(): void {
+		for (const wake of [...this.slotWaiters]) wake();
+	}
+
+	/** Reserve one subagent slot for `conversationId`, waiting while the concurrency cap is reached. */
+	private async acquireSubagentSlot(conversationId: string, signal?: AbortSignal): Promise<void> {
+		for (;;) {
+			signal?.throwIfAborted();
+			if (this.closed) throw new Error("桌面服务已关闭。");
+			const maxConcurrent = this.store.settings.maxConcurrentSubagents ?? DEFAULT_MAX_CONCURRENT_SUBAGENTS;
+			const active = this.store.tasks.filter(
+				(item) => item.parentConversationId === conversationId && ["queued", "running", "waiting_for_input"].includes(item.status),
+			).length;
+			const reserved = this.reservedSlots.get(conversationId) ?? 0;
+			if (active + reserved < maxConcurrent) {
+				this.reservedSlots.set(conversationId, reserved + 1);
+				return;
+			}
+			await new Promise<void>((resolve, reject) => {
+				const done = () => {
+					this.slotWaiters.delete(wake);
+					signal?.removeEventListener("abort", aborted);
+				};
+				const wake = () => { done(); resolve(); };
+				const aborted = () => { done(); reject(signal!.reason ?? new Error("aborted")); };
+				this.slotWaiters.add(wake);
+				signal?.addEventListener("abort", aborted, { once: true });
+			});
+		}
+	}
+
 	subscribeTasks(listener: (event: TaskEvent) => void): () => void {
 		this.taskListeners.add(listener);
 		return () => this.taskListeners.delete(listener);
@@ -4646,6 +4700,7 @@ export class DesktopService {
 		task.revision = (task.revision ?? 0) + 1;
 		for (const listener of this.taskListeners) listener({ type: "task_updated", task: structuredClone(task) });
 		this.waiters.notify(task.id);
+		this.wakeSlotWaiters();
 		await this.persist();
 		if (task.parentConversationId && !["queued", "running", "waiting_for_input"].includes(task.status)) {
 			void this.flushNotifications(task.parentConversationId, "auto");
@@ -5063,6 +5118,7 @@ export class DesktopService {
 		this.reapTimer = undefined;
 		this.delegation.dispose();
 		this.waiters.close();
+		this.wakeSlotWaiters();
 		for (const timer of this.notifyTimers.values()) clearTimeout(timer);
 		this.notifyTimers.clear();
 		await this.toolHost.close();
@@ -5153,6 +5209,7 @@ export class DesktopService {
 		for (const listener of this.taskListeners) listener({ type: "task_updated", task: structuredClone(task) });
 		void this.persist().catch(() => {});
 		this.waiters.notify(task.id);
+		this.wakeSlotWaiters();
 		this.delegation.observeTask(task);
 		this.external?.pump();
 	}
