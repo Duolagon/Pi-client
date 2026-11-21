@@ -28,7 +28,9 @@ const HOOK_EVENTS: HookEventName[] = [
 	"SubagentStart",
 	"SubagentStop",
 	"PreCompact",
+	"PostCompact",
 	"SessionStart",
+	"SessionEnd",
 	"Notification",
 ];
 

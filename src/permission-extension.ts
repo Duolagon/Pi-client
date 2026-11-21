@@ -245,6 +245,48 @@ export function escapeConfigValue(value: string): string {
 	return escaped.startsWith("!") ? dollar + escaped : escaped;
 }
 
+/** Custom message type of the visible notice written when the conversation switches to the fallback model. */
+export const FALLBACK_MESSAGE_TYPE = "desktop_model_fallback";
+
+/**
+ * Decides whether a final provider error should switch to the fallback model. Returns a short
+ * Chinese reason for overload, rate limits and server errors; undefined for everything else
+ * (aborts, authentication, invalid requests, context overflow, quota/billing, network issues).
+ */
+export function fallbackReason(errorMessage: unknown): string | undefined {
+	if (typeof errorMessage !== "string") return undefined;
+	const text = errorMessage.slice(0, 4096);
+	if (!text.trim()) return undefined;
+	const code = (pattern: string) => new RegExp(`(?<![a-z0-9.])(?:${pattern})(?![a-z0-9])`, "i");
+	// Never fall back on errors another model cannot fix or that the user caused.
+	if (/abort|cancel/i.test(text)) return undefined;
+	if (code("400|401|403|404|413|422").test(text)) return undefined;
+	if (/unauthori[sz]ed|forbidden|authenticat|permission.?denied|invalid.{0,12}(?:api.?key|token|x-api-key)|incorrect api key|api.?key/i.test(text)) return undefined;
+	if (/invalid.?request|bad.?request|validation/i.test(text)) return undefined;
+	if (/context.?(?:length|window|overflow)|maximum context|too many tokens|prompt is too long|token limit|exceeds? the (?:model'?s? )?(?:maximum|limit)/i.test(text)) return undefined;
+	if (/insufficient.?(?:quota|balance|funds)|quota.?exceeded|billing|out of budget|credit|usage limit|available balance/i.test(text)) return undefined;
+	if (/overload|server.?busy|servers are currently busy|high demand|at capacity|capacity/i.test(text) || code("529").test(text)) return "过载";
+	if (/rate.?limit|too many requests|throttl/i.test(text) || code("429").test(text)) return "限流";
+	if (/service.?(?:is.?)?(?:temporarily.?)?unavailable|bad.?gateway|gateway.?time.?out|server.?error|internal.?(?:server.?)?error/i.test(text) || code("5[0-9]{2}").test(text))
+		return "服务端错误";
+	return undefined;
+}
+
+/** Parses PI_DESKTOP_FALLBACK_MODEL; malformed values disable the fallback. */
+export function parseFallbackModel(raw: string | undefined): { provider: string; id: string } | undefined {
+	if (!raw) return undefined;
+	try {
+		const value = JSON.parse(raw) as { provider?: unknown; id?: unknown };
+		if (typeof value?.provider !== "string" || typeof value.id !== "string") return undefined;
+		const provider = value.provider.trim();
+		const id = value.id.trim();
+		if (!provider || !id || provider.length > 200 || id.length > 200) return undefined;
+		return { provider, id };
+	} catch {
+		return undefined;
+	}
+}
+
 /** Session spend in USD from the entries Pi records, including subagent usage entries. */
 export function sessionCost(entries: readonly unknown[]): number {
 	let total = 0;
@@ -573,6 +615,7 @@ export default function permissions(pi: ExtensionAPI) {
 	}
 	for (const [provider, connection] of Object.entries(connections))
 		registerConnection(provider as Provider, connection);
+	registerOutputStyle(pi, process.env.PI_DESKTOP_OUTPUT_STYLE_FILE);
 	const memoryRoot = process.env.PI_DESKTOP_MEMORY_ROOT;
 	const userMemoryFile = process.env.PI_DESKTOP_USER_MEMORY_FILE;
 	const memoryToolPaths = new Set<string>();
@@ -796,6 +839,57 @@ export default function permissions(pi: ExtensionAPI) {
 			};
 		});
 	}
+	const fallback = testingConnection ? undefined : parseFallbackModel(process.env.PI_DESKTOP_FALLBACK_MODEL);
+	if (fallback) {
+		let fallbackUsed = false;
+		let lastError: string | undefined;
+		// One automatic fallback per prompt (user message, wakeup or other run start).
+		pi.on("before_agent_start", () => {
+			fallbackUsed = false;
+			lastError = undefined;
+		});
+		pi.on("message_end", (event) => {
+			const message = event.message as { role?: string; stopReason?: string; errorMessage?: string };
+			if (message.role !== "assistant") return;
+			lastError = message.stopReason === "error" ? (message.errorMessage ?? "") : undefined;
+		});
+		// Pi reaches this boundary only after its own retries are exhausted and the run was not
+		// aborted; cost-cap and balance-floor stops abort the run, so they never get here.
+		pi.on("agent_before_settle", async (event, ctx) => {
+			if (event.outcome !== "error" || fallbackUsed || lastError === undefined) return;
+			if (maxTurns > 0 && turnCount >= maxTurns) return;
+			const reason = fallbackReason(lastError);
+			if (!reason) return;
+			const current = ctx.model;
+			if (!current || (current.provider === fallback.provider && current.id === fallback.id)) return;
+			const recent = event.context.contextMessages.slice(-4) as Array<{ role?: string; customType?: string }>;
+			if (recent.some((m) => m.role === "custom" && (m.customType === "desktop_max_cost" || m.customType === "desktop_min_balance")))
+				return;
+			fallbackUsed = true;
+			const target = ctx.modelRegistry.find(fallback.provider, fallback.id);
+			const switched = target ? await pi.setModel(target).catch(() => false) : false;
+			const primary = current.name || current.id;
+			if (!target || !switched) {
+				ctx.ui.notify(`主模型 ${primary} 暂不可用（${reason}），但备用模型 ${fallback.id} 当前不可用，未自动切换。`, "warning");
+				return;
+			}
+			const notice = `主模型 ${primary} 暂不可用（${reason}），已切换到备用模型 ${target.name || target.id} 继续。`;
+			ctx.ui.notify(notice, "warning");
+			lastError = undefined;
+			return {
+				continue: true,
+				entries: [
+					...event.entries,
+					{
+						type: "custom_message",
+						customType: FALLBACK_MESSAGE_TYPE,
+						content: `${notice}\n请从中断处继续完成上一个任务。`,
+						display: true,
+					},
+				],
+			};
+		});
+	}
 	pi.on("session_before_compact", async (event) => {
 		if (testingConnection) return;
 		const hook = await callHost(
@@ -897,6 +991,9 @@ export default function permissions(pi: ExtensionAPI) {
 					}
 				}
 			}
+			// dontAsk never opens an approval dialog, including prompts a hook asked for.
+			if (effectiveAction === "ask" && policy.dontAsk)
+				return { block: true, reason: `dontAsk 模式自动拒绝未预授权的操作：${confirmReason}` };
 			if (effectiveAction === "ask") {
 				const allowed = await ctx.ui.confirm(
 					`允许执行 ${event.toolName}？`,
@@ -971,4 +1068,23 @@ async function redactSearchResult<T extends { type: string }>(
 	if (!removed) return;
 	content.push({ type: "text", text: `\n[已按权限规则隐藏 ${removed} 条结果]` } as unknown as T);
 	return content;
+}
+
+/**
+ * Appends the desktop output style to the main conversation's system prompt.
+ * The file is re-read every turn, so a style change applies on the next turn.
+ * Delegated children never receive the file path.
+ */
+export const OUTPUT_STYLE_SECTION = "output_style";
+export function registerOutputStyle(pi: Pick<ExtensionAPI, "on">, file: string | undefined): void {
+	if (!file) return;
+	pi.on("before_agent_start", async (event) => {
+		// Write a named prompt section instead of returning `systemPrompt`: a returned prompt is
+		// forced as opaque text for the whole run and drops sections added by later handlers.
+		const sections = event?.systemPromptOptions?.sections as Record<string, string> | undefined;
+		if (!sections) return;
+		const style = (await readFile(file, "utf8").catch(() => "")).trim();
+		if (style) sections[OUTPUT_STYLE_SECTION] = style.slice(0, 64 * 1024);
+		else delete sections[OUTPUT_STYLE_SECTION];
+	});
 }

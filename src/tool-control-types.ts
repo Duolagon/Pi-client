@@ -13,12 +13,18 @@ export const desktopModelToolNames = [
 	"Agent", "SendMessage", "AgentSend", "AgentExecutors", "TaskOutput", "TaskStop", "TaskList",
 	"WorktreeCreate", "WorktreeList", "WorktreeMerge", "WorktreeRemove",
 	"TodoCreate", "TodoGet", "TodoUpdate", "TodoList",
-	"Monitor",
+	"Monitor", "BashOutput", "KillShell",
 	"ScheduleWakeup", "CronCreate", "CronList", "CronDelete",
 	"TeamCreate", "TeamDelete",
 	"WorkflowRun", "StructuredOutput",
 ] as const;
 export type DesktopModelToolName = (typeof desktopModelToolNames)[number];
+/**
+ * Host calls that are not separate model tools. `BashBackground` is the `bash` tool's
+ * `run_in_background: true` path; Pi has already run the bash permission checks for it.
+ */
+export const hostOnlyToolNames = ["BashBackground"] as const;
+export type HostToolName = DesktopModelToolName | (typeof hostOnlyToolNames)[number];
 /** Tools that start or continue a child; a child process never gets them. */
 export const delegatingToolNames: readonly DesktopModelToolName[] = ["Agent", "SendMessage", "AgentSend"];
 /** Delegating calls whose batch (the other calls of the same message) the parent reports. */
@@ -53,6 +59,7 @@ export const DELIVER_CUSTOM_TYPES = [
 	"desktop_cron_wakeup",
 	"desktop_team_message",
 	"desktop_workflow_event",
+	"desktop_shell_event",
 ] as const;
 export type DeliverCustomType = (typeof DELIVER_CUSTOM_TYPES)[number];
 /** A background child's run usage and the model it ran on. */
@@ -197,7 +204,7 @@ export interface WorktreeTargetToolInput { worktree_id: string }
  */
 export interface ToolCallBatch { writers: number }
 export interface DesktopToolInvocation {
-	tool: DesktopModelToolName;
+	tool: HostToolName;
 	toolCallId: string;
 	input: Record<string, unknown>;
 	/** Reported by the parent's Pi process for Agent calls; absent when unknown. */
@@ -226,9 +233,9 @@ function optionalBoolean(value: unknown, label: string): void {
 }
 
 /** Validate again at the host boundary; a model's schema is not an authorization boundary. */
-export function validateDesktopToolInput(tool: DesktopModelToolName, value: unknown): Record<string, unknown> {
+export function validateDesktopToolInput(tool: HostToolName, value: unknown): Record<string, unknown> {
 	const input = object(value);
-	const allowed: Record<DesktopModelToolName, string[]> = {
+	const allowed: Record<HostToolName, string[]> = {
 		// `mode` and `team_name` are the only leniently accepted fields; they are ignored.
 		Agent: ["description", "prompt", "subagent_type", "model", "run_in_background", "name", "isolation", "worktree_id", "executor", "fork", "mode", "team_name"],
 		SendMessage: ["to", "message", "summary", "run_in_background", "message_type", "request_id", "approve"],
@@ -240,6 +247,9 @@ export function validateDesktopToolInput(tool: DesktopModelToolName, value: unkn
 		TodoUpdate: ["id", "subject", "description", "status", "activeForm", "owner", "addBlocks", "addBlockedBy", "metadata"],
 		TodoList: ["include_completed"],
 		Monitor: ["description", "command", "url", "timeout_ms", "persistent"],
+		BashOutput: ["bash_id", "filter"],
+		KillShell: ["shell_id"],
+		BashBackground: ["command", "description"],
 		ScheduleWakeup: ["delay_seconds", "reason", "prompt"],
 		CronCreate: ["prompt", "cron", "interval_seconds", "recurring", "durable"],
 		CronList: [],
@@ -331,6 +341,14 @@ export function validateDesktopToolInput(tool: DesktopModelToolName, value: unkn
 			throw new Error("Invalid timeout_ms (expected 1000–86400000 ms)");
 		}
 		optionalBoolean(input.persistent, "persistent");
+	} else if (tool === "BashOutput") {
+		text(input.bash_id, "bash_id", 200);
+		if (input.filter !== undefined) text(input.filter, "filter", 1000);
+	} else if (tool === "KillShell") {
+		text(input.shell_id, "shell_id", 200);
+	} else if (tool === "BashBackground") {
+		text(input.command, "command", 64 * 1024);
+		if (input.description !== undefined) text(input.description, "description", 160);
 	} else if (tool === "ScheduleWakeup") {
 		if (typeof input.delay_seconds !== "number" || !Number.isSafeInteger(input.delay_seconds) || input.delay_seconds < 1 || input.delay_seconds > 604800) {
 			throw new Error("Invalid delay_seconds (expected 1–604800)");
@@ -374,12 +392,12 @@ export function validateDesktopToolInput(tool: DesktopModelToolName, value: unkn
 export function validateToolInvocation(value: unknown): DesktopToolInvocation {
 	const input = object(value);
 	if (Object.keys(input).some((key) => !["tool", "toolCallId", "input", "batch"].includes(key)) ||
-		!desktopModelToolNames.includes(input.tool as DesktopModelToolName)) throw new Error("Invalid desktop tool");
-	const tool = input.tool as DesktopModelToolName;
+		(!desktopModelToolNames.includes(input.tool as DesktopModelToolName) && !hostOnlyToolNames.includes(input.tool as never))) throw new Error("Invalid desktop tool");
+	const tool = input.tool as HostToolName;
 	let batch: ToolCallBatch | undefined;
 	if (input.batch !== undefined) {
 		const value = object(input.batch);
-		if (!batchedToolNames.includes(tool) || Object.keys(value).some((key) => key !== "writers") ||
+		if (!batchedToolNames.includes(tool as DesktopModelToolName) || Object.keys(value).some((key) => key !== "writers") ||
 			!Number.isSafeInteger(value.writers) || (value.writers as number) < 0 || (value.writers as number) > 10000) throw new Error("Invalid tool call batch");
 		batch = { writers: value.writers as number };
 	}

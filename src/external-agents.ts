@@ -372,9 +372,11 @@ export class ExternalAgents {
 		const task = record.task;
 		if (runtime.abort?.signal.aborted || signal?.aborted || this.closed || !active.has(task.status)) return { decision: "cancel" };
 		if (request.kind !== "question") {
-			const decision = await evaluatePermission(this.policyFor(record), normalizeCall(request));
+			const policy = this.policyFor(record);
+			const decision = await evaluatePermission(policy, normalizeCall(request));
 			if (runtime.abort?.signal.aborted || signal?.aborted || this.closed || !active.has(task.status)) return { decision: "cancel" };
-			if (decision.action === "deny") return { decision: "deny" };
+			// dontAsk never surfaces an approval prompt; anything not pre-approved is denied.
+			if (decision.action === "deny" || (decision.action === "ask" && policy.dontAsk)) return { decision: "deny" };
 			if (decision.action === "allow") return { decision: "allow" };
 		}
 		const id = randomUUID();
@@ -409,6 +411,7 @@ export class ExternalAgents {
 		}
 		const rules = [...unique.values()].map((rule, index) => ({ ...rule, id: `external-${index}-${rule.id.slice(0, 150)}` }));
 		return { version: 1, project: task.workingDirectory, mode: task.readOnly || current.mode === "read" || record.policy.mode === "read" ? "read" : current.mode === "ask" || record.policy.mode === "ask" ? "ask" : "auto",
+			...(record.policy.dontAsk || current.dontAsk ? { dontAsk: true } : {}),
 			rules, disabledTools: [...new Set([...record.policy.disabledTools, ...current.disabledTools, "Agent", "SendMessage", "AgentSend"])] };
 	}
 	private adapterEvent(task: ExternalTask, event: ExternalAdapterEvent): void {

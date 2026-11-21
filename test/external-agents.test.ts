@@ -395,3 +395,15 @@ test("external crash recovery advances event sequences past the durable log befo
 		assert.equal(new Set(after.map((event) => event.sequence)).size, after.length);
 	} finally { await resumed.close(); await data.cleanup(); }
 });
+
+test("external children under a dontAsk parent deny unapproved commands without an approval prompt", async () => {
+	const data = await setup();
+	try {
+		data.setPolicy({ mode: "ask", dontAsk: true });
+		const task = await data.manager.start({ executor: "codex", description: "No prompt", prompt: "ask dontAsk" }, "parent-a", "call-dont-ask");
+		const state = await until(() => data.manager.snapshot(task.id), terminal, "dontAsk task finished");
+		assert.equal(state.status, "completed");
+		assert.deepEqual(data.adapter.decisions, ["deny"]);
+		assert.equal(state.pendingApprovals.length, 0);
+	} finally { await data.cleanup(); }
+});

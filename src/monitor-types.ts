@@ -1,4 +1,5 @@
-export type MonitorKind = "command" | "websocket";
+/** `shell` is a background Bash command (Bash run_in_background) whose output is buffered for BashOutput. */
+export type MonitorKind = "command" | "websocket" | "shell";
 export type MonitorStatus = "running" | "stopped" | "exited" | "timed_out" | "error";
 
 export interface MonitorRecord {
@@ -17,6 +18,8 @@ export interface MonitorRecord {
 	exitCode?: number | null;
 	stopReason?: string;
 	error?: string;
+	/** Background shells: characters of output produced so far (including dropped ones). */
+	outputChars?: number;
 }
 
 export interface MonitorStartInput {

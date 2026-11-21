@@ -1,7 +1,9 @@
 import { timingSafeEqual } from "node:crypto";
 import { readFile, rename, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import type { ExtensionAPI, ToolDefinition, ToolInfo } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition, ToolInfo } from "@earendil-works/pi-coding-agent";
 import {
 	agentIsolationValues, agentModelValues, asModelToolResult, batchedToolNames, delegatingToolNames, desktopModelToolNames, validateControlRequest,
 	validateDesktopToolInput, validateToolOverrides,
@@ -103,6 +105,13 @@ export const toolSchemas: Record<DesktopModelToolName, JsonSchema> = {
 		timeout_ms: { type: "integer", minimum: 1000, maximum: 86_400_000, description: "Optional timeout in ms (default 300000)" },
 		persistent: { type: "boolean", description: "Allow longer timeouts up to 24 hours" },
 	}),
+	BashOutput: schema({
+		bash_id: { ...boundedText(200), description: "The shell_id returned by Bash with run_in_background: true" },
+		filter: { ...boundedText(1000), description: "Optional regular expression; only output lines matching it are returned (non-matching lines are consumed)" },
+	}, ["bash_id"]),
+	KillShell: schema({
+		shell_id: { ...boundedText(200), description: "The shell_id of the background shell to stop" },
+	}, ["shell_id"]),
 	ScheduleWakeup: schema({
 		delay_seconds: { type: "integer", minimum: 1, maximum: 604800, description: "Delay before wakeup in seconds (1–604800)" },
 		reason: { ...boundedText(2000), description: "Short explanation of why the wakeup is needed" },
@@ -169,6 +178,8 @@ const descriptions: Record<DesktopModelToolName, string> = {
 	TodoUpdate: "Update a task item on the shared checklist (status: pending | in_progress | completed | deleted, owner, activeForm, dependency edges, or merged metadata).",
 	TodoList: "List persistent tasks on the shared checklist for this root conversation, showing statuses, owners, and dependency blockers.",
 	Monitor: "Start a background command or WebSocket (wss:// or loopback ws://) monitor. Output is coalesced and delivered asynchronously via <monitor-event> follow-ups; stop it anytime with TaskStop.",
+	BashOutput: "Read output a background shell (started by Bash with run_in_background: true) produced since your last read, plus its status (running, completed, killed or failed) and exit code. filter is an optional regular expression applied per line. Only shells of this conversation can be read.",
+	KillShell: "Stop a background shell started by Bash with run_in_background: true, addressed by its shell_id. Only shells of this conversation can be stopped.",
 	ScheduleWakeup: "Schedule a one-shot reminder wakeup after delay_seconds (only fires when parent session is idle, consumes quota, max 7 days, unavailable to subagents).",
 	CronCreate: "Create a recurring or one-shot scheduled task with jitter and 7-day lifetime (fires only when session is idle, consumes quota, unavailable to subagents).",
 	CronList: "List active scheduled Cron / /loop / ScheduleWakeup jobs for the current session.",
@@ -311,6 +322,7 @@ export default function toolControl(pi: ExtensionAPI): void {
 				},
 			});
 		}
+		registerBackgroundBash(pi, host);
 	}
 	const config = async (): Promise<ToolOverrides> => validateToolOverrides(JSON.parse(await readFile(toolsFile, "utf8")));
 	let previousOverrides: Record<string, boolean> = {};
@@ -509,11 +521,87 @@ function recordUsage(ctx: unknown, usage: NotificationUsage, key: string): void 
 	} catch {}
 }
 
+const BACKGROUND_BASH_NOTE = " Set run_in_background: true for long-running commands (dev servers, watchers, long builds) instead of appending '&': the call returns a shell_id at once, BashOutput reads new output, KillShell stops it, and you get one notice when it ends. timeout does not apply to background commands.";
+
+function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * The permission extension wraps an approved bash command in sandbox-exec. The host applies
+ * the same profile to background shells itself, so remove the wrapper to avoid nesting.
+ */
+export function unwrapSandboxedCommand(command: string, profile: string | undefined): string {
+	if (!profile) return command;
+	const prefix = `/usr/bin/sandbox-exec -f ${shellQuote(profile)} /bin/sh -c `;
+	if (!command.startsWith(prefix)) return command;
+	const quoted = command.slice(prefix.length);
+	if (quoted.length < 2 || !quoted.startsWith("'") || !quoted.endsWith("'")) return command;
+	const inner = quoted.slice(1, -1).replaceAll("'\\''", "'");
+	return shellQuote(inner) === quoted ? inner : command;
+}
+
+/**
+ * Replace Pi's bash tool with the same definition plus Claude Code's `run_in_background`.
+ * A normal call runs Pi's own bash (same checks, sandbox rewrite and rendering); a background
+ * call has passed the same `tool_call` checks and is started by the host.
+ */
+function registerBackgroundBash(pi: ExtensionAPI, host: { url: string; token: string }): void {
+	const template = createBashToolDefinition(process.cwd());
+	const foreground = (ctx: ExtensionContext | undefined) => {
+		let settings: { shellCommandPrefix?: string; shellPath?: string } = {};
+		try { settings = pi.getSettings() as typeof settings; } catch {}
+		const shellPath = settings.shellPath?.startsWith("~/") ? join(homedir(), settings.shellPath.slice(2)) : settings.shellPath;
+		return {
+			definition: createBashToolDefinition(ctx?.cwd ?? process.cwd(), { commandPrefix: settings.shellCommandPrefix, shellPath }),
+			commandPrefix: settings.shellCommandPrefix,
+		};
+	};
+	const base = template.parameters as { properties?: Record<string, unknown>; required?: string[] };
+	pi.registerTool({
+		...template,
+		description: `${template.description}${BACKGROUND_BASH_NOTE}`,
+		promptGuidelines: [...(template.promptGuidelines ?? []), "Use Bash run_in_background: true for servers and watchers; poll with BashOutput and stop with KillShell."],
+		parameters: {
+			type: "object",
+			properties: {
+				...(base.properties ?? {}),
+				run_in_background: { type: "boolean", description: "Run the command in the background and return a shell_id immediately (default false)" },
+				description: { type: "string", maxLength: 160, description: "Optional short label for the command" },
+			},
+			required: base.required ?? ["command"],
+		} as JsonSchema,
+		async execute(toolCallId, input, signal, onUpdate, ctx) {
+			const { run_in_background: background, description, ...args } = input as { command: string; timeout?: number; run_in_background?: unknown; description?: unknown };
+			const shell = foreground(ctx);
+			if (background !== true) return shell.definition.execute(toolCallId, args, signal, onUpdate, ctx);
+			signal?.throwIfAborted();
+			const command = unwrapSandboxedCommand(String(args.command ?? ""), process.env.PI_DESKTOP_SANDBOX_PROFILE);
+			const params = validateDesktopToolInput("BashBackground", {
+				command: shell.commandPrefix ? `${shell.commandPrefix}\n${command}` : command,
+				...(typeof description === "string" && description.trim() ? { description: description.trim().slice(0, 160) } : {}),
+			});
+			const response = await postLoopbackJson(host.url, "/invoke", host.token, { tool: "BashBackground", toolCallId, input: params }, signal);
+			const record = response.body as { ok?: boolean; data?: { shell_id?: unknown }; error?: string } | undefined;
+			if (!record || response.status < 200 || response.status >= 300 || record.ok !== true || typeof record.data?.shell_id !== "string")
+				throw new Error(record?.error ?? `Background Bash failed (${response.status})`);
+			const id = record.data.shell_id;
+			return {
+				content: [{ type: "text", text: `Command running in background with ID: ${id}. Use BashOutput with bash_id "${id}" to read its output and KillShell to stop it.` }],
+				details: { ...record.data, background: true },
+				structuredContent: { output: "", truncated: false, exit_code: 0, wall_time_seconds: 0 },
+			};
+		},
+	} as ToolDefinition);
+}
+
 function describeTool(tool: ToolInfo, active: Set<string>, overrides: Record<string, boolean>, child: boolean, canDelegate: boolean, readOnlyChild: boolean, agentTeams: boolean, teamMember: boolean, structuredOutputEnabled: boolean): DesktopToolInfo {
 	const sourcePath = tool.sourceInfo?.path;
 	const source: DesktopToolInfo["source"] = tool.name.startsWith("mcp__") ? "mcp" :
 		desktopModelToolNames.includes(tool.name as DesktopModelToolName) && sourcePath?.includes("tool-control-extension") ? "desktop" :
-		nativeTools.has(tool.name) && sourcePath?.startsWith("builtin:") || sourcePath?.startsWith("builtin:") ? "builtin" : "extension";
+		nativeTools.has(tool.name) && sourcePath?.startsWith("builtin:") || sourcePath?.startsWith("builtin:") ? "builtin" :
+		// Pi's bash, wrapped only to add run_in_background.
+		tool.name === "bash" && sourcePath?.includes("tool-control-extension") ? "builtin" : "extension";
 	const canTeamMessage = tool.name === "SendMessage" && teamMember && agentTeams;
 	const blocked =
 		overrides[tool.name] === false ||

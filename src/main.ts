@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, safeStorage, shell } from "electron";
 import { join } from "node:path";
+import { mkdir, stat } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { DesktopService } from "./backend.ts";
 import { installWorkspaceHandlers } from "./workspace-ipc.ts";
@@ -11,8 +12,12 @@ import type { Command, ConnectionInput, DesktopAPI } from "./shared.ts";
 import { checkPreview, probePreview } from "./preview-check.ts";
 import { captureShellEnvironment, mergeNetworkEnvironment } from "./tool-path.ts";
 import { MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS } from "./delegation-limits.ts";
-import { parseModelRoutingUpdate } from "./model-routing.ts";
+import { parseFallbackModelUpdate, parseModelRoutingUpdate } from "./model-routing.ts";
 import type { RpcExtensionUIResponse } from "@earendil-works/pi-coding-agent";
+import { DesktopLog, describeError } from "./desktop-log.ts";
+import { MAX_USAGE_DAYS } from "./usage-stats.ts";
+import { EDITOR_CHOICES, editorChoice, editorUrl, launchesCode, parseOpenInEditorInput, resolveEditorTarget, type EditorChoice } from "./editor-open.ts";
+import { validOutputStyleName } from "./output-styles.ts";
 
 app.setName("Pi Desktop");
 if (process.env.PI_DESKTOP_DATA_DIR) app.setPath("userData", process.env.PI_DESKTOP_DATA_DIR);
@@ -26,6 +31,17 @@ app.on("second-instance", () => {
 	window.show();
 	window.focus();
 });
+// Local diagnostic log only; nothing is uploaded. Records carry no prompts, model output or settings.
+const logDir = join(app.getPath("userData"), "logs");
+const log = new DesktopLog({ dir: logDir });
+process.on("uncaughtExceptionMonitor", (error) => log.error("uncaughtException", { error: describeError(error) }));
+process.on("unhandledRejection", (reason) => log.error("unhandledRejection", { error: describeError(reason) }));
+app.on("render-process-gone", (_event, _contents, details) =>
+	log.error("render-process-gone", { reason: details.reason, exitCode: details.exitCode }),
+);
+app.on("child-process-gone", (_event, details) =>
+	log.error("child-process-gone", { type: details.type, reason: details.reason, exitCode: details.exitCode, name: details.name }),
+);
 let window: BrowserWindow | null = null;
 let service: DesktopService;
 let ready: Promise<unknown>;
@@ -61,6 +77,8 @@ function createWindow() {
 		callback(permission === "clipboard-sanitized-write"),
 	);
 	window.webContents.session.setPermissionCheckHandler((_contents, permission) => permission === "clipboard-sanitized-write");
+	window.on("unresponsive", () => log.warn("window-unresponsive"));
+	window.on("responsive", () => log.info("window-responsive"));
 	window.on("focus", () => updateDock());
 	window.on("closed", () => {
 		window = null;
@@ -234,7 +252,7 @@ function installHandlers() {
 	handle("pi:settings", (input) => {
 		const settings = object(input);
 		if (
-			!["ask", "acceptEdits", "auto", "read", "plan"].includes(String(settings.permission)) ||
+			!["ask", "acceptEdits", "auto", "read", "plan", "dontAsk"].includes(String(settings.permission)) ||
 			!["light", "dark", "grail", "system"].includes(String(settings.theme))
 		)
 			throw new Error("设置格式错误。");
@@ -275,6 +293,7 @@ function installHandlers() {
 		)
 			throw new Error("前台子 Agent 等待时长格式错误。");
 		if (settings.modelRouting !== undefined) parseModelRoutingUpdate(settings.modelRouting);
+		if (settings.fallbackModel !== undefined) parseFallbackModelUpdate(settings.fallbackModel);
 		if (settings.proxy !== undefined) string(settings.proxy, "代理地址", 2048);
 		if (settings.noProxy !== undefined) string(settings.noProxy, "代理例外", 4096);
 		if (settings.caFile !== undefined) string(settings.caFile, "CA 证书路径", 4096);
@@ -292,9 +311,49 @@ function installHandlers() {
 			throw new Error("余额底线需为 0.01–1000000。");
 		if (settings.disableAllHooks !== undefined && typeof settings.disableAllHooks !== "boolean")
 			throw new Error("Hooks 开关格式错误。");
+		if (settings.outputStyle !== undefined && settings.outputStyle !== null && !validOutputStyleName(settings.outputStyle))
+			throw new Error("输出风格格式错误。");
+		if (settings.editor !== undefined && !EDITOR_CHOICES.includes(settings.editor as EditorChoice))
+			throw new Error("编辑器设置格式错误。");
+		if (settings.statusBalance !== undefined && typeof settings.statusBalance !== "boolean")
+			throw new Error("状态栏余额开关格式错误。");
 		if (settings.provider !== undefined) connection(settings);
 		if (settings.agentDir !== undefined) string(settings.agentDir, "Pi 配置目录", 16384);
 		return service.saveSettings(settings as Parameters<DesktopAPI["saveSettings"]>[0]);
+	});
+	handle("pi:doctor", () => service.doctor());
+	handle("pi:usage-stats", (input) => {
+		if (input === undefined || input === null) return service.usageStats({});
+		const record = object(input);
+		const days = record.days;
+		if (days !== undefined && (!Number.isSafeInteger(days) || (days as number) < 1 || (days as number) > MAX_USAGE_DAYS))
+			throw new Error(`统计天数需为 1–${MAX_USAGE_DAYS} 的整数。`);
+		return service.usageStats({ days: days as number | undefined });
+	});
+	handle("pi:open-log-directory", async () => {
+		await mkdir(logDir, { recursive: true, mode: 0o700 });
+		const error = await shell.openPath(logDir);
+		if (error) throw new Error(`无法打开日志目录：${error}`);
+	});
+	handle("pi:output-styles", () => service.outputStyles());
+	handle("pi:open-in-editor", async (input) => {
+		const request = parseOpenInEditorInput(input);
+		const target = await resolveEditorTarget(request.path, await service.editorRoots());
+		const editor = editorChoice(service.editorSetting());
+		if (editor === "system") {
+			if (launchesCode(target, await stat(target))) {
+				shell.showItemInFolder(target);
+				return;
+			}
+			const error = await shell.openPath(target);
+			if (error) throw new Error(`无法打开文件：${error}`);
+			return;
+		}
+		try {
+			await shell.openExternal(editorUrl(editor, target, request.line));
+		} catch {
+			throw new Error(`无法打开 ${editor === "cursor" ? "Cursor" : "VS Code"}，请确认已安装，或在设置中改用“系统默认应用”。`);
+		}
 	});
 	handle("pi:test-connection", (input) => service.testConnection(connection(input)));
 	handle("pi:provider-balance", (input) => service.providerBalance(connection(input)));
@@ -329,6 +388,13 @@ function updateDock(requestAttention = false) {
 
 void app.whenReady().then(() => {
 	if (!primaryInstance) return;
+	log.info("app-start", {
+		version: app.getVersion(),
+		platform: `${process.platform}-${process.arch}`,
+		os: process.getSystemVersion(),
+		electron: process.versions.electron,
+		packaged: app.isPackaged,
+	});
 	const runtimeDir = app.isPackaged ? join(process.resourcesPath, "runtime") : join(__dirname, "runtime");
 	const environment: NodeJS.ProcessEnv = { ...process.env, ELECTRON_RUN_AS_NODE: "1" };
 	service = new DesktopService({
@@ -343,12 +409,15 @@ void app.whenReady().then(() => {
 			return safeStorage.encryptString(value).toString("base64");
 		},
 		decrypt: (value) => safeStorage.decryptString(Buffer.from(value, "base64")),
+		logDir,
+		onDiagnostic: (level, event, details) => log.write(level, event, details),
 	});
 	ready = captureShellEnvironment().then(({ path, network }) => {
 		environment.PATH = path;
 		mergeNetworkEnvironment(environment, network);
 		return service.initialize();
 	});
+	ready.catch((error: unknown) => log.error("initialize-failed", { error: describeError(error) }));
 	const notifyDesktop = (title: string, body: string) => {
 		if (process.env.PI_OFFLINE === "1" || !Notification.isSupported()) return;
 		if (window && !window.webContents.isDestroyed() && window.isFocused()) return;

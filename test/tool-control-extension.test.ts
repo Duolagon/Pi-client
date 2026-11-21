@@ -198,7 +198,9 @@ test("model tools validate inputs, use authenticated host calls, and clamp child
 	const item = await fixture({ PI_DESKTOP_HOST_URL: registration.url, PI_DESKTOP_HOST_TOKEN: registration.token });
 	try {
 		// SendMessage is the declared continuation tool; AgentSend stays callable but hides its declaration.
-		assert.equal(item.definitions.size, desktopModelToolNames.length);
+		// The desktop tools plus the background-capable bash wrapper.
+		assert.equal(item.definitions.size, desktopModelToolNames.length + 1);
+		assert.ok(item.definitions.has("bash"));
 		assert.ok(item.definitions.has("TodoCreate") && item.definitions.has("TodoGet") && item.definitions.has("TodoUpdate") && item.definitions.has("TodoList"));
 		assert.ok(item.definitions.has("SendMessage") && item.definitions.has("AgentSend") && item.definitions.has("AgentExecutors"));
 		assert.deepEqual((item.definitions.get("AgentSend") as { prepareLoadout?: () => unknown }).prepareLoadout?.(), { hiddenDeclarations: ["AgentSend"] });

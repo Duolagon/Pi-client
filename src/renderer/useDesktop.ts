@@ -186,6 +186,9 @@ export function useDesktop(api: DesktopAPI) {
 					: previous,
 			);
 		if (event.type === "tool_execution_end") setRevision((value) => value + 1);
+		// The fallback notice is committed outside message events, and the model changed with it.
+		if (event.type === "entry_appended" && event.entry.type === "custom_message" && event.entry.customType === "desktop_model_fallback")
+			void refresh();
 		setHistory((state) => applyEvent(state, event));
 	};
 	useEffect(() => {

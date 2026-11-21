@@ -6,6 +6,8 @@ import type {
 	ConnectionTestResult,
 	ProviderBalanceResult,
 	DesktopAPI,
+	EditorChoice,
+	OutputStyleInfo,
 	PermissionMode,
 	Provider,
 	ProviderPreset,
@@ -118,6 +120,8 @@ export function SettingsDialog({
 	const [agentTeams, setAgentTeams] = useState<boolean>(settings.agentTeams === true);
 	const initialRouting = routingKeys(settings.modelRouting);
 	const [routing, setRouting] = useState<Record<ModelRoutingRole, string>>(initialRouting);
+	const initialFallback = settings.fallbackModel ? `${settings.fallbackModel.provider}/${settings.fallbackModel.id}` : "";
+	const [fallbackModel, setFallbackModel] = useState(initialFallback);
 	const [sandboxOffline, setSandboxOffline] = useState(Boolean(settings.sandboxOffline));
 	const [sandboxInfo, setSandboxInfo] = useState<SandboxStatus | null>(null);
 	const [provider, setProvider] = useState<Provider>(initialProvider);
@@ -132,6 +136,12 @@ export function SettingsDialog({
 	const [clearHeaders, setClearHeaders] = useState(false);
 	const [maxCostText, setMaxCostText] = useState(settings.maxCostUsd ? String(settings.maxCostUsd) : "");
 	const [disableAllHooks, setDisableAllHooks] = useState(settings.disableAllHooks === true);
+	const [statusBalance, setStatusBalance] = useState(settings.statusBalance !== false);
+	const initialOutputStyle = settings.outputStyle ?? "default";
+	const [outputStyle, setOutputStyle] = useState(initialOutputStyle);
+	const [outputStyles, setOutputStyles] = useState<OutputStyleInfo[]>([]);
+	const initialEditor: EditorChoice = settings.editor ?? "vscode";
+	const [editor, setEditor] = useState<EditorChoice>(initialEditor);
 	const [minBalanceText, setMinBalanceText] = useState(settings.minBalance ? String(settings.minBalance) : "");
 	const [balance, setBalance] = useState<ProviderBalanceResult | null>(null);
 	const [checkingBalance, setCheckingBalance] = useState(false);
@@ -147,6 +157,7 @@ export function SettingsDialog({
 	useEffect(() => {
 		let mounted = true;
 		void window.pi.sandboxStatus().then((status) => { if (mounted) setSandboxInfo(status); }).catch(() => {});
+		void window.pi.outputStyles().then((styles) => { if (mounted) setOutputStyles(styles); }).catch(() => {});
 		return () => { mounted = false; };
 	}, []);
 	const preset = presets.find((item) => item.provider === provider)!;
@@ -174,13 +185,17 @@ export function SettingsDialog({
 		cronEnabled !== (settings.cronEnabled !== false) ||
 		agentTeams !== (settings.agentTeams === true) ||
 		MODEL_ROUTING_ROLES.some((role) => routing[role] !== initialRouting[role]) ||
+		fallbackModel !== initialFallback ||
 		agentDir.trim() !== (settings.agentDir ?? "") ||
 		proxy.trim() !== (settings.proxy ?? "") ||
 		noProxy.trim() !== (settings.noProxy ?? "") ||
 		caFile.trim() !== (settings.caFile ?? "") ||
 		maxCostText.trim() !== (settings.maxCostUsd ? String(settings.maxCostUsd) : "") ||
 		minBalanceText.trim() !== (settings.minBalance ? String(settings.minBalance) : "") ||
-		disableAllHooks !== (settings.disableAllHooks === true);
+		disableAllHooks !== (settings.disableAllHooks === true) ||
+		statusBalance !== (settings.statusBalance !== false) ||
+		outputStyle !== initialOutputStyle ||
+		editor !== initialEditor;
 	const headersEdited = Boolean(headerText.trim()) || clearHeaders;
 	const connectionChanged =
 		Boolean(apiKey.trim()) ||
@@ -289,6 +304,9 @@ export function SettingsDialog({
 				agentTeams,
 				...(maxCostText.trim() !== (settings.maxCostUsd ? String(settings.maxCostUsd) : "") ? { maxCostUsd: maxCost } : {}),
 				...(disableAllHooks !== (settings.disableAllHooks === true) ? { disableAllHooks } : {}),
+				...(outputStyle !== initialOutputStyle ? { outputStyle: outputStyle === "default" ? null : outputStyle } : {}),
+				...(editor !== initialEditor ? { editor } : {}),
+				...(statusBalance !== (settings.statusBalance !== false) ? { statusBalance } : {}),
 				...(minBalanceText.trim() !== (settings.minBalance ? String(settings.minBalance) : "") ? { minBalance } : {}),
 			};
 			if (MODEL_ROUTING_ROLES.some((role) => routing[role] !== initialRouting[role])) {
@@ -300,6 +318,7 @@ export function SettingsDialog({
 				}
 				update.modelRouting = next;
 			}
+			if (fallbackModel !== initialFallback) update.fallbackModel = parseRoutingKey(fallbackModel) ?? null;
 			if (agentDir.trim() !== (settings.agentDir ?? "")) update.agentDir = agentDir.trim();
 			if (proxy.trim() !== (settings.proxy ?? "")) update.proxy = proxy.trim();
 			if (noProxy.trim() !== (settings.noProxy ?? "")) update.noProxy = noProxy.trim();
@@ -670,7 +689,8 @@ export function SettingsDialog({
 								<option value="ask">手动确认：写文件和运行工具前询问</option>
 								<option value="acceptEdits">接受编辑：项目内文件编辑自动允许，命令仍按规则询问</option>
 								<option value="plan">计划模式：只读调研、子 Agent 与写入 .pi/plans/，批准后实施</option>
-								<option value="auto">跳过确认（危险）：除规则外不再询问，命令以本机权限运行</option>
+								<option value="auto">全部放行（危险）：除规则外不再询问，命令以本机权限运行</option>
+								<option value="dontAsk">不询问（未放行即拒绝）：不弹审批，规则或安全默认未放行的操作直接拒绝</option>
 								<option value="read">只读：仅允许读取与搜索</option>
 							</select>
 						</label>
@@ -685,6 +705,38 @@ export function SettingsDialog({
 								<option value="dark">深色</option>
 								<option value="grail">圣杯（二次元）</option>
 								<option value="system">跟随系统</option>
+							</select>
+						</label>
+						<label className="field-label">
+							输出风格
+							<select
+								value={outputStyle}
+								disabled={pending}
+								onChange={(event) => setOutputStyle(event.target.value)}
+							>
+								{!outputStyles.some((style) => style.name === outputStyle) && (
+									<option value={outputStyle}>{outputStyle}</option>
+								)}
+								{outputStyles.map((style) => (
+									<option key={style.name} value={style.name}>
+										{style.name}
+										{style.description ? `：${style.description}` : ""}
+										{style.source === "user" ? "（用户）" : style.source === "project" ? "（项目）" : ""}
+									</option>
+								))}
+							</select>
+							<small>只作用于主会话，子 Agent 不受影响。自定义风格放在 ~/.claude/output-styles 或已信任项目的 .claude/output-styles（Markdown）。下一轮对话生效。</small>
+						</label>
+						<label className="field-label">
+							打开文件的编辑器
+							<select
+								value={editor}
+								disabled={pending}
+								onChange={(event) => setEditor(event.target.value as EditorChoice)}
+							>
+								<option value="vscode">VS Code</option>
+								<option value="cursor">Cursor</option>
+								<option value="system">系统默认应用</option>
 							</select>
 						</label>
 						<label className="live-setting-toggle">
@@ -756,6 +808,16 @@ export function SettingsDialog({
 						<label className="live-setting-toggle">
 							<input
 								type="checkbox"
+								aria-label="状态栏显示账户余额"
+								checked={statusBalance}
+								disabled={pending || busy}
+								onChange={(event) => setStatusBalance(event.target.checked)}
+							/>
+							状态栏显示账户余额（支持余额查询的服务商，每分钟最多查询一次）
+						</label>
+						<label className="live-setting-toggle">
+							<input
+								type="checkbox"
 								aria-label="停用全部 Hooks"
 								checked={disableAllHooks}
 								disabled={pending || busy}
@@ -763,6 +825,19 @@ export function SettingsDialog({
 							/>
 							停用全部 Hooks（.claude/settings.json 与 .pi/hooks.json 中的 Hook 都不再运行）
 						</label>
+						<div className="field-label">
+							本地日志
+							<div>
+								<button
+									type="button"
+									className="secondary-button"
+									onClick={() => void window.pi.openLogDirectory().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)))}
+								>
+									打开日志目录
+								</button>
+							</div>
+							<small>崩溃和引擎错误记录在本机，已去除密钥和用户目录，不含对话内容，不会上传。</small>
+						</div>
 						<label className="live-setting-toggle">
 							<input
 								type="checkbox"
@@ -856,6 +931,26 @@ export function SettingsDialog({
 								onChange={(event) => setAgentTeams(event.target.checked)}
 							/>
 							启用实验性 Agent Teams 多成员协作（TeamCreate / TeamDelete 与结构化团队消息）
+						</label>
+						<label className="field-label">
+							备用模型（主模型过载或多次重试失败时自动切换）
+							<select
+								aria-label="备用模型"
+								value={fallbackModel}
+								disabled={pending}
+								onChange={(event) => setFallbackModel(event.target.value)}
+							>
+								<option value="">不使用</option>
+								{fallbackModel && !models.some((m) => `${m.provider}/${m.id}` === fallbackModel) && (
+									<option value={fallbackModel}>{fallbackModel}（当前不可用）</option>
+								)}
+								{models.map((m) => (
+									<option key={`${m.provider}/${m.id}`} value={`${m.provider}/${m.id}`}>
+										{m.name || m.id} · {m.provider}
+									</option>
+								))}
+							</select>
+							<small>主模型因过载、限流或服务端错误在自动重试后仍失败时，切换到这里的模型并继续一次。认证、请求格式、上下文超限、费用上限和余额底线不会触发切换。</small>
 						</label>
 						<fieldset className="live-routing">
 							<legend>子 Agent 模型路由</legend>

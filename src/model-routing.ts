@@ -12,6 +12,19 @@ function modelRef(value: unknown): { provider: string; id: string } | undefined 
 	return { provider: p, id: m };
 }
 
+/** Store-load sanitizer for settings.fallbackModel; malformed values are dropped. */
+export function sanitizeFallbackModel(value: unknown): { provider: string; id: string } | undefined {
+	return modelRef(value);
+}
+
+/** Strict IPC check for a fallbackModel update: null clears it, anything else must be { provider, id }. */
+export function parseFallbackModelUpdate(value: unknown): { provider: string; id: string } | null {
+	if (value === null) return null;
+	const ref = modelRef(value);
+	if (!ref) throw new Error("备用模型格式错误。");
+	return ref;
+}
+
 /**
  * Keep only known roles with a well-formed { provider, id }. Used when loading the store,
  * so a malformed entry is dropped instead of rejecting the whole settings file.
