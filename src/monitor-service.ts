@@ -65,7 +65,8 @@ function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-function blockedIpv4(ip: string, allowLoopback: boolean): boolean {
+// 198.18.0.0/15 is what proxy tools hand out as fake-ip DNS answers; allowed only for resolved names.
+function blockedIpv4(ip: string, allowLoopback: boolean, allowFakeIp = false): boolean {
 	const parts = ip.split(".").map(Number);
 	if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) return true;
 	const [a, b] = parts;
@@ -79,25 +80,25 @@ function blockedIpv4(ip: string, allowLoopback: boolean): boolean {
 		(a === 172 && b >= 16 && b <= 31) ||
 		(a === 192 && b === 168) ||
 		(a === 192 && b === 0) ||
-		(a === 198 && (b === 18 || b === 19))
+		(!allowFakeIp && a === 198 && (b === 18 || b === 19))
 	);
 }
 
-function blockedIpv6(ip: string, allowLoopback: boolean): boolean {
+function blockedIpv6(ip: string, allowLoopback: boolean, allowFakeIp = false): boolean {
 	const value = ip.toLowerCase();
 	if (value === "::1") return !allowLoopback;
 	if (value === "::" || value.startsWith("fc") || value.startsWith("fd") || /^fe[89ab]/.test(value) || value.startsWith("ff")) {
 		return true;
 	}
 	const dotted = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(value);
-	if (dotted) return blockedIpv4(dotted[1], allowLoopback);
+	if (dotted) return blockedIpv4(dotted[1], allowLoopback, allowFakeIp);
 	return false;
 }
 
-function blockedAddress(address: string, allowLoopback: boolean): boolean {
+function blockedAddress(address: string, allowLoopback: boolean, allowFakeIp = false): boolean {
 	const family = isIP(address);
-	if (family === 4) return blockedIpv4(address, allowLoopback);
-	if (family === 6) return blockedIpv6(address, allowLoopback);
+	if (family === 4) return blockedIpv4(address, allowLoopback, allowFakeIp);
+	if (family === 6) return blockedIpv6(address, allowLoopback, allowFakeIp);
 	return true;
 }
 
@@ -143,7 +144,7 @@ export async function validateMonitorWebSocketUrl(raw: string): Promise<URL> {
 		return parsed;
 	}
 	const resolved = (await lookup(cleanHost, { all: true, verbatim: true }).catch(() => [])) as Array<{ address: string }>;
-	if (!resolved.length || resolved.some((item) => blockedAddress(item.address, false))) {
+	if (!resolved.length || resolved.some((item) => blockedAddress(item.address, false, true))) {
 		throw new Error("Monitor wss:// target resolved to a blocked private or metadata address");
 	}
 	return parsed;
