@@ -996,25 +996,6 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		}).catch(() => {});
 		return () => { mounted = false; };
 	}, [activeConvId, planMode, activePermMode, app.revision, running]);
-	if (!snapshot)
-		return (
-			<div className="cl-start">
-				<PiMark />
-				<h1>Pi Desktop</h1>
-				<p>{app.error || "正在连接本地 Pi…"}</p>
-				{app.error && (
-					<button className="primary-button" onClick={() => void app.refresh()}>
-						重试连接
-					</button>
-				)}
-			</div>
-		);
-	const ready = snapshot.engineStatus === "ready";
-	const sidebarGroups = groupSidebarConversations(snapshot.conversations);
-	const groups = sidebarGroups.groups;
-	const focusedSubagentTask = focusedSubagentTaskId ? tasksMap[focusedSubagentTaskId] : undefined;
-	const liveChildApprovals = collectDescendantApprovals(Object.values(tasksMap), snapshot.active?.id);
-	const childApprovals = liveChildApprovals.length > 0 ? liveChildApprovals : (snapshot.childApprovals ?? []);
 	const latestTodos: TodoItem[] = (() => {
 		const startedById = new Map<string, number>();
 		const completedById = new Map<string, number>();
@@ -1082,6 +1063,25 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		return () => clearInterval(timer);
 	}, [hasActiveTodo]);
 	const checklistEta = latestTodos.length > 0 ? computeChecklistEta(latestTodos, todoClock) : undefined;
+	if (!snapshot)
+		return (
+			<div className="cl-start">
+				<PiMark />
+				<h1>Pi Desktop</h1>
+				<p>{app.error || "正在连接本地 Pi…"}</p>
+				{app.error && (
+					<button className="primary-button" onClick={() => void app.refresh()}>
+						重试连接
+					</button>
+				)}
+			</div>
+		);
+	const ready = snapshot.engineStatus === "ready";
+	const sidebarGroups = groupSidebarConversations(snapshot.conversations);
+	const groups = sidebarGroups.groups;
+	const focusedSubagentTask = focusedSubagentTaskId ? tasksMap[focusedSubagentTaskId] : undefined;
+	const liveChildApprovals = collectDescendantApprovals(Object.values(tasksMap), snapshot.active?.id);
+	const childApprovals = liveChildApprovals.length > 0 ? liveChildApprovals : (snapshot.childApprovals ?? []);
 	const lastMessage = history.messages[history.messages.length - 1];
 	const inPlanMode = planMode || snapshot.settings.permission === "plan";
 	const showPlanApproval =
