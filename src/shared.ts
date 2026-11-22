@@ -301,6 +301,12 @@ export interface Settings {
 	statusBalance?: boolean;
 	/** Enable WebSearch (DeepSeek Search API for any model; built-in free search on DeepSeek models); absent means true. */
 	webSearchEnabled?: boolean;
+	/** Reviewer model for Grail judgements; absent means the conversation's current model. */
+	grailModel?: { provider: string; id: string };
+	/** Spend cap in US dollars for one Grail judgement; absent means 2. */
+	grailMaxCost?: number;
+	/** Timeout of one Grail judgement in seconds; absent means 900. */
+	grailTimeoutSec?: number;
 	/** True when a dedicated DeepSeek Search API key is stored in encrypted settings. */
 	webSearchApiKeyConfigured?: boolean;
 }
@@ -367,6 +373,140 @@ export interface BtwResult {
 	answer: string;
 	model?: string;
 	latencyMs: number;
+}
+export type GrailGrade = "grail" | "granted" | "twisted" | "unfulfilled" | "unjudgeable";
+export type GrailStep = "diff" | "objective" | "distortion" | "blind" | "comparison";
+export type GrailCheckName = "test" | "check" | "lint";
+export type GrailCriterion =
+	| "requirement"
+	| "broken"
+	| "cut"
+	| "hardSpots"
+	| "edge"
+	| "removable"
+	| "missing"
+	| "flawless"
+	| "beyond"
+	| "lessCode";
+/** Criteria the comparison step must judge; each conclusion must cite changed diff lines. */
+export const GRAIL_CRITERIA: Record<GrailCriterion, string> = {
+	requirement: "需求已实现",
+	broken: "没有弄坏已有行为",
+	cut: "下刀点不浅于盲解，代码不多于盲解",
+	hardSpots: "盲解列出的难点都已处理并有测试锁住",
+	edge: "刀刃：改动后代码库更简单，新增复杂度几乎为零",
+	removable: "无可删",
+	missing: "无可缺",
+	flawless: "无可挑",
+	beyond: "超出预期（深度而非范围）",
+	lessCode: "无法用更少的代码做到同样好或更好",
+};
+export interface GrailCheckRun {
+	name: GrailCheckName;
+	/** package.json script name that ran. */
+	script: string;
+	/** Display form, e.g. "npm run test". */
+	command: string;
+	exitCode: number | null;
+	timedOut: boolean;
+	/** Last 64 KB of combined stdout/stderr. */
+	output: string;
+	testCount?: number;
+	errorCount?: number;
+}
+export interface GrailObjectiveResult {
+	status: "pass" | "fail" | "unavailable";
+	reason?: string;
+	runs: GrailCheckRun[];
+}
+export interface GrailDistortionHit {
+	file: string;
+	line: number;
+	side: "+" | "-";
+	rule: string;
+	text: string;
+}
+export interface GrailDistortionResult {
+	hits: GrailDistortionHit[];
+}
+export interface GrailBlindSolution {
+	rootCause: string;
+	cutPoint: string;
+	files: string[];
+	sizeEstimate: string;
+	hardSpots: string[];
+	tests: string[];
+}
+export interface GrailBlindResult {
+	status: "ok" | "unavailable";
+	reason?: string;
+	solution?: GrailBlindSolution;
+}
+export interface GrailCitation {
+	file: string;
+	side: "+" | "-";
+	line: number;
+}
+export interface GrailFinding {
+	criterion: GrailCriterion;
+	pass: boolean;
+	note: string;
+	citations: GrailCitation[];
+}
+export interface GrailComparisonResult {
+	status: "ok" | "unavailable";
+	reason?: string;
+	findings: GrailFinding[];
+	/** Conclusions dropped because they cited no changed diff line. */
+	dropped: number;
+}
+export interface GrailStepResults {
+	objective?: GrailObjectiveResult;
+	distortion?: GrailDistortionResult;
+	blind?: GrailBlindResult;
+	comparison?: GrailComparisonResult;
+}
+export interface GrailVerdict {
+	id: string;
+	conversationId: string;
+	/** Index of the wish in this conversation (0 = first); unchanged by re-judging. */
+	wish: number;
+	startedAt: number;
+	finishedAt: number;
+	grade: GrailGrade;
+	reasons: string[];
+	steps: GrailStepResults;
+	/** Requirement given to the reviewer: the wish's user messages. */
+	requirement: string[];
+	files: { path: string; status: string }[];
+	model?: { provider: string; id: string };
+	costUsd: number;
+	/** Grade of the previous verdict of the same wish, for "上次 / 这次". */
+	previousGrade?: GrailGrade;
+}
+export interface GrailState {
+	conversationId: string;
+	wish: number;
+	/** Running judgement, if any. */
+	running?: { id: string; step: GrailStep; startedAt: number };
+	/** Every verdict of this conversation, oldest first. */
+	verdicts: GrailVerdict[];
+	/** True when the current wish has a git checkpoint (the button can be enabled). */
+	hasDiff: boolean;
+}
+export type GrailEvent =
+	| { type: "grail_progress"; conversationId: string; id: string; step: GrailStep }
+	| { type: "grail_verdict"; conversationId: string; verdict: GrailVerdict }
+	| { type: "grail_failed"; conversationId: string; id: string; error: string; cancelled: boolean }
+	| { type: "grail_sealed"; conversationId: string; wish: number };
+export interface DesktopGrailAPI {
+	/** Starts a judgement of the current wish; cancels a running one of the same conversation. */
+	start(conversationId: string): Promise<{ id: string }>;
+	cancel(conversationId: string): Promise<boolean>;
+	state(conversationId: string): Promise<GrailState>;
+	/** Seals the current wish; later changes belong to the next wish. */
+	seal(conversationId: string): Promise<GrailState>;
+	onEvent(listener: (event: GrailEvent) => void): () => void;
 }
 export interface ClaudePermissionsSyncResult {
 	path: string;
@@ -542,6 +682,7 @@ export interface DesktopAPI {
 	cron: DesktopCronAPI;
 	teams: DesktopTeamsAPI;
 	workflow: DesktopWorkflowAPI;
+	grail: DesktopGrailAPI;
 	snapshot(): Promise<Snapshot>;
 	openProject(): Promise<Snapshot | null>;
 	selectProject(path: string): Promise<Snapshot>;
@@ -616,6 +757,12 @@ export interface DesktopAPI {
 		caFile?: string;
 		maxCostUsd?: number | null;
 		minBalance?: number | null;
+		/** null clears; the conversation model is used then. */
+		grailModel?: { provider: string; id: string } | null;
+		/** null resets to the default. */
+		grailMaxCost?: number | null;
+		/** null resets to the default. */
+		grailTimeoutSec?: number | null;
 		disableAllHooks?: boolean;
 		/** null clears the fallback model. */
 		fallbackModel?: { provider: string; id: string } | null;

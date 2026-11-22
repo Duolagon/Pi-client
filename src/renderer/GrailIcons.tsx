@@ -118,7 +118,7 @@ export function getServantInfo(modelId?: string): ServantInfo {
 	return { className: "Servant", rarity: "SR", title: "契约从者", accent: "#f5c542" };
 }
 
-/** Cracked chalice — the "杂音/愿未达成" omen when a turn errors or fails verification. */
+/** Cracked chalice — shown for a Grail judgement whose wish was twisted or not fulfilled. */
 export function CrackedGrailIcon(props: SVGProps<SVGSVGElement>) {
 	return (
 		<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" {...props}>
@@ -131,7 +131,7 @@ export function CrackedGrailIcon(props: SVGProps<SVGSVGElement>) {
 	);
 }
 
-/** Dim ember — the neutral "悬而未验" omen when code changed but no check ran. */
+/** Dim ember — the neutral "未验证" mark when code changed but no check ran. */
 export function EmberIcon(props: SVGProps<SVGSVGElement>) {
 	return (
 		<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" {...props}>
@@ -142,10 +142,33 @@ export function EmberIcon(props: SVGProps<SVGSVGElement>) {
 	);
 }
 
-/** Pick the glyph for a quality omen. "grail" reuses the Holy Grail chalice. */
-export function OmenGlyph({ omen, ...props }: { omen: "grail" | "problem" | "unverified" | "none" } & SVGProps<SVGSVGElement>) {
-	if (omen === "grail") return <HolyGrailIcon {...props} />;
-	if (omen === "problem") return <CrackedGrailIcon {...props} />;
+/** Check mark for a turn whose changes passed the agent's own verification. */
+function VerifiedIcon(props: SVGProps<SVGSVGElement>) {
+	return (
+		<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" {...props}>
+			<circle cx="12" cy="12" r="8" fill="currentColor" fillOpacity="0.1" />
+			<path d="M8.5 12.2L11 14.6L15.6 9.6" strokeLinecap="round" strokeLinejoin="round" />
+		</svg>
+	);
+}
+
+/** Warning mark for a turn with tool/model errors or a failed check. */
+function ProblemIcon(props: SVGProps<SVGSVGElement>) {
+	return (
+		<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" {...props}>
+			<path d="M12 4.5L20 18.5H4Z" fill="currentColor" fillOpacity="0.1" strokeLinejoin="round" />
+			<path d="M12 10V13.6M12 16V16.2" strokeLinecap="round" />
+		</svg>
+	);
+}
+
+/**
+ * Glyph for a per-turn verdict. Deliberately not the chalice: the Grail imagery is
+ * reserved for the user-initiated judgement.
+ */
+export function OmenGlyph({ omen, ...props }: { omen: "verified" | "problem" | "unverified" | "none" } & SVGProps<SVGSVGElement>) {
+	if (omen === "verified") return <VerifiedIcon {...props} />;
+	if (omen === "problem") return <ProblemIcon {...props} />;
 	if (omen === "unverified") return <EmberIcon {...props} />;
 	return null;
 }

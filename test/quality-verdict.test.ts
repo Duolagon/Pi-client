@@ -49,19 +49,19 @@ test("conversation-only turn yields no omen", () => {
 	assert.equal(v.omen, "none");
 });
 
-test("edit + passing verify (agent Bash) = grail", () => {
+test("edit + passing verify (agent Bash) = verified", () => {
 	const msgs: Message[] = [
 		assistant(null, { tools: [edit(), bash("b1", "npm run test:backend")] }),
 		toolResult("b1", false),
 	];
 	const v = scoreTurn(msgs);
-	assert.equal(v.omen, "grail");
+	assert.equal(v.omen, "verified");
 	assert.equal(v.signals.verifyPassed, true);
 });
 
-test("edit + passing verify via ! bashExecution exit 0 = grail", () => {
+test("edit + passing verify via ! bashExecution exit 0 = verified", () => {
 	const msgs: Message[] = [assistant(null, { tools: [edit()] }), bashExec("node --test test/foo.test.ts", 0)];
-	assert.equal(scoreTurn(msgs).omen, "grail");
+	assert.equal(scoreTurn(msgs).omen, "verified");
 });
 
 test("edit with no verification = unverified (never a fake pass)", () => {
@@ -109,8 +109,8 @@ test("cancelled verify = problem", () => {
 });
 
 // Pi registers its built-in tools in lower case. These mirror the real demo turn:
-// read → write → `node --test`, which must reach the grail.
-test("Pi lowercase tool names: write + passing node --test = grail", () => {
+// read → write → `node --test`, which must reach "verified".
+test("Pi lowercase tool names: write + passing node --test = verified", () => {
 	const msgs: Message[] = [
 		assistant(null, {
 			tools: [
@@ -126,7 +126,7 @@ test("Pi lowercase tool names: write + passing node --test = grail", () => {
 	const v = scoreTurn(msgs);
 	assert.equal(v.signals.edited, true);
 	assert.equal(v.signals.verifyPassed, true);
-	assert.equal(v.omen, "grail");
+	assert.equal(v.omen, "verified");
 });
 
 test("Pi lowercase tool names: edit without verification = unverified", () => {

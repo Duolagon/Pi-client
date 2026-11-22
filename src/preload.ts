@@ -139,6 +139,13 @@ const api: DesktopAPI = {
 		respond: (workflowId, requestId, decision) => ipcRenderer.invoke("pi:workflow:respond", workflowId, requestId, decision),
 		onEvent: (listener) => listen("pi:workflow:event", listener),
 	},
+	grail: {
+		start: (conversationId) => ipcRenderer.invoke("pi:grail:start", conversationId),
+		cancel: (conversationId) => ipcRenderer.invoke("pi:grail:cancel", conversationId),
+		state: (conversationId) => ipcRenderer.invoke("pi:grail:state", conversationId),
+		seal: (conversationId) => ipcRenderer.invoke("pi:grail:seal", conversationId),
+		onEvent: (listener) => listen("pi:grail:event", listener),
+	},
 	snapshot: () => ipcRenderer.invoke("pi:snapshot"),
 	openProject: () => ipcRenderer.invoke("pi:open-project"),
 	selectProject: (path) => ipcRenderer.invoke("pi:select-project", path),

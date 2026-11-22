@@ -70,7 +70,8 @@ export type BuiltinSlashAction =
 	| "stats"
 	| "add-dir"
 	| "goal"
-	| "verify";
+	| "verify"
+	| "grail";
 
 const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[] = [
 	{ name: "compact", description: "压缩上下文（支持 /compact <聚焦指令>）" },
@@ -103,6 +104,7 @@ const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[
 	{ name: "export", description: "把当前会话导出为文件" },
 	{ name: "fork", description: "复制当前会话为新分支继续（别名 /branch）" },
 	{ name: "add-dir", description: "附加工作目录并放行读写与沙箱（/add-dir <目录> 或 /add-dir rm <目录>）" },
+	{ name: "grail", description: "鉴定本次需求的全部改动（测试、作弊扫描、独立评审；结果不发给 Agent）" },
 	{ name: "goal", description: "设定目标自动续跑（/goal [--max-turns 8] [--max-cost 2] <目标>，/goal stop 停止）" },
 	{ name: "verify", description: "让模型用 PreviewCheck 自动验证本地网页（启动服务、操作 DOM、截图与检查报错）" },
 ];
@@ -111,7 +113,7 @@ const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[
 const BUILTIN_WITH_ARGS = new Set<BuiltinSlashAction>(["theme", "rename", "copy", "export", "fork", "output-style", "add-dir", "goal", "verify"]);
 const BUILTIN_ALIASES: Record<string, BuiltinSlashAction> = { branch: "fork" };
 /** Argument-free builtins added later that also yield to a Pi command or skill of the same name. */
-const YIELDING_BUILTINS = new Set<BuiltinSlashAction>(["doctor", "stats"]);
+const YIELDING_BUILTINS = new Set<BuiltinSlashAction>(["doctor", "stats", "grail"]);
 
 /**
  * Claude Code built-in commands with no Pi Desktop equivalent. Sending them as

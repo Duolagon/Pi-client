@@ -18,6 +18,7 @@ import { DesktopLog, describeError } from "./desktop-log.ts";
 import { MAX_USAGE_DAYS } from "./usage-stats.ts";
 import { EDITOR_CHOICES, editorChoice, editorUrl, launchesCode, parseOpenInEditorInput, resolveEditorTarget, type EditorChoice } from "./editor-open.ts";
 import { validOutputStyleName } from "./output-styles.ts";
+import { parseGrailModelUpdate, validGrailMaxCost, validGrailTimeout } from "./grail-judge.ts";
 
 app.setName("Pi Desktop");
 if (process.env.PI_DESKTOP_DATA_DIR) app.setPath("userData", process.env.PI_DESKTOP_DATA_DIR);
@@ -357,6 +358,11 @@ function installHandlers() {
 			(typeof settings.minBalance !== "number" || !Number.isFinite(settings.minBalance) || settings.minBalance < 0.01 || settings.minBalance > 1000000)
 		)
 			throw new Error("余额底线需为 0.01–1000000。");
+		if (settings.grailModel !== undefined) parseGrailModelUpdate(settings.grailModel);
+		if (settings.grailMaxCost !== undefined && settings.grailMaxCost !== null && !validGrailMaxCost(settings.grailMaxCost))
+			throw new Error("单次鉴定费用上限需为 0.01–1000 美元。");
+		if (settings.grailTimeoutSec !== undefined && settings.grailTimeoutSec !== null && !validGrailTimeout(settings.grailTimeoutSec))
+			throw new Error("鉴定超时需为 30–7200 秒的整数。");
 		if (settings.disableAllHooks !== undefined && typeof settings.disableAllHooks !== "boolean")
 			throw new Error("Hooks 开关格式错误。");
 		if (settings.outputStyle !== undefined && settings.outputStyle !== null && !validOutputStyleName(settings.outputStyle))
@@ -372,6 +378,10 @@ function installHandlers() {
 		if (settings.agentDir !== undefined) string(settings.agentDir, "Pi 配置目录", 16384);
 		return service.saveSettings(settings as Parameters<DesktopAPI["saveSettings"]>[0]);
 	});
+	handle("pi:grail:start", (id) => service.startGrail(string(id, "会话 ID", 200)));
+	handle("pi:grail:cancel", (id) => service.cancelGrail(string(id, "会话 ID", 200)));
+	handle("pi:grail:state", (id) => service.grailState(string(id, "会话 ID", 200)));
+	handle("pi:grail:seal", (id) => service.sealGrailWish(string(id, "会话 ID", 200)));
 	handle("pi:doctor", () => service.doctor());
 	handle("pi:usage-stats", (input) => {
 		if (input === undefined || input === null) return service.usageStats({});
@@ -533,6 +543,9 @@ void app.whenReady().then(() => {
 	});
 	service.subscribeTeams((event) => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:teams:event", event);
+	});
+	service.subscribeGrail((event) => {
+		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:grail:event", event);
 	});
 	service.subscribeWorkflows((event) => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:workflow:event", event);

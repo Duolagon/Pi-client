@@ -1,14 +1,15 @@
 import type { Message } from "../shared.ts";
 
 /**
- * Per-turn code-quality verdict ("显灵/征兆") derived ONLY from honest signals that
- * already exist in the finalized transcript — never a fabricated pass. Pi runs no
- * standing test/tsc/biome, so a "grail" requires that the agent itself ran a
- * recognized verify command that exited 0, with no tool/model errors.
+ * Per-turn code-quality verdict derived ONLY from honest signals that already exist
+ * in the finalized transcript — never a fabricated pass. Pi runs no standing
+ * test/tsc/biome, so "verified" requires that the agent itself ran a recognized
+ * verify command that exited 0, with no tool/model errors. Labels stay neutral:
+ * the Grail wording is reserved for the user-initiated judgement.
  */
 export type QualityOmen =
 	/** Code changed, a recognized verify command exited 0, and nothing errored. */
-	| "grail"
+	| "verified"
 	/** A tool/model error, a nonzero verify exit, or an aborted turn. */
 	| "problem"
 	/** Code changed but no verification ran — honest "unproven", never a pass. */
@@ -49,7 +50,7 @@ function toolName(call: { name: string }): string {
 
 /**
  * Recognized verification commands. Matched against the leading program token of a
- * shell command (after common runners), so only a real check counts toward a grail.
+ * shell command (after common runners), so only a real check counts as verified.
  */
 const VERIFY_PATTERN =
 	/\b(vitest|jest|mocha|ava|pytest|tsc|tsd|biome|eslint|prettier|ruff|mypy|cargo\s+(test|check|clippy)|go\s+test|rspec|phpunit|ctest)\b/i;
@@ -130,14 +131,14 @@ export function scoreTurn(turnMessages: Message[]): QualityVerdict {
 
 	// The user pressed stop: neither success nor failure, so no omen.
 	if (aborted) return { omen: "none", label: "", reason: "本次回复已停止", signals };
-	if (modelError) return { omen: "problem", label: "愿未达成", reason: "模型返回错误", signals };
+	if (modelError) return { omen: "problem", label: "有报错", reason: "模型返回错误", signals };
 	if (toolErrors > 0 || verifyFailed) {
 		const bits: string[] = [];
 		if (verifyFailed) bits.push("校验未通过");
 		if (toolErrors > 0) bits.push(`${toolErrors} 处工具报错`);
-		return { omen: "problem", label: "现杂音", reason: bits.join(" · "), signals };
+		return { omen: "problem", label: "有报错", reason: bits.join(" · "), signals };
 	}
 	if (!edited) return { omen: "none", label: "", reason: "本轮无代码改动", signals };
-	if (verifyPassed) return { omen: "grail", label: "圣杯显灵", reason: "改动已自验证且全部通过", signals };
-	return { omen: "unverified", label: "悬而未验", reason: "有代码改动，但本轮未运行校验", signals };
+	if (verifyPassed) return { omen: "verified", label: "已验证", reason: "改动已自验证且全部通过", signals };
+	return { omen: "unverified", label: "未验证", reason: "有代码改动，但本轮未运行校验", signals };
 }

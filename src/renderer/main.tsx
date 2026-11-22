@@ -55,14 +55,16 @@ import type {
 	TodoRecord,
 	WorkflowRecord,
 } from "../shared.ts";
+import type { GrailState } from "../shared.ts";
+import { GrailBadge, GrailReportDialog, GrailReveal } from "./GrailReport.tsx";
+import { grailWording, latestVerdict, revealDecision } from "./grail-view.ts";
 import { IconButton, Modal, PiMark, menuKeyNav } from "../prototype/ui.tsx";
 import { useDesktop } from "./useDesktop.ts";
 import { TranscriptView, type TodoItem } from "./TranscriptView.tsx";
 import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
 import { parseGoalCommand } from "../goal-mode.ts";
 import { WorkspacePicker } from "./WorkspacePicker.tsx";
-import { GrailEmblem, HolyGrailIcon, MagicCircleBackdrop, MagicCircleLoader, OmenGlyph, getServantInfo } from "./GrailIcons.tsx";
-import { scoreTurn, type QualityVerdict } from "./quality-verdict.ts";
+import { GrailEmblem, HolyGrailIcon, MagicCircleBackdrop, MagicCircleLoader, getServantInfo } from "./GrailIcons.tsx";
 import { SubagentPanel, type SubagentPanelHandle } from "./SubagentPanel.tsx";
 import { SubagentTranscriptView } from "./SubagentTranscriptView.tsx";
 import { SubagentApprovals } from "./SubagentApprovals.tsx";
@@ -119,7 +121,6 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [focusedTerminal, setFocusedTerminal] = useState<{ conversationId: string; terminalId: string }>();
 	const [controlsTab, setControlsTab] = useState<ControlsTab | null>(null);
 	const [checkpointsOpen, setCheckpointsOpen] = useState(false);
-	const [omenReveal, setOmenReveal] = useState<QualityVerdict | null>(null);
 	const [rewindQuery, setRewindQuery] = useState<string | undefined>(undefined);
 	const [tasksOpen, setTasksOpen] = useState(false);
 	const [taskInitialId, setTaskInitialId] = useState<string | undefined>(undefined);
@@ -249,32 +250,105 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	useEffect(() => {
 		if (stickToEnd.current) scroll.current?.scrollTo({ top: scroll.current.scrollHeight });
 	}, [history, running]);
-	// On turn settle (running true→false), reveal the just-finished turn's quality omen briefly.
-	// The run is tied to the conversation it started in, so switching away from a running
-	// conversation never reveals a verdict for a different one.
-	const wasRunning = useRef(false);
-	const runningConversation = useRef<string | undefined>(undefined);
+	// User-initiated judgement of the current wish. Verdicts live outside the Pi session.
+	const [grail, setGrail] = useState<GrailState | null>(null);
+	const [grailReportId, setGrailReportId] = useState<string | null>(null);
+	const [grailReveal, setGrailReveal] = useState(false);
+	const pendingReveal = useRef<string | undefined>(undefined);
+	const activeConversationId = snapshot?.active?.id;
+	const activeConversationRef = useRef(activeConversationId);
+	activeConversationRef.current = activeConversationId;
+	const loadGrail = useCallback(
+		(id: string | undefined) => {
+			if (!id) return setGrail(null);
+			void api.grail
+				.state(id)
+				.then((state) => {
+					if (activeConversationRef.current === id) setGrail(state);
+				})
+				.catch(() => {});
+		},
+		[api],
+	);
 	useEffect(() => {
-		const conversation = snapshot?.active?.id;
-		if (running && !wasRunning.current) runningConversation.current = conversation;
-		if (wasRunning.current && !running && runningConversation.current === conversation) {
-			const messages = history.messages;
-			let start = messages.length;
-			while (start > 0 && messages[start - 1].role !== "user" && messages[start - 1].role !== "custom") start--;
-			const verdict = start < messages.length ? scoreTurn(messages.slice(start)) : null;
-			if (verdict && verdict.omen !== "none") setOmenReveal(verdict);
-		}
-		wasRunning.current = running;
-	}, [running, history.messages, snapshot?.active?.id]);
-	// The timer depends only on the reveal itself, so transcript updates cannot cancel it.
+		// Switching conversations never replays a reveal.
+		pendingReveal.current = undefined;
+		setGrailReveal(false);
+		setGrailReportId(null);
+		setGrail(null);
+		loadGrail(activeConversationId);
+	}, [activeConversationId, loadGrail]);
+	// A finished turn may have created the wish's first checkpoint, which enables the button.
 	useEffect(() => {
-		if (!omenReveal) return;
-		const timer = setTimeout(() => setOmenReveal(null), 2500);
+		if (!running) loadGrail(activeConversationRef.current);
+	}, [running, loadGrail]);
+	useEffect(() => {
+		const visible = () => document.visibilityState === "visible" && document.hasFocus();
+		const reducedMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+		const off = api.grail.onEvent((event) => {
+			if (event.conversationId !== activeConversationRef.current) return;
+			if (event.type === "grail_progress")
+				setGrail((prev) => prev && { ...prev, running: { id: event.id, step: event.step, startedAt: prev.running?.id === event.id ? prev.running.startedAt : Date.now() } });
+			else if (event.type === "grail_failed") {
+				setGrail((prev) => (prev && prev.running?.id === event.id ? { ...prev, running: undefined } : prev));
+				if (!event.cancelled) app.fail(new Error(`鉴定失败：${event.error}`));
+			} else if (event.type === "grail_verdict") {
+				setGrail((prev) => prev && { ...prev, running: undefined, verdicts: [...prev.verdicts, event.verdict] });
+				const decision = revealDecision({
+					grade: event.verdict.grade,
+					verdictConversation: event.conversationId,
+					activeConversation: activeConversationRef.current,
+					visible: visible(),
+					reducedMotion: reducedMotion(),
+				});
+				if (decision === "play") setGrailReveal(true);
+				else if (decision === "defer") pendingReveal.current = event.conversationId;
+				loadGrail(event.conversationId);
+			} else if (event.type === "grail_sealed") loadGrail(event.conversationId);
+		});
+		const resume = () => {
+			if (!pendingReveal.current || !visible()) return;
+			if (pendingReveal.current === activeConversationRef.current) setGrailReveal(true);
+			pendingReveal.current = undefined;
+		};
+		window.addEventListener("focus", resume);
+		document.addEventListener("visibilitychange", resume);
+		return () => {
+			off();
+			window.removeEventListener("focus", resume);
+			document.removeEventListener("visibilitychange", resume);
+		};
+	}, [api, app.fail, loadGrail]);
+	useEffect(() => {
+		if (!grailReveal) return;
+		const timer = setTimeout(() => setGrailReveal(false), 1800);
 		return () => clearTimeout(timer);
-	}, [omenReveal]);
-	useEffect(() => {
-		setOmenReveal(null);
-	}, [snapshot?.active?.id]);
+	}, [grailReveal]);
+	const startGrail = () => {
+		const id = activeConversationRef.current;
+		if (!id) return;
+		setGrailReportId(null);
+		void api.grail
+			.start(id)
+			.then((run) => setGrail((prev) => prev && { ...prev, running: { id: run.id, step: "diff", startedAt: Date.now() } }))
+			.catch(app.fail);
+	};
+	const cancelGrail = () => {
+		const id = activeConversationRef.current;
+		if (id) void api.grail.cancel(id).catch(app.fail);
+	};
+	const sealGrail = () => {
+		const id = activeConversationRef.current;
+		if (!id) return;
+		void api.grail
+			.seal(id)
+			.then((state) => {
+				setGrail(state);
+				setGrailReportId(null);
+				app.setNotice("已封存，之后的改动算作下一个需求。");
+			})
+			.catch(app.fail);
+	};
 	useEffect(() => {
 		let active = true;
 		void api.tasks.list().then((list) => {
@@ -813,6 +887,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			setDoctorOpen(true);
 		} else if (action === "stats") {
 			setUsageOpen(true);
+		} else if (action === "grail") {
+			if (blocked) app.setNotice("请等待当前任务结束后再发起鉴定。");
+			else if (!grail?.hasDiff) app.setNotice("这个需求还没有代码改动（或不是 Git 项目），暂时无法鉴定。");
+			else startGrail();
 		}
 	};
 	useEffect(() => {
@@ -979,6 +1057,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		{ id: "settings", label: "打开客户端与模型设置", keywords: "settings model api key theme", run: () => setSettings(true) },
 	];
 	const isGrail = snapshot.settings.theme === "grail";
+	const grailText = grailWording(isGrail);
+	const latestGrailVerdict = latestVerdict(grail);
+	// The latest 圣杯显灵 keeps a persistent gold badge even after later verdicts.
+	const grailBest = grail?.verdicts.filter((verdict) => verdict.grade === "grail").at(-1);
+	const grailReportVerdict = grailReportId ? grail?.verdicts.find((verdict) => verdict.id === grailReportId) : undefined;
 	const servant = isGrail ? getServantInfo(snapshot.state?.model?.id) : null;
 	return (
 		<div
@@ -1883,12 +1966,6 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											))}
 										</div>
 									)}
-									{!running && isGrail && omenReveal && (
-										<div className={`cl-working grail-omen-reveal omen-${omenReveal.omen}`} role="status">
-											<OmenGlyph omen={omenReveal.omen} width={17} height={17} />
-											<span>{omenReveal.label}</span>
-										</div>
-									)}
 									{showJump && (
 										<button
 											type="button"
@@ -2092,6 +2169,39 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								>
 									停止目标
 								</button>
+							</div>
+						)}
+						{snapshot.active && Boolean(grail?.hasDiff || grail?.running || grail?.verdicts.length) && (
+							<div className="cc-grail-bar" role="region" aria-label={grailText.report}>
+								{grail?.running ? (
+									<span className="cc-grail-running" role="status">
+										{isGrail ? <MagicCircleLoader size={14} /> : <span className="cl-spinner" />}
+										{grailText.running} · {grailText.steps[grail.running.step]}
+									</span>
+								) : (
+									<button
+										type="button"
+										className="cc-mini-btn cc-grail-start"
+										disabled={!grail?.hasDiff || blocked}
+										title={grail?.hasDiff ? "鉴定本次需求的全部改动，结果不会发给 Agent" : "这个需求还没有代码改动"}
+										onClick={startGrail}
+									>
+										{grailText.start}
+									</button>
+								)}
+								{grail?.running && (
+									<button type="button" className="cc-mini-btn" onClick={cancelGrail}>
+										取消
+									</button>
+								)}
+								<span className="cc-grail-badges">
+									{latestGrailVerdict && latestGrailVerdict.grade === "grail" ? null : grailBest && (
+										<GrailBadge verdict={grailBest} wording={grailText} onOpen={() => setGrailReportId(grailBest.id)} />
+									)}
+									{latestGrailVerdict && (
+										<GrailBadge verdict={latestGrailVerdict} wording={grailText} onOpen={() => setGrailReportId(latestGrailVerdict.id)} />
+									)}
+								</span>
 							</div>
 						)}
 						<LiveComposer
@@ -2591,6 +2701,19 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				/>
 			)}
 			{usageOpen && <UsageStatsDialog close={() => setUsageOpen(false)} />}
+			{grailReportVerdict && grail && (
+				<GrailReportDialog
+					verdict={grailReportVerdict}
+					wording={grailText}
+					busy={Boolean(grail.running)}
+					canRejudge={grailReportVerdict.wish === grail.wish && grail.hasDiff && !blocked}
+					canSeal={grailReportVerdict.wish === grail.wish}
+					onRejudge={startGrail}
+					onSeal={sealGrail}
+					close={() => setGrailReportId(null)}
+				/>
+			)}
+			{grailReveal && <GrailReveal label={grailText.grades.grail} />}
 			{doctorOpen && <DoctorDialog close={() => setDoctorOpen(false)} onNotice={(msg) => app.setNotice(msg)} />}
 			{paletteOpen && (
 				<CommandPalette
