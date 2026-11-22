@@ -8,7 +8,7 @@ import { AntigravityAdapter, antigravityProfile } from "../src/external-antigrav
 import { discoverExecutors } from "../src/external-executors.ts";
 import type { ExternalAdapterEvent, ExternalApprovalRequest, ExternalSessionOptions } from "../src/external-types.ts";
 
-// Antigravity's `agy acp` speaks ACP v1 like Kimi but exposes no session modes.
+// Antigravity's `agy acp` speaks ACP v1 and, like Kimi, advertises a manual "default" session mode.
 async function fixture(env: NodeJS.ProcessEnv = {}) {
 	const root = await mkdtemp(join(tmpdir(), "pi-agy-acp-test-"));
 	const executable = join(root, "agy");
@@ -18,7 +18,7 @@ async function fixture(env: NodeJS.ProcessEnv = {}) {
 	const events: ExternalAdapterEvent[] = [];
 	const approvals: ExternalApprovalRequest[] = [];
 	const options: ExternalSessionOptions = {
-		executable, cwd: root, env: { PATH: process.env.PATH, KIMI_TEST_LOG: log, ACP_TEST_NO_MODES: "1", ...env },
+		executable, cwd: root, env: { PATH: process.env.PATH, KIMI_TEST_LOG: log, ...env },
 		policy: { version: 1, mode: "ask", project: root, rules: [], disabledTools: [] },
 		onEvent: (event) => events.push(event),
 		onPermission: async (request) => { approvals.push(request); return { decision: "allow" }; },
@@ -26,7 +26,7 @@ async function fixture(env: NodeJS.ProcessEnv = {}) {
 	return { root, events, approvals, options, records: async () => (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line)), cleanup: () => rm(root, { recursive: true, force: true }) };
 }
 
-test("Antigravity ACP starts without session modes, forwards approvals and continues its session", async () => {
+test("Antigravity ACP forces the manual default mode, forwards approvals and continues its session", async () => {
 	const data = await fixture();
 	const session = await new AntigravityAdapter().open(data.options);
 	try {
@@ -35,7 +35,7 @@ test("Antigravity ACP starts without session modes, forwards approvals and conti
 		assert.equal(data.approvals[0].toolName, "bash");
 		assert.equal((await session.run("follow-up")).text, "turn 2: follow-up");
 		const records = await data.records();
-		assert.equal(records.some((item) => item.method === "session/set_mode"), false);
+		assert.deepEqual(records.find((item) => item.method === "session/set_mode").params, { sessionId: session.sessionId, modeId: "default" });
 		assert.equal(records.filter((item) => item.method === "session/new").length, 1);
 	} finally { await session.close(); await data.cleanup(); }
 });
@@ -62,20 +62,19 @@ test("Antigravity still refuses read-only and fine-grained policies before spawn
 });
 
 test("Antigravity fails closed when it advertises modes but no manual default mode", async () => {
-	const data = await fixture({ ACP_TEST_NO_MODES: "0", ACP_TEST_ODD_MODES: "1" });
+	const data = await fixture({ ACP_TEST_ODD_MODES: "1" });
 	try { await assert.rejects(new AntigravityAdapter().open(data.options), /manual\/default approval mode/); }
 	finally { await data.cleanup(); }
 });
 
-test("Antigravity tolerates mode updates when it never advertised modes", async () => {
+test("Antigravity fails closed without session modes and stops on a switch to an unattended mode", async () => {
+	const bare = await fixture({ ACP_TEST_NO_MODES: "1" });
+	try { await assert.rejects(new AntigravityAdapter().open(bare.options), /manual\/default approval mode/); }
+	finally { await bare.cleanup(); }
 	const data = await fixture();
 	const session = await new AntigravityAdapter().open(data.options);
-	try {
-		const next = session.run("auto-mode");
-		await new Promise((resolve) => setTimeout(resolve, 200));
-		await session.interrupt();
-		assert.equal((await next).status, "cancelled");
-	} finally { await session.close(); await data.cleanup(); }
+	try { await assert.rejects(session.run("auto-mode"), /invalid JSONL|unattended/); }
+	finally { await session.close(); await data.cleanup(); }
 });
 
 test("discovery finds agy under the antigravity executor and marks it writable-only", async () => {

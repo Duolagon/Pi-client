@@ -23,7 +23,7 @@ available 表示能找到并运行版本探测，不表示账号已经登录或�
 | Codex | App Server JSONL / thread / turn | native，接住服务端发出的审批 | read-only/workspace-write 沙箱；不能逐工具落实任意 Pi 规则 |
 | Claude Code | 固定 SDK core + 独立 helper | per-tool-hook，PreToolUse 与 canUseTool | 宿主逐工具判定、只读工具上限 |
 | Kimi Code | 新版 ACP JSON-RPC | native，保留原生选项 ID 和问题表单 | 当前不提供可强制执行的只读与逐工具策略 |
-| Antigravity CLI | `agy acp --disable-telemetry`，ACP v1 | native，agy 的审批请求转给宿主，agy 自身规则已允许/拒绝的操作不再询问 | 不提供只读模式和逐工具策略；ACP 不暴露 session mode，宿主无法强制手动模式 |
+| Antigravity CLI | `agy acp --disable-telemetry`，ACP v1 | native，宿主强制 `default` 手动模式并转发审批；agy 自身规则已允许/拒绝的操作不再询问 | 不提供只读模式和逐工具策略 |
 
 capabilities 返回 transport、continuation、approvals、cancellation、readOnly、fineGrainedPolicy、approvalSemantics。前端应展示限制并禁用不可用组合；这些是本适配器的能力上限，握手仍可能因本机 CLI 过旧或不兼容而拒绝启动。
 
@@ -93,7 +93,7 @@ decision 为 allow/deny/cancel。pendingApprovals 给出宿主审批 ID、kind�
 - Claude：每个 PreToolUse 都经过本地与宿主策略，未知工具在只读模式下拒绝；问题单独交互。旧 CLI 不支持原生 onFailure:block 时，helper 使用全面 catch→deny、短于原生 hook timeout 的审批期限、断管清理和进程组退出保护。
 - Codex：强制并校验 untrusted/user 审批以及 read-only/workspace-write 沙箱，拒绝提权；只读任务还要求原生配置没有 MCP。原生安全操作可能无需发出审批，不能宣称和 Pi ask 模式逐次确认一致。
 - Kimi：恢复后设置原生手动模式并验证确认，接收原生权限请求，不宣告客户端文件系统/终端能力。不能以 Plan 模式冒充真正只读。
-- Antigravity：启动时固定开启 `--sandbox`，接收原生权限请求；ACP 不暴露 session mode，agy 自身规则已允许的操作不经宿主审批（capabilities.approvalSemantics 为 `agent-rules`），因此拒绝 dontAsk 策略。
+- Antigravity：启动时固定开启 `--sandbox`，设置并锁定原生 `default` 手动模式，接收原生权限请求；agy 自身规则已允许的操作不经宿主审批（capabilities.approvalSemantics 为 `agent-rules`），因此拒绝 dontAsk 策略。
 - Codex/Kimi/Antigravity：无法可靠执行的非宿主 deny/ask 规则或原生工具停用，会在启动时明确拒绝，不静默丢弃。仅 allow 规则允许使用原生更保守的审批。运行时修改宿主策略会停止缺少逐工具 hook 的活动任务，需显式继续。
 
 原生 CLI 的配置、插件、hooks 和 MCP 是各执行器自己的受信代码边界；Pi 的工具钩子不是它们的 OS 沙箱。宿主不会用全局跳过审批参数解决兼容问题。root/管理员进程及恶意本机扩展的任意系统访问不在此工具权限契约的隔离承诺内。
@@ -131,5 +131,5 @@ SDK 固定版本与许可见 [UPSTREAM](../UPSTREAM.md)。构建将 JavaScript S
 - 探测命令名 `agy`（PATH、`~/.local/bin` 等常见目录），也可在“外部执行器”里配置绝对路径。
 - 启动参数固定为 `acp --sandbox --disable-telemetry`，不传 `--dangerously-skip-permissions`。客户端不读取、不保存 Google 凭据；agy 复用自己在钥匙串里的登录。
 - 未登录时 agy 返回 `Authentication required`，任务启动失败并提示先运行 `agy` 或 `agy acp --login`。
-- agy 的 ACP 服务不暴露 session mode，因此宿主无法像 Kimi 那样强制 `default` 手动模式。它是否先询问再执行，取决于 agy 自己的 `agentMode` 与 `~/.gemini/antigravity-cli/settings.json` 里的 `permissions` 规则；被规则直接允许的操作不会出现审批。因此父会话为 dontAsk 时拒绝启动；若 agy 将来声明了 session mode 却没有 `default`，同样拒绝启动。
+- agy 1.5.14 的 ACP 会话提供 `default`、`accept-edits`、`auto`、`plan` 四种模式。宿主和 Kimi 一样强制 `default`，之后若 agy 切到其他非 plan 模式就中止任务；没有 `default` 模式时拒绝启动。`default` 模式下 agy 仍遵守 `~/.gemini/antigravity-cli/settings.json` 里的 `permissions` 规则，被规则直接允许的操作不会出现审批，因此父会话为 dontAsk 时拒绝启动。
 - 只能运行可写任务（需要 Git 仓库和独立 Worktree），不能用于 Explore/Plan。
