@@ -2648,6 +2648,9 @@
 		padding-left: 16px;
 		padding-right: 16px;
 	}
+	.cc-pinned-todos {
+		width: calc(100% - 32px);
+	}
 }
 @media (max-width: 900px) {
 	.cl-composer-hint {
@@ -3288,7 +3291,7 @@ body {
 
 /* Pinned & inline Todo checklist */
 .cc-pinned-todos {
-	max-width: 820px;
+	max-width: 764px;
 	width: calc(100% - 56px);
 	margin: 0 auto 8px;
 	border: 1px solid var(--cl-line);
@@ -5147,4 +5150,23 @@ body.cc-resizing iframe {
 	.grail-reveal {
 		display: none;
 	}
+}
+
+/* Collapsed run of consecutive bash/read/search tool calls */
+.cl-tool-group {
+  margin: 2px 0;
+}
+.cc-tool-group-head {
+  color: var(--cl-2);
+}
+.cl-tool-group.is-open > .cc-tool-group-head .cl-tool-chevron {
+  transform: rotate(90deg);
+}
+.cc-tool-group-body {
+  margin-left: 10px;
+  padding-left: 10px;
+  border-left: 1px solid var(--cl-line-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }

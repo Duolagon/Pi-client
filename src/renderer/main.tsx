@@ -1981,7 +1981,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										</button>
 									)}
 								</div>
-						{latestTodos.length > 0 && (
+						{latestTodos.length > 0 && !(!running && latestTodos.every((t) => t.status === "completed")) && (
 							<div className="cc-pinned-todos">
 								<button type="button" className="cc-pinned-todos-head" onClick={() => setTodoExpanded((v) => !v)}>
 									<span>

@@ -458,7 +458,7 @@ function TurnBlocks({
 	onOpenPreview?: (url: string) => void;
 	onOpenFile?: OpenFileHandler;
 }) {
-	return message.content.map((block, part) => {
+	const nodes = message.content.map((block, part) => {
 		if (block.type === "text") {
 			if (!block.text.trim()) return null;
 			return (
@@ -509,6 +509,74 @@ function TurnBlocks({
 			/>
 		);
 	});
+	const groupable = new Set(["bash", "read", "grep", "find", "ls"]);
+	const out: ReactNode[] = [];
+	let run: number[] = [];
+	const flush = () => {
+		if (run.length < 2) {
+			for (const i of run) out.push(nodes[i]);
+		} else {
+			const counts = { bash: 0, read: 0, search: 0 };
+			let running = false;
+			let failed = false;
+			for (const i of run) {
+				const b = message.content[i];
+				if (b.type !== "toolCall") continue;
+				if (b.name === "bash") counts.bash++;
+				else if (b.name === "read") counts.read++;
+				else counts.search++;
+				const res = state.messages.find(
+					(item): item is Extract<Message, { role: "toolResult" }> => item.role === "toolResult" && item.toolCallId === b.id,
+				);
+				if (res) {
+					if (res.isError) failed = true;
+				} else if ((state.tools[b.id]?.status ?? "running") === "running") {
+					running = true;
+				}
+			}
+			const parts: string[] = [];
+			if (counts.bash) parts.push(`运行 ${counts.bash} 条命令`);
+			if (counts.read) parts.push(`读取 ${counts.read} 个文件`);
+			if (counts.search) parts.push(`搜索 ${counts.search} 次`);
+			const first = message.content[run[0]];
+			out.push(
+				<ToolGroup key={`group-${first.type === "toolCall" ? first.id : run[0]}`} summary={parts.join("，")} running={running} failed={failed}>
+					{run.map((i) => nodes[i])}
+				</ToolGroup>,
+			);
+		}
+		run = [];
+	};
+	for (let i = 0; i < message.content.length; i++) {
+		const block = message.content[i];
+		if (nodes[i] === null) continue;
+		if (block.type === "toolCall" && groupable.has(block.name)) {
+			run.push(i);
+		} else {
+			flush();
+			out.push(nodes[i]);
+		}
+	}
+	flush();
+	return out;
+}
+
+/** Collapses a run of consecutive low-signal tool calls (bash/read/grep/...) into one summary row, like Claude Code. */
+function ToolGroup({ summary, running, failed, children }: { summary: string; running: boolean; failed: boolean; children: ReactNode }) {
+	const [open, setOpen] = useState(false);
+	const isOpen = open || running;
+	return (
+		<div className={`cl-tool-group ${running ? "running" : failed ? "error" : "done"} ${isOpen ? "is-open" : ""}`}>
+			<button type="button" className="cc-tool-row cc-tool-group-head" onClick={() => setOpen((v) => !v)} aria-expanded={isOpen}>
+				<span className={`cc-dot ${running ? "run" : failed ? "err" : "ok"}`} />
+				<span className="cc-tool-head">
+					<span className="cc-tool-verb">{summary}</span>
+				</span>
+				<ChevronRight size={13} className="cl-tool-chevron" />
+			</button>
+			{isOpen && <div className="cc-tool-group-body">{children}</div>}
+		</div>
+	);
 }
 
 interface ToolPresentation {
