@@ -18,7 +18,7 @@ import { formatAgentListing, parseAgentListing } from "./agent-listing.ts";
 import { TASK_NOTIFICATION_TYPE, formatTaskProgressSummary } from "./delegation-format.ts";
 import { postLoopbackJson, postLoopbackNdjson } from "./loopback-request.ts";
 import { isLspSupportedFile } from "./language-service.ts";
-import { createGuardedBashOperations } from "./host-guard.ts";
+import { createGuardedBashOperations } from "./host-guard-bash.ts";
 import type { TaskProgress } from "./task-types.ts";
 
 const NOTIFICATION_ACK = "desktop_notification_ack";

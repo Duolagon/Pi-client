@@ -4,11 +4,11 @@ import test from "node:test";
 import {
 	HostResourceGuard,
 	buildSafeComputeEnv,
-	createGuardedBashOperations,
 	parsePsGroupRss,
 	resolveMaxRssBytes,
 	resolveNiceCommand,
 } from "../src/host-guard.ts";
+import { createGuardedBashOperations } from "../src/host-guard-bash.ts";
 
 test("resolveNiceCommand wraps commands with /usr/bin/nice on Unix without double wrapping", () => {
 	if (process.platform === "win32") return;
