@@ -8,6 +8,7 @@ export interface ToolProgress {
 	args: unknown;
 	output: string;
 	status: "running" | "done" | "error";
+	startedAt?: number;
 }
 export interface Transcript {
 	messages: Message[];
@@ -121,6 +122,7 @@ export function applyEvent(state: Transcript, event: DesktopEvent["event"]): Tra
 					args: event.args,
 					output: "",
 					status: "running",
+					startedAt: Date.now(),
 				},
 			},
 		};

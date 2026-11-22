@@ -84,6 +84,7 @@ export const toolSchemas: Record<DesktopModelToolName, JsonSchema> = {
 		blocks: { type: "array", items: boundedText(64), maxItems: 100 },
 		blockedBy: { type: "array", items: boundedText(64), maxItems: 100 },
 		metadata: { type: "object" },
+		estimatedSeconds: { type: "integer", minimum: 1, maximum: 604_800, description: "Optional estimated duration in seconds so the user sees an ETA while waiting" },
 	}, ["subject", "description"]),
 	TodoGet: schema({ id: { ...boundedText(64), description: "Checklist task ID returned by TodoCreate or TodoList" } }, ["id"]),
 	TodoUpdate: schema({
@@ -96,6 +97,7 @@ export const toolSchemas: Record<DesktopModelToolName, JsonSchema> = {
 		addBlocks: { type: "array", items: boundedText(64), maxItems: 100 },
 		addBlockedBy: { type: "array", items: boundedText(64), maxItems: 100 },
 		metadata: { type: "object" },
+		estimatedSeconds: { type: "integer", minimum: 1, maximum: 604_800, description: "Optional updated estimated duration in seconds" },
 	}, ["id"]),
 	TodoList: schema({
 		include_completed: { type: "boolean", description: "Whether to include completed items (default true)" },

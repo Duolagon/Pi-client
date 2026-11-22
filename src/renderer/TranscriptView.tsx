@@ -1,8 +1,9 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { copyText } from "./clipboard.ts";
 import ReactMarkdown from "react-markdown";
 import { ArrowDownToLine, Check, Circle, CircleAlert, ChevronRight, Copy, ExternalLink, Eye, GitFork, LoaderCircle, RotateCcw, Square } from "lucide-react";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
+import { formatRunningToolTimer } from "../task-eta.ts";
 import type { DesktopTask, ExternalTask, Message, TaskProgress } from "../shared.ts";
 import type { Transcript, ToolProgress } from "./messages.ts";
 import { CodeLines, InlineEditDiff, computeLineDiff } from "./DiffView.tsx";
@@ -14,6 +15,9 @@ export interface TodoItem {
 	id: string;
 	content: string;
 	status: "pending" | "in_progress" | "completed";
+	estimatedSeconds?: number;
+	startedAt?: number;
+	completedAt?: number;
 }
 
 type Assistant = Extract<Message, { role: "assistant" }>;
@@ -1020,6 +1024,19 @@ function ToolCard({
 	const dotClass = effectiveStatus === "error" ? "err" : effectiveStatus === "done" ? "ok" : "run";
 	const [open, setOpen] = useState(false);
 	const isOpen = open || status === "running";
+	const showLiveTimer = effectiveStatus === "running" && !matchedTask && typeof progress?.startedAt === "number";
+	const [tickNow, setTickNow] = useState(() => Date.now());
+	useEffect(() => {
+		if (!showLiveTimer) return;
+		setTickNow(Date.now());
+		const timer = setInterval(() => setTickNow(Date.now()), 1000);
+		return () => clearInterval(timer);
+	}, [showLiveTimer]);
+	const timeoutSeconds =
+		args && typeof args === "object" && typeof (args as { timeout?: unknown }).timeout === "number"
+			? (args as { timeout: number }).timeout
+			: undefined;
+	const liveTimerLabel = showLiveTimer ? formatRunningToolTimer(progress?.startedAt, timeoutSeconds, tickNow) : undefined;
 	const fileTarget = onOpenFile ? toolFileTarget(name, args) : undefined;
 	const summaryLine = matchedTask
 		? formatMatchedTaskSummary(matchedTask, taskProgress)
@@ -1040,7 +1057,8 @@ function ToolCard({
 						{"executor" in matchedTask ? matchedTask.executor : "pi"} · {matchedTask.status}
 					</span>
 				)}
-				{!matchedTask && info.badge && <span className={`cc-tool-badge ${status === "error" ? "err" : ""}`}>{info.badge}</span>}
+				{liveTimerLabel && <span className="cc-tool-badge cc-eta-pill">{liveTimerLabel}</span>}
+				{!matchedTask && !liveTimerLabel && info.badge && <span className={`cc-tool-badge ${status === "error" ? "err" : ""}`}>{info.badge}</span>}
 				<ChevronRight size={13} className="cl-tool-chevron" />
 			</button>
 			{fileTarget && onOpenFile && (

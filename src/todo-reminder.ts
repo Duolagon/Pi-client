@@ -17,6 +17,26 @@ export function staleTodoReminder(messages: readonly unknown[], threshold = TODO
 		for (let j = msg.content.length - 1; j >= 0; j--) {
 			const block = msg.content[j] as Block;
 			if (block?.type !== "toolCall") continue;
+			if (block.name === "TodoCreate" || block.name === "TodoUpdate") {
+				if (callsSince < threshold) return undefined;
+				const args = (block.arguments ?? {}) as { status?: unknown; subject?: unknown; id?: unknown };
+				if (block.name === "TodoUpdate" && args.status === "completed") {
+					return [
+						"<system-reminder>",
+						"Your shared Todo checklist has not been updated for several steps.",
+						"Call TodoUpdate (to mark finished items completed and set the current item to in_progress) or TodoCreate if new steps were added.",
+						"Do not mention this reminder to the user.",
+						"</system-reminder>",
+					].join("\n");
+				}
+				return [
+					"<system-reminder>",
+					"Your shared Todo checklist has not been updated for a while, so the progress the user sees is out of date.",
+					"Call TodoUpdate now to mark finished items completed and keep the active item in_progress.",
+					"Do not mention this reminder to the user.",
+					"</system-reminder>",
+				].join("\n");
+			}
 			if (block.name !== "TodoWrite") {
 				callsSince++;
 				continue;

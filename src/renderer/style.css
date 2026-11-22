@@ -3300,6 +3300,16 @@ body {
 	background: var(--cl-surface);
 	overflow: hidden;
 }
+.cc-pinned-todos-progress {
+	width: 100%;
+	height: 2px;
+	background: var(--cl-line-soft);
+}
+.cc-pinned-todos-progress-fill {
+	height: 100%;
+	background: var(--cl-clay);
+	transition: width 220ms ease;
+}
 .cc-pinned-todos-head {
 	width: 100%;
 	display: flex;
@@ -3321,6 +3331,13 @@ body {
 	gap: 4px;
 	border-top: 1px solid var(--cl-line-soft);
 }
+.cc-pinned-todos-title {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	min-width: 0;
+	flex-wrap: wrap;
+}
 .cc-todo-row {
 	display: flex;
 	align-items: center;
@@ -3328,9 +3345,45 @@ body {
 	font-size: var(--fs-sm);
 	color: var(--cl-2);
 }
-.cc-todo-row.completed span {
+.cc-todo-row-text {
+	flex: 1;
+	min-width: 0;
+}
+.cc-todo-row.completed .cc-todo-row-text {
 	text-decoration: line-through;
 	opacity: 0.65;
+}
+.cc-eta-pill {
+	display: inline-flex;
+	align-items: center;
+	padding: 1px 7px;
+	border-radius: 999px;
+	font-size: 11px;
+	font-variant-numeric: tabular-nums;
+	line-height: 1.45;
+	color: var(--cl-2);
+	background: var(--cl-soft);
+	border: 1px solid var(--cl-line-soft);
+	white-space: nowrap;
+	flex-shrink: 0;
+}
+.cc-eta-pill.overdue,
+.cc-eta-pill.stale {
+	color: #b45309;
+	background: rgba(245, 158, 11, 0.14);
+	border-color: rgba(245, 158, 11, 0.35);
+}
+.cc-eta-summary-bar {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	padding: 6px 10px;
+	margin-bottom: 8px;
+	border-radius: var(--r-md);
+	background: var(--cl-soft);
+	font-size: var(--fs-sm);
+	color: var(--cl-2);
 }
 .cc-todo-row .ok {
 	color: var(--cl-green);

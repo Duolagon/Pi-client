@@ -44,6 +44,14 @@ function assertOptionalText(value: unknown, label: string, maxLength: number): s
 	return assertBoundedText(value, label, maxLength);
 }
 
+function assertOptionalEstimatedSeconds(value: unknown): number | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 1 || value > 604_800) {
+		throw new Error("Invalid estimatedSeconds (expected 1–604800 seconds)");
+	}
+	return Math.round(value);
+}
+
 function assertIdList(value: unknown, label: string): string[] {
 	if (value === undefined) return [];
 	if (!Array.isArray(value) || value.length > MAX_EDGE_LIST) throw new Error(`Invalid ${label}`);
@@ -112,6 +120,11 @@ function parseBoard(raw: unknown): StoredTodoBoard {
 			blocks: assertIdList(item.blocks, "blocks"),
 			blockedBy: assertIdList(item.blockedBy, "blockedBy"),
 			...(item.metadata !== undefined ? { metadata: validateMetadata(item.metadata) } : {}),
+			...(typeof item.estimatedSeconds === "number" && Number.isFinite(item.estimatedSeconds) && item.estimatedSeconds >= 1
+				? { estimatedSeconds: Math.min(604_800, Math.round(item.estimatedSeconds)) }
+				: {}),
+			...(typeof item.startedAt === "number" && Number.isFinite(item.startedAt) && item.startedAt > 0 ? { startedAt: item.startedAt } : {}),
+			...(typeof item.completedAt === "number" && Number.isFinite(item.completedAt) && item.completedAt > 0 ? { completedAt: item.completedAt } : {}),
 			createdAt: typeof item.createdAt === "number" && Number.isFinite(item.createdAt) ? item.createdAt : 0,
 			updatedAt: typeof item.updatedAt === "number" && Number.isFinite(item.updatedAt) ? item.updatedAt : 0,
 		});
@@ -225,7 +238,7 @@ export class TodoService {
 	async create(rootConversationId: string, rawInput: TodoCreateInput): Promise<TodoRecord> {
 		const rootId = this.assertRootId(rootConversationId);
 		const input = assertObject(rawInput, "TodoCreate input");
-		const allowed = ["subject", "description", "activeForm", "owner", "blocks", "blockedBy", "metadata"];
+		const allowed = ["subject", "description", "activeForm", "owner", "blocks", "blockedBy", "metadata", "estimatedSeconds"];
 		if (Object.keys(input).some((k) => !allowed.includes(k))) throw new Error("Unknown TodoCreate field");
 		const subject = assertBoundedText(input.subject, "subject", MAX_SUBJECT_LENGTH);
 		const description = assertBoundedText(input.description, "description", MAX_DESCRIPTION_LENGTH);
@@ -234,6 +247,7 @@ export class TodoService {
 		const blocks = assertIdList(input.blocks, "blocks");
 		const blockedBy = assertIdList(input.blockedBy, "blockedBy");
 		const metadata = validateMetadata(input.metadata);
+		const estimatedSeconds = assertOptionalEstimatedSeconds(input.estimatedSeconds);
 
 		return this.serialize(rootId, async () => {
 			const board = await this.loadBoard(rootId);
@@ -256,6 +270,7 @@ export class TodoService {
 				blocks: [],
 				blockedBy: [],
 				...(metadata ? { metadata } : {}),
+				...(estimatedSeconds !== undefined ? { estimatedSeconds } : {}),
 				createdAt: now,
 				updatedAt: now,
 			};
@@ -298,6 +313,7 @@ export class TodoService {
 			"addBlocks",
 			"addBlockedBy",
 			"metadata",
+			"estimatedSeconds",
 		];
 		if (Object.keys(input).some((k) => !allowed.includes(k))) throw new Error("Unknown TodoUpdate field");
 		const id = assertBoundedText(input.id, "id", 64);
@@ -309,6 +325,7 @@ export class TodoService {
 		const addBlocks = assertIdList(input.addBlocks, "addBlocks");
 		const addBlockedBy = assertIdList(input.addBlockedBy, "addBlockedBy");
 		const metadataPatch = validateMetadata(input.metadata);
+		const estimatedSeconds = assertOptionalEstimatedSeconds(input.estimatedSeconds);
 		let status: TodoStatus | undefined;
 		if (input.status !== undefined) {
 			if (typeof input.status !== "string" || !todoStatuses.includes(input.status as TodoStatus)) {
@@ -329,12 +346,14 @@ export class TodoService {
 			if (description !== undefined) record.description = description;
 			if (activeForm !== undefined) record.activeForm = activeForm;
 			if (owner !== undefined) record.owner = owner;
+			if (estimatedSeconds !== undefined) record.estimatedSeconds = estimatedSeconds;
 			if (metadataPatch !== undefined) {
 				const merged = mergeMetadata(record.metadata, metadataPatch);
 				if (merged) record.metadata = merged;
 				else delete record.metadata;
 			}
 
+			const now = Date.now();
 			if (status === "deleted") {
 				record.status = "deleted";
 				record.blocks = [];
@@ -344,7 +363,15 @@ export class TodoService {
 					peer.blockedBy = peer.blockedBy.filter((entry) => entry !== id);
 				}
 			} else {
-				if (status !== undefined) record.status = status;
+				if (status !== undefined) {
+					record.status = status;
+					if (status === "in_progress" && !record.startedAt) record.startedAt = now;
+					if (status === "completed") {
+						if (record.startedAt) record.completedAt = now;
+					} else if (status === "pending") {
+						delete record.completedAt;
+					}
+				}
 				for (const targetId of addBlocks) {
 					const target = byId.get(targetId);
 					if (!target || target.status === "deleted") throw new Error(`Unknown blocked todo id: ${targetId}`);

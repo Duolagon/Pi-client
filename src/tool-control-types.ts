@@ -242,9 +242,9 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 		AgentSend: ["task_id", "message", "run_in_background"], AgentExecutors: [],
 		TaskOutput: ["task_id", "block", "timeout"], TaskStop: ["task_id"], TaskList: [],
 		WorktreeCreate: ["base_ref"], WorktreeList: [], WorktreeMerge: ["worktree_id"], WorktreeRemove: ["worktree_id"],
-		TodoCreate: ["subject", "description", "activeForm", "owner", "blocks", "blockedBy", "metadata"],
+		TodoCreate: ["subject", "description", "activeForm", "owner", "blocks", "blockedBy", "metadata", "estimatedSeconds"],
 		TodoGet: ["id"],
-		TodoUpdate: ["id", "subject", "description", "status", "activeForm", "owner", "addBlocks", "addBlockedBy", "metadata"],
+		TodoUpdate: ["id", "subject", "description", "status", "activeForm", "owner", "addBlocks", "addBlockedBy", "metadata", "estimatedSeconds"],
 		TodoList: ["include_completed"],
 		Monitor: ["description", "command", "url", "timeout_ms", "persistent"],
 		BashOutput: ["bash_id", "filter"],
@@ -312,6 +312,8 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 			}
 		}
 		if (input.metadata !== undefined) object(input.metadata);
+		if (input.estimatedSeconds !== undefined && (typeof input.estimatedSeconds !== "number" || !Number.isFinite(input.estimatedSeconds) || input.estimatedSeconds < 1 || input.estimatedSeconds > 604_800))
+			throw new Error("Invalid estimatedSeconds (expected 1–604800 seconds)");
 	} else if (tool === "TodoGet") {
 		text(input.id, "id", 64);
 	} else if (tool === "TodoUpdate") {
@@ -330,6 +332,8 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 			}
 		}
 		if (input.metadata !== undefined) object(input.metadata);
+		if (input.estimatedSeconds !== undefined && (typeof input.estimatedSeconds !== "number" || !Number.isFinite(input.estimatedSeconds) || input.estimatedSeconds < 1 || input.estimatedSeconds > 604_800))
+			throw new Error("Invalid estimatedSeconds (expected 1–604800 seconds)");
 	} else if (tool === "TodoList") {
 		optionalBoolean(input.include_completed, "include_completed");
 	} else if (tool === "Monitor") {

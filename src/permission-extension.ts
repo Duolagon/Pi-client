@@ -313,6 +313,8 @@ export default function permissions(pi: ExtensionAPI) {
 	const testingConnection = process.env.PI_DESKTOP_CONNECTION_TEST === "1";
 	const forkChild = process.env.PI_DESKTOP_FORK_CHILD === "1";
 	const isChild = process.env.PI_DESKTOP_CHILD === "1" || process.env.PI_DESKTOP_READ_ONLY_CHILD === "1";
+	let activeTodoWriteItems: Array<{ id: string; content: string; status: string; estimatedSeconds?: number }> = [];
+	let callsSinceTodoUpdate = 0;
 	if (!testingConnection && (!isChild || forkChild) && process.env.PI_DESKTOP_HOST_URL) {
 		pi.registerTool({
 			name: "TodoWrite",
@@ -321,7 +323,7 @@ export default function permissions(pi: ExtensionAPI) {
 				"Manage a structured task checklist for multi-step work so the user can track progress. " +
 				"The user sees only the latest call, so call it again every time a step finishes or starts: " +
 				"mark finished items completed right away (do not batch them), keep exactly one item in_progress, " +
-				"and rewrite the list when the plan changes. Always pass the whole list.",
+				"and rewrite the list when the plan changes. Include estimatedSeconds when a step may take noticeable time so the user sees an ETA. Always pass the whole list.",
 			promptSnippet: "Track multi-step task progress with a structured checklist",
 			parameters: {
 				type: "object",
@@ -339,6 +341,12 @@ export default function permissions(pi: ExtensionAPI) {
 								id: { type: "string", minLength: 1, maxLength: 100 },
 								content: { type: "string", minLength: 1, maxLength: 500 },
 								status: { type: "string", enum: ["pending", "in_progress", "completed"] },
+								estimatedSeconds: {
+									type: "integer",
+									minimum: 1,
+									maximum: 604_800,
+									description: "Optional rough duration estimate in seconds so the UI can show ETA",
+								},
 							},
 						},
 					},
@@ -348,13 +356,27 @@ export default function permissions(pi: ExtensionAPI) {
 			defaultActive: true,
 			executionMode: "sequential",
 			async execute(_toolCallId, input) {
-				const rec = input as { todos?: Array<{ id: string; content: string; status: string }> };
+				const rec = input as { todos?: Array<{ id: string; content: string; status: string; estimatedSeconds?: number }> };
 				const todos = Array.isArray(rec?.todos) ? rec.todos.slice(0, 50) : [];
-				return { content: [{ type: "text", text: JSON.stringify({ todos }) }], details: { todos } };
+				activeTodoWriteItems = todos;
+				callsSinceTodoUpdate = 0;
+				return {
+					content: [
+						{
+							type: "text",
+							text: JSON.stringify({
+								todos,
+								message:
+									"Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress: call TodoWrite immediately whenever a step finishes or starts, and keep exactly one item in_progress.",
+							}),
+						},
+					],
+					details: { todos },
+				};
 			},
 		});
 		pi.on("context_with_system", (event) => {
-			const reminder = staleTodoReminder(event.messages);
+			const reminder = staleTodoReminder(event.messages, 4);
 			const first = event.messages[0];
 			if (!reminder || first?.role !== "system") return;
 			return { messages: [{ ...first, sections: { ...first.sections, desktopTodoReminder: reminder } }, ...event.messages.slice(1)] };
@@ -1085,7 +1107,26 @@ export default function permissions(pi: ExtensionAPI) {
 			? undefined
 			: await redactSearchResult(await loadRuntimePermissionPolicy().catch(() => undefined), event.toolName, event.input, event.content);
 		if (redacted) event = { ...event, content: redacted } as typeof event;
-		const changed = () => (redacted ? { content: redacted } : undefined);
+		let postTodoReminder: string | undefined;
+		if (["TodoWrite", "TodoCreate", "TodoUpdate"].includes(event.toolName)) {
+			callsSinceTodoUpdate = 0;
+		} else if (!testingConnection && activeTodoWriteItems.some((t) => t.status !== "completed")) {
+			callsSinceTodoUpdate += 1;
+			if (callsSinceTodoUpdate >= 4 && callsSinceTodoUpdate % 4 === 0) {
+				const list = activeTodoWriteItems
+					.map((t) => `- [${t.status}] ${String(t.content).slice(0, 160)}`)
+					.join("\n");
+				postTodoReminder = `\n\n<system-reminder>\nThe TodoWrite checklist shown to the user has not been updated for ${callsSinceTodoUpdate} tool calls. Call TodoWrite now if any item finished or started so the user's progress bar stays current.\n${list}\n</system-reminder>`;
+			}
+		}
+		const withTodoNudge = <T extends { type: string }>(blocks: T[]): T[] =>
+			postTodoReminder
+				? ([...blocks, { type: "text", text: postTodoReminder } as unknown as T])
+				: blocks;
+		const changed = () => {
+			if (!redacted && !postTodoReminder) return undefined;
+			return { content: withTodoNudge(event.content) };
+		};
 		if (testingConnection) return changed();
 		const errorText = event.isError ? textFromBlocks(event.content).slice(0, 4000) : undefined;
 		const hook = await callHost("/hook", {

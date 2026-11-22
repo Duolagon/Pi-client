@@ -4,6 +4,7 @@ import { Modal } from "../prototype/ui.tsx";
 import { TranscriptView } from "./TranscriptView.tsx";
 import { applyEvent, transcript, type Transcript } from "./messages.ts";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
+import { computeChecklistEta, computeMonitorTiming, computeTodoTiming } from "../task-eta.ts";
 import type { CronJobRecord, DesktopTask, ExternalTask, MonitorRecord, RpcExtensionUIRequest, TaskProgress, TeamRecord, TodoRecord, WorkflowRecord, WorktreeInfo } from "../shared.ts";
 
 export function TasksDrawer({
@@ -38,6 +39,18 @@ export function TasksDrawer({
 	const [detailPendingUI, setDetailPendingUI] = useState<RpcExtensionUIRequest[]>([]);
 	const [approvalInputs, setApprovalInputs] = useState<Record<string, string>>({});
 	const [detailSeq, setDetailSeq] = useState(0);
+	const [clockNow, setClockNow] = useState(() => Date.now());
+	const hasActiveItems =
+		monitors.some((m) => m.status === "running") ||
+		todos.some((t) => t.status === "in_progress") ||
+		tasks.some((t) => t.status === "running" || t.status === "queued" || t.status === "waiting_for_input") ||
+		externalTasks.some((t) => t.status === "running" || t.status === "queued" || t.status === "waiting_for_input");
+	useEffect(() => {
+		if (!hasActiveItems) return;
+		setClockNow(Date.now());
+		const timer = setInterval(() => setClockNow(Date.now()), 1000);
+		return () => clearInterval(timer);
+	}, [hasActiveItems]);
 	const [detailTask, setDetailTask] = useState<DesktopTask | null>(null);
 	const [extDetail, setExtDetail] = useState<ExternalTask | null>(null);
 	const [extFollowUp, setExtFollowUp] = useState("");
@@ -704,42 +717,62 @@ export function TasksDrawer({
 										</div>
 									);
 								})}
-								{monitors.map((mon) => (
-									<div key={mon.id} className="cc-tool-ctrl-row">
-										<div className="cc-tool-ctrl-info">
-											<div className="cc-tool-ctrl-name">
-												<strong>{mon.kind === "shell" ? "[后台 Bash]" : `[Monitor:${mon.kind}]`} {mon.description}</strong>
-												<span className={`cc-action-badge ${mon.status === "running" ? "ask" : mon.status === "exited" || mon.status === "stopped" ? "allow" : "deny"}`}>
-													{mon.status}
-												</span>
+								{monitors.map((mon) => {
+									const monTiming = computeMonitorTiming(mon, clockNow);
+									return (
+										<div key={mon.id} className="cc-tool-ctrl-row">
+											<div className="cc-tool-ctrl-info">
+												<div className="cc-tool-ctrl-name">
+													<strong>{mon.kind === "shell" ? "[后台 Bash]" : `[Monitor:${mon.kind}]`} {mon.description}</strong>
+													<span className={`cc-action-badge ${mon.status === "running" ? "ask" : mon.status === "exited" || mon.status === "stopped" ? "allow" : "deny"}`}>
+														{mon.status}
+													</span>
+													<span className="cc-eta-pill">{monTiming.elapsedLabel}</span>
+													{monTiming.activityLabel && (
+														<span className={`cc-eta-pill ${monTiming.stale ? "stale" : ""}`}>
+															{monTiming.activityLabel}
+														</span>
+													)}
+													{monTiming.timeoutLabel && <span className="cc-eta-pill">{monTiming.timeoutLabel}</span>}
+												</div>
+												<p className="cc-tool-ctrl-desc">
+													id={mon.id} · {mon.kind === "shell" ? `输出行数=${mon.eventCount}${mon.status !== "running" && mon.exitCode !== undefined ? ` · 退出码=${mon.exitCode ?? "无"}` : ""}` : `事件数=${mon.eventCount}`} · {mon.target}
+												</p>
 											</div>
-											<p className="cc-tool-ctrl-desc">
-												id={mon.id} · {mon.kind === "shell" ? `输出行数=${mon.eventCount}${mon.status !== "running" && mon.exitCode !== undefined ? ` · 退出码=${mon.exitCode ?? "无"}` : ""}` : `事件数=${mon.eventCount}`} · {mon.target}
-											</p>
+											<div className="cc-tool-ctrl-actions">
+												{mon.status === "running" && (
+													<button
+														type="button"
+														className="cc-mini-btn danger"
+														onClick={() => void window.pi.monitors.stop(mon.id).then(refresh).catch(fail)}
+													>
+														<Square size={12} /> {mon.kind === "shell" ? "停止命令" : "停止监听"}
+													</button>
+												)}
+											</div>
 										</div>
-										<div className="cc-tool-ctrl-actions">
-											{mon.status === "running" && (
-												<button
-													type="button"
-													className="cc-mini-btn danger"
-													onClick={() => void window.pi.monitors.stop(mon.id).then(refresh).catch(fail)}
-												>
-													<Square size={12} /> {mon.kind === "shell" ? "停止命令" : "停止监听"}
-												</button>
-											)}
-										</div>
-									</div>
-								))}
+									);
+								})}
 								{!totalTasks && !monitors.length && <p className="subtle-note">暂无后台任务、Monitor 或模型子 Agent。</p>}
 							</div>
 						)}
 					</div>
 				)}
 
-				{tab === "todos" && (
+				{tab === "todos" && (() => {
+					const drawerEta = todos.length > 0 ? computeChecklistEta(todos, clockNow) : undefined;
+					return (
 					<div className="cc-controls-body">
+						{drawerEta?.summaryLabel && (
+							<div className="cc-eta-summary-bar">
+								<span>清单进度：{todos.filter((t) => t.status === "completed").length}/{todos.length}</span>
+								<span className={`cc-eta-pill ${drawerEta.anyOverdue ? "overdue" : ""}`}>{drawerEta.summaryLabel}</span>
+							</div>
+						)}
 						<div className="cc-list-scroll">
-							{todos.map((item) => (
+							{todos.map((item) => {
+								const timing = computeTodoTiming(item, clockNow);
+								return (
 								<div key={item.id} className="cc-tool-ctrl-row">
 									<div className="cc-tool-ctrl-info">
 										<div className="cc-tool-ctrl-name">
@@ -754,6 +787,11 @@ export function TasksDrawer({
 											<span className={`cc-action-badge ${item.status === "completed" ? "allow" : item.status === "in_progress" ? "ask" : ""}`}>
 												{item.status}
 											</span>
+											{timing.label && (
+												<span className={`cc-eta-pill ${timing.overdue ? "overdue" : ""}`}>
+													{timing.label}
+												</span>
+											)}
 											{item.owner && <span className="cc-source-tag">@{item.owner}</span>}
 										</div>
 										<p className="cc-tool-ctrl-desc">
@@ -784,11 +822,13 @@ export function TasksDrawer({
 										</div>
 									)}
 								</div>
-							))}
+								);
+							})}
 							{!todos.length && <p className="subtle-note">当前会话暂无持久化任务条目（模型可使用 TodoCreate / TodoUpdate 创建与更新）。</p>}
 						</div>
 					</div>
-				)}
+					);
+				})()}
 
 				{tab === "cron" && (
 					<div className="cc-controls-body">

@@ -61,6 +61,7 @@ import { grailWording, latestVerdict, revealDecision } from "./grail-view.ts";
 import { IconButton, Modal, PiMark, menuKeyNav } from "../prototype/ui.tsx";
 import { useDesktop } from "./useDesktop.ts";
 import { TranscriptView, type TodoItem } from "./TranscriptView.tsx";
+import { computeChecklistEta, computeTodoTiming } from "../task-eta.ts";
 import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
 import { parseGoalCommand } from "../goal-mode.ts";
 import { WorkspacePicker } from "./WorkspacePicker.tsx";
@@ -1014,28 +1015,73 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const focusedSubagentTask = focusedSubagentTaskId ? tasksMap[focusedSubagentTaskId] : undefined;
 	const liveChildApprovals = collectDescendantApprovals(Object.values(tasksMap), snapshot.active?.id);
 	const childApprovals = liveChildApprovals.length > 0 ? liveChildApprovals : (snapshot.childApprovals ?? []);
-	const latestTodos: TodoItem[] = sharedTodos.length > 0
-		? sharedTodos.map((item) => ({
-			id: item.id,
-			content: (item.status === "in_progress" && item.activeForm ? item.activeForm : item.subject) +
-				(item.owner ? ` (@${item.owner})` : "") +
-				(item.blockedBy.length ? ` [阻塞于 #${item.blockedBy.join(", #")}]` : ""),
-			status: item.status === "completed" ? "completed" : item.status === "in_progress" ? "in_progress" : "pending",
-		}))
-		: (() => {
-			for (let i = history.messages.length - 1; i >= 0; i--) {
-				const msg = history.messages[i];
-				if (msg.role !== "assistant") continue;
-				for (let j = msg.content.length - 1; j >= 0; j--) {
-					const block = msg.content[j];
-					if (block.type === "toolCall" && block.name === "TodoWrite" && block.arguments && typeof block.arguments === "object") {
-						const todos = (block.arguments as { todos?: TodoItem[] }).todos;
-						if (Array.isArray(todos)) return todos;
+	const latestTodos: TodoItem[] = (() => {
+		const startedById = new Map<string, number>();
+		const completedById = new Map<string, number>();
+		let latestWrite: TodoItem[] = [];
+		let latestWriteTs = 0;
+		for (let i = 0; i < history.messages.length; i++) {
+			const msg = history.messages[i];
+			if (msg.role !== "assistant") continue;
+			const ts = typeof msg.timestamp === "number" && msg.timestamp > 0 ? msg.timestamp : i + 1;
+			for (let j = 0; j < msg.content.length; j++) {
+				const block = msg.content[j];
+				if (block.type === "toolCall" && block.name === "TodoWrite" && block.arguments && typeof block.arguments === "object") {
+					const todos = (block.arguments as { todos?: TodoItem[] }).todos;
+					if (Array.isArray(todos)) {
+						for (const item of todos) {
+							if (item.status === "in_progress" && !startedById.has(item.id)) startedById.set(item.id, ts);
+							if (item.status === "completed" && !completedById.has(item.id)) completedById.set(item.id, ts);
+						}
+						latestWrite = todos;
+						latestWriteTs = Math.max(latestWriteTs, ts);
 					}
 				}
 			}
-			return [];
-		})();
+		}
+		for (const activeTool of Object.values(history.tools ?? {})) {
+			if (activeTool.name === "TodoWrite" && activeTool.args && typeof activeTool.args === "object") {
+				const todos = (activeTool.args as { todos?: TodoItem[] }).todos;
+				if (Array.isArray(todos)) {
+					const ts = activeTool.startedAt ?? Date.now();
+					for (const item of todos) {
+						if (item.status === "in_progress" && !startedById.has(item.id)) startedById.set(item.id, ts);
+						if (item.status === "completed" && !completedById.has(item.id)) completedById.set(item.id, ts);
+					}
+					latestWrite = todos;
+					latestWriteTs = Math.max(latestWriteTs, ts);
+				}
+			}
+		}
+		const latestSharedTs = sharedTodos.reduce((max, item) => Math.max(max, item.updatedAt || item.createdAt || 0), 0);
+		if (sharedTodos.length > 0 && latestSharedTs >= latestWriteTs) {
+			return sharedTodos.map((item) => ({
+				id: item.id,
+				content:
+					(item.status === "in_progress" && item.activeForm ? item.activeForm : item.subject) +
+					(item.owner ? ` (@${item.owner})` : "") +
+					(item.blockedBy.length ? ` [阻塞于 #${item.blockedBy.join(", #")}]` : ""),
+				status: item.status === "completed" ? "completed" : item.status === "in_progress" ? "in_progress" : "pending",
+				estimatedSeconds: item.estimatedSeconds,
+				startedAt: item.startedAt,
+				completedAt: item.completedAt,
+			}));
+		}
+		return latestWrite.map((item) => ({
+			...item,
+			startedAt: item.startedAt ?? startedById.get(item.id),
+			completedAt: item.completedAt ?? completedById.get(item.id),
+		}));
+	})();
+	const hasActiveTodo = latestTodos.some((t) => t.status === "in_progress");
+	const [todoClock, setTodoClock] = useState(() => Date.now());
+	useEffect(() => {
+		if (!hasActiveTodo) return;
+		setTodoClock(Date.now());
+		const timer = setInterval(() => setTodoClock(Date.now()), 1000);
+		return () => clearInterval(timer);
+	}, [hasActiveTodo]);
+	const checklistEta = latestTodos.length > 0 ? computeChecklistEta(latestTodos, todoClock) : undefined;
 	const lastMessage = history.messages[history.messages.length - 1];
 	const inPlanMode = planMode || snapshot.settings.permission === "plan";
 	const showPlanApproval =
@@ -2014,35 +2060,62 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										</button>
 									)}
 								</div>
-						{latestTodos.length > 0 && !latestTodos.every((t) => t.status === "completed") && (
+						{latestTodos.length > 0 && !latestTodos.every((t) => t.status === "completed") && (() => {
+							const doneCount = latestTodos.filter((t) => t.status === "completed").length;
+							const activeTodo = latestTodos.find((t) => t.status === "in_progress");
+							const activeTiming = activeTodo ? computeTodoTiming(activeTodo, todoClock) : undefined;
+							const pct = Math.min(100, Math.max(0, Math.round((doneCount / latestTodos.length) * 100)));
+							return (
 							<div className="cc-pinned-todos">
+								<div className="cc-pinned-todos-progress" aria-hidden="true">
+									<div className="cc-pinned-todos-progress-fill" style={{ width: `${pct}%` }} />
+								</div>
 								<button type="button" className="cc-pinned-todos-head" onClick={() => setTodoExpanded((v) => !v)}>
-									<span>
-										任务进度 ({latestTodos.filter((t) => t.status === "completed").length}/{latestTodos.length})
-										{latestTodos.find((t) => t.status === "in_progress")
-											? ` · ${latestTodos.find((t) => t.status === "in_progress")!.content}`
-											: ""}
+									<span className="cc-pinned-todos-title">
+										<span>
+											任务进度 ({doneCount}/{latestTodos.length})
+											{activeTodo ? ` · ${activeTodo.content}` : ""}
+										</span>
+										{activeTiming?.label && (
+											<span className={`cc-eta-pill ${activeTiming.overdue ? "overdue" : ""}`}>
+												{activeTiming.label}
+											</span>
+										)}
+										{checklistEta?.summaryLabel && checklistEta.summaryLabel !== activeTiming?.label && (
+											<span className={`cc-eta-pill ${checklistEta.anyOverdue ? "overdue" : ""}`}>
+												{checklistEta.summaryLabel}
+											</span>
+										)}
 									</span>
 									<span>{todoExpanded ? "收起" : "展开"}</span>
 								</button>
 								{todoExpanded && (
 									<div className="cc-pinned-todos-list">
-										{latestTodos.map((item) => (
-											<div key={item.id} className={`cc-todo-row ${item.status}`}>
-												{item.status === "completed" ? (
-													<Check size={12} className="ok" />
-												) : item.status === "in_progress" ? (
-													<LoaderCircle size={12} className="spin run" />
-												) : (
-													<Circle size={11} className="pending" />
-												)}
-												<span>{item.content}</span>
-											</div>
-										))}
+										{latestTodos.map((item) => {
+											const timing = computeTodoTiming(item, todoClock);
+											return (
+												<div key={item.id} className={`cc-todo-row ${item.status}`}>
+													{item.status === "completed" ? (
+														<Check size={12} className="ok" />
+													) : item.status === "in_progress" ? (
+														<LoaderCircle size={12} className="spin run" />
+													) : (
+														<Circle size={11} className="pending" />
+													)}
+													<span className="cc-todo-row-text">{item.content}</span>
+													{timing.label && (
+														<span className={`cc-eta-pill ${timing.overdue ? "overdue" : ""}`}>
+															{timing.label}
+														</span>
+													)}
+												</div>
+											);
+										})}
 									</div>
 								)}
 							</div>
-						)}
+							);
+						})()}
 						{btwState && (
 							<div className="cc-btw-card" role="region" aria-label="侧问结果">
 								<div className="cc-btw-head">

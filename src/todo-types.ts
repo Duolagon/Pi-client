@@ -11,6 +11,9 @@ export interface TodoRecord {
 	blocks: string[];
 	blockedBy: string[];
 	metadata?: Record<string, unknown>;
+	estimatedSeconds?: number;
+	startedAt?: number;
+	completedAt?: number;
 	createdAt: number;
 	updatedAt: number;
 }
@@ -23,6 +26,7 @@ export interface TodoCreateInput {
 	blocks?: string[];
 	blockedBy?: string[];
 	metadata?: Record<string, unknown>;
+	estimatedSeconds?: number;
 }
 
 export interface TodoGetInput {
@@ -39,6 +43,7 @@ export interface TodoUpdateInput {
 	addBlocks?: string[];
 	addBlockedBy?: string[];
 	metadata?: Record<string, unknown>;
+	estimatedSeconds?: number;
 }
 
 export interface TodoListInput {
