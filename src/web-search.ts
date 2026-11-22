@@ -204,5 +204,12 @@ export function injectDeepSeekBuiltinSearch(payload: unknown): unknown {
 	const nextTools = hasBuiltin
 		? filtered
 		: [...filtered, { type: "deepseek_web_search", name: "deepseek_web_search" }];
-	return { ...record, tools: nextTools };
+	// DeepSeek rejects `strict` on function tools whenever a built-in tool such as deepseek_web_search is present.
+	const relaxed = nextTools.map((tool) => {
+		const fn = (tool as { function?: Record<string, unknown> } | null)?.function;
+		if (!fn || typeof fn !== "object" || !("strict" in fn)) return tool;
+		const { strict: _strict, ...rest } = fn;
+		return { ...(tool as object), function: rest };
+	});
+	return { ...record, tools: relaxed };
 }

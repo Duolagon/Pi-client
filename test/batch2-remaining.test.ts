@@ -191,6 +191,15 @@ test("#14 WebSearch: DeepSeek Search API client and DeepSeek built-in search pay
 	const twice = injectDeepSeekBuiltinSearch(rewritten) as { tools: Array<{ type?: string }> };
 	assert.equal(twice.tools.filter((t) => t.type === "deepseek_web_search").length, 1);
 
+	// DeepSeek rejects `strict` on function tools next to the built-in search tool.
+	const strictPayload = injectDeepSeekBuiltinSearch({
+		model: "deepseek-chat",
+		tools: [{ type: "function", function: { name: "read", description: "read file", strict: true, parameters: {} } }],
+	}) as { tools: Array<{ type?: string; function?: Record<string, unknown> }> };
+	assert.equal(strictPayload.tools.some((t) => t.type === "deepseek_web_search"), true);
+	assert.equal(strictPayload.tools.some((t) => t.function && "strict" in t.function), false);
+	assert.equal(strictPayload.tools[0].function?.name, "read");
+
 	let seenAuth = "";
 	let seenUrl = "";
 	let seenBody: Record<string, unknown> = {};
