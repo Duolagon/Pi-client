@@ -247,6 +247,32 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		}
 	};
 
+	// Send now: pull the queued text out, stop the current step, then send it as a fresh prompt.
+	const sendQueuedNow = async () => {
+		const id = snapshot?.active?.id;
+		if (!id) return;
+		try {
+			const result = (await api.command({ type: "clear_queue" }, id)) as { steering?: string[]; followUp?: string[] } | undefined;
+			const texts = [...(result?.steering ?? []), ...(result?.followUp ?? [])].filter((text) => text.trim());
+			const message = (texts.length ? texts : queued[id] ?? []).join("\n\n").trim();
+			setQueued((prev) => ({ ...prev, [id]: [] }));
+			if (!message) {
+				await app.refresh();
+				return;
+			}
+			await api.command({ type: "abort" }, id);
+			for (let i = 0; i < 50; i++) {
+				const next = await api.snapshot();
+				if (next.active?.id !== id || !(next.state?.isStreaming || next.state?.isCompacting)) break;
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+			await api.command({ type: "prompt", message }, id);
+			await app.refresh();
+		} catch (error) {
+			app.fail(error);
+		}
+	};
+
 	useEffect(() => {
 		if (stickToEnd.current) scroll.current?.scrollTo({ top: scroll.current.scrollHeight });
 	}, [history, running]);
@@ -1955,9 +1981,16 @@ function Desktop({ api }: { api: DesktopAPI }) {
 														? `${snapshot.state.pendingMessageCount} 条指令排队中，当前步骤结束后发送`
 														: `已停止，${snapshot.state.pendingMessageCount} 条指令还在排队，会和下一条消息一起发送`}
 												</span>
-												<button type="button" className="cc-mini-btn" onClick={() => void withdrawQueued()}>
-													撤回到输入框
-												</button>
+												<span className="cc-queue-actions">
+													<button type="button" className="cc-mini-btn" onClick={() => void withdrawQueued()}>
+														撤回到输入框
+													</button>
+													{running && (
+														<button type="button" className="cc-mini-btn primary" title="停止当前步骤，立即发送这条指令" onClick={() => void sendQueuedNow()}>
+															立即发送
+														</button>
+													)}
+												</span>
 											</div>
 											{(queued[snapshot.active?.id ?? ""] ?? []).map((text, index) => (
 												<p key={`${index}-${text.slice(0, 16)}`} className="cc-queue-item" title={text}>
@@ -1981,7 +2014,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										</button>
 									)}
 								</div>
-						{latestTodos.length > 0 && !(!running && latestTodos.every((t) => t.status === "completed")) && (
+						{latestTodos.length > 0 && !latestTodos.every((t) => t.status === "completed") && (
 							<div className="cc-pinned-todos">
 								<button type="button" className="cc-pinned-todos-head" onClick={() => setTodoExpanded((v) => !v)}>
 									<span>

@@ -381,23 +381,24 @@ export function TranscriptView({
 					.join("\n\n");
 				return (
 					<article className="cl-msg cl-msg-ai" key={`turn-${last.timestamp}-${index}`}>
-						{unit.messages.map((message, part) => (
-							<TurnBlocks
-								key={`${message.timestamp}-${part}`}
-								message={message}
-								state={state}
-								isStreaming={isStreaming && part === unit.messages.length - 1}
-								isFirst={part === 0}
-								tasks={tasks}
-								externalTasks={externalTasks}
-								taskProgressMap={taskProgressMap}
-								onOpenTask={onOpenTask}
-								onBackgroundTask={onBackgroundTask}
-								onStopTask={onStopTask}
-								onOpenPreview={onOpenPreview}
-								onOpenFile={onOpenFile}
-							/>
-						))}
+						{groupTurnItems(
+							unit.messages.flatMap((message, part) =>
+								turnItems({
+									message,
+									state,
+									isStreaming: isStreaming && part === unit.messages.length - 1,
+									tasks,
+									externalTasks,
+									taskProgressMap,
+									onOpenTask,
+									onBackgroundTask,
+									onStopTask,
+									onOpenPreview,
+									onOpenFile,
+								}),
+							),
+							state,
+						)}
 						{errorMessage && !aborted && (
 							<div className="cl-msg-error" role="alert">
 								<CircleAlert size={15} />
@@ -431,11 +432,14 @@ export function TranscriptView({
 	);
 }
 
-function TurnBlocks({
+type TurnBlock = Assistant["content"][number];
+type TurnItem = { key: string; block: TurnBlock; node: ReactNode; live?: boolean };
+
+/** Builds one renderable item per content block of an assistant message; grouping happens per turn. */
+function turnItems({
 	message,
 	state,
 	isStreaming,
-	isFirst,
 	tasks,
 	externalTasks,
 	taskProgressMap,
@@ -448,7 +452,6 @@ function TurnBlocks({
 	message: Assistant;
 	state: Transcript;
 	isStreaming: boolean;
-	isFirst: boolean;
 	tasks: DesktopTask[];
 	externalTasks: ExternalTask[];
 	taskProgressMap: Record<string, TaskProgress>;
@@ -457,35 +460,49 @@ function TurnBlocks({
 	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
 	onOpenPreview?: (url: string) => void;
 	onOpenFile?: OpenFileHandler;
-}) {
-	const nodes = message.content.map((block, part) => {
+}): TurnItem[] {
+	const items: TurnItem[] = [];
+	message.content.forEach((block, part) => {
+		const key = `${message.timestamp}-${part}`;
 		if (block.type === "text") {
-			if (!block.text.trim()) return null;
-			return (
-				<div className="cc-ai-text" key={part}>
-					<span className="cc-ai-bullet" aria-hidden="true" />
-					<div className="cc-ai-text-inner">
-						<MarkdownContent text={block.text} onOpenPreview={onOpenPreview} />
+			if (!block.text.trim()) return;
+			items.push({
+				key,
+				block,
+				node: (
+					<div className="cc-ai-text" key={key}>
+						<span className="cc-ai-bullet" aria-hidden="true" />
+						<div className="cc-ai-text-inner">
+							<MarkdownContent text={block.text} onOpenPreview={onOpenPreview} />
+						</div>
 					</div>
-				</div>
-			);
+				),
+			});
+			return;
 		}
 		if (block.type === "thinking") {
-			if (!block.thinking) return null;
+			if (!block.thinking) return;
 			const activeThink = isStreaming && part === message.content.length - 1;
-			return (
-				<details className={`cl-think ${activeThink ? "thinking-active" : ""}`} key={part}>
-					<summary>
-						<span className={`cc-think-glyph ${activeThink ? "pulse" : ""}`}>∴</span>
-						<span>{activeThink ? "Thinking…" : "Thought"}</span>
-						<ChevronRight size={12} className="cl-tool-chevron" />
-					</summary>
-					<div className="cl-markdown">
-						<ReactMarkdown>{block.thinking}</ReactMarkdown>
-					</div>
-				</details>
-			);
+			items.push({
+				key,
+				block,
+				live: activeThink,
+				node: (
+					<details className={`cl-think ${activeThink ? "thinking-active" : ""}`} key={key}>
+						<summary>
+							<span className={`cc-think-glyph ${activeThink ? "pulse" : ""}`}>∴</span>
+							<span>{activeThink ? "Thinking…" : "Thought"}</span>
+							<ChevronRight size={12} className="cl-tool-chevron" />
+						</summary>
+						<div className="cl-markdown">
+							<ReactMarkdown>{block.thinking}</ReactMarkdown>
+						</div>
+					</details>
+				),
+			});
+			return;
 		}
+		if (block.type !== "toolCall") return;
 		const result = state.messages.find(
 			(item): item is Extract<Message, { role: "toolResult" }> => item.role === "toolResult" && item.toolCallId === block.id,
 		);
@@ -493,88 +510,130 @@ function TurnBlocks({
 		const matchedTask =
 			tasks.find((t) => t.parentToolCallId === block.id || t.turnCalls?.includes(block.id)) ??
 			externalTasks.find((t) => t.parentToolCallId === block.id);
-		return (
-			<ToolCard
-				key={block.id}
-				name={block.name}
-				args={block.arguments}
-				progress={progress}
-				result={result}
-				matchedTask={matchedTask}
-				taskProgress={matchedTask ? taskProgressMap[matchedTask.id] : undefined}
-				onOpenTask={onOpenTask}
-				onBackgroundTask={onBackgroundTask}
-				onStopTask={onStopTask}
-				onOpenFile={onOpenFile}
-			/>
-		);
+		items.push({
+			key: block.id,
+			block,
+			node: (
+				<ToolCard
+					key={block.id}
+					name={block.name}
+					args={block.arguments}
+					progress={progress}
+					result={result}
+					matchedTask={matchedTask}
+					taskProgress={matchedTask ? taskProgressMap[matchedTask.id] : undefined}
+					onOpenTask={onOpenTask}
+					onBackgroundTask={onBackgroundTask}
+					onStopTask={onStopTask}
+					onOpenFile={onOpenFile}
+				/>
+			),
+		});
 	});
-	const groupable = new Set(["bash", "read", "grep", "find", "ls"]);
+	return items;
+}
+
+/** Tools whose calls fold into a summary row instead of listing raw commands, like Claude. */
+const GROUP_KIND: Record<string, "bash" | "read" | "search" | "edit" | "web"> = {
+	bash: "bash",
+	read: "read",
+	grep: "search",
+	find: "search",
+	ls: "search",
+	write: "edit",
+	edit: "edit",
+	NotebookEdit: "edit",
+	WebFetch: "web",
+	WebSearch: "web",
+};
+
+/** Folds every run of work steps (tool calls plus the thinking between them) in a turn into one ToolGroup. */
+function groupTurnItems(items: TurnItem[], state: Transcript): ReactNode[] {
 	const out: ReactNode[] = [];
-	let run: number[] = [];
+	let run: TurnItem[] = [];
 	const flush = () => {
-		if (run.length < 2) {
-			for (const i of run) out.push(nodes[i]);
-		} else {
-			const counts = { bash: 0, read: 0, search: 0 };
-			let running = false;
-			let failed = false;
-			for (const i of run) {
-				const b = message.content[i];
-				if (b.type !== "toolCall") continue;
-				if (b.name === "bash") counts.bash++;
-				else if (b.name === "read") counts.read++;
-				else counts.search++;
-				const res = state.messages.find(
-					(item): item is Extract<Message, { role: "toolResult" }> => item.role === "toolResult" && item.toolCallId === b.id,
-				);
-				if (res) {
-					if (res.isError) failed = true;
-				} else if ((state.tools[b.id]?.status ?? "running") === "running") {
-					running = true;
-				}
-			}
-			const parts: string[] = [];
-			if (counts.bash) parts.push(`运行 ${counts.bash} 条命令`);
-			if (counts.read) parts.push(`读取 ${counts.read} 个文件`);
-			if (counts.search) parts.push(`搜索 ${counts.search} 次`);
-			const first = message.content[run[0]];
-			out.push(
-				<ToolGroup key={`group-${first.type === "toolCall" ? first.id : run[0]}`} summary={parts.join("，")} running={running} failed={failed}>
-					{run.map((i) => nodes[i])}
-				</ToolGroup>,
-			);
+		const tools = run.filter((item) => item.block.type === "toolCall");
+		if (!tools.length) {
+			for (const item of run) out.push(item.node);
+			run = [];
+			return;
 		}
+		const counts = { bash: 0, read: 0, search: 0, edit: 0, web: 0 };
+		let running = false;
+		let failed = false;
+		const live: ReactNode[] = [];
+		for (const item of run) {
+			const b = item.block;
+			if (b.type !== "toolCall") {
+				if (item.live) live.push(item.node);
+				continue;
+			}
+			counts[GROUP_KIND[b.name]]++;
+			const res = state.messages.find(
+				(m): m is Extract<Message, { role: "toolResult" }> => m.role === "toolResult" && m.toolCallId === b.id,
+			);
+			if (res) {
+				if (res.isError) failed = true;
+			} else if ((state.tools[b.id]?.status ?? "running") === "running") {
+				running = true;
+				live.push(item.node);
+			}
+		}
+		const only = tools.length === 1 ? tools[0].block : undefined;
+		const description =
+			only?.type === "toolCall" && only.name === "bash" ? asRecord(only.arguments).description : undefined;
+		const parts: string[] = [];
+		if (counts.bash) parts.push(`运行 ${counts.bash} 条命令`);
+		if (counts.read) parts.push(`读取 ${counts.read} 个文件`);
+		if (counts.search) parts.push(`搜索 ${counts.search} 次`);
+		if (counts.edit) parts.push(`编辑 ${counts.edit} 个文件`);
+		if (counts.web) parts.push(`查阅 ${counts.web} 个网页`);
+		const summary = typeof description === "string" && description.trim() ? description.trim() : parts.join("，");
+		out.push(
+			<ToolGroup key={`group-${run[0].key}`} summary={summary} running={running} failed={failed} live={live}>
+				{run.map((item) => item.node)}
+			</ToolGroup>,
+		);
 		run = [];
 	};
-	for (let i = 0; i < message.content.length; i++) {
-		const block = message.content[i];
-		if (nodes[i] === null) continue;
-		if (block.type === "toolCall" && groupable.has(block.name)) {
-			run.push(i);
+	for (const item of items) {
+		const b = item.block;
+		if (b.type === "thinking" || (b.type === "toolCall" && GROUP_KIND[b.name] !== undefined)) {
+			run.push(item);
 		} else {
 			flush();
-			out.push(nodes[i]);
+			out.push(item.node);
 		}
 	}
 	flush();
 	return out;
 }
 
-/** Collapses a run of consecutive low-signal tool calls (bash/read/grep/...) into one summary row, like Claude Code. */
-function ToolGroup({ summary, running, failed, children }: { summary: string; running: boolean; failed: boolean; children: ReactNode }) {
+/** One summary row for a run of work steps. Collapsed by default; only the step running right now shows underneath. */
+function ToolGroup({
+	summary,
+	running,
+	failed,
+	live,
+	children,
+}: {
+	summary: string;
+	running: boolean;
+	failed: boolean;
+	live: ReactNode[];
+	children: ReactNode;
+}) {
 	const [open, setOpen] = useState(false);
-	const isOpen = open || running;
 	return (
-		<div className={`cl-tool-group ${running ? "running" : failed ? "error" : "done"} ${isOpen ? "is-open" : ""}`}>
-			<button type="button" className="cc-tool-row cc-tool-group-head" onClick={() => setOpen((v) => !v)} aria-expanded={isOpen}>
+		<div className={`cl-tool-group ${running ? "running" : failed ? "error" : "done"} ${open ? "is-open" : ""}`}>
+			<button type="button" className="cc-tool-row cc-tool-group-head" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
 				<span className={`cc-dot ${running ? "run" : failed ? "err" : "ok"}`} />
 				<span className="cc-tool-head">
-					<span className="cc-tool-verb">{summary}</span>
+					<span className="cc-tool-verb cc-tool-group-summary">{summary}</span>
 				</span>
 				<ChevronRight size={13} className="cl-tool-chevron" />
 			</button>
-			{isOpen && <div className="cc-tool-group-body">{children}</div>}
+			{open ? <div className="cc-tool-group-body">{children}</div> : live.length > 0 && <div className="cc-tool-group-body">{live}</div>}
 		</div>
 	);
 }
@@ -1050,7 +1109,7 @@ function ToolCard({
 						<CodeLines content={info.lineContent.content} startLine={info.lineContent.startLine} />
 					) : output ? (
 						<pre className={name === "bash" ? "cc-bash-out" : ""}>{output}</pre>
-					) : !images.length ? (
+					) : !images.length && status !== "running" ? (
 						<pre className="cl-tool-args">{JSON.stringify(args, null, 2)}</pre>
 					) : null}
 					{output && args != null && (

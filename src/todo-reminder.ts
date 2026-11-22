@@ -8,7 +8,7 @@ type Todo = { id?: unknown; content?: unknown; status?: unknown };
 type Block = { type?: unknown; name?: unknown; arguments?: unknown };
 type Message = { role?: unknown; content?: unknown };
 
-/** Returns reminder text, or undefined when the checklist is current, finished, or never used. */
+/** Returns reminder text, or undefined when the checklist is current or never used. */
 export function staleTodoReminder(messages: readonly unknown[], threshold = TODO_STALE_TOOL_CALLS): string | undefined {
 	let callsSince = 0;
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -24,7 +24,16 @@ export function staleTodoReminder(messages: readonly unknown[], threshold = TODO
 			const todos = (block.arguments as { todos?: unknown })?.todos;
 			if (!Array.isArray(todos) || callsSince < threshold) return undefined;
 			const items = todos as Todo[];
-			if (!items.some((t) => t?.status !== "completed")) return undefined;
+			if (!items.some((t) => t?.status !== "completed")) {
+				// Finished checklist, but the model kept working: the panel has nothing to show for the new work.
+				return [
+					"<system-reminder>",
+					"Every item in your TodoWrite checklist is completed, but you are still doing more work.",
+					"If this new work has several steps, call TodoWrite with a new checklist for it so the user can follow progress.",
+					"Do not mention this reminder to the user.",
+					"</system-reminder>",
+				].join("\n");
+			}
 			const list = items
 				.map((t) => `- [${String(t?.status ?? "pending")}] ${String(t?.content ?? "").slice(0, 200)}`)
 				.join("\n");

@@ -28,9 +28,11 @@ test("reminds after the threshold with the current checklist", () => {
 	assert.match(text, /\[pending\] submit baseline/);
 });
 
-test("no reminder when every item is completed", () => {
+test("finished checklist with continued work asks for a new checklist", () => {
 	const done = open.map((t) => ({ ...t, status: "completed" }));
-	assert.equal(staleTodoReminder([todo(done), ...bash(40)]), undefined);
+	assert.equal(staleTodoReminder([todo(done), ...bash(9)]), undefined);
+	const text = staleTodoReminder([todo(done), ...bash(10)]);
+	assert.ok(text?.includes("new checklist"));
 });
 
 test("a newer TodoWrite resets the count", () => {
