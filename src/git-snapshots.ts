@@ -138,6 +138,42 @@ export class GitSnapshots {
 		});
 	}
 
+	/** Differences from a checkpoint's before-state to the current worktree (spanning later checkpoints). */
+	async diffToWorktree(project: string, id: string): Promise<GitCheckpointDiff> {
+		const root = await this.projectRoot(project);
+		return this.serialize(root, async () => {
+			const manifest = await this.load(root, id);
+			const current = await this.capture(root, Object.keys(manifest.before));
+			const files: GitCheckpointDiff["files"] = [];
+			for (const change of changes(manifest.before, current)) {
+				if (change.beforeKind === "directory" || change.afterKind === "directory") continue;
+				const result = await this.fileDiff(change.path, manifest.before[change.path] ?? missing, current[change.path] ?? missing);
+				files.push({ ...change, ...result });
+			}
+			return { checkpointId: id, files };
+		});
+	}
+
+	/** Write a checkpoint's before-state files into an empty directory outside the project (read-only copy). */
+	async materializeBefore(project: string, id: string, target: string): Promise<void> {
+		const root = await this.projectRoot(project);
+		if (inside(root, resolve(target))) throw new Error("快照副本必须位于项目目录之外。");
+		return this.serialize(root, async () => {
+			const manifest = await this.load(root, id);
+			for (const [path, entry] of Object.entries(manifest.before).sort(([a], [b]) => a.localeCompare(b))) {
+				const destination = join(target, path);
+				if (entry.kind === "directory") await mkdir(destination, { recursive: true, mode: 0o700 });
+				else if (entry.kind === "file") {
+					await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+					await writeFile(destination, await this.bytes(entry), { flag: "wx", mode: 0o600 });
+				} else if (entry.kind === "symlink") {
+					await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+					await symlink((await this.bytes(entry)).toString(), destination);
+				}
+			}
+		});
+	}
+
 	/** Restore selected changed paths only if their current state still matches this checkpoint. */
 	async restore(project: string, id: string, paths?: string[]): Promise<GitRestoreResult> {
 		const root = await this.projectRoot(project);

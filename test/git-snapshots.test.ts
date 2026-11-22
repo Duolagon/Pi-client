@@ -259,3 +259,30 @@ test("selected-file restore recreates missing ancestor permissions and remains c
 		await cleanup();
 	}
 });
+
+test("materializeBefore reconstructs files, directories, and symlinks from the wish start state", async () => {
+	const { project, data, service, cleanup } = await fixture();
+	const copy = await mkdtemp(join(tmpdir(), "pi-git-snapshots-copy-"));
+	try {
+		await mkdir(join(project, "nested"));
+		await writeFile(join(project, "nested", "inner.txt"), "inner original\n");
+		await writeFile(join(project, "target.txt"), "link target\n");
+		await symlink("target.txt", join(project, "link"));
+		const start = await service.begin(project, "conversation-materialize");
+		// Mutate the worktree after the wish start; materializeBefore must ignore these.
+		await rm(join(project, "link"));
+		await writeFile(join(project, "target.txt"), "changed after start\n");
+		await service.finish(project, start.id);
+		const destination = join(copy, "before");
+		await new GitSnapshots(data).materializeBefore(project, start.id, destination);
+		assert.equal(await readFile(join(destination, "tracked.txt"), "utf8"), "user's unstaged work\n");
+		assert.equal(await readFile(join(destination, "nested", "inner.txt"), "utf8"), "inner original\n");
+		assert.equal(await readFile(join(destination, "target.txt"), "utf8"), "link target\n");
+		const info = await lstat(join(destination, "link"));
+		assert.ok(info.isSymbolicLink(), "snapshot symlink must be recreated in the before-state copy");
+		assert.equal(await readlink(join(destination, "link")), "target.txt");
+	} finally {
+		await rm(copy, { recursive: true, force: true });
+		await cleanup();
+	}
+});

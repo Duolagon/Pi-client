@@ -122,6 +122,12 @@ export function SettingsDialog({
 	const [routing, setRouting] = useState<Record<ModelRoutingRole, string>>(initialRouting);
 	const initialFallback = settings.fallbackModel ? `${settings.fallbackModel.provider}/${settings.fallbackModel.id}` : "";
 	const [fallbackModel, setFallbackModel] = useState(initialFallback);
+	const initialGrailModel = settings.grailModel ? `${settings.grailModel.provider}/${settings.grailModel.id}` : "";
+	const [grailModel, setGrailModel] = useState(initialGrailModel);
+	const initialGrailCost = settings.grailMaxCost !== undefined ? String(settings.grailMaxCost) : "";
+	const [grailCostText, setGrailCostText] = useState(initialGrailCost);
+	const initialGrailTimeout = settings.grailTimeoutSec !== undefined ? String(settings.grailTimeoutSec) : "";
+	const [grailTimeoutText, setGrailTimeoutText] = useState(initialGrailTimeout);
 	const [sandboxOffline, setSandboxOffline] = useState(Boolean(settings.sandboxOffline));
 	const [sandboxInfo, setSandboxInfo] = useState<SandboxStatus | null>(null);
 	const [provider, setProvider] = useState<Provider>(initialProvider);
@@ -189,6 +195,9 @@ export function SettingsDialog({
 		agentTeams !== (settings.agentTeams === true) ||
 		MODEL_ROUTING_ROLES.some((role) => routing[role] !== initialRouting[role]) ||
 		fallbackModel !== initialFallback ||
+		grailModel !== initialGrailModel ||
+		grailCostText.trim() !== initialGrailCost ||
+		grailTimeoutText.trim() !== initialGrailTimeout ||
 		agentDir.trim() !== (settings.agentDir ?? "") ||
 		proxy.trim() !== (settings.proxy ?? "") ||
 		noProxy.trim() !== (settings.noProxy ?? "") ||
@@ -281,6 +290,16 @@ export function SettingsDialog({
 			setError("费用上限需为 0.01–100000 美元，留空表示不限制。");
 			return;
 		}
+		const grailCost = grailCostText.trim() ? Number(grailCostText.trim()) : null;
+		if (grailCost !== null && (!Number.isFinite(grailCost) || grailCost < 0.01 || grailCost > 1000)) {
+			setError("单次鉴定费用上限需为 0.01–1000 美元，留空表示默认 2 美元。");
+			return;
+		}
+		const grailTimeout = grailTimeoutText.trim() ? Number(grailTimeoutText.trim()) : null;
+		if (grailTimeout !== null && (!/^\d+$/.test(grailTimeoutText.trim()) || grailTimeout < 30 || grailTimeout > 7200)) {
+			setError("鉴定超时需为 30–7200 秒的整数，留空表示默认 900 秒。");
+			return;
+		}
 		const minBalance = minBalanceText.trim() ? Number(minBalanceText.trim()) : null;
 		if (minBalance !== null && (!Number.isFinite(minBalance) || minBalance < 0.01 || minBalance > 1000000)) {
 			setError("余额底线需为 0.01–1000000，留空表示不检查。");
@@ -327,6 +346,9 @@ export function SettingsDialog({
 				update.modelRouting = next;
 			}
 			if (fallbackModel !== initialFallback) update.fallbackModel = parseRoutingKey(fallbackModel) ?? null;
+			if (grailModel !== initialGrailModel) update.grailModel = parseRoutingKey(grailModel) ?? null;
+			if (grailCostText.trim() !== initialGrailCost) update.grailMaxCost = grailCost;
+			if (grailTimeoutText.trim() !== initialGrailTimeout) update.grailTimeoutSec = grailTimeout;
 			if (agentDir.trim() !== (settings.agentDir ?? "")) update.agentDir = agentDir.trim();
 			if (proxy.trim() !== (settings.proxy ?? "")) update.proxy = proxy.trim();
 			if (noProxy.trim() !== (settings.noProxy ?? "")) update.noProxy = noProxy.trim();
@@ -1011,6 +1033,57 @@ export function SettingsDialog({
 							</select>
 							<small>主模型因过载、限流或服务端错误在自动重试后仍失败时，切换到这里的模型并继续一次。认证、请求格式、上下文超限、费用上限和余额底线不会触发切换。</small>
 						</label>
+						<fieldset className="live-routing">
+							<legend>{theme === "grail" ? "圣杯鉴定" : "质量鉴定"}</legend>
+							<label className="field-label">
+								评审模型
+								<select
+									aria-label="鉴定评审模型"
+									value={grailModel}
+									disabled={pending}
+									onChange={(event) => setGrailModel(event.target.value)}
+								>
+									<option value="">跟随当前会话</option>
+									{grailModel && !models.some((m) => `${m.provider}/${m.id}` === grailModel) && (
+										<option value={grailModel}>{grailModel}（当前不可用）</option>
+									)}
+									{models.map((m) => (
+										<option key={`${m.provider}/${m.id}`} value={`${m.provider}/${m.id}`}>
+											{m.name || m.id} · {m.provider}
+										</option>
+									))}
+								</select>
+								<small>建议选当前最强、且不同于写代码的模型。鉴定只在你主动发起时运行，结果不会发给写代码的 Agent。</small>
+							</label>
+							<label className="field-label">
+								单次鉴定费用上限（美元）
+								<input
+									type="number"
+									aria-label="单次鉴定费用上限"
+									min={0.01}
+									max={1000}
+									step="0.01"
+									placeholder="默认 2"
+									value={grailCostText}
+									disabled={pending}
+									onChange={(event) => setGrailCostText(event.target.value)}
+								/>
+							</label>
+							<label className="field-label">
+								鉴定超时（秒）
+								<input
+									type="number"
+									aria-label="鉴定超时"
+									min={30}
+									max={7200}
+									step="1"
+									placeholder="默认 900"
+									value={grailTimeoutText}
+									disabled={pending}
+									onChange={(event) => setGrailTimeoutText(event.target.value)}
+								/>
+							</label>
+						</fieldset>
 						<fieldset className="live-routing">
 							<legend>子 Agent 模型路由</legend>
 							<small>

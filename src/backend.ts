@@ -5,11 +5,26 @@ import { randomBytes, randomUUID, createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, writeFile, rename, realpath, stat, readdir, rm } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { summarizeEngineError, tildify } from "./desktop-log.ts";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { AgentProcess } from "./rpc.ts";
 import { GitSnapshots } from "./git-snapshots.ts";
+import {
+	annotateDiff,
+	buildBlindPrompt,
+	buildComparisonPrompt,
+	gradeVerdict,
+	parseBlindSolution,
+	parseComparison,
+	parseDiffLines,
+	parseGrailModelUpdate,
+	runObjectiveChecks,
+	scanDistortions,
+	scriptEnvironment,
+	validGrailMaxCost,
+	validGrailTimeout,
+} from "./grail-judge.ts";
 import { TerminalService } from "./terminal-service.ts";
 import { WorktreeService } from "./worktree-service.ts";
 import { SessionHistoryService } from "./session-history.ts";
@@ -93,6 +108,12 @@ import type {
 	ConnectionTestResult,
 	ProviderBalanceResult,
 	ConnectionMode,
+	GrailEvent,
+	GrailObjectiveResult,
+	GrailState,
+	GrailStep,
+	GrailStepResults,
+	GrailVerdict,
 } from "./shared.ts";
 import { connectionMode, validateEndpoint } from "./model-connections.ts";
 import { providerModels, providerPresets } from "./provider-presets.ts";
@@ -213,6 +234,15 @@ interface StoredState {
 	taskPolicies?: Record<string, RuntimePermissionPolicy>;
 	/** Canonical project path to the user's explicit trust decision. */
 	projectTrust?: Record<string, ProjectTrustDecision>;
+}
+const DEFAULT_GRAIL_MAX_COST = 2;
+const DEFAULT_GRAIL_TIMEOUT_SEC = 900;
+/** Desktop-side record of a conversation's wishes; stored in <dataDir>/grail, never in the Pi session. */
+interface GrailRecord {
+	version: 1;
+	/** Seal times; wish N starts after sealedAt[N - 1]. */
+	sealedAt: number[];
+	verdicts: GrailVerdict[];
 }
 interface SessionRuntime {
 	conversationId: string;
@@ -352,6 +382,9 @@ export class DesktopService {
 	private historyAvailable = false;
 	private readonly usage = new UsageStatsCollector();
 	private connectionCheck?: { agent: AgentProcess; cancel: (error: Error) => void };
+	private grailListeners = new Set<(event: GrailEvent) => void>();
+	private grailRuns = new Map<string, { id: string; controller: AbortController; step: GrailStep; startedAt: number }>();
+	private grailWrites = new Map<string, Promise<void>>();
 	private engineError?: string;
 	private closed = false;
 	private listeners = new Set<(event: DesktopEvent) => void>();
@@ -3360,6 +3393,9 @@ export class DesktopService {
 		caFile?: string;
 		maxCostUsd?: number | null;
 		minBalance?: number | null;
+		grailModel?: { provider: string; id: string } | null;
+		grailMaxCost?: number | null;
+		grailTimeoutSec?: number | null;
 		disableAllHooks?: boolean;
 		fallbackModel?: { provider: string; id: string } | null;
 		outputStyle?: string | null;
@@ -3444,6 +3480,23 @@ export class DesktopService {
 				else if (typeof value !== "number" || !Number.isFinite(value) || value < 0.01 || value > 1000000)
 					throw new Error("余额底线需为 0.01–1000000。");
 				else next.settings.minBalance = Math.round(value * 100) / 100;
+			}
+			if (settings.grailModel !== undefined) {
+				const ref = parseGrailModelUpdate(settings.grailModel);
+				if (ref) next.settings.grailModel = ref;
+				else delete next.settings.grailModel;
+			}
+			if (settings.grailMaxCost !== undefined) {
+				const value = settings.grailMaxCost;
+				if (value === null) delete next.settings.grailMaxCost;
+				else if (!validGrailMaxCost(value)) throw new Error("单次鉴定费用上限需为 0.01–1000 美元。");
+				else next.settings.grailMaxCost = Math.round(value * 100) / 100;
+			}
+			if (settings.grailTimeoutSec !== undefined) {
+				const value = settings.grailTimeoutSec;
+				if (value === null) delete next.settings.grailTimeoutSec;
+				else if (!validGrailTimeout(value)) throw new Error("鉴定超时需为 30–7200 秒的整数。");
+				else next.settings.grailTimeoutSec = value;
 			}
 			if (settings.disableAllHooks !== undefined) {
 				if (typeof settings.disableAllHooks !== "boolean") throw new Error("Hooks 开关设置无效。");
@@ -3751,6 +3804,319 @@ export class DesktopService {
 		const runtime = await this.ensureRuntime(this.requireActive());
 		const result = await this.requireAgent(runtime).request<{ path: string }>({ type: "export_html", outputPath });
 		return result.path;
+	}
+
+	subscribeGrail(listener: (event: GrailEvent) => void): () => void {
+		this.grailListeners.add(listener);
+		return () => this.grailListeners.delete(listener);
+	}
+
+	private emitGrail(event: GrailEvent): void {
+		for (const listener of this.grailListeners) listener(event);
+	}
+
+	private grailFile(conversationId: string): string {
+		if (!/^[A-Za-z0-9-]{1,200}$/.test(conversationId)) throw new Error("会话 ID 无效。");
+		return join(this.options.dataDir, "grail", `${conversationId}.json`);
+	}
+
+	/** Judge records live beside, never inside, the Pi session, so the coding agent cannot see them. */
+	private async readGrail(conversationId: string): Promise<GrailRecord> {
+		try {
+			const value: unknown = JSON.parse(await readFile(this.grailFile(conversationId), "utf8"));
+			const record = value as Partial<GrailRecord>;
+			if (record?.version === 1 && Array.isArray(record.sealedAt) && Array.isArray(record.verdicts))
+				return {
+					version: 1,
+					sealedAt: record.sealedAt.filter((item): item is number => Number.isFinite(item)),
+					verdicts: record.verdicts.filter((item) => item && typeof item === "object" && typeof item.grade === "string"),
+				};
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+		}
+		return { version: 1, sealedAt: [], verdicts: [] };
+	}
+
+	private updateGrail<T>(conversationId: string, change: (record: GrailRecord) => T): Promise<T> {
+		const run = (this.grailWrites.get(conversationId) ?? Promise.resolve()).then(async () => {
+			const record = await this.readGrail(conversationId);
+			const result = change(record);
+			await mkdir(join(this.options.dataDir, "grail"), { recursive: true, mode: 0o700 });
+			await this.atomicJson(this.grailFile(conversationId), record);
+			return result;
+		});
+		this.grailWrites.set(conversationId, run.then(() => {}, () => {}));
+		return run;
+	}
+
+	/** The wish starts at the conversation start or the last seal; its diff starts at its first checkpoint. */
+	private async grailWish(conversation: Conversation, record: GrailRecord) {
+		const since = record.sealedAt.at(-1) ?? 0;
+		const workspace = await this.workspace(conversation.id).catch(() => undefined);
+		const checkpoints = workspace?.isGit ? await this.git.list(conversation.project, conversation.id).catch(() => []) : [];
+		const first = checkpoints.filter((item) => item.createdAt >= since).at(-1);
+		return { wish: record.sealedAt.length, since, checkpoint: first };
+	}
+
+	async grailState(conversationId: string): Promise<GrailState> {
+		await this.operation;
+		const conversation = this.conversation(conversationId);
+		const record = await this.readGrail(conversation.id);
+		const { wish, checkpoint } = await this.grailWish(conversation, record);
+		const running = this.grailRuns.get(conversation.id);
+		return {
+			conversationId: conversation.id,
+			wish,
+			running: running && { id: running.id, step: running.step, startedAt: running.startedAt },
+			verdicts: record.verdicts,
+			hasDiff: Boolean(checkpoint),
+		};
+	}
+
+	cancelGrail(conversationId: string): Promise<boolean> {
+		const run = this.grailRuns.get(conversationId);
+		if (!run) return Promise.resolve(false);
+		run.controller.abort();
+		this.grailRuns.delete(conversationId);
+		this.emitGrail({ type: "grail_failed", conversationId, id: run.id, error: "鉴定已取消。", cancelled: true });
+		return Promise.resolve(true);
+	}
+
+	async sealGrailWish(conversationId: string): Promise<GrailState> {
+		await this.operation;
+		const conversation = this.conversation(conversationId);
+		await this.cancelGrail(conversation.id);
+		const wish = await this.updateGrail(conversation.id, (record) => {
+			record.sealedAt.push(Math.max(Date.now(), (record.sealedAt.at(-1) ?? 0) + 1));
+			return record.sealedAt.length;
+		});
+		this.emitGrail({ type: "grail_sealed", conversationId: conversation.id, wish });
+		return this.grailState(conversation.id);
+	}
+
+	/** User-initiated Grail judgement; progress and the verdict arrive through subscribeGrail. */
+	async startGrail(conversationId: string): Promise<{ id: string }> {
+		await this.operation;
+		if (this.closed) throw new Error("桌面服务已关闭。");
+		const conversation = this.conversation(conversationId);
+		const active = this.runtimes.get(conversation.id);
+		if (active?.busy || active?.bashBusy || active?.checkpointId) throw new Error("请等待当前任务结束后再发起鉴定。");
+		await this.cancelGrail(conversation.id);
+		const run = { id: randomUUID(), controller: new AbortController(), step: "diff" as GrailStep, startedAt: Date.now() };
+		this.grailRuns.set(conversation.id, run);
+		void this.runGrail(conversation, run).then(
+			async (verdict) => {
+				if (run.controller.signal.aborted) return;
+				await this.updateGrail(conversation.id, (record) => {
+					verdict.previousGrade = record.verdicts.filter((item) => item.wish === verdict.wish).at(-1)?.grade;
+					record.verdicts.push(verdict);
+					record.verdicts.splice(0, Math.max(0, record.verdicts.length - 200));
+				});
+				if (this.grailRuns.get(conversation.id) === run) this.grailRuns.delete(conversation.id);
+				this.emitGrail({ type: "grail_verdict", conversationId: conversation.id, verdict });
+			},
+		).catch((error: unknown) => {
+			if (run.controller.signal.aborted) return;
+			if (this.grailRuns.get(conversation.id) === run) this.grailRuns.delete(conversation.id);
+			this.emitGrail({ type: "grail_failed", conversationId: conversation.id, id: run.id, error: error instanceof Error ? error.message : String(error), cancelled: false });
+		});
+		return { id: run.id };
+	}
+
+	private async runGrail(conversation: Conversation, run: { id: string; controller: AbortController; step: GrailStep; startedAt: number }): Promise<GrailVerdict> {
+		const signal = run.controller.signal;
+		const settings = this.store.settings;
+		const deadline = run.startedAt + (settings.grailTimeoutSec ?? DEFAULT_GRAIL_TIMEOUT_SEC) * 1000;
+		const budget = { spent: 0, max: settings.grailMaxCost ?? DEFAULT_GRAIL_MAX_COST };
+		const step = (name: GrailStep) => {
+			if (signal.aborted) throw new Error("鉴定已取消。");
+			run.step = name;
+			this.emitGrail({ type: "grail_progress", conversationId: conversation.id, id: run.id, step: name });
+		};
+		const record = await this.readGrail(conversation.id);
+		const { wish, since, checkpoint } = await this.grailWish(conversation, record);
+		const runtime = this.runtimes.get(conversation.id);
+		const model = settings.grailModel ?? runtime?.state?.model ?? settings.defaultModel;
+		const snapshot = await this.buildSnapshot(conversation.id);
+		const requirement = snapshot.messages.flatMap((message) => {
+			if (message.role !== "user" || (message.timestamp ?? 0) < since) return [];
+			const text = typeof message.content === "string" ? message.content : message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
+			return text.trim() ? [text.slice(0, 16000)] : [];
+		});
+		const steps: GrailStepResults = {};
+		let files: GrailVerdict["files"] = [];
+		const finish = (): GrailVerdict => ({
+			id: run.id,
+			conversationId: conversation.id,
+			wish,
+			startedAt: run.startedAt,
+			finishedAt: Date.now(),
+			...gradeVerdict(steps),
+			steps,
+			requirement,
+			files,
+			model: model ? { provider: model.provider, id: model.id } : undefined,
+			costUsd: Math.round(budget.spent * 10000) / 10000,
+		});
+		step("diff");
+		const unjudgeable = (reason: string): GrailVerdict => ({ ...finish(), grade: "unjudgeable", reasons: [reason] });
+		if (!checkpoint) return unjudgeable("这个愿望没有 Git 快照（不是 Git 项目或还没有改动），无法取得 diff。");
+		if (!requirement.length) return unjudgeable("这个愿望里没有用户需求消息。");
+		const diff = await this.git.diffToWorktree(conversation.project, checkpoint.id);
+		files = diff.files.map((file) => ({ path: file.path, status: file.status }));
+		if (!diff.files.length) return unjudgeable("这个愿望没有代码改动。");
+		const lines = parseDiffLines(diff.files);
+
+		step("objective");
+		if (this.store.projectTrust?.[this.trustProjectFor(conversation.project)] === "untrusted")
+			steps.objective = { status: "unavailable", reason: "项目被标记为不信任，不执行项目脚本。", runs: [] };
+		else steps.objective = await this.grailObjective(conversation, deadline, signal);
+		if (steps.objective.status !== "pass") return finish();
+
+		step("distortion");
+		steps.distortion = { hits: scanDistortions(lines) };
+		if (steps.distortion.hits.length) return finish();
+
+		if (!model?.provider || !model.id) {
+			steps.blind = { status: "unavailable", reason: "没有可用的评审模型。" };
+			return finish();
+		}
+		step("blind");
+		// The blind reviewer reads the repository as it was before this wish, never the agent's code.
+		const before = await mkdtemp(join(tmpdir(), "pi-grail-blind-"));
+		try {
+			await this.git.materializeBefore(conversation.project, checkpoint.id, before);
+			const output = await this.grailModelRun(before, model, buildBlindPrompt(requirement), true, budget, deadline, signal);
+			steps.blind = parseBlindSolution(output);
+		} catch (error) {
+			if (signal.aborted) throw error;
+			steps.blind = { status: "unavailable", reason: error instanceof Error ? error.message : String(error) };
+		} finally {
+			await rm(before, { recursive: true, force: true });
+		}
+		if (steps.blind.status !== "ok") return finish();
+
+		step("comparison");
+		const annotated = annotateDiff(diff.files);
+		try {
+			const prompt = buildComparisonPrompt(requirement, steps.blind.solution!, annotated.text);
+			steps.comparison = parseComparison(await this.grailModelRun(conversation.project, model, prompt, false, budget, deadline, signal), lines);
+		} catch (error) {
+			if (signal.aborted) throw error;
+			steps.comparison = { status: "unavailable", reason: error instanceof Error ? error.message : String(error), findings: [], dropped: 0 };
+		}
+		return finish();
+	}
+
+	private async grailObjective(conversation: Conversation, deadline: number, signal: AbortSignal): Promise<GrailObjectiveResult> {
+		let manifest: unknown;
+		try {
+			manifest = JSON.parse(await readFile(join(conversation.project, "package.json"), "utf8"));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+				return { status: "unavailable", reason: "package.json 无法解析。", runs: [] };
+		}
+		const scratch = await mkdtemp(join(tmpdir(), "pi-grail-"));
+		try {
+			let sandboxProfile: string | undefined;
+			if (this.store.settings.sandbox && (await probeSeatbeltSupport()).supported) {
+				sandboxProfile = join(scratch, "grail.sb");
+				const extra = await resolveGitWorktreeWritablePaths(conversation.project);
+				await writeFile(sandboxProfile, buildSeatbeltProfile(conversation.project, extra, true), { mode: 0o600 });
+			}
+			return await runObjectiveChecks({
+				project: conversation.project,
+				manifest,
+				files: await readdir(conversation.project),
+				env: scriptEnvironment({ ...process.env, ...this.options.env }, join(scratch, "npm-cache")),
+				sandboxProfile,
+				deadline,
+				signal,
+			});
+		} finally {
+			await rm(scratch, { recursive: true, force: true });
+		}
+	}
+
+	/** One reviewer run outside the conversation, like /btw; the blind solve may only read the repository. */
+	private async grailModelRun(
+		cwd: string,
+		model: { provider: string; id: string },
+		prompt: string,
+		readOnlyTools: boolean,
+		budget: { spent: number; max: number },
+		deadline: number,
+		signal: AbortSignal,
+	): Promise<string> {
+		const env: NodeJS.ProcessEnv = {
+			...process.env,
+			...this.options.env,
+			PI_SKIP_VERSION_CHECK: "1",
+			PI_DESKTOP_CONNECTION_TEST: "1",
+			PI_DESKTOP_PERMISSION_MODE: "read",
+			...networkEnvironment(this.store.settings),
+		};
+		delete env.PI_DESKTOP_POLICY_FILE;
+		delete env.PI_DESKTOP_SANDBOX_PROFILE;
+		if (this.store.settings.agentDir) env.PI_CODING_AGENT_DIR = this.store.settings.agentDir;
+		env.PI_DESKTOP_CONNECTIONS = JSON.stringify(this.connectionEnvironment(env));
+		const runtimeDir = this.options.runtimeDir ?? dirname(dirname(dirname(this.options.entry!)));
+		let agent: AgentProcess | undefined;
+		let timer: NodeJS.Timeout | undefined;
+		let onAbort: (() => void) | undefined;
+		try {
+			let last: Extract<Message, { role: "assistant" }> | undefined;
+			let settle!: () => void;
+			let fail!: (error: Error) => void;
+			const completion = new Promise<void>((resolve, reject) => {
+				settle = resolve;
+				fail = reject;
+			});
+			agent = new AgentProcess({
+				executable: this.options.executable,
+				entry: this.options.entry ?? join(runtimeDir, "dist/bundle/rpc-entry.js"),
+				cwd,
+				args: [
+					"--no-session",
+					...(readOnlyTools ? ["--tools", "read,grep,find,ls"] : ["--no-tools"]),
+					"--no-skills",
+					"--no-prompt-templates",
+					"--no-context-files",
+					"--no-approve",
+					"--extension",
+					this.options.permissionExtension ?? join(runtimeDir, "permission-extension.mjs"),
+					"--provider",
+					model.provider,
+					"--model",
+					model.id,
+				],
+				env,
+				onEvent: (event) => {
+					if (event.type === "message_end" && event.message.role === "assistant") {
+						last = event.message;
+						budget.spent += finiteCount(event.message.usage?.cost?.total);
+						if (budget.spent > budget.max) fail(new Error(`鉴定费用超过上限 $${budget.max}。`));
+					}
+					// Nobody answers dialogs for the reviewer; anything needing approval is refused.
+					if (event.type === "extension_ui_request" && ["confirm", "select", "input", "editor"].includes(event.method))
+						void agent?.respond({ type: "extension_ui_response", id: event.id, cancelled: true }).catch(() => {});
+					if (event.type === "agent_settled") settle();
+					if (event.type === "desktop_error") fail(new Error(event.message));
+				},
+			});
+			timer = setTimeout(() => fail(new Error("鉴定超时。")), Math.max(1, deadline - Date.now()));
+			onAbort = () => fail(new Error("鉴定已取消。"));
+			signal.addEventListener("abort", onAbort, { once: true });
+			if (signal.aborted) throw new Error("鉴定已取消。");
+			await Promise.all([agent.request({ type: "prompt", message: prompt }), completion]);
+			if (!last || last.stopReason === "error" || last.stopReason === "aborted")
+				throw new Error(last?.errorMessage ?? "评审模型没有返回有效回复。");
+			return last.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
+		} finally {
+			clearTimeout(timer);
+			if (onAbort) signal.removeEventListener("abort", onAbort);
+			await agent?.stop();
+		}
 	}
 
 	async askBtw(question: string, conversationId?: string): Promise<BtwResult> {
@@ -5123,6 +5489,7 @@ export class DesktopService {
 		this.notifyTimers.clear();
 		await this.toolHost.close();
 		this.connectionCheck?.cancel(new Error("桌面服务已关闭，连接测试已取消。"));
+		for (const conversationId of [...this.grailRuns.keys()]) await this.cancelGrail(conversationId);
 		await this.operation;
 		await this.external.close();
 		await this.monitors.close();
@@ -6589,6 +6956,9 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 				value.settings.minBalance <= 1000000
 					? value.settings.minBalance
 					: undefined,
+			grailModel: sanitizeFallbackModel(value.settings.grailModel),
+			grailMaxCost: validGrailMaxCost(value.settings.grailMaxCost) ? value.settings.grailMaxCost : undefined,
+			grailTimeoutSec: validGrailTimeout(value.settings.grailTimeoutSec) ? value.settings.grailTimeoutSec : undefined,
 			disableAllHooks: value.settings.disableAllHooks === true ? true : undefined,
 			fallbackModel: sanitizeFallbackModel(value.settings.fallbackModel),
 			outputStyle: (() => {

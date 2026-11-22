@@ -439,100 +439,13 @@
 	}
 }
 
-/* ── Per-turn quality omen (显灵/征兆): badge glow + settle reveal ── */
-:root[data-theme="grail"] .cc-omen-grail {
-	color: var(--grail-gold, #f2c96b);
-	text-shadow: 0 0 8px var(--grail-gold-glow, rgba(242, 201, 107, 0.34));
-}
-:root[data-theme="grail"] .cc-omen-grail svg {
-	filter: drop-shadow(0 0 5px var(--grail-gold-glow, rgba(242, 201, 107, 0.34)));
-}
+/* ── Per-turn quality badge: neutral colours, no gold and no reveal animation. ── */
 :root[data-theme="grail"] .cc-omen-problem {
-	color: var(--grail-crimson, #f43f5e);
+	color: var(--grail-crimson, var(--cl-red));
 }
 :root[data-theme="grail"] .cc-omen-unverified {
-	color: var(--grail-azure, #8ea2ff);
+	color: var(--grail-azure, var(--cl-3));
 	opacity: 0.8;
-}
-
-/* Reveal animation shown in the working-indicator slot right after a turn settles. */
-.grail-omen-reveal {
-	display: flex;
-	align-items: center;
-	gap: 8px;
-	font-size: var(--fs-md);
-	font-weight: 600;
-	letter-spacing: 0.02em;
-}
-.grail-omen-reveal.omen-grail {
-	color: var(--grail-gold, #f2c96b);
-	animation: grail-bloom 2.5s ease-out both;
-}
-.grail-omen-reveal.omen-problem {
-	color: var(--grail-crimson, #f43f5e);
-	animation: grail-omen-shake 2.5s ease-out both;
-}
-.grail-omen-reveal.omen-unverified {
-	color: var(--grail-azure, #8ea2ff);
-	animation: grail-fade-dim 2.5s ease-out both;
-}
-.grail-omen-reveal svg {
-	flex-shrink: 0;
-}
-
-@keyframes grail-bloom {
-	0% {
-		opacity: 0;
-		transform: scale(0.7);
-		filter: drop-shadow(0 0 0 rgba(242, 201, 107, 0));
-	}
-	35% {
-		opacity: 1;
-		transform: scale(1.12);
-		filter: drop-shadow(0 0 18px rgba(242, 201, 107, 0.9));
-	}
-	60% {
-		transform: scale(1);
-		filter: drop-shadow(0 0 12px rgba(242, 201, 107, 0.6));
-	}
-	100% {
-		opacity: 0;
-		filter: drop-shadow(0 0 6px rgba(242, 201, 107, 0.2));
-	}
-}
-@keyframes grail-omen-shake {
-	0% {
-		opacity: 0;
-		transform: translateX(0);
-	}
-	15% {
-		opacity: 1;
-		transform: translateX(-3px);
-	}
-	30% {
-		transform: translateX(3px);
-	}
-	45% {
-		transform: translateX(-2px);
-	}
-	60% {
-		transform: translateX(0);
-	}
-	100% {
-		opacity: 0;
-	}
-}
-@keyframes grail-fade-dim {
-	0% {
-		opacity: 0;
-	}
-	30%,
-	60% {
-		opacity: 0.85;
-	}
-	100% {
-		opacity: 0;
-	}
 }
 
 /* Honor the OS "reduce motion" setting: no spin/pulse/reveal, just static state. */
@@ -542,9 +455,13 @@
 	:root[data-theme="grail"] .grail-emblem-orbit {
 		animation: none !important;
 	}
-	.grail-omen-reveal.omen-grail,
-	.grail-omen-reveal.omen-problem,
-	.grail-omen-reveal.omen-unverified {
-		animation: grail-fade-dim 2.5s ease-out both;
-	}
+}
+
+/* Grail judgement: the 圣杯显灵 badge glows gold; other grades keep the theme status colours. */
+:root[data-theme="grail"] .tone-gold {
+	color: var(--grail-gold);
+}
+:root[data-theme="grail"] .cc-grail-badge.tone-gold {
+	background: color-mix(in srgb, var(--grail-gold) 14%, transparent);
+	box-shadow: 0 0 10px var(--grail-gold-glow);
 }
