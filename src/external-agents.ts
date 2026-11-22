@@ -86,7 +86,7 @@ export class ExternalAgents {
 			}
 			for (const record of raw.tasks) {
 				const task = record?.task;
-				if (!task || typeof task.id !== "string" || !/^external-[a-f0-9-]{36}$/.test(task.id) || !["codex", "claude", "kimi"].includes(task.executor) ||
+				if (!task || typeof task.id !== "string" || !/^external-[a-f0-9-]{36}$/.test(task.id) || !["codex", "claude", "kimi", "antigravity"].includes(task.executor) ||
 					typeof task.parentConversationId !== "string" || !/^[a-zA-Z0-9._-]{1,200}$/.test(task.parentConversationId) ||
 					!["queued", "running", "waiting_for_input", "completed", "failed", "cancelled", "interrupted"].includes(task.status) ||
 					typeof task.workingDirectory !== "string" || !isAbsolute(task.workingDirectory) || typeof task.project !== "string" || !isAbsolute(task.project) ||
@@ -142,7 +142,7 @@ export class ExternalAgents {
 		return this.serialize(async () => {
 			if (this.options.delegated(owner)) throw new Error("子任务不能再委派外部 Agent。");
 			validatePrompt(input.prompt); validateDescription(input.description);
-			if (!["codex", "claude", "kimi"].includes(input.executor)) throw new Error("未知外部执行器。");
+			if (!["codex", "claude", "kimi", "antigravity"].includes(input.executor)) throw new Error("未知外部执行器。");
 			const previous = toolCallId && [...this.tasks.values()].find(({ task }) => task.parentConversationId === owner && task.parentToolCallId === toolCallId);
 			if (previous) return structuredClone(previous.task);
 			if (this.tasks.size >= 500 || this.list(owner).filter((task) => active.has(task.status)).length >= 8) throw new Error("外部任务数量已达上限，请先完成或停止已有子任务。");

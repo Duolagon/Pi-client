@@ -8,7 +8,7 @@ export function installExternalHandlers(handle: Handle, service: DesktopService)
 	handle("pi:external:configure", (value) => service.configureExternal(validateExecutorInput(value)));
 	handle("pi:external:start", (value) => {
 		const input = object(value, ["executor", "conversationId", "description", "prompt", "subagent_type", "isolation", "worktree_id", "run_in_background"]);
-		if (!["codex", "claude", "kimi"].includes(input.executor as string)) throw new Error("未知执行器。");
+		if (!["codex", "claude", "kimi", "antigravity"].includes(input.executor as string)) throw new Error("未知执行器。");
 		if (input.subagent_type !== undefined && !["Explore", "Plan", "general-purpose"].includes(input.subagent_type as string)) throw new Error("子任务类型无效。");
 		if (input.isolation !== undefined && input.isolation !== "shared" && input.isolation !== "worktree") throw new Error("隔离方式无效。");
 		const request: ExternalTaskStartInput = {

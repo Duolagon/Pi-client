@@ -2,6 +2,7 @@
 import { createInterface } from "node:readline";
 import { appendFileSync } from "node:fs";
 
+if (process.argv.includes("--version")) { process.stdout.write("fake-acp 1.0\n"); process.exit(0); }
 const line = createInterface({ input: process.stdin });
 let session = "kimi-session-test";
 let prompt;
@@ -13,6 +14,7 @@ const result = (id, data) => send({ id, result: data });
 const update = (value, id = session) => send({ method: "session/update", params: { sessionId: id, update: value } });
 const text = (value) => update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: value } });
 const modes = { currentModeId: "yolo", availableModes: [{ id: "default", name: "Default" }, { id: "plan", name: "Plan" }] };
+if (process.env.ACP_TEST_ODD_MODES === "1") modes.availableModes = [{ id: "manual", name: "Manual" }, { id: "auto", name: "Auto" }];
 const finish = (reason = "end_turn") => { const current = prompt; prompt = undefined; if (current) result(current.id, { stopReason: reason }); };
 const ask = (id, method, params, handler) => { callbacks.set(id, handler); send({ id, method, params: { sessionId: session, ...params } }); };
 
@@ -20,12 +22,14 @@ line.on("line", (raw) => {
 	const message = JSON.parse(raw);
 	log(message);
 	if (!message.method) { callbacks.get(message.id)?.(message); callbacks.delete(message.id); return; }
+	if (message.method === "initialize" && process.env.ACP_TEST_AUTH === "1")
+		return send({ id: message.id, error: { code: -32000, message: "Authentication required" } });
 	if (message.method === "initialize") return result(message.id, {
 		protocolVersion: process.env.KIMI_TEST_PROTOCOL === "2" ? 2 : 1,
 		agentInfo: { name: "Kimi Code CLI", version: "test" },
 		agentCapabilities: { loadSession: process.env.KIMI_TEST_NO_RESTORE !== "1", sessionCapabilities: { ...(process.env.KIMI_TEST_LOAD_ONLY === "1" || process.env.KIMI_TEST_NO_RESTORE === "1" ? {} : { resume: {} }), close: {} } },
 	});
-	if (message.method === "session/new") return result(message.id, { sessionId: session, modes });
+	if (message.method === "session/new") return result(message.id, process.env.ACP_TEST_NO_MODES === "1" ? { sessionId: session } : { sessionId: session, modes });
 	if (message.method === "session/resume" || message.method === "session/load") {
 		session = message.params.sessionId;
 		update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "old replay should not appear" } });

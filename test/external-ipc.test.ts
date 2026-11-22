@@ -80,7 +80,7 @@ async function setup() {
 	try {
 		const snapshot = await service.initialize();
 		assert.equal(snapshot.engineStatus, "ready", snapshot.engineError);
-		for (const id of ["codex", "claude", "kimi"]) await invoke("pi:external:configure", { id, executable: binary });
+		for (const id of ["codex", "claude", "kimi", "antigravity"]) await invoke("pi:external:configure", { id, executable: binary });
 		return { fixture, service, adapter, invoke, handlers, events, id: snapshot.active!.id, binary,
 			guardCalls: () => guardCalls, setSender: (value: boolean) => { allowedSender = value; },
 			cleanup: async () => { await service.close(); await fixture.cleanup(); } };
@@ -97,7 +97,7 @@ test("external IPC exposes all endpoints through the host gate, continues exact 
 	const data = await setup(); t.after(data.cleanup);
 	assert.deepEqual([...data.handlers.keys()].sort(), ["pi:external:cancel", "pi:external:configure", "pi:external:executors", "pi:external:list", "pi:external:replay", "pi:external:respond", "pi:external:result", "pi:external:send", "pi:external:snapshot", "pi:external:start"]);
 	const executors = await data.invoke<ExternalExecutor[]>("pi:external:executors");
-	assert.equal(executors.length, 3); assert.ok(executors.every((item) => item.available && item.version === "External fixture 1.0"));
+	assert.equal(executors.length, 4); assert.ok(executors.every((item) => item.available && item.version === "External fixture 1.0"));
 	data.setSender(false);
 	await assert.rejects(data.invoke("pi:external:executors"), /Untrusted renderer/);
 	data.setSender(true);

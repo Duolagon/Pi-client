@@ -78,7 +78,7 @@ await window.pi.permissions.remove("allow-project-tests");
 
 | 工具 | 参数与结果 |
 | --- | --- |
-| Agent | `{description,prompt,subagent_type?,model?,run_in_background?,name?,isolation?,worktree_id?,executor?,fork?,mode?,team_name?}`，`subagent_type` 缺省为 general-purpose，`"fork"` 复制父会话分支上下文快照（与兼容参数 `fork: true` 等价）；`model` 为 `sonnet/opus/haiku/fable/inherit`；默认 Pi，也可选择本机 codex/claude/kimi；`mode`、`team_name` 接收后忽略并在结果中提示 |
+| Agent | `{description,prompt,subagent_type?,model?,run_in_background?,name?,isolation?,worktree_id?,executor?,fork?,mode?,team_name?}`，`subagent_type` 缺省为 general-purpose，`"fork"` 复制父会话分支上下文快照（与兼容参数 `fork: true` 等价）；`model` 为 `sonnet/opus/haiku/fable/inherit`；默认 Pi，也可选择本机 codex/claude/kimi/antigravity；`mode`、`team_name` 接收后忽略并在结果中提示 |
 | AgentExecutors | `{}`，探测本机外部执行器与权限能力 |
 | SendMessage | `{to,message,summary?,run_in_background?}`，按 agentId 或 `name` 继续本父会话自己的子 Agent（Pi 或外部）：运行中的直接送达，已结束/停止/中断的带完整历史开始下一轮，见下文“SendMessage 续聊” |
 | AgentSend | `{task_id,message,run_in_background?}`，SendMessage 的兼容别名（`task_id` 即 `to`，默认前台）；仍可调用，但不再向模型声明 |
@@ -94,7 +94,7 @@ Agent 的 `subagent_type`：`general-purpose / Explore / Plan`，或 `.pi/agents
 
 模型选择优先级：调用参数 `model` > 定义中的 `model` > 父会话当前模型。调用参数中的别名在父会话可用模型中按名称匹配（同服务商优先），匹配不到直接报错，不静默回退；`inherit` 使用父会话模型。fork 忽略 `model`（结果中提示）。
 
-前后台默认值：`run_in_background ?? 定义的 background ?? 设置 subagentDefaultBackground（默认 true）`，即 Agent 默认后台运行、立即返回。Explore/Plan/只读自定义 Agent 使用只读工具上限，默认共享项目读取；git 项目中 general-purpose 与可写自定义 Agent 默认 Git Worktree。非 git 项目中可写子 Agent 没有 Worktree，未显式指定后台时**默认改为前台**并共享项目目录写入：父会话阻塞在这次工具调用上（包括子 Agent 等待审批期间），不会与子 Agent 并发写同一目录；宿主为此豁免正在等待它的父会话对目录的占用。后台、共享、可写三者同时成立时拒绝并提示“请设 run_in_background:false，或在 git 仓库中用 worktree”。git 项目里共享目录的可写委派仍然拒绝（父会话一轮的 Git 恢复点会覆盖子 Agent 的修改）。显式 Worktree 引用必须属于本父会话。外部执行器（codex/claude/kimi）的可写任务始终使用 Worktree，同样遵循后台默认值。外部执行器使用自己配置的模型、只能按 task_id 寻址：带 `model`（`inherit` 除外）或 `name` 的外部 Agent 调用直接报错，不静默丢弃；`mode`、`team_name` 同 Pi 子 Agent 一样忽略并在结果的 `warnings` 中提示。
+前后台默认值：`run_in_background ?? 定义的 background ?? 设置 subagentDefaultBackground（默认 true）`，即 Agent 默认后台运行、立即返回。Explore/Plan/只读自定义 Agent 使用只读工具上限，默认共享项目读取；git 项目中 general-purpose 与可写自定义 Agent 默认 Git Worktree。非 git 项目中可写子 Agent 没有 Worktree，未显式指定后台时**默认改为前台**并共享项目目录写入：父会话阻塞在这次工具调用上（包括子 Agent 等待审批期间），不会与子 Agent 并发写同一目录；宿主为此豁免正在等待它的父会话对目录的占用。后台、共享、可写三者同时成立时拒绝并提示“请设 run_in_background:false，或在 git 仓库中用 worktree”。git 项目里共享目录的可写委派仍然拒绝（父会话一轮的 Git 恢复点会覆盖子 Agent 的修改）。显式 Worktree 引用必须属于本父会话。外部执行器（codex/claude/kimi/antigravity）的可写任务始终使用 Worktree，同样遵循后台默认值。外部执行器使用自己配置的模型、只能按 task_id 寻址：带 `model`（`inherit` 除外）或 `name` 的外部 Agent 调用直接报错，不静默丢弃；`mode`、`team_name` 同 Pi 子 Agent 一样忽略并在结果的 `warnings` 中提示。
 
 同一条助手消息中的工具调用，只要没有 sequential 工具，Pi 会并行执行。父会话扩展在 `message_end` 记下每个 Agent 调用同批次中“可能改文件”的其它调用数（已注册、且不在 read/grep/find/ls、Task*/WorktreeList/AgentExecutors、Agent/SendMessage/AgentSend 之列的工具，如 write、edit、bash），随 `/invoke` 的 `batch: {writers}` 交给宿主（宿主校验：仅 Agent/SendMessage/AgentSend、非负整数、无多余字段）。续聊非 git 共享目录的可写子 Agent 时同样要求它是该消息中唯一会改文件的调用。非 git 项目中前台共享目录的可写子 Agent 必须是该消息中唯一会改文件的调用，否则拒绝并提示单独再调用一次 Agent；只读子 Agent、git 项目中的 Worktree 子 Agent 不受此限制。未上报批次（旧扩展）时不做此检查。
 
@@ -168,4 +168,4 @@ Worktree 合并/删除作为顺序工具执行：只能豁免正在等待该工�
 
 类型入口：`src/shared.ts`、`src/control-types.ts`、`src/tool-control-types.ts`、`src/permission-types.ts`、`src/delegation-types.ts`。新增 IPC 安装在 `src/control-ipc.ts`，沿用主进程 sender/origin 校验。宿主令牌、随机控制命令、控制文件路径均不通过这些前端 API 暴露。
 
-本机 Codex/Claude/Kimi 外部执行器已实现，参数、独立审批与事件流见 [本机多 Agent 接入](local-external-agents.md)。本节其余 Pi tasks/sessions 接口不用于外部任务；SSH 留待后续。
+本机 Codex/Claude/Kimi/Antigravity 外部执行器已实现，参数、独立审批与事件流见 [本机多 Agent 接入](local-external-agents.md)。本节其余 Pi tasks/sessions 接口不用于外部任务；SSH 留待后续。

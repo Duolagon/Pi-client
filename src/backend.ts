@@ -167,6 +167,7 @@ import { ExternalAgents } from "./external-agents.ts";
 import { CodexAdapter } from "./external-codex.ts";
 import { ClaudeAdapter } from "./external-claude.ts";
 import { KimiAdapter } from "./external-kimi.ts";
+import { AntigravityAdapter } from "./external-antigravity.ts";
 import type { ExternalAdapter, ExternalApprovalResponse, ExternalEvent, ExternalExecutorInput, ExternalProvider, ExternalTask, ExternalTaskSendInput, ExternalTaskStartInput } from "./external-types.ts";
 import type { DeliverCustomType, DesktopToolInvocation, NotificationDelivery, NotificationDisposition, NotificationUsage, ToolHostContext } from "./tool-control-types.ts";
 import { formatTaskNotification, notificationStatus, TASK_NOTIFICATION_TYPE, type TaskNotificationDetails } from "./delegation-format.ts";
@@ -724,7 +725,7 @@ export class DesktopService {
 		this.external = new ExternalAgents({
 			dataDir: options.dataDir, env: { ...process.env, ...options.env }, nodeExecutable: options.executable,
 			claudeHelperPath: options.claudeHelperPath ?? join(runtimeDir, "external-claude-helper.mjs"),
-			adapters: options.externalAdapters ?? { codex: new CodexAdapter(), claude: new ClaudeAdapter(), kimi: new KimiAdapter() },
+			adapters: options.externalAdapters ?? { codex: new CodexAdapter(), claude: new ClaudeAdapter(), kimi: new KimiAdapter(), antigravity: new AntigravityAdapter() },
 			maxConcurrent: options.maxConcurrentTasks ?? 4,
 			project: (id) => this.conversation(id).project,
 			policy: (id) => this.permissionPolicy(id),

@@ -1,12 +1,12 @@
 # 本机外部 Agent 接入契约
 
-本机 Codex、Claude Code、Kimi Code 已接入后端；主 Pi 模型可主动委派、继续原生会话、收集结果和取消。`src/renderer/` 与 `src/prototype/` 没有修改。SSH 和跨机器项目映射尚未实现。
+本机 Codex、Claude Code、Kimi Code、Antigravity CLI（`agy`）已接入后端；主 Pi 模型可主动委派、继续原生会话、收集结果和取消。前端只通过 `executors()` 的数据展示执行器，没有为单个执行器写专门界面。SSH 和跨机器项目映射尚未实现。
 
 ## 执行器与能力探测
 
 ```ts
 const executors = await window.pi.externalAgents.executors();
-// id: codex | claude | kimi
+// id: codex | claude | kimi | antigravity
 // enabled, available, executable?, version?, error?, capabilities
 
 await window.pi.externalAgents.configure({ id: "kimi", executable: "/absolute/path/to/kimi", enabled: true });
@@ -23,6 +23,7 @@ available 表示能找到并运行版本探测，不表示账号已经登录或�
 | Codex | App Server JSONL / thread / turn | native，接住服务端发出的审批 | read-only/workspace-write 沙箱；不能逐工具落实任意 Pi 规则 |
 | Claude Code | 固定 SDK core + 独立 helper | per-tool-hook，PreToolUse 与 canUseTool | 宿主逐工具判定、只读工具上限 |
 | Kimi Code | 新版 ACP JSON-RPC | native，保留原生选项 ID 和问题表单 | 当前不提供可强制执行的只读与逐工具策略 |
+| Antigravity CLI | `agy acp --disable-telemetry`，ACP v1 | native，agy 的审批请求转给宿主，agy 自身规则已允许/拒绝的操作不再询问 | 不提供只读模式和逐工具策略；ACP 不暴露 session mode，宿主无法强制手动模式 |
 
 capabilities 返回 transport、continuation、approvals、cancellation、readOnly、fineGrainedPolicy、approvalSemantics。前端应展示限制并禁用不可用组合；这些是本适配器的能力上限，握手仍可能因本机 CLI 过旧或不兼容而拒绝启动。
 
@@ -40,7 +41,7 @@ capabilities 返回 transport、continuation、approvals、cancellation、readOn
 {"tool":"TaskStop","input":{"task_id":"external-..."}}
 ```
 
-Agent 的 executor 为 `pi / codex / claude / kimi`，省略仍为 Pi。AgentExecutors 返回本机可用性和限制；模型不能配置可执行文件。TaskList/TaskOutput/TaskStop 同时支持 Pi 与外部任务，外部结果带 executor 区分。SendMessage（兼容别名 AgentSend，`task_id` 即 `to`）先按 id 匹配外部任务，否则继续 Pi 子 Agent；不能给其他父会话的任务发消息。外部任务没有 name，只能按 task_id 寻址。
+Agent 的 executor 为 `pi / codex / claude / kimi / antigravity`，省略仍为 Pi。AgentExecutors 返回本机可用性和限制；模型不能配置可执行文件。TaskList/TaskOutput/TaskStop 同时支持 Pi 与外部任务，外部结果带 executor 区分。SendMessage（兼容别名 AgentSend，`task_id` 即 `to`）先按 id 匹配外部任务，否则继续 Pi 子 Agent；不能给其他父会话的任务发消息。外部任务没有 name，只能按 task_id 寻址。
 
 每个外部任务保留固定执行器、父会话、Worktree 和原生 session/thread ID。SendMessage/AgentSend 是下一轮指令，必须等待上一轮终止；若只剩进程清理会等待清理完成，若上一轮仍在运行则明确报错。它不会把消息投给“此目录最近的一段聊天”。进程按需关闭，下一轮显式恢复同一原生会话，不重放上一条 prompt。
 
@@ -61,7 +62,7 @@ await window.pi.externalAgents.send({ taskId: task.id, message: "根据发现继
 await window.pi.externalAgents.cancel(task.id);
 ```
 
-start 的 subagent_type 可省略，默认 general-purpose。Explore/Plan 要求可强制执行的只读能力；Kimi 不支持此组合。可写任务必须用 Worktree，非 Git 目录不能启动可写任务；只读任务默认共享项目读取。可传 isolation 和已归属父会话的 worktree_id。项目由 conversationId 绑定，模型不能指定任意目录。
+start 的 subagent_type 可省略，默认 general-purpose。Explore/Plan 要求可强制执行的只读能力；Kimi 和 Antigravity 不支持此组合。可写任务必须用 Worktree，非 Git 目录不能启动可写任务；只读任务默认共享项目读取。可传 isolation 和已归属父会话的 worktree_id。项目由 conversationId 绑定，模型不能指定任意目录。
 
 start/send 的前端 API 返回任务状态，不阻塞等待模型完成；result 支持 block 和 0–60000 毫秒等待。模型调用 Agent 时未传 run_in_background 则按设置 `subagentDefaultBackground`（默认 true）后台运行（外部可写任务总是使用 Worktree，不适用 Pi 在非 git 项目中的“可写默认前台”规则）；外部执行器不支持 fork 和 `isolation: "remote"`，结果仍为 JSON 结构。模型前台 Agent/SendMessage 最多等待 5 分钟（SendMessage 未传 run_in_background 时按 `subagentDefaultBackground` 默认后台，AgentSend 别名默认前台）；遇人工审批提前返回状态，继续完成后再回传。run_in_background/runInBackground 为 true 时，完成、失败或被停止（用户停止、宿主权限变更、执行器自行取消、应用重启/关闭中断）会在该轮记下输出后经宿主的持久化 outbox 以 `desktop_task_notification` 交给父 Pi 会话：父会话 runtime 在运行时立即投递并触发继续处理（父会话正在一轮运行中则等这一轮结束再投递）；父进程不可用时不自动重启它，结果留到父会话下次打开（排入下一轮，界面可“立即交付”）。每轮只交付一次，应用重启后仍会补交。模型 TaskStop 和父会话中止造成的取消不通知；父会话中止（Esc）只取消前台外部任务。
 
@@ -92,7 +93,8 @@ decision 为 allow/deny/cancel。pendingApprovals 给出宿主审批 ID、kind�
 - Claude：每个 PreToolUse 都经过本地与宿主策略，未知工具在只读模式下拒绝；问题单独交互。旧 CLI 不支持原生 onFailure:block 时，helper 使用全面 catch→deny、短于原生 hook timeout 的审批期限、断管清理和进程组退出保护。
 - Codex：强制并校验 untrusted/user 审批以及 read-only/workspace-write 沙箱，拒绝提权；只读任务还要求原生配置没有 MCP。原生安全操作可能无需发出审批，不能宣称和 Pi ask 模式逐次确认一致。
 - Kimi：恢复后设置原生手动模式并验证确认，接收原生权限请求，不宣告客户端文件系统/终端能力。不能以 Plan 模式冒充真正只读。
-- Codex/Kimi：无法可靠执行的非宿主 deny/ask 规则或原生工具停用，会在启动时明确拒绝，不静默丢弃。仅 allow 规则允许使用原生更保守的审批。运行时修改宿主策略会停止缺少逐工具 hook 的活动任务，需显式继续。
+- Antigravity：启动时固定开启 `--sandbox`，接收原生权限请求；ACP 不暴露 session mode，agy 自身规则已允许的操作不经宿主审批（capabilities.approvalSemantics 为 `agent-rules`），因此拒绝 dontAsk 策略。
+- Codex/Kimi/Antigravity：无法可靠执行的非宿主 deny/ask 规则或原生工具停用，会在启动时明确拒绝，不静默丢弃。仅 allow 规则允许使用原生更保守的审批。运行时修改宿主策略会停止缺少逐工具 hook 的活动任务，需显式继续。
 
 原生 CLI 的配置、插件、hooks 和 MCP 是各执行器自己的受信代码边界；Pi 的工具钩子不是它们的 OS 沙箱。宿主不会用全局跳过审批参数解决兼容问题。root/管理员进程及恶意本机扩展的任意系统访问不在此工具权限契约的隔离承诺内。
 
@@ -123,3 +125,11 @@ SDK 固定版本与许可见 [UPSTREAM](../UPSTREAM.md)。构建将 JavaScript S
 回归使用隔离目录、本地协议进程和脚本化模型：原生适配器协议、审批/取消、真实 Pi 主动委派、真 Git Worktree、持续会话、重启、事件回放和 IPC 均有覆盖。本机 Codex/Claude 另外做无个人凭据、无模型 prompt 的真实握手；Kimi 在当前机器未安装，尚未做本机原生验收。未调用付费模型；完整账号与模型实际生成需用户通过官方 CLI 配好后验收。
 
 外部执行器设置、原生 ID、任务与日志仅在应用数据目录 external-agents.json / external-events 中，不属于 Git 发布内容；桌面模型密钥、宿主控制令牌不会转发给外部执行器。
+
+## Antigravity CLI
+
+- 探测命令名 `agy`（PATH、`~/.local/bin` 等常见目录），也可在“外部执行器”里配置绝对路径。
+- 启动参数固定为 `acp --sandbox --disable-telemetry`，不传 `--dangerously-skip-permissions`。客户端不读取、不保存 Google 凭据；agy 复用自己在钥匙串里的登录。
+- 未登录时 agy 返回 `Authentication required`，任务启动失败并提示先运行 `agy` 或 `agy acp --login`。
+- agy 的 ACP 服务不暴露 session mode，因此宿主无法像 Kimi 那样强制 `default` 手动模式。它是否先询问再执行，取决于 agy 自己的 `agentMode` 与 `~/.gemini/antigravity-cli/settings.json` 里的 `permissions` 规则；被规则直接允许的操作不会出现审批。因此父会话为 dontAsk 时拒绝启动；若 agy 将来声明了 session mode 却没有 `default`，同样拒绝启动。
+- 只能运行可写任务（需要 Git 仓库和独立 Worktree），不能用于 Explore/Plan。

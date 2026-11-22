@@ -1,7 +1,7 @@
 import type { RuntimePermissionPolicy } from "./permission-types.ts";
 import type { TaskStatus } from "./task-types.ts";
 
-export type ExternalProvider = "codex" | "claude" | "kimi";
+export type ExternalProvider = "codex" | "claude" | "kimi" | "antigravity";
 export interface ExternalApprovalOption { id: string; label: string; kind?: string }
 export interface ExternalApprovalRequest {
 	id: string;
@@ -59,7 +59,7 @@ export interface ExternalExecutor {
 	executable?: string;
 	version?: string;
 	error?: string;
-	capabilities: { transport: "app-server" | "sdk" | "acp"; continuation: boolean; approvals: boolean; cancellation: boolean; readOnly: boolean; fineGrainedPolicy: boolean; approvalSemantics: "per-tool-hook" | "native" };
+	capabilities: { transport: "app-server" | "sdk" | "acp"; continuation: boolean; approvals: boolean; cancellation: boolean; readOnly: boolean; fineGrainedPolicy: boolean; approvalSemantics: "per-tool-hook" | "native" | "agent-rules" };
 }
 export interface ExternalExecutorInput { id: ExternalProvider; executable?: string | null; enabled?: boolean }
 export interface ExternalTask {

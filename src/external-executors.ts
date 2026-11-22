@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import type { ExternalExecutor, ExternalExecutorInput, ExternalProvider } from "./external-types.ts";
 
 const exec = promisify(execFile);
-export const externalProviders: ExternalProvider[] = ["codex", "claude", "kimi"];
+export const externalProviders: ExternalProvider[] = ["codex", "claude", "kimi", "antigravity"];
 export interface ExternalExecutorSetting { enabled: boolean; executable?: string }
 export type ExternalExecutorSettings = Partial<Record<ExternalProvider, ExternalExecutorSetting>>;
 
@@ -33,9 +33,9 @@ export async function discoverExecutors(settings: ExternalExecutorSettings, env:
 		const setting = settings[id];
 		const result: ExternalExecutor = {
 			id, enabled: setting?.enabled ?? true, available: false,
-			capabilities: { transport: id === "codex" ? "app-server" : id === "claude" ? "sdk" : "acp", continuation: true, approvals: true, cancellation: true, readOnly: id !== "kimi", fineGrainedPolicy: id === "claude", approvalSemantics: id === "claude" ? "per-tool-hook" : "native" },
+			capabilities: { transport: id === "codex" ? "app-server" : id === "claude" ? "sdk" : "acp", continuation: true, approvals: true, cancellation: true, readOnly: id !== "kimi" && id !== "antigravity", fineGrainedPolicy: id === "claude", approvalSemantics: id === "claude" ? "per-tool-hook" : id === "antigravity" ? "agent-rules" : "native" },
 		};
-		const names = id === "kimi" ? ["kimi", "kimicode"] : [id];
+		const names = id === "kimi" ? ["kimi", "kimicode"] : id === "antigravity" ? ["agy"] : [id];
 		const directories = [...new Set([...(env.PATH ?? "").split(delimiter).filter((path) => isAbsolute(path)), "/opt/homebrew/bin", "/usr/local/bin", join(homedir(), ".local/bin")])];
 		const candidates = setting?.executable ? [setting.executable] : directories.flatMap((path) => names.map((name) => join(path, name)));
 		if (id === "codex" && !setting?.executable && process.platform === "darwin") candidates.push("/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex");

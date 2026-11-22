@@ -108,7 +108,7 @@ Pi Desktop 当前已经适合个人用户的日常本地开发。文件读写、
 - API Key 使用 Electron `safeStorage` 保存，不返回渲染进程，也不放在启动参数中。
 - 支持 Pi 子 Agent、Explore、Plan、fork、后台任务、审批、续写和结果回传。
 - 支持 Agent Teams、Workflow、Cron、Monitor、Todo 和 `/batch` 式并行任务。
-- 支持本机 Codex、Claude Code 和 Kimi Code 执行器，保留原生会话、审批、Worktree 和继续执行能力。
+- 支持本机 Codex、Claude Code、Kimi Code 和 Antigravity CLI 执行器，保留原生会话、审批、Worktree 和继续执行能力。
 
 多模型和本机外部 Agent 是 Pi Desktop 面向个人用户的核心差异化能力，应继续保持。
 
@@ -224,7 +224,7 @@ Claude Code 的 `/code-review`、`/security-review`、`/simplify` 等命令适�
 | 自定义 Agent | 完整 | 模型、工具、权限、Memory、隔离和 Hooks 已接入 | Teams 细节和边界仍在完善 |
 | MCP | 完整生命周期 | 增删、启停、stdio、HTTP、OAuth 终端 | `.mcp.json`、健康状态和资源浏览待补 |
 | 多模型 | Anthropic 生态为主 | 多服务商和自定义协议 | Pi Desktop 更灵活 |
-| 外部 Agent | 主要使用 Claude 生态 | Pi、Codex、Claude、Kimi 本机协作 | Pi Desktop 更灵活，依赖本机安装 |
+| 外部 Agent | 主要使用 Claude 生态 | Pi、Codex、Claude、Kimi、Antigravity 本机协作 | Pi Desktop 更灵活，依赖本机安装 |
 | 后台任务 | 可后台、接管和恢复 | 后台任务和通知已具备，应用退出后需继续 | 需要轻量 supervisor |
 | 浏览器和搜索 | WebFetch、WebSearch、Chrome | WebFetch、localhost 预览 | 缺 WebSearch 和 Chrome |
 | 个人配置 | 主题、键位和模型选项 | 主题、命令面板、固定快捷键和模型选项 | 自定义程度较低 |

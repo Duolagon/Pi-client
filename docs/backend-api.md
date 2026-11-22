@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `pi.tools` | `list / setEnabled / onEvent` | 真实工具清单、分范围启停和恢复继承 |
 | `pi.permissions` | `list / upsert / remove / check / onEvent` | 细粒度规则、授权预览与热更新 |
-| `pi.externalAgents` | `executors / configure / start / list / snapshot / send / result / cancel / respond / replay / onEvent` | 本机 Codex／Claude／Kimi 协作与独立审批流 |
+| `pi.externalAgents` | `executors / configure / start / list / snapshot / send / result / cancel / respond / replay / onEvent` | 本机 Codex／Claude／Kimi／Antigravity 协作与独立审批流 |
 | `pi.git` | `begin / finish / list / diff / restore` | 工作树检查点与安全恢复 |
 | `pi.terminals` | `create / list / write / resize / close / replay / onEvent / ssh / mcpOAuth / packages` | PTY 与输出回放、SSH、MCP OAuth 和 Pi CLI 扩展管理 |
 | `pi.tasks` | `start / list / snapshot / result / cancel / stopAll / deliverNow / command / respond / files / readFile / workspace / diff / onEvent` | 后台任务、模型委派结果与指定会话操作；`stopAll` 停止会话的全部后台子 Agent，`deliverNow` 立即交付待交付的子 Agent 结果 |

@@ -175,7 +175,7 @@ export function validateControlRequest(value: unknown, requestId: string, maxByt
 }
 
 export interface AgentToolInput {
-	executor?: "pi" | "codex" | "claude" | "kimi";
+	executor?: "pi" | "codex" | "claude" | "kimi" | "antigravity";
 	description: string;
 	prompt: string;
 	/** Defaults to general-purpose; `"fork"` forks this conversation. */
@@ -267,7 +267,7 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 		text(input.prompt, "prompt", MAX_AGENT_PROMPT);
 		if (input.subagent_type !== undefined && (typeof input.subagent_type !== "string" || !input.subagent_type.trim() || exceedsLength(input.subagent_type, 100)))
 			throw new Error("Invalid subagent_type");
-		if (input.executor !== undefined && (typeof input.executor !== "string" || !["pi", "codex", "claude", "kimi"].includes(input.executor))) throw new Error("Invalid executor");
+		if (input.executor !== undefined && (typeof input.executor !== "string" || !["pi", "codex", "claude", "kimi", "antigravity"].includes(input.executor))) throw new Error("Invalid executor");
 		if (input.model !== undefined && !agentModelValues.includes(input.model as never)) throw new Error("Invalid model (expected sonnet, opus, haiku, fable or inherit)");
 		if (input.name !== undefined && (typeof input.name !== "string" || !AGENT_CALL_NAME_PATTERN.test(input.name))) throw new Error("Invalid name");
 		optionalBoolean(input.run_in_background, "run_in_background");

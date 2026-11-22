@@ -389,8 +389,9 @@ try {
 	await page.evaluate(() => window.pi.tools.setEnabled({ name: "grep", enabled: null }));
 	checks.push("real tool inventory, scoped enablement and permission rule preload interfaces");
 	const executors = await page.evaluate(() => window.pi.externalAgents.executors());
-	assert.deepEqual(executors.map((item) => item.id), ["codex", "claude", "kimi"]);
+	assert.deepEqual(executors.map((item) => item.id), ["codex", "claude", "kimi", "antigravity"]);
 	assert.equal(executors.find((item) => item.id === "kimi").capabilities.readOnly, false);
+	assert.equal(executors.find((item) => item.id === "antigravity").capabilities.readOnly, false);
 	assert.deepEqual(await page.evaluate(() => window.pi.externalAgents.list()), []);
 	const configured = await page.evaluate(() => window.pi.externalAgents.configure({ id: "codex", enabled: false }));
 	assert.equal(configured.find((item) => item.id === "codex").enabled, false);
