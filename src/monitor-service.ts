@@ -5,6 +5,7 @@ import { isIP } from "node:net";
 import type { Readable } from "node:stream";
 import { Script, createContext } from "node:vm";
 import { escapeMarkup } from "./delegation-format.ts";
+import { HostResourceGuard, buildSafeComputeEnv, killProcessGroup, resolveNiceCommand } from "./host-guard.ts";
 import type { DeliverCustomType, NotificationDelivery, NotificationDisposition } from "./tool-control-types.ts";
 import type { MonitorEvent, MonitorRecord, MonitorStartInput, MonitorStatus } from "./monitor-types.ts";
 
@@ -192,10 +193,12 @@ export class MonitorService {
 	private listeners = new Set<(event: MonitorEvent) => void>();
 	private closing = false;
 	private coalesceMs: number;
+	private guard: HostResourceGuard;
 
-	constructor(options: { deliver: MonitorDeliverFn; coalesceMs?: number }) {
+	constructor(options: { deliver: MonitorDeliverFn; coalesceMs?: number; guard?: HostResourceGuard }) {
 		this.deliver = options.deliver;
 		this.coalesceMs = options.coalesceMs ?? COALESCE_MS;
+		this.guard = options.guard ?? new HostResourceGuard();
 	}
 
 	subscribe(listener: (event: MonitorEvent) => void): () => void {
@@ -468,13 +471,23 @@ export class MonitorService {
 		const wrapped = sandboxProfileFile
 			? `/usr/bin/sandbox-exec -f ${shellQuote(sandboxProfileFile)} /bin/sh -c ${shellQuote(command)}`
 			: command;
-		const child = spawn("/bin/sh", ["-c", wrapped], {
+		const launch = resolveNiceCommand("/bin/sh", ["-c", wrapped]);
+		const child = spawn(launch.command, launch.args, {
 			cwd,
-			env: env ?? process.env,
+			env: buildSafeComputeEnv(env ?? process.env),
 			stdio: ["ignore", "pipe", "pipe"],
 			detached: process.platform !== "win32",
 		});
 		live.child = child;
+		if (child.pid) {
+			this.guard.register(child.pid, {
+				label: live.record.description || command.trim().slice(0, 80) || live.record.id,
+				onKill: (reason) => {
+					if (live.shell) this.pushShellLine(live, "stderr", reason);
+					void this.terminate(live.record.id, "error", { error: reason, reason: "memory_limit", notify: true });
+				},
+			});
+		}
 		const handleChunk = (source: "stdout" | "stderr", chunk: Buffer) => {
 			if (live.terminated) return;
 			if (live.shell) {
@@ -509,6 +522,7 @@ export class MonitorService {
 			void this.terminate(live.record.id, "error", { error: err.message, reason: "error", notify: true });
 		});
 		child.once("close", (code, signal) => {
+			if (child.pid) this.guard.unregister(child.pid);
 			if (live.shell && !live.terminated) {
 				for (const stream of ["stdout", "stderr"] as const) {
 					if (live.shell.partial[stream]) this.pushShellLine(live, stream, live.shell.partial[stream]);
@@ -741,24 +755,21 @@ export class MonitorService {
 		if (live.child) {
 			const child = live.child;
 			live.child = undefined;
+			if (child.pid) this.guard.unregister(child.pid);
 			try {
 				if (process.platform !== "win32" && child.pid) {
+					const pgid = child.pid;
 					try {
-						process.kill(-child.pid, "SIGTERM");
+						process.kill(-pgid, "SIGTERM");
 					} catch {
 						child.kill("SIGTERM");
 					}
 					setTimeout(() => {
-						try {
-							if (child.pid) process.kill(-child.pid, "SIGKILL");
-						} catch {
-							try {
-								child.kill("SIGKILL");
-							} catch {}
-						}
+						killProcessGroup(pgid);
 					}, 300).unref?.();
 				} else {
-					child.kill("SIGKILL");
+					if (child.pid) killProcessGroup(child.pid);
+					else child.kill("SIGKILL");
 				}
 			} catch {}
 		}
@@ -849,6 +860,7 @@ export class MonitorService {
 		this.closing = true;
 		const ids = [...this.monitors.keys()];
 		await Promise.all(ids.map((id) => this.terminate(id, "stopped", { reason: "service_close", notify: false })));
+		this.guard.stop();
 		this.monitors.clear();
 		this.listeners.clear();
 	}

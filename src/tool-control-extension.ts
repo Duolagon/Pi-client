@@ -18,6 +18,7 @@ import { formatAgentListing, parseAgentListing } from "./agent-listing.ts";
 import { TASK_NOTIFICATION_TYPE, formatTaskProgressSummary } from "./delegation-format.ts";
 import { postLoopbackJson, postLoopbackNdjson } from "./loopback-request.ts";
 import { isLspSupportedFile } from "./language-service.ts";
+import { createGuardedBashOperations } from "./host-guard.ts";
 import type { TaskProgress } from "./task-types.ts";
 
 const NOTIFICATION_ACK = "desktop_notification_ack";
@@ -636,7 +637,11 @@ function registerBackgroundBash(pi: ExtensionAPI, host: { url: string; token: st
 		try { settings = pi.getSettings() as typeof settings; } catch {}
 		const shellPath = settings.shellPath?.startsWith("~/") ? join(homedir(), settings.shellPath.slice(2)) : settings.shellPath;
 		return {
-			definition: createBashToolDefinition(ctx?.cwd ?? process.cwd(), { commandPrefix: settings.shellCommandPrefix, shellPath }),
+			definition: createBashToolDefinition(ctx?.cwd ?? process.cwd(), {
+				commandPrefix: settings.shellCommandPrefix,
+				shellPath,
+				operations: createGuardedBashOperations({ shellPath }),
+			}),
 			commandPrefix: settings.shellCommandPrefix,
 		};
 	};
@@ -644,7 +649,11 @@ function registerBackgroundBash(pi: ExtensionAPI, host: { url: string; token: st
 	pi.registerTool({
 		...template,
 		description: `${template.description}${BACKGROUND_BASH_NOTE}`,
-		promptGuidelines: [...(template.promptGuidelines ?? []), "Use Bash run_in_background: true for servers and watchers; poll with BashOutput and stop with KillShell."],
+		promptGuidelines: [
+			...(template.promptGuidelines ?? []),
+			"Use Bash run_in_background: true for servers and watchers; poll with BashOutput and stop with KillShell.",
+			"Never detach heavy jobs with nohup ... & in foreground bash (use run_in_background: true so the host tracks and cleans up the process tree). Reserve at least 2-3 CPU cores and bound total memory well below 50% of host RAM for parallel workloads.",
+		],
 		parameters: {
 			type: "object",
 			properties: {
