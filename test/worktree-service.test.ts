@@ -248,3 +248,28 @@ test("omitted baseRef prefers origin/HEAD when present and falls back to HEAD ot
 		assert.equal(fromOrigin.baseCommit, originCommit);
 	} finally { await data.cleanup(); }
 });
+
+test("listing a non-git project returns an empty array instead of throwing", { timeout: 30000 }, async () => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "pi-worktree-test-")));
+	const plain = join(root, "not a repo");
+	const dataDir = join(root, "app-data");
+	await mkdir(plain);
+	await mkdir(dataDir);
+	const service = new WorktreeService({ dataDir, env });
+	try {
+		assert.deepEqual(await service.list(plain), []);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("listing a git repo with no commits returns an empty array", { timeout: 30000 }, async () => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "pi-worktree-test-")));
+	const repo = join(root, "unborn repo");
+	const dataDir = join(root, "app-data");
+	await mkdir(repo);
+	await mkdir(dataDir);
+	await git(repo, "-c", "init.defaultBranch=main", "init");
+	const service = new WorktreeService({ dataDir, env });
+	try {
+		assert.deepEqual(await service.list(repo), []);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});

@@ -1,4 +1,5 @@
 import { projectMemoryContext, userMemoryContext } from "./project-memory.ts";
+import { staleTodoReminder } from "./todo-reminder.ts";
 import { get as getHttp } from "node:http";
 import { get as getHttps } from "node:https";
 import { Readable } from "node:stream";
@@ -316,7 +317,11 @@ export default function permissions(pi: ExtensionAPI) {
 		pi.registerTool({
 			name: "TodoWrite",
 			label: "TodoWrite",
-			description: "Manage a structured task checklist for multi-step coding work so the user can track progress.",
+			description:
+				"Manage a structured task checklist for multi-step work so the user can track progress. " +
+				"The user sees only the latest call, so call it again every time a step finishes or starts: " +
+				"mark finished items completed right away (do not batch them), keep exactly one item in_progress, " +
+				"and rewrite the list when the plan changes. Always pass the whole list.",
 			promptSnippet: "Track multi-step task progress with a structured checklist",
 			parameters: {
 				type: "object",
@@ -347,6 +352,12 @@ export default function permissions(pi: ExtensionAPI) {
 				const todos = Array.isArray(rec?.todos) ? rec.todos.slice(0, 50) : [];
 				return { content: [{ type: "text", text: JSON.stringify({ todos }) }], details: { todos } };
 			},
+		});
+		pi.on("context_with_system", (event) => {
+			const reminder = staleTodoReminder(event.messages);
+			const first = event.messages[0];
+			if (!reminder || first?.role !== "system") return;
+			return { messages: [{ ...first, sections: { ...first.sections, desktopTodoReminder: reminder } }, ...event.messages.slice(1)] };
 		});
 		pi.registerTool({
 			name: "WebFetch",

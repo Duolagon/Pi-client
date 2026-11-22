@@ -35,7 +35,16 @@ export class WorktreeService {
 	list(project?: string): Promise<WorktreeInfo[]> {
 		return this.serialize(async () => {
 			await this.load();
-			const repository = project === undefined ? undefined : await this.repository(project);
+			// A project that is not a git repo (or has no commits) owns no worktrees. Listing
+			// should return [] rather than throw, so callers like the Tasks drawer still open.
+			let repository: string | undefined;
+			if (project !== undefined) {
+				try {
+					repository = await this.repository(project);
+				} catch {
+					return [];
+				}
+			}
 			return Promise.all(
 				this.records.filter((item) => !repository || item.repository === repository).map((item) => this.info(item)),
 			);
