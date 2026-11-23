@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -249,7 +249,10 @@ try {
 	await idle();
 	assert.equal(await page.locator(".cl-msg-user").count(), 1);
 	assert.equal(await page.locator(".cl-msg-ai").count(), 1);
+	const stepGroup = page.locator(".cc-tool-group-head").filter({ hasText: "读取 1 个文件" });
+	await stepGroup.click();
 	assert.equal(await page.locator(".cl-tool.done").count(), 3);
+	await stepGroup.click();
 	assert.match(await readFile(join(project, "src/greeting.mjs"), "utf8"), /你好/);
 	assert.ok((await input.boundingBox()).height < 100);
 	await page.locator(".cl-title-button").click();
@@ -782,6 +785,110 @@ try {
 	}, "Electron utilityProcess workflow completed via Once approval");
 	checks.push("P8 settings notices, bundled /batch skill, TasksDrawer tabs, pinned Todo*, and Electron utilityProcess workflow approval E2E UI");
 
+
+	const newChat = async () => {
+		const previousId = (await snapshot()).active.id;
+		await page.getByRole("button", { name: "新建会话", exact: true }).first().click();
+		await until(async () => (await snapshot()).active.id !== previousId, "new conversation");
+		await ready();
+	};
+	const attachmentInput = page.getByLabel("选择附件", { exact: true });
+	const picture = page.getByRole("button", { name: "移除附件 regression.png", exact: true });
+	const attachPicture = async () => {
+		await attachmentInput.setInputFiles({
+			name: "regression.png",
+			mimeType: "image/png",
+			buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==", "base64"),
+		});
+		await picture.waitFor();
+	};
+	const queue = page.getByRole("region", { name: "排队的指令", exact: true });
+	const startStream = async () => {
+		await submit("停止生成验证");
+		await page.locator(".cl-transcript").getByText(/^流式恢复验证：/).first().waitFor();
+	};
+	const queuedUserMessage = (messages, text) => messages.find(
+		(message) => message.role === "user" && message.content.some((part) => part.type === "text" && part.text === text),
+	);
+	for (const withImage of [false, true]) {
+		await newChat();
+		await startStream();
+		const text = withImage ? "带图的立即发送回归检查" : "纯文本立即发送回归检查";
+		await input.fill(text);
+		if (withImage) await attachPicture();
+		await input.press("Enter");
+		await queue.waitFor();
+		await queue.getByRole("button", { name: "立即发送", exact: true }).click();
+		await until(async () => Boolean(queuedUserMessage((await snapshot()).messages, text)), text);
+		await idle();
+		const userMessage = queuedUserMessage((await snapshot()).messages, text);
+		assert.equal(userMessage.content.some((part) => part.type === "image"), withImage);
+	}
+	await newChat();
+	await startStream();
+	await input.fill("撤回时保留图片");
+	await attachPicture();
+	await input.press("Enter");
+	await queue.waitFor();
+	await input.fill("输入框里原有的草稿");
+	await queue.getByRole("button", { name: "撤回到输入框", exact: true }).click();
+	await picture.waitFor();
+	assert.equal(await input.inputValue(), "撤回时保留图片\n\n输入框里原有的草稿");
+	await page.getByRole("button", { name: "停止任务", exact: true }).click();
+	await idle();
+	checks.push("send queued text and images immediately, and withdraw into an existing draft");
+
+	await newChat();
+	await submit("持久草稿会话");
+	await idle();
+	await input.fill("重启后保留的草稿");
+	await attachPicture();
+	await newChat();
+	assert.equal(await input.inputValue(), "");
+	assert.equal(await picture.count(), 0);
+	await page.locator(".cl-conv").filter({ hasText: "持久草稿会话" }).click();
+	await picture.waitFor();
+	assert.equal(await input.inputValue(), "重启后保留的草稿");
+	await page.reload();
+	await ready();
+	await picture.waitFor();
+	assert.equal(await input.inputValue(), "重启后保留的草稿");
+	await application.close();
+	application = await electron.launch({
+		executablePath: executable,
+		env: { ...env, PI_DESKTOP_WORKSPACE: undefined },
+		timeout: 30000,
+	});
+	page = await application.firstWindow();
+	page.setDefaultTimeout(15000);
+	page.on("pageerror", (error) => pageErrors.push(error.message));
+	await ready();
+	await page.getByRole("button", { name: "移除附件 regression.png", exact: true }).waitFor();
+	assert.equal(await page.getByRole("textbox", { name: "输入任务", exact: true }).inputValue(), "重启后保留的草稿");
+	checks.push("draft text and attachments are isolated per conversation and survive reload and restart");
+
+	await page.evaluate(async (project) => {
+		await window.pi.selectProject(project);
+		await window.pi.newConversation();
+	}, project);
+	await page.reload();
+	await ready();
+	const oversized = join(project, "checkpoint-oversized.bin");
+	await writeFile(oversized, "");
+	await truncate(oversized, 65 * 1024 * 1024);
+	const permissions = page.getByRole("combobox", { name: "权限模式", exact: true });
+	for (const [mode, text] of [["read", "有大文件时的只读提问"], ["ask", "有大文件时的普通提问"]]) {
+		await permissions.selectOption(mode);
+		await until(async () => (await snapshot()).settings.permission === mode && !(await permissions.isDisabled()), mode);
+		await submit(text);
+		await until(async () => Boolean(queuedUserMessage((await snapshot()).messages, text)), text);
+		await idle();
+	}
+	const checkpointList = await page.evaluate(() => window.pi.git.list());
+	assert.equal(checkpointList.length, 1);
+	assert.equal(checkpointList[0].excludedFiles, 1);
+	await rm(oversized);
+	checks.push("read-only prompts bypass snapshots and writable prompts skip oversized files");
 
 	assert.deepEqual(pageErrors, []);
 	if (capture)

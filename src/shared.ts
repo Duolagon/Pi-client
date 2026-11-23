@@ -1,3 +1,4 @@
+import type { ComposerDraft } from "./composer-draft.ts";
 import type {
 	JsonAgentSessionEvent,
 	RpcCommand,
@@ -619,6 +620,7 @@ export interface Snapshot {
 	trust?: ProjectTrustState;
 	/** Background sub-agent results this conversation holds without delivery ("待交付"). */
 	pendingTaskNotifications?: number;
+	queuedMessages?: string[];
 	/** Open interactive approvals of all descendant tasks of the active conversation. */
 	childApprovals?: ChildApprovalRequest[];
 }
@@ -633,6 +635,8 @@ export type DesktopEvent = {
 		| { type: "extension_error"; extensionPath: string; event: string; error: string };
 };
 export type Command = RpcCommand;
+export type DesktopPromptResult = { disposition: "started" | "handled" | "queued" | "forked_skill" };
+export type QueueActionResult = { drafts: ComposerDraft[]; error?: string };
 export interface DesktopTodosAPI {
 	list(conversationId?: string): Promise<TodoRecord[]>;
 	create(conversationId: string, input: TodoCreateInput): Promise<TodoRecord>;
@@ -698,6 +702,8 @@ export interface DesktopAPI {
 	/** Removes the conversation from the list and moves its Pi session file to Trash when unreferenced. */
 	removeConversation(id: string): Promise<Snapshot>;
 	command(command: Command, conversationId?: string): Promise<unknown>;
+	sendPrompt(id: string, draft: ComposerDraft, streamingBehavior?: "steer" | "followUp"): Promise<DesktopPromptResult>;
+	actOnQueue(id: string, action: "withdraw" | "send"): Promise<QueueActionResult>;
 	respond(response: RpcExtensionUIResponse, conversationId?: string): Promise<void>;
 	files(path: string): Promise<FileEntry[]>;
 	readFile(path: string): Promise<{ path: string; content: string }>;

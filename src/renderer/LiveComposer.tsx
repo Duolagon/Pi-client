@@ -6,12 +6,8 @@ import { SandboxControl } from "./SandboxControl.tsx";
 import { CommandSealIcon } from "./GrailIcons.tsx";
 import { StatusLine } from "./StatusLine.tsx";
 
-type Image = NonNullable<Extract<Command, { type: "prompt" }>["images"]>[number];
-interface Attachment {
-	name: string;
-	text?: string;
-	image?: Image;
-}
+import { draftPrompt, maximumImageDataLength, type ComposerAttachment, type ComposerDraft, type Prompt } from "../composer-draft.ts";
+
 const DEFAULT_DESKTOP_KEYBINDINGS = { submit: "Enter" };
 const PERMISSION_LABEL: Record<PermissionMode, string> = {
 	ask: "手动确认",
@@ -21,23 +17,6 @@ const PERMISSION_LABEL: Record<PermissionMode, string> = {
 	dontAsk: "不询问（未放行即拒绝）",
 	read: "只读模式",
 };
-// Keep attachment checks aligned with the main process prompt wire limits.
-const maximumImageDataLength = 10 * 1024 * 1024;
-function promptInput(draft: string, attachments: Attachment[]): Extract<Command, { type: "prompt" }> {
-	const images = attachments.flatMap((item) => (item.image ? [item.image] : []));
-	if (images.length > 10) throw new Error("每条任务最多添加 10 张图片，请移除多余图片。");
-	if (images.some((image) => image.data.length > maximumImageDataLength))
-		throw new Error("图片编码后超过 10 MB，请压缩图片后重试。");
-	const message =
-		draft.trim() +
-		attachments
-			.filter((item) => item.text !== undefined)
-			.map((item) => `\n\n附件 ${item.name}：\n${item.text}`)
-			.join("");
-	if (message.length > 2 * 1024 * 1024)
-		throw new Error("任务正文与文本附件合计超过 2 MB，请精简内容后重试。");
-	return { type: "prompt", message: message || "请查看这些图片。", images };
-}
 export type BuiltinSlashAction =
 	| "compact"
 	| "new"
@@ -134,6 +113,8 @@ export function LiveComposer({
 	snapshot,
 	activeProject,
 	draft,
+	attachments,
+	updateAttachments,
 	setDraft,
 	running,
 	changing,
@@ -162,12 +143,14 @@ export function LiveComposer({
 	snapshot: Snapshot;
 	activeProject?: Project;
 	draft: string;
+	attachments: ComposerAttachment[];
+	updateAttachments: (update: (items: ComposerAttachment[]) => ComposerAttachment[]) => void;
 	setDraft: (value: string) => void;
 	running: boolean;
 	changing: boolean;
 	planMode?: boolean;
 	onTogglePlanMode?: () => void;
-	send: (prompt: Extract<Command, { type: "prompt" }>) => Promise<unknown>;
+	send: (prompt: Prompt, input?: ComposerDraft) => Promise<unknown>;
 	stop: () => void;
 	command: (value: Command) => Promise<void>;
 	setPermission: (value: PermissionMode) => void;
@@ -189,7 +172,6 @@ export function LiveComposer({
 	gitBranch?: string;
 	fail: (error: unknown) => void;
 }) {
-	const [attachments, setAttachments] = useState<Attachment[]>([]);
 	const [sending, setSending] = useState(false);
 	const [slashIndex, setSlashIndex] = useState(0);
 	const [slashDismissed, setSlashDismissed] = useState(false);
@@ -202,7 +184,6 @@ export function LiveComposer({
 	const skillsRef = useRef<HTMLDivElement>(null);
 	const promptHistory = useRef<string[]>([]);
 	const historyCursor = useRef<number>(-1);
-	const attachmentList = useRef<Attachment[]>([]);
 	const currentDraft = useRef(draft);
 	currentDraft.current = draft;
 	const active = useRef(true);
@@ -242,21 +223,15 @@ export function LiveComposer({
 	}, [draft]);
 	const hasModel = snapshot.models.length > 0 && Boolean(snapshot.state?.model);
 	const disabled = changing || sending || snapshot.engineStatus !== "ready" || !snapshot.active || !hasModel;
-	const updateAttachments = (items: Attachment[]) => {
-		attachmentList.current = items;
-		setAttachments(items);
-	};
 	const attach = async (files: File[]) => {
 		try {
-			const added: Attachment[] = [];
+			const added: ComposerAttachment[] = [];
 			for (const file of files) {
 				if (file.size > 10 * 1024 * 1024) throw new Error(`${file.name} 超过 10 MB，请缩小后再添加。`);
 				if (/^image\/(png|jpeg|webp|gif)$/.test(file.type)) {
 					if (4 * Math.ceil(file.size / 3) > maximumImageDataLength)
 						throw new Error(`${file.name} 编码后超过 10 MB，请压缩图片后再添加。`);
-					if (
-						attachmentList.current.filter((item) => item.image).length + added.filter((item) => item.image).length >= 10
-					)
+					if (added.filter((item) => item.image).length >= 10)
 						throw new Error("每条任务最多添加 10 张图片，请移除多余图片。");
 					const data = await new Promise<string>((resolve, reject) => {
 						const reader = new FileReader();
@@ -274,9 +249,11 @@ export function LiveComposer({
 				}
 			}
 			if (!active.current) return;
-			const next = [...attachmentList.current, ...added];
-			promptInput(currentDraft.current, next);
-			updateAttachments(next);
+			updateAttachments((items) => {
+				const next = [...items, ...added];
+				draftPrompt({ text: currentDraft.current, attachments: next });
+				return next;
+			});
 		} catch (error) {
 			if (active.current) fail(error);
 		}
@@ -313,12 +290,10 @@ export function LiveComposer({
 				setDraft("");
 				setSending(true);
 				try {
-					await send(
-						promptInput(
-							`[Bundled /batch Skill]\n请先分析需求与仓库结构，将下述批量任务拆解为 5–30 个互不重叠的独立子单元，先使用 TodoCreate 写入共享任务清单，再使用并行 Agent(isolation="worktree") 或 WorkflowRun(parallel, phase, budget) 隔离执行并在最后汇总结果：\n\n${argText}`,
-							[],
-						),
-					);
+					await send(draftPrompt({
+						text: `[Bundled /batch Skill]\n请先分析需求与仓库结构，将下述批量任务拆解为 5–30 个互不重叠的独立子单元，先使用 TodoCreate 写入共享任务清单，再使用并行 Agent(isolation="worktree") 或 WorkflowRun(parallel, phase, budget) 隔离执行并在最后汇总结果：\n\n${argText}`,
+						attachments: [],
+					}));
 				} catch {
 				} finally {
 					setSending(false);
@@ -350,7 +325,7 @@ export function LiveComposer({
 				if (disabled) return;
 				setSending(true);
 				try {
-					await send(promptInput(`/${skill.name}${argText ? ` ${argText}` : ""}`, []));
+					await send(draftPrompt({ text: `/${skill.name}${argText ? ` ${argText}` : ""}`, attachments: [] }));
 				} catch {
 					/* The controller keeps the draft and displays the failure. */
 				} finally {
@@ -423,7 +398,7 @@ export function LiveComposer({
 		if (disabled || (!trimmed && !attachments.length)) return;
 		let input: Extract<Command, { type: "prompt" }>;
 		try {
-			input = promptInput(draft, attachments);
+			input = draftPrompt({ text: draft, attachments });
 		} catch (error) {
 			fail(error);
 			return;
@@ -433,10 +408,8 @@ export function LiveComposer({
 		}
 		historyCursor.current = -1;
 		setSending(true);
-		const submitted = new Set(attachments);
 		try {
-			await send(input);
-			if (active.current) updateAttachments(attachmentList.current.filter((item) => !submitted.has(item)));
+			await send(input, { text: draft, attachments });
 		} catch {
 			/* The controller keeps the draft and displays the failure. */
 		} finally {
@@ -609,7 +582,7 @@ export function LiveComposer({
 									type="button"
 									aria-label={`移除附件 ${item.name}`}
 									onClick={() => {
-										updateAttachments(attachmentList.current.filter((_, at) => at !== index));
+										updateAttachments((items) => items.filter((_, at) => at !== index));
 										textarea.current?.focus();
 									}}
 								>
