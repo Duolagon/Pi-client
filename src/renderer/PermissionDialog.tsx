@@ -16,6 +16,7 @@ export interface SubagentApprovalSource {
 
 export function PermissionDialog({
 	request,
+	inline = false,
 	conversationId,
 	project,
 	subagentSource,
@@ -25,6 +26,7 @@ export function PermissionDialog({
 	fail,
 }: {
 	request: RpcExtensionUIRequest | TaskPendingApproval;
+	inline?: boolean;
 	conversationId?: string;
 	project?: string;
 	/** Present when this approval bubbled up from a delegated sub-agent. */
@@ -183,27 +185,31 @@ export function PermissionDialog({
 	const modalTitle = subagentLabel ? `${subagentLabel} 请求：${title}${queueTag}` : `${title}${queueTag}`;
 
 	const canDefer = Boolean(defer) && !("timeout" in request && request.timeout);
-	return (
-		<Modal title={modalTitle} close={cancel}>
+	const reason = parsedConfirm?.reason;
+	const detailReason = inline && reason === "此工具操作需要确认。" ? "" : reason;
+	const fileReason = parsedConfirm && <p className="cc-perm-reason">
+		{detailReason && <span>{detailReason}{!inline && " · "}</span>}
+		<code>{String(parsedConfirm.input.path ?? "")}</code>
+	</p>;
+	const controls = (
+		<>
 			{canDefer && request.method !== "confirm" && (
 				<button type="button" className="cc-mini-btn cc-defer-approval cc-defer-top" disabled={pending} onClick={defer}>稍后处理</button>
 			)}
 			<div className="simple-dialog permission-dialog">
-				<div className="live-permission-note">
+				{!inline && <div className="live-permission-note">
 					<ShieldCheck size={17} />
 					<span>
 						{subagentLabel
 							? `此请求来自 ${subagentLabel}；按 Esc 仅拒绝本次调用，不会停止子 Agent。`
-							: "此请求来自正在运行的 Pi 会话。"}
+							: "此操作正在等待你决定。"}
 					</span>
-				</div>
+				</div>}
 				{request.method === "confirm" && (
 					<>
 						{parsedConfirm && editHunks.length > 0 ? (
 							<div className="cc-perm-preview">
-								<p className="cc-perm-reason">
-									{parsedConfirm.reason} · <code>{String(parsedConfirm.input.path ?? "")}</code>
-								</p>
+								{fileReason}
 								<div className="cc-perm-scroll">
 									{editHunks.map((hunk, idx) => (
 										<div key={idx} className={idx > 0 ? "cc-edit-hunk-sep" : undefined}>
@@ -214,16 +220,14 @@ export function PermissionDialog({
 							</div>
 						) : parsedConfirm && inferredTool === "write" && typeof parsedConfirm.input.content === "string" ? (
 							<div className="cc-perm-preview">
-								<p className="cc-perm-reason">
-									{parsedConfirm.reason} · <code>{String(parsedConfirm.input.path ?? "")}</code>
-								</p>
+								{fileReason}
 								<div className="cc-perm-scroll">
 									<CodeLines content={parsedConfirm.input.content} />
 								</div>
 							</div>
 						) : parsedConfirm && inferredTool === "bash" && typeof parsedConfirm.input.command === "string" ? (
 							<div className="cc-perm-preview">
-								<p className="cc-perm-reason">{parsedConfirm.reason}</p>
+								{detailReason && <p className="cc-perm-reason">{detailReason}</p>}
 								<pre className="permission-detail cc-bash-out">{`$ ${parsedConfirm.input.command}`}</pre>
 							</div>
 						) : (
@@ -257,7 +261,7 @@ export function PermissionDialog({
 								</button>
 							)}
 							<button
-								autoFocus data-autofocus
+								autoFocus={!inline} data-autofocus={!inline || undefined}
 								disabled={pending}
 								onClick={() => void answer({ type: "extension_ui_response", id: request.id, confirmed: true })}
 								className="primary-button"
@@ -391,6 +395,15 @@ export function PermissionDialog({
 					</form>
 				)}
 			</div>
-		</Modal>
+		</>
 	);
+	if (inline) {
+		return (
+			<section className="cc-inline-approval" role="region" aria-label={modalTitle} tabIndex={-1}>
+				<h3>{modalTitle}</h3>
+				{controls}
+			</section>
+		);
+	}
+	return <Modal title={modalTitle} close={cancel}>{controls}</Modal>;
 }

@@ -715,6 +715,17 @@ export default function permissions(pi: ExtensionAPI) {
 			memoryToolPaths.clear();
 			analyzedPaths = -1;
 		});
+		// Steering and follow-up inputs enter the active run as user messages, without
+		// another before_agent_start event. Resolve references when the input is delivered.
+		pi.on("message_start", ({ message }) => {
+			if (message.role !== "user") return;
+			const next = typeof message.content === "string" ? message.content : message.content
+				.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+			if (next !== prompt) {
+				prompt = next;
+				analyzedPaths = -1;
+			}
+		});
 		pi.on("context_with_system", async (event) => {
 			if (analyzedPaths !== memoryToolPaths.size) {
 				const user = userMemoryFile ? await userMemoryContext(userMemoryFile, system) : "";
@@ -1099,6 +1110,12 @@ export default function permissions(pi: ExtensionAPI) {
 		}
 	});
 	pi.on("tool_result", async (event) => {
+		const bashExitCode = event.toolName === "bash" && event.structuredContent &&
+			typeof event.structuredContent === "object" && "exit_code" in event.structuredContent
+			? event.structuredContent.exit_code : undefined;
+		const recorded = typeof bashExitCode === "number" && Number.isInteger(bashExitCode)
+			? { details: { ...(event.details && typeof event.details === "object" ? event.details : {}), exitCode: bashExitCode } }
+			: undefined;
 		if (memoryRoot && !event.isError && ["read", "write", "edit"].includes(event.toolName) && typeof event.input.path === "string" && memoryToolPaths.size < 64)
 			memoryToolPaths.add(event.input.path);
 		// grep/find/ls search a directory; hide individual results that path deny
@@ -1124,8 +1141,8 @@ export default function permissions(pi: ExtensionAPI) {
 				? ([...blocks, { type: "text", text: postTodoReminder } as unknown as T])
 				: blocks;
 		const changed = () => {
-			if (!redacted && !postTodoReminder) return undefined;
-			return { content: withTodoNudge(event.content) };
+			if (!redacted && !postTodoReminder) return recorded;
+			return { ...recorded, content: withTodoNudge(event.content) };
 		};
 		if (testingConnection) return changed();
 		const errorText = event.isError ? textFromBlocks(event.content).slice(0, 4000) : undefined;
@@ -1141,10 +1158,10 @@ export default function permissions(pi: ExtensionAPI) {
 		if (!hook) return changed();
 		if (hook.blocked && !event.isError) {
 			const reason = typeof hook.reason === "string" ? hook.reason : "PostToolUse Hook 报告检查失败。";
-			return { content: [...event.content, { type: "text" as const, text: `\n\n[Hook Blocked] ${reason}` }], isError: true };
+			return { ...recorded, content: [...event.content, { type: "text" as const, text: `\n\n[Hook Blocked] ${reason}` }], isError: true };
 		}
 		if (!hook.suppressOutput && typeof hook.additionalContext === "string" && hook.additionalContext.trim()) {
-			return { content: [...event.content, { type: "text" as const, text: `\n\n[Hook Context]\n${hook.additionalContext.trim()}` }] };
+			return { ...recorded, content: [...event.content, { type: "text" as const, text: `\n\n[Hook Context]\n${hook.additionalContext.trim()}` }] };
 		}
 		return changed();
 	});

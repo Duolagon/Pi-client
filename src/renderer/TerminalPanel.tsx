@@ -17,6 +17,7 @@ export function TerminalPanel({
 	readOnly,
 	bashBusy,
 	bashOutput,
+	prefill,
 	onRunBash,
 	onAbortBash,
 	onClose,
@@ -30,19 +31,20 @@ export function TerminalPanel({
 	readOnly: boolean;
 	bashBusy: boolean;
 	bashOutput: string;
+	prefill?: { command: string; requestId: number };
 	onRunBash: (cmd: string) => Promise<void>;
 	onAbortBash: () => void;
 	onClose: () => void;
 	fail: (error: unknown) => void;
 }) {
-	const [mode, setMode] = useState<"bash" | "pty">(focusId ? "pty" : "bash");
+	const [mode, setMode] = useState<"bash" | "pty">(focusId && !prefill ? "pty" : "bash");
 	const [packageForm, setPackageForm] = useState(false);
 	const [packageSource, setPackageSource] = useState("");
 	const [sshForm, setSshForm] = useState(false);
 	const [sshHost, setSshHost] = useState("");
 	const [sshPi, setSshPi] = useState(true);
 	const [creating, setCreating] = useState(false);
-	const [shellInput, setShellInput] = useState("");
+	const [shellInput, setShellInput] = useState(prefill?.command ?? "");
 	const shellHistory = useRef<string[]>([]);
 	const historyAt = useRef(-1);
 	const [ptyInput, setPtyInput] = useState("");
@@ -50,6 +52,13 @@ export function TerminalPanel({
 	const [activeId, setActiveId] = useState<string | null>(null);
 	const [ptyOutputs, setPtyOutputs] = useState<Record<string, string>>({});
 	const shellRef = useRef<HTMLDivElement>(null);
+	const commandInput = useRef<HTMLInputElement>(null);
+	useEffect(() => {
+		if (!prefill) return;
+		setMode("bash");
+		setShellInput(prefill.command);
+		requestAnimationFrame(() => commandInput.current?.focus());
+	}, [prefill]);
 
 	useEffect(() => {
 		shellRef.current?.scrollTo({ top: shellRef.current.scrollHeight });
@@ -60,7 +69,7 @@ export function TerminalPanel({
 		void window.pi.terminals.list(conversationId).then(async (list) => {
 			setTerminals(list);
 			const live = list.find((t) => t.id === focusId) ?? [...list].reverse().find((t) => t.status === "running" || t.status === "starting") ?? list[list.length - 1];
-			if (focusId || list.some((t) => t.status === "running" || t.status === "starting")) setMode("pty");
+			if (!prefill && (focusId || list.some((t) => t.status === "running" || t.status === "starting"))) setMode("pty");
 			if (live) {
 				setActiveId(live.id);
 				try {
@@ -219,7 +228,7 @@ export function TerminalPanel({
 						<label htmlFor="shell-command">$</label>
 						<input
 							id="shell-command"
-							aria-label="终端命令"
+							aria-label="终端命令" ref={commandInput}
 							value={shellInput}
 							onChange={(event) => setShellInput(event.target.value)}
 							onKeyDown={(event) => {

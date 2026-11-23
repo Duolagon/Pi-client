@@ -1,0 +1,93 @@
+.cc-composer-delivery {
+	display: inline-flex;
+	align-items: center;
+}
+
+.cc-composer-delivery select {
+	max-width: 100%;
+	border: 1px solid var(--cl-line);
+	border-radius: var(--r-md);
+	background: var(--cl-soft);
+	color: var(--cl-text);
+	font: inherit;
+	font-size: var(--fs-sm);
+	padding: 4px 6px;
+}
+
+.cl-conversation .cl-composer-row-left {
+	overflow: visible;
+}
+.cl-composer-row-left .cc-ws-picker-composer {
+	max-width: 50%;
+}
+.cl-composer-row-left .cl-pill-inline {
+	max-width: 55%;
+}
+.cl-conversation .cl-composer-row-left .cl-pill-inline :is(.cl-pill-select, select) {
+	min-width: 0;
+	max-width: 100%;
+}
+.cl-conversation .cl-composer-row-left .cl-pill-inline select {
+	text-overflow: ellipsis;
+}
+@container conversation (max-width: 640px) {
+	.cl-composer .cl-composer-hint {
+		display: none;
+	}
+	.cl-composer .cl-composer-row-left > .cc-ws-picker-composer {
+		flex: 0 0 auto;
+	}
+	.cl-composer .cc-ws-picker-composer .cc-ws-trigger {
+		padding-inline: 6px;
+	}
+	.cl-composer .cc-ws-picker-composer .cc-ws-name {
+		display: none;
+	}
+	.cl-composer .cl-composer-bar {
+		flex-wrap: wrap;
+	}
+	.cl-composer .cl-composer-row-left .cl-pill-inline {
+		max-width: none;
+	}
+	.cl-composer .cc-status-model,
+	.cl-composer .cc-status-model + .cc-status-item::before {
+		display: none;
+	}
+}
+@container conversation (max-width: 600px) {
+	.cl-composer.is-running .cl-composer-row {
+		flex-wrap: wrap;
+	}
+	.cl-composer.is-running .cl-composer-row-left {
+		flex-basis: 100%;
+		flex-wrap: wrap;
+	}
+	.cl-composer.is-running .cl-composer-row-right {
+		margin-inline-start: auto;
+	}
+}
+
+.cc-reference-empty {
+	padding: 12px;
+	color: var(--cl-3);
+	font-size: var(--fs-sm);
+}
+
+.cc-reference-chips {
+	max-height: 72px;
+	overflow-y: auto;
+}
+
+.cc-reference-status {
+	flex: 0 0 auto;
+	color: var(--cl-3);
+	font-size: var(--fs-xs);
+}
+
+.cc-reference-chips [role="listitem"] {
+	min-width: 0;
+}
+
+.cc-reference-chips .cl-attachment-name {
+	min-width: 0;
+}

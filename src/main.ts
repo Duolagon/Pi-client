@@ -297,6 +297,11 @@ function installHandlers() {
 		}
 	});
 	handle("pi:files", (path) => service.files(string(path, "文件路径")));
+	handle("pi:search-files", (id, query) => service.searchFiles(string(id, "会话 ID", 200), string(query, "文件查询", 4096)));
+	handle("pi:check-file-references", (id, paths) => {
+		if (!Array.isArray(paths) || paths.length > 24) throw new Error("文件引用列表无效。");
+		return service.checkFileReferences(string(id, "会话 ID", 200), paths.map((path) => string(path, "文件路径", 4096)));
+	});
 	handle("pi:read-file", (path) => service.readFile(string(path, "文件路径")));
 	handle("pi:workspace", () => service.workspace());
 	handle("pi:workspace:create-draft-pr", (id, input) => {

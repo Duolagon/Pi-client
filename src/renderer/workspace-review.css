@@ -1,0 +1,284 @@
+.workspace-review {
+	container: workspace-review / inline-size;
+	min-width: 0;
+}
+.workspace-review .workspace-review-header {
+	gap: 12px;
+}
+.workspace-review-header .workspace-review-tabs {
+	height: auto;
+	flex-shrink: 0;
+}
+.workspace-review-header .workspace-review-header-actions {
+	gap: 4px;
+	margin-inline-start: auto;
+}
+.workspace-review .workspace-review-scopes,
+.workspace-review .workspace-review-undo {
+	display: flex;
+	flex: none;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+	padding: 8px 12px;
+	border-bottom: 1px solid var(--cl-line-soft);
+}
+.workspace-review-scopes [aria-pressed="true"] {
+	background: var(--cl-soft);
+	border-color: var(--cl-2);
+	color: var(--cl-text);
+	font-weight: 600;
+}
+.workspace-review-scopes time,
+.workspace-review-git summary span {
+	margin-left: auto;
+	color: var(--cl-3);
+}
+.workspace-review .workspace-review-git {
+	flex: none;
+	border-bottom: 1px solid var(--cl-line-soft);
+}
+.workspace-review-git > summary {
+	cursor: pointer;
+	padding: 7px 12px;
+	font-size: var(--fs-sm);
+}
+.workspace-review-git > summary span {
+	margin-left: 8px;
+}
+.workspace-review-git > .cc-git-bulk {
+	padding: 4px 12px 8px;
+	flex-wrap: wrap;
+}
+.workspace-review .workspace-review-hint {
+	flex: none;
+	margin: 0;
+	padding: 6px 12px;
+	font-size: var(--fs-sm);
+}
+.workspace-review .workspace-review-body {
+	display: flex;
+	flex: 1;
+	flex-direction: column;
+	min-height: 0;
+	min-width: 0;
+}
+.workspace-review .workspace-review-files {
+	flex: 1;
+	align-content: start;
+	grid-auto-rows: max-content;
+	min-height: 0;
+	min-width: 0;
+	overflow: auto;
+	padding: 6px 8px 8px;
+}
+.workspace-review .workspace-review-files:has(+ .workspace-review-preview) {
+	flex: 0 1 auto;
+	min-height: 64px;
+	max-height: 28%;
+	border-bottom: 1px solid var(--cl-line-soft);
+}
+.workspace-review-files .cc-change-section {
+	padding: 6px 8px 2px;
+}
+.workspace-review-files .cc-change-row {
+	padding-inline-end: 0;
+}
+.workspace-review-files .cc-change-open {
+	min-height: 30px;
+	font-size: var(--fs-sm);
+}
+.workspace-review-files .cc-change-open > svg {
+	flex: none;
+}
+.workspace-review-files .cc-change-open[aria-current="true"] {
+	background: var(--cl-soft);
+	box-shadow: inset 2px 0 var(--cl-clay);
+	color: var(--cl-text);
+}
+.workspace-review .workspace-review-preview {
+	display: flex;
+	flex: 1;
+	flex-direction: column;
+	min-width: 0;
+	min-height: 0;
+}
+.workspace-review .workspace-review-navigation {
+	display: flex;
+	flex: none;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px 12px;
+	padding: 8px 12px;
+	border-bottom: 1px solid var(--cl-line-soft);
+}
+.workspace-review-path {
+	display: flex;
+	flex: 1 1 100%;
+	min-width: 0;
+	color: var(--cl-text);
+	font-family: var(--mono);
+	font-size: var(--fs-sm);
+}
+.workspace-review-path > * {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.workspace-review-path span {
+	max-width: 50%;
+	color: var(--cl-3);
+}
+.workspace-review-path strong {
+	flex: 0 1 auto;
+	font-weight: 600;
+}
+.workspace-review-toolbar,
+.workspace-review-stepper,
+.workspace-review .workspace-review-actions {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 5px;
+	font-size: var(--fs-xs);
+}
+.workspace-review-toolbar {
+	min-width: 0;
+	gap: 5px 8px;
+}
+.workspace-review-stepper {
+	flex-wrap: nowrap;
+	gap: 2px;
+	border: 1px solid var(--cl-line-soft);
+	border-radius: var(--r-sm);
+	color: var(--cl-3);
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+.workspace-review-toolbar .icon-button {
+	width: 24px;
+	height: 24px;
+}
+.workspace-review-actions .cc-mini-btn,
+.workspace-review-actions .icon-button {
+	height: 26px;
+}
+.workspace-review-toolbar .icon-button svg {
+	width: 14px;
+	height: 14px;
+}
+.workspace-review-stepper .icon-button:disabled {
+	opacity: 0.4;
+}
+.workspace-review .workspace-review-diff {
+	min-height: 0;
+	min-width: 0;
+	padding: 0;
+}
+.workspace-review .workspace-review-diff .cc-diff:not(.cc-diff-split) {
+	width: max-content;
+	min-width: 100%;
+	overflow: visible;
+}
+.workspace-review .workspace-review-diff .cc-diff-split .cc-diff-line {
+	min-width: 0;
+}
+.workspace-review .workspace-review-diff .cc-diff-split-cell .cc-diff-code,
+.workspace-review .workspace-review-diff .cc-diff-split .cc-diff-meta .cc-diff-code {
+	min-width: 0;
+	overflow: visible;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	text-overflow: clip;
+}
+.workspace-review .workspace-review-notes {
+	flex: 0 1 auto;
+	max-height: 34%;
+	min-height: 0;
+	overflow: auto;
+	padding: 8px 12px;
+	border-top: 1px solid var(--cl-line-soft);
+	background: var(--cl-surface);
+	font-size: var(--fs-sm);
+}
+.workspace-review-notes ul {
+	display: grid;
+	gap: 7px;
+	margin: 0 0 8px;
+	padding: 0;
+	list-style: none;
+}
+.workspace-review-notes li {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 8px;
+	padding: 7px 8px;
+	border-radius: var(--r-sm);
+	background: var(--cl-soft);
+}
+.workspace-review-notes li div:first-child {
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+.workspace-review-notes li div:last-child,
+.workspace-review-note-editor > div,
+.workspace-review-discard > div:last-child {
+	display: flex;
+	flex-shrink: 0;
+	gap: 5px;
+}
+.workspace-review-notes li p {
+	margin: 2px 0 0;
+	white-space: pre-wrap;
+}
+.workspace-review-note-editor {
+	display: grid;
+	gap: 6px;
+	margin-bottom: 8px;
+}
+.workspace-review-note-editor label {
+	display: grid;
+	gap: 4px;
+	overflow-wrap: anywhere;
+}
+.workspace-review-note-editor textarea {
+	width: 100%;
+	min-height: 58px;
+}
+.workspace-review-discard code {
+	overflow-wrap: anywhere;
+}
+.workspace-review-discard > div:last-child {
+	justify-content: flex-end;
+	margin-top: 14px;
+}
+@container workspace-review (min-width: 620px) {
+	.workspace-review .workspace-review-body {
+		flex-direction: row;
+	}
+	.workspace-review .workspace-review-files:has(+ .workspace-review-preview) {
+		flex: 0 0 clamp(188px, 30%, 260px);
+		max-height: none;
+		border-right: 1px solid var(--cl-line-soft);
+		border-bottom: 0;
+	}
+}
+@container workspace-review (min-width: 920px) {
+	.workspace-review-path {
+		flex-basis: 190px;
+	}
+}
+.workspace-review .inspector-header .workspace-review-back {
+	display: none;
+	white-space: nowrap;
+}
+@media (max-width: 860px) {
+	.workspace-review .inspector-header .workspace-review-back {
+		display: inline-flex;
+	}
+	.workspace-review .inspector-header .workspace-review-focus {
+		display: none;
+	}
+}

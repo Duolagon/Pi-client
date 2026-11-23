@@ -64,9 +64,9 @@ export function WorkspacePicker({
 				<Folder size={13} className="cc-ws-icon" />
 				<span className="cc-ws-name">{activeProject ? activeProject.name : "选择工作目录"}</span>
 				{variant === "topbar" && activeProject && gitBranch && (
-					<span className="cc-ws-branch">
+					<span className="cc-ws-branch" title={gitBranch}>
 						<GitBranch size={11} />
-						{gitBranch}
+						<span>{gitBranch}</span>
 					</span>
 				)}
 				<ChevronDown size={12} className="cc-ws-caret" />

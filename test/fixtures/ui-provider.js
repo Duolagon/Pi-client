@@ -51,6 +51,9 @@ export default function uiProvider(pi) {
 				response = results.length < steps.length ? steps[results.length] : fauxAssistantMessage(results.some((result) => result.isError)
 					? "本地演示验证失败，请检查工具输出。"
 					: "已完成问候函数，并通过项目测试。\n\n- 补全 `greet(name)`，返回中文问候语。\n- 使用真实文件工具更新 `src/greeting.mjs`。\n- 运行 `node --test`，测试全部通过。\n\n可以在右侧审核代码差异，再继续下一步。\n\n```js\ngreet(\"Pi\"); // 你好，Pi！\n```");
+			} else if (prompt === "提交本地演示计划") {
+				response = results.length ? fauxAssistantMessage("本地演示计划已提交。")
+					: fauxAssistantMessage(fauxToolCall("ExitPlanMode", { title: "E2E Plan", plan: "1. Review the implementation." }), { stopReason: "toolUse" });
 			} else if (prompt.includes("审批拒绝验证")) {
 				response = results.length ? fauxAssistantMessage(results[0].isError ? "写入已按你的选择取消。" : "写入已执行。")
 					: fauxAssistantMessage(fauxToolCall("write", { path: "denied.txt", content: "should be denied\n" }), { stopReason: "toolUse" });

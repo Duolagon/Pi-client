@@ -124,6 +124,15 @@ try {
 		await page.getByRole("button", { name: "更多工具", exact: true }).click();
 		await page.getByRole("menuitem", { name, exact: true }).click();
 	};
+	const assertChatEdges = async (card) => {
+		const boxes = await Promise.all([".cl-transcript", ".cl-composer-box", card].map((selector) => page.locator(selector).boundingBox()));
+		assert.ok(boxes.every(Boolean), `Visible transcript, composer and ${card}`);
+		const [transcript, ...rest] = boxes;
+		for (const box of rest) {
+			assert.ok(Math.abs(box.x - transcript.x) <= 2 && Math.abs(box.width - transcript.width) <= 2,
+				`Chat edges should align for ${card}: ${JSON.stringify(boxes)}`);
+		}
+	};
 	await ready();
 	assert.ok((await snapshot()).models.length >= 2);
 	await page.getByRole("combobox", { name: "选择模型", exact: true }).selectOption({ label: "本地演示模型 · 备用" });
@@ -211,7 +220,7 @@ try {
 	checks.push("conversation attachment isolation, input resize and upload limits");
 
 	await submit("审批拒绝验证");
-	await page.getByRole("dialog", { name: "允许执行 write？", exact: true }).waitFor();
+	await page.getByRole("region", { name: "允许执行 write？", exact: true }).waitFor();
 	await page.getByRole("button", { name: "拒绝", exact: true }).click();
 	await page.getByText("写入已按你的选择取消。", { exact: true }).waitFor();
 	await idle();
@@ -240,9 +249,33 @@ try {
 
 	await page.getByRole("button", { name: "新建会话", exact: true }).click();
 	await ready();
+	const personalFile = join(project, "personal-notes.txt");
+	await writeFile(personalFile, "原有手工笔记\n");
+	const appWindow = await application.browserWindow(page);
+	const [originalWidth, originalHeight] = await appWindow.evaluate((win) => win.getSize());
+	const resizeWindow = async (width) => {
+		await appWindow.evaluate((win, [w, h]) => win.setSize(w, h), [width, originalHeight]);
+		await page.waitForFunction((w) => window.innerWidth === w, width);
+	};
 	await submit("请实现问候函数，并运行测试确认中文问候语正确。");
 	for (const name of ["write", "bash"]) {
-		await page.getByRole("dialog", { name: `允许执行 ${name}？`, exact: true }).waitFor();
+		await page.getByRole("region", { name: `允许执行 ${name}？`, exact: true }).waitFor();
+		await assertChatEdges(".cc-active-request");
+		if (name === "write") {
+			await resizeWindow(1100);
+			await page.getByRole("button", { name: "代码修改", exact: true }).click();
+			await page.locator(".live-app.has-compact-inspector").waitFor();
+			await assertChatEdges(".cc-active-request");
+			const timing = await page.getByRole("combobox", { name: "补充指令发送时机", exact: true }).boundingBox();
+			for (const label of ["选择模型", "思考强度"]) {
+				const control = await page.getByRole("combobox", { name: label, exact: true }).boundingBox();
+				assert.ok(control?.width > 20 && timing?.width > 20 &&
+					(control.x + control.width <= timing.x || control.y + control.height <= timing.y),
+					`${label} and the delivery selector must remain visible without overlap`);
+			}
+			await page.getByRole("button", { name: "关闭工作区面板", exact: true }).click();
+			await resizeWindow(originalWidth);
+		}
 		await page.getByRole("button", { name: "允许执行", exact: true }).click();
 	}
 	await page.getByText("已完成问候函数，并通过项目测试。", { exact: true }).waitFor();
@@ -255,14 +288,55 @@ try {
 	await stepGroup.click();
 	assert.match(await readFile(join(project, "src/greeting.mjs"), "utf8"), /你好/);
 	assert.ok((await input.boundingBox()).height < 100);
+	const checksDetail = page.locator(".cc-turn-checks");
+	await checksDetail.locator("summary").click();
+	await checksDetail.getByText("node --test test/greeting.test.mjs", { exact: true }).waitFor();
+	await checksDetail.getByText("通过 · 退出码 0", { exact: true }).waitFor();
+	await checksDetail.getByRole("button", { name: "在终端重跑", exact: true }).click();
+	await until(async () => await page.getByRole("textbox", { name: "终端命令", exact: true }).inputValue() === "node --test test/greeting.test.mjs", "recorded command in terminal input");
+	await page.getByRole("button", { name: "关闭终端", exact: true }).click();
 	await page.locator(".cl-title-button").click();
 	await page.getByRole("textbox", { name: "会话名称", exact: true }).fill("实现问候函数与测试");
 	await page.getByRole("button", { name: "保存名称", exact: true }).click();
-	await page.getByRole("button", { name: "代码修改", exact: true }).click();
-	await page.locator(".changed-file-list button").filter({ hasText: "greeting.mjs" }).click();
+	await page.getByRole("button", { name: "审查本轮改动", exact: true }).click();
+	const files = page.locator(".changed-file-list .cc-change-open");
+	await files.filter({ hasText: "greeting.mjs" }).click();
+	assert.equal(await files.filter({ hasText: "personal-notes.txt" }).count(), 0);
 	await page.locator(".live-diff").filter({ hasText: "你好" }).waitFor();
-	await page.getByRole("button", { name: "关闭工作区面板", exact: true }).click();
-	checks.push("real read/write/bash tools, grouped transcript and Git diff");
+	await page.getByRole("button", { name: "整个工作区", exact: true }).click();
+	await files.filter({ hasText: "personal-notes.txt" }).waitFor();
+	await page.getByRole("button", { name: "本轮改动", exact: true }).click();
+	await rm(personalFile);
+	checks.push("real read/write/bash tools, recorded check and rerun, exact turn review excludes pre-existing edits");
+
+	await resizeWindow(1100);
+	const expandSidebar = page.getByRole("button", { name: "展开侧栏", exact: true });
+	await expandSidebar.waitFor();
+	const chatHeader = await page.locator(".cl-top").boundingBox();
+	const reviewHeader = await page.locator(".workspace-review > .inspector-header").boundingBox();
+	const moreTools = await page.getByRole("button", { name: "更多工具", exact: true }).boundingBox();
+	assert.ok(chatHeader && reviewHeader && moreTools);
+	assert.equal(await page.getByRole("complementary", { name: "项目与会话" }).count(), 0);
+	assert.ok((await expandSidebar.boundingBox()).x >= 90, "The sidebar button must clear the macOS window controls");
+	assert.ok(Math.abs(chatHeader.height - reviewHeader.height) <= 1, "Chat and review headers must align");
+	assert.ok(moreTools.x + moreTools.width <= reviewHeader.x, "The toolbar must fit within the chat column");
+	await assertChatEdges(".cc-completion-card");
+	await expandSidebar.click();
+	await page.getByRole("complementary", { name: "项目与会话" }).waitFor();
+	await page.getByRole("button", { name: "审查本轮改动", exact: true }).click();
+
+	await resizeWindow(800);
+	const backToChat = page.getByRole("button", { name: "返回聊天", exact: true });
+	await backToChat.waitFor();
+	await input.waitFor({ state: "hidden" });
+	const fullReviewHeader = await page.locator(".workspace-review > .inspector-header").boundingBox();
+	assert.ok(fullReviewHeader && Math.abs(fullReviewHeader.width - 800) <= 1);
+	assert.ok((await backToChat.boundingBox()).x >= 90, "The full-width review toolbar must clear the macOS window controls");
+	await backToChat.click();
+	await input.waitFor();
+	await resizeWindow(originalWidth);
+	await appWindow.dispose();
+	checks.push("macOS window control clearance, aligned chat surfaces and responsive review at 1100px and 800px");
 	if (capture) {
 		const screenshots = join(repo, "docs/screenshots");
 		await mkdir(screenshots, { recursive: true });
@@ -451,6 +525,7 @@ try {
 	checks.push("Claude Code UI modals, autocomplete and PTY panel");
 
 	await page.getByRole("button", { name: "代码修改", exact: true }).click();
+	await page.getByRole("button", { name: "整个工作区", exact: true }).click();
 	await page.getByRole("button", { name: "暂存 src/greeting.mjs", exact: true }).click();
 	await page.locator(".cc-change-section").filter({ hasText: "已暂存 (1)" }).waitFor();
 	await page.getByRole("button", { name: "取消暂存 src/greeting.mjs", exact: true }).click();
@@ -461,11 +536,17 @@ try {
 	await page.locator(".cc-diff-split").waitFor();
 	await page.getByRole("button", { name: /^评审新行 / }).first().click();
 	await page.getByRole("textbox", { name: "逐行评审反馈", exact: true }).fill("Check greeting punctuation.");
-	await page.getByRole("button", { name: "加入会话草稿", exact: true }).click();
-	assert.match(await input.inputValue(), /src\/greeting.mjs[\s\S]*Check greeting punctuation\./);
+	await input.fill("这份会话草稿应当保留");
+	await page.getByRole("button", { name: "保存评审意见", exact: true }).click();
+	assert.equal(await input.inputValue(), "这份会话草稿应当保留");
+	await page.getByRole("button", { name: "发送 1 条评审意见", exact: true }).click();
+	await until(async () => (await snapshot()).messages.some((message) => message.role === "user" &&
+		message.content.some((block) => block.type === "text" && /src\/greeting.mjs[\s\S]*Check greeting punctuation\./.test(block.text))), "sent review feedback");
+	await idle();
+	assert.equal(await input.inputValue(), "这份会话草稿应当保留");
 	await input.fill("");
 	await page.getByRole("button", { name: "关闭工作区面板", exact: true }).click();
-	checks.push("split Diff line feedback enters the active draft");
+	checks.push("split diff and batched inline review feedback preserve the existing chat draft");
 
 	await openMore("项目记忆与状态");
 	await page.getByRole("dialog", { name: "项目记忆与会话状态", exact: true }).waitFor();
@@ -534,13 +615,40 @@ try {
 	await page.getByText("已收到补充指令，客户端与 Pi 引擎连接正常。", { exact: true }).waitFor();
 	await idle();
 	await page.getByRole("region", { name: "计划审批", exact: true }).waitFor();
+	assert.equal(await page.getByRole("button", { name: "批准计划 · 接受编辑", exact: true }).count(), 0);
 	await page.getByRole("button", { name: "编写计划正文", exact: true }).click();
 	await page.getByRole("textbox", { name: "编辑计划内容", exact: true }).fill("# E2E Plan\n1. Check plan persistence\n");
-	await page.getByRole("button", { name: "退出 Plan", exact: true }).click();
+	await page.getByRole("button", { name: "使用这份计划", exact: true }).click();
+	const plan = await page.evaluate(() => window.pi.readPlan());
+	await mkdir(dirname(plan.path), { recursive: true });
+	await writeFile(plan.path, "# 另一份计划\n");
+	await page.getByRole("button", { name: "批准计划 · 接受编辑", exact: true }).click();
+	await page.getByRole("alert").filter({ hasText: "计划文件在编辑期间发生了变化" }).waitFor();
+	assert.equal((await snapshot()).settings.permission, "plan");
+	assert.equal(await readFile(plan.path, "utf8"), "# 另一份计划\n");
+	page.once("dialog", (dialog) => dialog.accept());
+	await page.getByRole("button", { name: "重新读取计划", exact: true }).click();
+	const planEditor = page.getByRole("textbox", { name: "编辑计划内容", exact: true });
+	await until(async () => (await planEditor.inputValue()) === "# 另一份计划\n", "latest plan file in editor");
+	await submit("提交本地演示计划");
+	await page.getByText("本地演示计划已提交。", { exact: true }).waitFor();
+	await idle();
+	const approve = page.getByRole("button", { name: "批准计划 · 逐项确认", exact: true });
+	await approve.waitFor();
+	const approvedBody = "# E2E Plan\n1. Review this exact version.\n";
+	await planEditor.fill(approvedBody);
+	await approve.click();
 	await until(
-		async () => (await page.getByRole("combobox", { name: "权限模式", exact: true }).inputValue()) === "ask",
-		"Plan mode restore ask",
+		async () => {
+			const value = await snapshot();
+			return value.settings.permission === "ask" && value.messages.some((message) => message.role === "user" &&
+				message.content.some((part) => part.type === "text" && part.text.startsWith("计划已批准") && part.text.trimEnd().endsWith(approvedBody.trimEnd())));
+		},
+		"the approved revision reaches the model in the selected permission mode",
 	);
+	await idle();
+	assert.equal(await readFile(plan.path, "utf8"), approvedBody);
+	checks.push("plan requires explicit submission, rejects stale revisions and sends the approved saved body with the chosen permissions");
 	await input.fill("");
 
 	await openMore("工具与权限");
@@ -683,8 +791,10 @@ try {
 	await submit("停止生成验证");
 	await page.waitForFunction(() => document.querySelector(".cl-transcript")?.textContent.includes("流式恢复验证："));
 	await input.fill("第二条会话草稿");
-	await page.locator(".cl-conv").filter({ hasText: "审批拒绝验证" }).filter({ has: page.locator(".cl-conv-status", { hasText: "待确认" }) }).first().click();
-	await page.getByRole("dialog", { name: "允许执行 write？", exact: true }).waitFor();
+	const attention = page.getByRole("region", { name: "任务动态", exact: true });
+	await attention.getByRole("heading", { name: /待我处理/ }).waitFor();
+	await attention.getByRole("button", { name: /审批拒绝验证/ }).first().click();
+	await page.getByRole("region", { name: "允许执行 write？", exact: true }).waitFor();
 	assert.equal(await input.inputValue(), "只属于第一条会话的草稿");
 	assert.equal((await snapshot()).active.id, approvalSession.id);
 	assert.equal((await snapshot()).activity[secondSession.id], "running");
@@ -814,11 +924,15 @@ try {
 		await newChat();
 		await startStream();
 		const text = withImage ? "带图的立即发送回归检查" : "纯文本立即发送回归检查";
+		const timing = page.getByRole("combobox", { name: "补充指令发送时机", exact: true });
+		assert.equal(await timing.inputValue(), "followUp");
+		if (withImage) await timing.selectOption("steer");
 		await input.fill(text);
 		if (withImage) await attachPicture();
 		await input.press("Enter");
 		await queue.waitFor();
-		await queue.getByRole("button", { name: "立即发送", exact: true }).click();
+		await queue.getByText(withImage ? "下一工具步骤" : "本轮结束后", { exact: true }).waitFor();
+		await queue.getByRole("button", { name: "停止并发送队列", exact: true }).click();
 		await until(async () => Boolean(queuedUserMessage((await snapshot()).messages, text)), text);
 		await idle();
 		const userMessage = queuedUserMessage((await snapshot()).messages, text);

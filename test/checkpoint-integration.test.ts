@@ -129,6 +129,8 @@ test(
 			const checkpoints = await service.listCheckpoints();
 			assert.equal(checkpoints.length, 1);
 			assert.equal(checkpoints[0].status, "ready");
+			const entries = await service.sessionForkMessages();
+			assert.equal(checkpoints[0].userEntryId, entries.messages[0].entryId);
 			assert.deepEqual(
 				checkpoints[0].changes.map((change) => change.path),
 				["command.txt", "generated.txt"],
@@ -148,6 +150,28 @@ test(
 		}
 	},
 );
+
+test("identical prompts get distinct native checkpoint identities and cannot be restored from another conversation", { timeout: 30000 }, async () => {
+	const { service, events, cleanup } = await setup();
+	try {
+		for (let run = 0; run < 2; run++) {
+			const settled = events.wait("agent_settled");
+			await service.command({ type: "prompt", message: "read-write-bash" });
+			await settled;
+		}
+		const checkpoints = await service.listCheckpoints();
+		const entries = await service.sessionForkMessages();
+		assert.equal(checkpoints.length, 2);
+		assert.equal(checkpoints[0].label, checkpoints[1].label);
+		assert.deepEqual(checkpoints.map((checkpoint) => checkpoint.userEntryId), entries.messages.map((entry) => entry.entryId).reverse());
+		const another = await service.newConversation();
+		assert.equal(another.active?.project, checkpoints[0].project);
+		await assert.rejects(service.checkpointDiff(checkpoints[0].id, another.active!.id), /不属于当前会话/);
+		await assert.rejects(service.restoreCheckpoint(checkpoints[0].id, another.active!.id), /不属于当前会话/);
+	} finally {
+		await cleanup();
+	}
+});
 
 test(
 	"direct bash gets its own checkpoint and later external edits block an all-files restore",

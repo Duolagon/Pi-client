@@ -72,6 +72,18 @@ export interface DesktopGitAPI {
 	diff(input: CheckpointTarget & { path?: string }): Promise<GitCheckpointDiff>;
 	restore(input: CheckpointTarget & { paths?: string[] }): Promise<GitRestoreResult>;
 }
+
+export interface GitDiscardInput {
+	conversationId?: string;
+	path: string;
+	kind: "tracked" | "untracked";
+}
+
+export interface GitDiscardResult {
+	workspace: Workspace;
+	disposition: "restored" | "trashed";
+	undoCheckpoint?: GitCheckpoint;
+}
 export type PiPackageAction = "list" | "install" | "update" | "remove";
 export interface DesktopTerminalAPI {
 	packages(conversationId: string, action: PiPackageAction, source?: string): Promise<TerminalInfo>;
@@ -621,6 +633,7 @@ export interface Snapshot {
 	/** Background sub-agent results this conversation holds without delivery ("待交付"). */
 	pendingTaskNotifications?: number;
 	queuedMessages?: string[];
+	queuedPromptGroups?: QueuedPromptGroups;
 	/** Open interactive approvals of all descendant tasks of the active conversation. */
 	childApprovals?: ChildApprovalRequest[];
 }
@@ -628,6 +641,7 @@ export type DesktopEvent = {
 	conversationId: string;
 	/** Monotonic within this desktop host; used to replay events crossing a snapshot. */
 	sequence?: number;
+	queuedPromptGroups?: QueuedPromptGroups;
 	event:
 		| JsonAgentSessionEvent
 		| RpcExtensionUIRequest
@@ -637,6 +651,8 @@ export type DesktopEvent = {
 export type Command = RpcCommand;
 export type DesktopPromptResult = { disposition: "started" | "handled" | "queued" | "forked_skill" };
 export type QueueActionResult = { drafts: ComposerDraft[]; error?: string };
+export type QueuedPromptGroups = { steering: string[]; followUp: string[] };
+export type FileReferenceAvailability = "ready" | "untrusted" | "unavailable";
 export interface DesktopTodosAPI {
 	list(conversationId?: string): Promise<TodoRecord[]>;
 	create(conversationId: string, input: TodoCreateInput): Promise<TodoRecord>;
@@ -706,6 +722,8 @@ export interface DesktopAPI {
 	actOnQueue(id: string, action: "withdraw" | "send"): Promise<QueueActionResult>;
 	respond(response: RpcExtensionUIResponse, conversationId?: string): Promise<void>;
 	files(path: string): Promise<FileEntry[]>;
+	searchFiles(conversationId: string, query: string): Promise<FileEntry[]>;
+	checkFileReferences(conversationId: string, paths: string[]): Promise<FileReferenceAvailability[]>;
 	readFile(path: string): Promise<{ path: string; content: string }>;
 	workspace(): Promise<Workspace>;
 	createDraftPullRequest(conversationId: string, draft: DraftPullRequest): Promise<{ url: string; number: number }>;
@@ -715,7 +733,8 @@ export interface DesktopAPI {
 	diff(path: string): Promise<string>;
 	gitStage(paths?: string[]): Promise<Workspace>;
 	gitUnstage(paths?: string[]): Promise<Workspace>;
-	gitDiscard(paths: string[]): Promise<Workspace>;
+	gitDiscardPreview(input: GitDiscardInput): Promise<{ version: string }>;
+	gitDiscard(input: GitDiscardInput & { expectedVersion: string }): Promise<GitDiscardResult>;
 	gitCommit(message: string): Promise<GitCommitResult>;
 	readMemory(): Promise<MemoryFileEntry[]>;
 	writeMemory(file: "AGENTS.md" | "CLAUDE.md", content: string): Promise<MemoryFileEntry>;

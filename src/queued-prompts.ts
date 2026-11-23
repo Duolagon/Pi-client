@@ -1,4 +1,5 @@
 import type { ComposerDraft } from "./composer-draft.ts";
+import type { QueuedPromptGroups } from "./shared.ts";
 
 type Lane = "steering" | "followUp";
 export type NativeQueue = Record<Lane, readonly string[]>;
@@ -74,8 +75,14 @@ export class QueuedPrompts {
 		});
 	}
 
-	preview(): string[] {
-		return [...this.entries.steering, ...this.entries.followUp].map(({ text, draft }) =>
+	groups(): QueuedPromptGroups {
+		const preview = (items: Entry[]) => items.map(({ text, draft }) =>
 			draft ? draft.text.trim() || draft.attachments.map((item) => item.name).join("、") : text);
+		return { steering: preview(this.entries.steering), followUp: preview(this.entries.followUp) };
+	}
+
+	preview(): string[] {
+		const { steering, followUp } = this.groups();
+		return [...steering, ...followUp];
 	}
 }

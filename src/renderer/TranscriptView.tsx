@@ -239,6 +239,10 @@ export function TranscriptView({
 	onStopTask,
 	onRewindPrompt,
 	onForkPrompt,
+	entryIds,
+	checkpointIds,
+	approvalTool,
+	onRerunCheck,
 	onOpenPreview,
 	onOpenFile,
 }: {
@@ -249,12 +253,20 @@ export function TranscriptView({
 	onOpenTask?: (taskId: string) => void;
 	onBackgroundTask?: (taskId: string) => void;
 	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
-	onRewindPrompt?: (text: string) => void;
-	onForkPrompt?: (text: string) => void;
+	onRewindPrompt?: (checkpointId: string) => void;
+	onForkPrompt?: (entryId: string) => void;
+	entryIds?: Record<number, string>;
+	checkpointIds?: Record<string, string>;
+	approvalTool?: string;
+	onRerunCheck?: (command: string) => void;
 	onOpenPreview?: (url: string) => void;
 	/** Opens a tool's file path in the configured external editor. */
 	onOpenFile?: OpenFileHandler;
 }) {
+	const messageIndices = new Map(state.messages.map((message, index) => [message, index]));
+	const approvals = approvalTool ? Object.entries(state.tools)
+		.filter(([, tool]) => tool.name === approvalTool && tool.status === "running") : [];
+	const waitingToolId = approvals.length === 1 ? approvals[0][0] : undefined;
 	return (
 		<div className="cl-transcript">
 			{units(state.messages).map((unit, index) => {
@@ -299,13 +311,8 @@ export function TranscriptView({
 							</details>
 						);
 					}
-					const promptText =
-						typeof message.content === "string"
-							? message.content
-							: message.content
-									.filter((b) => b.type === "text")
-									.map((b) => b.text)
-									.join("\n");
+					const entryId = entryIds?.[messageIndices.get(message) ?? -1];
+					const checkpointId = entryId ? checkpointIds?.[entryId] : undefined;
 					return (
 						<div className="cl-msg cl-msg-user" key={`user-${message.timestamp}-${index}`}>
 							<div className="cl-user-bubble">
@@ -325,15 +332,15 @@ export function TranscriptView({
 										)
 									)}
 								</div>
-								{(onRewindPrompt || onForkPrompt) && promptText.trim() && (
+								{entryId && (onRewindPrompt || onForkPrompt) && (
 									<div className="cc-user-actions">
 										{onForkPrompt && (
-											<button type="button" title="从此处分叉对话" onClick={() => onForkPrompt(promptText)}>
+											<button type="button" title="从此处分叉对话" onClick={() => onForkPrompt(entryId)}>
 												<GitFork size={12} />
 											</button>
 										)}
-										{onRewindPrompt && (
-											<button type="button" title="回滚到此检查点" onClick={() => onRewindPrompt(promptText)}>
+										{onRewindPrompt && checkpointId && (
+											<button type="button" title="回滚到此检查点" onClick={() => onRewindPrompt(checkpointId)}>
 												<RotateCcw size={12} />
 											</button>
 										)}
@@ -369,15 +376,20 @@ export function TranscriptView({
 					);
 				}
 				const last = unit.messages[unit.messages.length - 1];
-				const firstIndex = state.messages.indexOf(unit.messages[0]);
-				const lastIndex = state.messages.indexOf(last);
+				const firstIndex = messageIndices.get(unit.messages[0]) ?? -1;
+				const lastIndex = messageIndices.get(last) ?? -1;
 				const isStreaming = state.streamingIndex !== null && state.streamingIndex >= firstIndex && state.streamingIndex <= lastIndex;
 				const errorMessage = [...unit.messages].reverse().find((message) => message.errorMessage)?.errorMessage;
 				const aborted = unit.messages.some((message) => message.stopReason === "aborted");
 				const usage = last.usage;
-				// Score from the full turn slice (assistant messages + their interleaved toolResults).
-				const verdict: QualityVerdict | null =
-					isStreaming || firstIndex < 0 ? null : scoreTurn(state.messages.slice(firstIndex, lastIndex + 1));
+				let end = lastIndex + 1;
+				for (; end < state.messages.length; end++) {
+					const message = state.messages[end];
+					if (message.role === "assistant" || message.role === "user" || message.role === "branchSummary" ||
+						message.role === "compactionSummary" || (message.role === "custom" && message.display)) break;
+				}
+				const verdict: QualityVerdict | null = isStreaming || firstIndex < 0 || last.stopReason === "toolUse"
+					? null : scoreTurn(state.messages.slice(firstIndex, end));
 				const turnText = unit.messages
 					.flatMap((m) => m.content)
 					.filter((b): b is Extract<typeof b, { type: "text" }> => b.type === "text")
@@ -391,6 +403,7 @@ export function TranscriptView({
 									message,
 									state,
 									isStreaming: isStreaming && part === unit.messages.length - 1,
+									waitingToolId,
 									tasks,
 									externalTasks,
 									taskProgressMap,
@@ -410,6 +423,18 @@ export function TranscriptView({
 							</div>
 						)}
 						{aborted && <p className="cl-stopped">本次回复已停止。</p>}
+						{Boolean(verdict?.checks.length) && <details className="cc-turn-checks">
+							<summary>{verdict!.checks.length} 项检查</summary>
+							<ul>
+								{verdict!.checks.map((check) => (
+									<li key={check.id}>
+										<code>{check.command}</code>
+										<span>{check.status === "passed" ? "通过" : check.status === "failed" ? "未通过" : check.status === "stale" ? "早于后续改动" : "无完成结果"}{check.exitCode !== undefined ? ` · 退出码 ${check.exitCode}` : ""}</span>
+										{onRerunCheck && <button type="button" className="cc-mini-btn" onClick={() => onRerunCheck(check.command)}>在终端重跑</button>}
+									</li>
+								))}
+							</ul>
+						</details>}
 						{!isStreaming && last.model && (
 							<footer className="cl-ai-meta">
 								<span>{last.model}</span>
@@ -444,6 +469,7 @@ function turnItems({
 	message,
 	state,
 	isStreaming,
+	waitingToolId,
 	tasks,
 	externalTasks,
 	taskProgressMap,
@@ -456,6 +482,7 @@ function turnItems({
 	message: Assistant;
 	state: Transcript;
 	isStreaming: boolean;
+	waitingToolId?: string;
 	tasks: DesktopTask[];
 	externalTasks: ExternalTask[];
 	taskProgressMap: Record<string, TaskProgress>;
@@ -523,6 +550,7 @@ function turnItems({
 					name={block.name}
 					args={block.arguments}
 					progress={progress}
+					waitingForApproval={block.id === waitingToolId}
 					result={result}
 					matchedTask={matchedTask}
 					taskProgress={matchedTask ? taskProgressMap[matchedTask.id] : undefined}
@@ -633,7 +661,7 @@ function ToolGroup({
 			<button type="button" className="cc-tool-row cc-tool-group-head" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
 				<span className={`cc-dot ${running ? "run" : failed ? "err" : "ok"}`} />
 				<span className="cc-tool-head">
-					<span className="cc-tool-verb cc-tool-group-summary">{summary}</span>
+					<span className="cc-tool-verb cc-tool-group-summary">{summary}{failed && <span className="cc-tool-error-label"> · 有失败步骤</span>}</span>
 				</span>
 				<ChevronRight size={13} className="cl-tool-chevron" />
 			</button>
@@ -976,6 +1004,7 @@ function ToolCard({
 	name,
 	args,
 	progress,
+	waitingForApproval,
 	result,
 	matchedTask,
 	taskProgress,
@@ -987,6 +1016,7 @@ function ToolCard({
 	name: string;
 	args: unknown;
 	progress?: ToolProgress;
+	waitingForApproval?: boolean;
 	result?: Extract<Message, { role: "toolResult" }>;
 	matchedTask?: DesktopTask | ExternalTask;
 	taskProgress?: TaskProgress;
@@ -1023,8 +1053,8 @@ function ToolCard({
 		: status;
 	const dotClass = effectiveStatus === "error" ? "err" : effectiveStatus === "done" ? "ok" : "run";
 	const [open, setOpen] = useState(false);
-	const isOpen = open || status === "running";
-	const showLiveTimer = effectiveStatus === "running" && !matchedTask && typeof progress?.startedAt === "number";
+	const isOpen = open || (status === "running" && !waitingForApproval);
+	const showLiveTimer = effectiveStatus === "running" && !waitingForApproval && !matchedTask && typeof progress?.startedAt === "number";
 	const [tickNow, setTickNow] = useState(() => Date.now());
 	useEffect(() => {
 		if (!showLiveTimer) return;
@@ -1038,7 +1068,7 @@ function ToolCard({
 			: undefined;
 	const liveTimerLabel = showLiveTimer ? formatRunningToolTimer(progress?.startedAt, timeoutSeconds, tickNow) : undefined;
 	const fileTarget = onOpenFile ? toolFileTarget(name, args) : undefined;
-	const summaryLine = matchedTask
+	const summaryLine = waitingForApproval ? undefined : matchedTask
 		? formatMatchedTaskSummary(matchedTask, taskProgress)
 		: status === "running" && (name === "Agent" || name === "SendMessage") && progress?.output
 			? progress.output
@@ -1058,7 +1088,8 @@ function ToolCard({
 					</span>
 				)}
 				{liveTimerLabel && <span className="cc-tool-badge cc-eta-pill">{liveTimerLabel}</span>}
-				{!matchedTask && !liveTimerLabel && info.badge && <span className={`cc-tool-badge ${status === "error" ? "err" : ""}`}>{info.badge}</span>}
+				{waitingForApproval && <span className="cc-tool-badge cc-tool-awaiting">待确认</span>}
+				{!waitingForApproval && !matchedTask && !liveTimerLabel && info.badge && <span className={`cc-tool-badge ${status === "error" ? "err" : ""}`}>{info.badge}</span>}
 				<ChevronRight size={13} className="cl-tool-chevron" />
 			</button>
 			{fileTarget && onOpenFile && (
@@ -1109,7 +1140,7 @@ function ToolCard({
 					))}
 				</div>
 			)}
-			{info.editPairs && info.editPairs.length > 0 && (
+			{(!waitingForApproval || open) && info.editPairs && info.editPairs.length > 0 && (
 				<div className="cl-tool-body cc-inline-edit-body">
 					{info.editPairs.map((pair, idx) => (
 						<div key={idx} className={idx > 0 ? "cc-edit-hunk-sep" : undefined}>

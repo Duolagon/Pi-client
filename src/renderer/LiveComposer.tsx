@@ -1,14 +1,22 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowUp, Brain, Paperclip, ShieldCheck, Square, X } from "lucide-react";
-import type { Command, PermissionMode, Project, SandboxStatus, Snapshot, ThinkingLevel } from "../shared.ts";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ArrowUp, Brain, File, Folder, Paperclip, ShieldCheck, Square, X } from "lucide-react";
+import type { Command, FileEntry, FileReferenceAvailability, PermissionMode, Project, SandboxStatus, Snapshot, ThinkingLevel } from "../shared.ts";
 import { WorkspacePicker } from "./WorkspacePicker.tsx";
 import { SandboxControl } from "./SandboxControl.tsx";
 import { CommandSealIcon } from "./GrailIcons.tsx";
 import { StatusLine } from "./StatusLine.tsx";
+import { fileReferences, insertFileReference, referenceQuery, removeFileReference } from "../file-references.ts";
+import "./composer-controls.css";
 
 import { draftPrompt, maximumImageDataLength, type ComposerAttachment, type ComposerDraft, type Prompt } from "../composer-draft.ts";
 
 const DEFAULT_DESKTOP_KEYBINDINGS = { submit: "Enter" };
+const CYCLABLE_PERMISSIONS: PermissionMode[] = ["ask", "read", "plan", "acceptEdits"];
+const REFERENCE_STATUS_LABEL: Record<FileReferenceAvailability, string> = {
+	ready: "发送时可读取",
+	untrusted: "项目尚未授权载入",
+	unavailable: "无法自动载入",
+};
 const PERMISSION_LABEL: Record<PermissionMode, string> = {
 	ask: "手动确认",
 	acceptEdits: "接受编辑",
@@ -150,7 +158,7 @@ export function LiveComposer({
 	changing: boolean;
 	planMode?: boolean;
 	onTogglePlanMode?: () => void;
-	send: (prompt: Prompt, input?: ComposerDraft) => Promise<unknown>;
+	send: (prompt: Prompt, input?: ComposerDraft, delivery?: Prompt["streamingBehavior"]) => Promise<unknown>;
 	stop: () => void;
 	command: (value: Command) => Promise<void>;
 	setPermission: (value: PermissionMode) => void;
@@ -177,7 +185,11 @@ export function LiveComposer({
 	const [slashDismissed, setSlashDismissed] = useState(false);
 	const [atIndex, setAtIndex] = useState(0);
 	const [atDismissed, setAtDismissed] = useState(false);
-	const [projectFiles, setProjectFiles] = useState<string[]>([]);
+	const [fileResults, setFileResults] = useState<{ key: string; entries: FileEntry[]; error?: boolean }>();
+	const [referenceStatus, setReferenceStatus] = useState<{ key: string; statuses: FileReferenceAvailability[] }>();
+	const [selection, setSelection] = useState({ start: draft.length, end: draft.length });
+	const [editorFocused, setEditorFocused] = useState(false);
+	const [delivery, setDelivery] = useState<NonNullable<Prompt["streamingBehavior"]>>("followUp");
 	const [skillsOpen, setSkillsOpen] = useState(false);
 	const [skillsFilter, setSkillsFilter] = useState("");
 	const [skillsIndex, setSkillsIndex] = useState(0);
@@ -409,7 +421,7 @@ export function LiveComposer({
 		historyCursor.current = -1;
 		setSending(true);
 		try {
-			await send(input, { text: draft, attachments });
+			await send(input, { text: draft, attachments }, running ? delivery : undefined);
 		} catch {
 			/* The controller keeps the draft and displays the failure. */
 		} finally {
@@ -452,53 +464,66 @@ export function LiveComposer({
 		textarea.current?.focus();
 	};
 
-	// @ file reference autocomplete
-	const atMatch = !atDismissed && !slashMatch ? /(?:^|\s)@([^\s\n]*)$/.exec(draft) : null;
-	const atQuery = atMatch ? atMatch[1].toLowerCase() : "";
+	// Match the token at the insertion point and keep the rest of the draft intact.
+	const atMatch = editorFocused && !atDismissed && !slashMatch && selection.start === selection.end
+		? referenceQuery(draft, selection.start)
+		: undefined;
+	const conversationId = snapshot.active?.id;
+	const atQuery = atMatch?.query;
+	const fileSearchKey = conversationId && atQuery !== undefined ? `${conversationId}\0${atQuery}` : undefined;
 	useEffect(() => {
-		if (!atMatch || !snapshot.active) return;
+		if (!fileSearchKey || !conversationId || atQuery === undefined) return;
 		let cancelled = false;
-		const ignored = new Set([".git", "node_modules", "dist", "release", ".next", "coverage"]);
-		const collect = async () => {
-			const paths: string[] = [];
-			const queue: { dir: string; depth: number }[] = [{ dir: "", depth: 0 }];
-			while (queue.length > 0 && paths.length < 400 && !cancelled) {
-				const current = queue.shift()!;
-				try {
-					const entries = await window.pi.files(current.dir);
-					for (const entry of entries) {
-						if (ignored.has(entry.name)) continue;
-						paths.push(entry.directory ? `${entry.path}/` : entry.path);
-						if (entry.directory && current.depth < 3 && paths.length < 400) {
-							queue.push({ dir: entry.path, depth: current.depth + 1 });
-						}
-						if (paths.length >= 400) break;
-					}
-				} catch {
-					/* ignore unreadable directory */
-				}
-			}
-			if (!cancelled) setProjectFiles(paths);
-		};
-		void collect();
-		return () => {
-			cancelled = true;
-		};
-	}, [Boolean(atMatch), snapshot.active?.project]);
+		const timer = setTimeout(() => {
+			void window.pi.searchFiles(conversationId, atQuery).then(
+				(entries) => { if (!cancelled) setFileResults({ key: fileSearchKey, entries }); },
+				() => { if (!cancelled) setFileResults({ key: fileSearchKey, entries: [], error: true }); },
+			);
+		}, 70);
+		return () => { cancelled = true; clearTimeout(timer); };
+	}, [fileSearchKey, conversationId, atQuery]);
 
-	const atOptions = atMatch
-		? projectFiles.filter((p) => p.toLowerCase().includes(atQuery)).slice(0, 8)
-		: [];
+	const filesLoading = Boolean(fileSearchKey && fileResults?.key !== fileSearchKey);
+	const atOptions = fileSearchKey && fileResults?.key === fileSearchKey ? fileResults.entries : [];
 	const activeAtIndex = atOptions.length ? Math.min(atIndex, atOptions.length - 1) : 0;
-	const selectAtFile = (path: string) => {
+	const selectAtFile = (file: FileEntry) => {
 		if (!atMatch) return;
-		const prefixLen = draft.length - atMatch[1].length - 1;
-		// A folder stays open (no trailing space) so the menu lists its files next.
-		setDraft(`${draft.slice(0, prefixLen)}@${path}${path.endsWith("/") ? "" : " "}`);
-		setAtDismissed(false);
+		const next = insertFileReference(draft, atMatch, file.path, file.directory);
+		setDraft(next.text);
+		setSelection({ start: next.cursor, end: next.cursor });
+		setAtDismissed(!file.directory);
 		setAtIndex(0);
-		textarea.current?.focus();
+		requestAnimationFrame(() => {
+			textarea.current?.focus();
+			textarea.current?.setSelectionRange(next.cursor, next.cursor);
+		});
 	};
+	const removeReference = (ref: ReturnType<typeof fileReferences>[number]) => {
+		const editor = textarea.current;
+		const direction = editor?.selectionDirection;
+		const next = removeFileReference(draft, ref, editor ? { start: editor.selectionStart, end: editor.selectionEnd } : selection);
+		setDraft(next.text);
+		setSelection(next.selection);
+		setAtDismissed(true);
+		requestAnimationFrame(() => {
+			textarea.current?.focus();
+			textarea.current?.setSelectionRange(next.selection.start, next.selection.end, direction);
+		});
+	};
+	const references = useMemo(() => fileReferences(draft), [draft]);
+	const referencePathKey = JSON.stringify(references.slice(0, 24).map(({ path }) => path));
+	const referenceKey = JSON.stringify([conversationId, snapshot.trust?.decision, referencePathKey]);
+	useEffect(() => {
+		const paths = JSON.parse(referencePathKey) as string[];
+		if (!conversationId || !paths.length) return;
+		let active = true;
+		void window.pi.checkFileReferences(conversationId, paths).then(
+			(statuses) => { if (active) setReferenceStatus({ key: referenceKey, statuses }); },
+			() => { if (active) setReferenceStatus({ key: referenceKey, statuses: paths.map(() => "unavailable") }); },
+		);
+		return () => { active = false; };
+	}, [conversationId, referenceKey, referencePathKey]);
+
 	useEffect(() => {
 		if (slashOptions.length) document.getElementById(`cc-slash-${activeSlashIndex}`)?.scrollIntoView({ block: "nearest" });
 	}, [activeSlashIndex, slashOptions.length]);
@@ -517,7 +542,7 @@ export function LiveComposer({
 	};
 
 	return (
-		<div className="cl-composer">
+		<div className={`cl-composer${running ? " is-running" : ""}`}>
 			{slashOptions.length > 0 && (
 				<div className="cc-slash-menu" role="listbox" aria-label="斜杠命令">
 					{slashOptions.map((item, idx) => (
@@ -540,12 +565,15 @@ export function LiveComposer({
 					))}
 				</div>
 			)}
-			{atOptions.length > 0 && (
-				<div className="cc-slash-menu" role="listbox" aria-label="引用项目文件">
-					{atOptions.map((filePath, idx) => (
+			{atMatch && (
+				<div className="cc-slash-menu" id="cc-at-files" role="listbox" aria-label="引用项目文件" aria-busy={filesLoading}>
+					{!atOptions.length && <div className="cc-reference-empty" role="status">
+						{filesLoading ? "正在查找项目文件…" : fileResults?.error ? "无法查找项目文件" : "没有匹配的项目文件"}
+					</div>}
+					{atOptions.map((file, idx) => (
 						<button
 							type="button"
-							key={filePath}
+							key={file.path}
 							role="option"
 							aria-selected={idx === activeAtIndex}
 							id={`cc-at-${idx}`}
@@ -553,10 +581,11 @@ export function LiveComposer({
 							onMouseEnter={() => setAtIndex(idx)}
 							onMouseDown={(event) => {
 								event.preventDefault();
-								selectAtFile(filePath);
+								selectAtFile(file);
 							}}
 						>
-							<span className="cc-slash-name">@{filePath}</span>
+							{file.directory ? <Folder size={13} /> : <File size={13} />}
+							<span className="cc-slash-name">@{file.path}{file.directory ? "/" : ""}</span>
 						</button>
 					))}
 				</div>
@@ -592,6 +621,23 @@ export function LiveComposer({
 						))}
 					</div>
 				)}
+				{references.some((ref) => ref.from !== atMatch?.from) && (
+					<div className="cl-attachments cc-reference-chips" role="list" aria-label="草稿的文件引用">
+						{references.map((ref, index) => {
+							if (ref.from === atMatch?.from) return null;
+							const status = index >= 24 ? "超过单次引用上限" : referenceStatus?.key === referenceKey
+								? REFERENCE_STATUS_LABEL[referenceStatus.statuses[index] ?? "unavailable"] : "检查中";
+							return (
+								<span key={ref.from} role="listitem" title={`${ref.path} · ${status}`}>
+									<File size={12} aria-hidden="true" />
+									<span className="cl-attachment-name">{ref.path}</span>
+									<span className="cc-reference-status">{status}</span>
+									<button type="button" aria-label={`移除引用 ${ref.path}`} onClick={() => removeReference(ref)}><X size={13} /></button>
+								</span>
+							);
+						})}
+					</div>
+				)}
 				<textarea
 					ref={(el) => {
 						textarea.current = el;
@@ -599,10 +645,20 @@ export function LiveComposer({
 					}}
 					aria-label="输入任务"
 					value={draft}
+					aria-controls={atMatch ? "cc-at-files" : undefined}
+					aria-activedescendant={atOptions.length ? `cc-at-${activeAtIndex}` : undefined}
+					onFocus={(event) => {
+						setEditorFocused(true);
+						setSelection({ start: event.currentTarget.selectionStart, end: event.currentTarget.selectionEnd });
+					}}
+					onSelect={(event) => {
+						const { selectionStart: start, selectionEnd: end } = event.currentTarget;
+						setSelection((previous) => previous.start === start && previous.end === end ? previous : { start, end });
+					}}
 					onBlur={() => {
+						setEditorFocused(false);
 						// Menu items use onMouseDown + preventDefault, so this only fires for clicks elsewhere.
 						if (slashOptions.length) setSlashDismissed(true);
-						if (atOptions.length) setAtDismissed(true);
 					}}
 					style={{ minHeight: "62px", maxHeight: "200px" }}
 					placeholder={
@@ -619,6 +675,7 @@ export function LiveComposer({
 						setAtDismissed(false);
 						setSlashIndex(0);
 						setAtIndex(0);
+						setSelection({ start: event.currentTarget.selectionStart, end: event.currentTarget.selectionEnd });
 						setDraft(event.target.value);
 					}}
 					onPaste={(event) => {
@@ -628,10 +685,11 @@ export function LiveComposer({
 						}
 					}}
 					onKeyDown={(event) => {
-						if (event.key === "Tab" && event.shiftKey && !changing && !running) {
+						if (event.nativeEvent.isComposing) return;
+						if (event.key === "Tab" && event.shiftKey && !changing && !running && !slashOptions.length && !atMatch) {
 							event.preventDefault();
-							const order: PermissionMode[] = ["ask", "acceptEdits", "plan", "auto", "dontAsk", "read"];
-							const next = order[(order.indexOf(snapshot.settings.permission) + 1) % order.length];
+							const current = CYCLABLE_PERMISSIONS.indexOf(snapshot.settings.permission);
+							const next = CYCLABLE_PERMISSIONS[(current + 1) % CYCLABLE_PERMISSIONS.length];
 							setPermission(next);
 							return;
 						}
@@ -646,7 +704,7 @@ export function LiveComposer({
 								setSlashIndex((idx) => (idx - 1 + slashOptions.length) % slashOptions.length);
 								return;
 							}
-							if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing)) {
+							if ((event.key === "Tab" && !event.shiftKey) || (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing)) {
 								event.preventDefault();
 								selectSlash(slashOptions[activeSlashIndex].name);
 								return;
@@ -668,7 +726,7 @@ export function LiveComposer({
 								setAtIndex((idx) => (idx - 1 + atOptions.length) % atOptions.length);
 								return;
 							}
-							if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing)) {
+							if ((event.key === "Tab" && !event.shiftKey) || (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing)) {
 								event.preventDefault();
 								selectAtFile(atOptions[activeAtIndex]);
 								return;
@@ -678,6 +736,15 @@ export function LiveComposer({
 								setAtDismissed(true);
 								return;
 							}
+						}
+						if (event.key === "Escape" && atMatch) {
+							event.preventDefault();
+							setAtDismissed(true);
+							return;
+						}
+						if (event.key === "Enter" && !event.shiftKey && filesLoading) {
+							event.preventDefault();
+							return;
 						}
 						if (event.key === "Escape" && running) {
 							event.preventDefault();
@@ -770,23 +837,34 @@ export function LiveComposer({
 						)}
 					</div>
 					<div className="cl-composer-row-right">
-						<span className="cl-composer-hint">
-							{running ? "补充指令将进入引导队列" : "Enter 发送"}
-						</span>
-						{running ? (
-							<button type="button" className="cl-send stop" aria-label="停止任务" onClick={stop}>
-								<Square size={13} fill="currentColor" />
-							</button>
-						) : (
-							<button
-								type="submit"
-								className="cl-send"
-								aria-label="发送任务"
-								disabled={disabled || (!draft.trim() && !attachments.length)}
-							>
-								{snapshot.settings.theme === "grail" ? <CommandSealIcon width={17} height={17} /> : <ArrowUp size={17} />}
-							</button>
+						{running && (
+							<>
+								<label className="cc-composer-delivery">
+									<select
+										aria-label="补充指令发送时机"
+										value={delivery}
+										onChange={(event) => setDelivery(event.target.value as NonNullable<Prompt["streamingBehavior"]>)}
+										disabled={disabled}
+									>
+										<option value="followUp">本轮结束后</option>
+										<option value="steer">下一工具步骤</option>
+									</select>
+								</label>
+								<button type="button" className="cl-send stop" aria-label="停止任务" title="停止当前任务（Esc）" onClick={stop}>
+									<Square size={12} fill="currentColor" />
+								</button>
+							</>
 						)}
+						{!running && <span className="cl-composer-hint">Enter 发送</span>}
+						<button
+							type="submit"
+							className="cl-send"
+							aria-label={running ? "追加指令" : "发送任务"}
+							title={running ? "追加指令（Enter）" : "发送任务（Enter）"}
+							disabled={disabled || (!draft.trim() && !attachments.length)}
+						>
+							{snapshot.settings.theme === "grail" ? <CommandSealIcon width={17} height={17} /> : <ArrowUp size={17} />}
+						</button>
 					</div>
 				</div>
 			</form>
@@ -829,7 +907,7 @@ export function LiveComposer({
 							disabled={changing || running}
 							title="切换 Plan 计划模式（先只读调研与出方案，确认后再执行）"
 						>
-							Plan
+							计划
 						</button>
 					)}
 				</div>

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { after, before, test } from "node:test";
@@ -17,6 +17,8 @@ import type {
 	GitCheckpoint,
 	GitCheckpointDiff,
 	GitCommitResult,
+	GitDiscardInput,
+	GitDiscardResult,
 	GitRestoreResult,
 	MemoryFileEntry,
 	Snapshot,
@@ -304,6 +306,21 @@ test("isolated tasks from a source subdirectory run real Pi tools in its matchin
 		assert.equal((await data.invoke<{ content: string }>("pi:task:read-file", task.id, "seed.txt")).content, "subdirectory seed content\n");
 		assert.equal(await readFile(join(expected, "generated.txt"), "utf8"), "written by real Pi tool\n");
 		assert.equal(await readFile(join(expected, "command.txt"), "utf8"), "real-pi-command\n");
+		await writeFile(join(tree.path, "outside.txt"), "change outside the task folder\n");
+		await git(tree.path, "add", "--", "outside.txt");
+		await writeFile(join(expected, "seed.txt"), "task subdirectory modification\n");
+		const scoped = await data.invoke<Workspace>("pi:task:workspace", task.id);
+		assert.deepEqual(scoped.changes.map((change) => change.path).sort(), ["command.txt", "generated.txt", "seed.txt"]);
+		assert.match(await data.invoke<string>("pi:task:diff", task.id, "seed.txt"), /\+task subdirectory modification/);
+		await data.service.gitStage(undefined, task.conversationId);
+		await data.service.gitUnstage(undefined, task.conversationId);
+		assert.equal(await git(tree.path, "diff", "--cached", "--name-only"), "outside.txt");
+		const input = { conversationId: task.conversationId, kind: "tracked" as const, path: "seed.txt" };
+		const { version } = await data.invoke<{ version: string }>("pi:workspace:discard:preview", input);
+		const result = await data.invoke<GitDiscardResult>("pi:workspace:discard", { ...input, expectedVersion: version });
+		assert.deepEqual(result.undoCheckpoint?.changes.map((change) => change.path), ["seed.txt"]);
+		assert.equal(await readFile(join(expected, "seed.txt"), "utf8"), "subdirectory seed content\n");
+		assert.equal(await readFile(join(tree.path, "outside.txt"), "utf8"), "change outside the task folder\n");
 		await assert.rejects(access(join(project, "generated.txt")));
 		await assert.rejects(access(join(tree.path, "generated.txt")));
 		assert.equal(await git(data.project, "status", "--porcelain=v1"), "");
@@ -355,7 +372,8 @@ test("workspace IPC rejects malformed wire input and forged approvals without mu
 			{ label: "Workspace stage paths type", channel: "pi:workspace:stage", args: ["bad"], pattern: /文件路径列表无效/ },
 			{ label: "Workspace stage traversal", channel: "pi:workspace:stage", args: [["../outside"]], pattern: /超出/ },
 			{ label: "Workspace stage .git metadata", channel: "pi:workspace:stage", args: [[".git/config"]], pattern: /\.git/ },
-			{ label: "Workspace discard empty", channel: "pi:workspace:discard", args: [[]], pattern: /指定/ },
+			{ label: "Workspace discard empty", channel: "pi:workspace:discard", args: [{ kind: "tracked", path: "" }], pattern: /指定/ },
+			{ label: "Workspace discard invalid kind", channel: "pi:workspace:discard", args: [{ kind: "anything", path: "seed.txt" }], pattern: /操作类型/ },
 			{ label: "Workspace commit empty", channel: "pi:workspace:commit", args: ["   "], pattern: /提交说明/ },
 			{ label: "Workspace memory name allowlist", channel: "pi:workspace:write-memory", args: ["README.md", "hi"], pattern: /记忆文件名无效/ },
 		];
@@ -374,6 +392,11 @@ test("workspace IPC handles Git stage/unstage/discard/commit and project memory 
 	const data = await setup();
 	try {
 		const originalSeed = await readFile(join(data.project, "seed.txt"), "utf8");
+		const previewDiscard = (input: GitDiscardInput) => data.invoke<{ version: string }>("pi:workspace:discard:preview", input);
+		const confirmDiscard = async (input: GitDiscardInput) => {
+			const { version } = await previewDiscard(input);
+			return data.invoke<GitDiscardResult>("pi:workspace:discard", { ...input, expectedVersion: version });
+		};
 		await git(data.project, "config", "user.name", "Desktop Test");
 		await git(data.project, "config", "user.email", "desktop@example.invalid");
 		await git(data.project, "config", "commit.gpgSign", "false");
@@ -392,11 +415,31 @@ test("workspace IPC handles Git stage/unstage/discard/commit and project memory 
 		const afterUnstage = await data.invoke<Workspace>("pi:workspace:unstage", ["notes.txt"]);
 		assert.equal(afterUnstage.changes.find((c) => c.path === "notes.txt")?.staged, false);
 
-		await data.invoke<Workspace>("pi:workspace:discard", ["notes.txt"]);
+		await assert.rejects(previewDiscard({ kind: "tracked", path: "notes.txt" }), /Git 状态已改变/);
+		assert.equal(await readFile(join(data.project, "notes.txt"), "utf8"), "scratch note\n");
+		const notes = { kind: "untracked" as const, path: "notes.txt" };
+		const { version } = await previewDiscard(notes);
+		await writeFile(join(data.project, "notes.txt"), "another note\n");
+		await assert.rejects(data.invoke("pi:workspace:discard", { ...notes, expectedVersion: version }), /确认后发生变化/);
+		assert.equal(await readFile(join(data.project, "notes.txt"), "utf8"), "another note\n");
+		await writeFile(join(data.project, "notes.txt"), "scratch note\n");
+		const trashed = await confirmDiscard(notes);
+		assert.equal(trashed.disposition, "trashed");
 		await assert.rejects(access(join(data.project, "notes.txt")));
+		const trashDir = join(data.fixture.dataDir, "trash");
+		const trashedNotes = (await readdir(trashDir)).find((file) => file.endsWith("-notes.txt"))!;
+		assert.equal(await readFile(join(trashDir, trashedNotes), "utf8"), "scratch note\n");
 
-		await data.invoke<Workspace>("pi:workspace:discard", ["seed.txt"]);
+		await symlink("seed.txt", join(data.project, "notes-link"));
+		await confirmDiscard({ kind: "untracked", path: "notes-link" });
+		assert.equal(await readFile(join(data.project, "seed.txt"), "utf8"), `${originalSeed}modified\n`);
+		const discarded = await confirmDiscard({ kind: "tracked", path: "seed.txt" });
+		assert.equal(discarded.disposition, "restored");
 		assert.equal(await readFile(join(data.project, "seed.txt"), "utf8"), originalSeed);
+		assert.equal(discarded.undoCheckpoint?.kind, "discard-undo");
+		assert.deepEqual(discarded.undoCheckpoint?.changes.map((change) => change.path), ["seed.txt"]);
+		await data.invoke("pi:git:restore", { checkpointId: discarded.undoCheckpoint!.id });
+		assert.equal(await readFile(join(data.project, "seed.txt"), "utf8"), `${originalSeed}modified\n`);
 
 		await writeFile(join(data.project, "seed.txt"), `${originalSeed}committed\n`);
 		await data.invoke<Workspace>("pi:workspace:stage");
@@ -419,7 +462,7 @@ test("workspace IPC handles Git stage/unstage/discard/commit and project memory 
 		await writeFile(join(data.project, "seed.txt"), `${originalSeed}blocked-in-readonly\n`);
 		await assert.rejects(data.invoke("pi:workspace:stage", ["seed.txt"]), /只读模式/);
 		await assert.rejects(data.invoke("pi:workspace:unstage", ["seed.txt"]), /只读模式/);
-		await assert.rejects(data.invoke("pi:workspace:discard", ["seed.txt"]), /只读模式/);
+		await assert.rejects(previewDiscard({ kind: "tracked", path: "seed.txt" }), /只读模式/);
 		await assert.rejects(data.invoke("pi:workspace:commit", "should fail"), /只读模式/);
 		await assert.rejects(data.invoke("pi:workspace:write-memory", "CLAUDE.md", "nope"), /只读模式/);
 		const readableInReadMode = await data.invoke<MemoryFileEntry[]>("pi:workspace:read-memory");
