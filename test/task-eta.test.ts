@@ -10,7 +10,7 @@ import {
 	formatDurationBrief,
 	formatDurationClock,
 	formatRunningToolTimer,
-	isChecklistStaleOnIdle,
+	isChecklistStale,
 } from "../src/task-eta.ts";
 import { TodoService } from "../src/todo-service.ts";
 import { validateDesktopToolInput } from "../src/tool-control-types.ts";
@@ -80,11 +80,29 @@ test("computeChecklistEta sums explicit estimates and extrapolates missing items
 	const paused = computeTodoTiming({ id: "2", status: "in_progress", startedAt: now - 3_600_000 }, now, false);
 	assert.equal(paused.label, "已暂停");
 
-	// Stale checklist from earlier turns auto-hides once idle
-	assert.equal(isChecklistStaleOnIdle({ isRunning: false, userTurnsAfterLastUpdate: 1, allCompleted: false }), true);
-	assert.equal(isChecklistStaleOnIdle({ isRunning: false, userTurnsAfterLastUpdate: 0, allCompleted: false }), false);
-	assert.equal(isChecklistStaleOnIdle({ isRunning: true, userTurnsAfterLastUpdate: 2, allCompleted: false }), false);
-	assert.equal(isChecklistStaleOnIdle({ isRunning: true, userTurnsAfterLastUpdate: 0, allCompleted: true }), true);
+	// Stale checklist from earlier turns must stay hidden even when a brand-new turn starts running
+	assert.equal(
+		isChecklistStale({ isRunning: true, completedUserTurnsAfterLastUpdate: 1, userTurnsAfterLastUpdate: 2, allCompleted: false }),
+		true,
+	);
+	assert.equal(
+		isChecklistStale({ isRunning: false, completedUserTurnsAfterLastUpdate: 1, userTurnsAfterLastUpdate: 1, allCompleted: false }),
+		true,
+	);
+	// Immediate follow-up turn (within 2h, 0 prior completed turns after update) stays visible while running
+	assert.equal(
+		isChecklistStale({ isRunning: true, completedUserTurnsAfterLastUpdate: 0, userTurnsAfterLastUpdate: 1, allCompleted: false, staleAgeMs: 60_000 }),
+		false,
+	);
+	// Ancient checklist (>2h old) does not resurrect on a new turn
+	assert.equal(
+		isChecklistStale({ isRunning: true, completedUserTurnsAfterLastUpdate: 0, userTurnsAfterLastUpdate: 1, allCompleted: false, staleAgeMs: 3 * 3600 * 1000 }),
+		true,
+	);
+	assert.equal(
+		isChecklistStale({ isRunning: true, completedUserTurnsAfterLastUpdate: 0, userTurnsAfterLastUpdate: 0, allCompleted: true }),
+		true,
+	);
 });
 
 test("computeMonitorTiming detects silence/stale status and timeout ceiling", () => {

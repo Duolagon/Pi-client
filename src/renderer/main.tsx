@@ -61,7 +61,7 @@ import { grailWording, latestVerdict, revealDecision } from "./grail-view.ts";
 import { IconButton, Modal, PiMark, menuKeyNav } from "../prototype/ui.tsx";
 import { useDesktop } from "./useDesktop.ts";
 import { TranscriptView, type TodoItem } from "./TranscriptView.tsx";
-import { computeChecklistEta, computeTodoTiming, isChecklistStaleOnIdle } from "../task-eta.ts";
+import { computeChecklistEta, computeTodoTiming, isChecklistStale } from "../task-eta.ts";
 import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
 import { parseGoalCommand } from "../goal-mode.ts";
 import { WorkspacePicker } from "./WorkspacePicker.tsx";
@@ -1071,12 +1071,24 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				}
 			}
 		}
+		// While a turn is running, the latest user message is still in flight; all earlier ones have completed.
+		const completedUserTurnsAfter = running ? Math.max(0, userTurnsAfter - 1) : userTurnsAfter;
+		const lastUpdateTs = useShared ? latestSharedTs : latestWriteTs;
+		const staleAgeMs = lastUpdateTs > 1_000_000_000_000 ? Math.max(0, Date.now() - lastUpdateTs) : undefined;
 
-		const sig = `${useShared ? "shared" : "write"}:${useShared ? latestSharedTs : latestWriteTs}:${items.map((t) => `${t.id}=${t.status}`).join(",")}`;
+		const sig = `${useShared ? "shared" : "write"}:${lastUpdateTs}:${items.map((t) => `${t.id}=${t.status}`).join(",")}`;
 		const activeConvKey = snapshot?.active?.id ?? "__none__";
 		const dismissed = dismissedTodoSig[activeConvKey] === sig;
 		const allCompleted = items.length === 0 || items.every((t) => t.status === "completed");
-		const hidden = dismissed || isChecklistStaleOnIdle({ isRunning: running, userTurnsAfterLastUpdate: userTurnsAfter, allCompleted });
+		const hidden =
+			dismissed ||
+			isChecklistStale({
+				isRunning: running,
+				completedUserTurnsAfterLastUpdate: completedUserTurnsAfter,
+				userTurnsAfterLastUpdate: userTurnsAfter,
+				allCompleted,
+				staleAgeMs,
+			});
 		return { items: hidden ? [] : items, useShared, sig };
 	})();
 	const latestTodos = pinnedTodoState.items;

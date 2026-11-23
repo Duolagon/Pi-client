@@ -191,17 +191,27 @@ export function computeChecklistEta(items: readonly TimedTodoLike[], now: number
 }
 
 /**
- * Determine whether a checklist from an earlier turn should be hidden automatically so stale
- * incomplete checklists do not linger forever after the user has moved on to newer turns.
+ * Determine whether a checklist from an earlier turn is stale/abandoned and should stay hidden
+ * (even when a new turn starts running) until the model creates or updates a fresh checklist.
  */
-export function isChecklistStaleOnIdle(opts: {
+export function isChecklistStale(opts: {
 	isRunning: boolean;
+	completedUserTurnsAfterLastUpdate: number;
 	userTurnsAfterLastUpdate: number;
 	allCompleted: boolean;
+	staleAgeMs?: number;
 }): boolean {
 	if (opts.allCompleted) return true;
-	if (opts.isRunning) return false;
-	return opts.userTurnsAfterLastUpdate >= 1;
+	// Once at least one subsequent user turn has already completed without updating this checklist,
+	// the checklist is abandoned and must never resurrect on future turns.
+	if (opts.completedUserTurnsAfterLastUpdate >= 1) return true;
+	// If idle and any subsequent user message already exists, hide immediately.
+	if (!opts.isRunning && opts.userTurnsAfterLastUpdate >= 1) return true;
+	// If a new user turn started hours after the last update, do not resurrect an ancient checklist.
+	if (opts.userTurnsAfterLastUpdate >= 1 && typeof opts.staleAgeMs === "number" && opts.staleAgeMs > 2 * 60 * 60 * 1000) {
+		return true;
+	}
+	return false;
 }
 
 /** Compute live elapsed + silence/activity status for a background shell or monitor. */
