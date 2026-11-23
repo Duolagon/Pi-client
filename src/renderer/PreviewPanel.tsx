@@ -17,22 +17,26 @@ function normalizeLocalUrl(raw: string): string | null {
 }
 
 export function PreviewPanel({
-	initialUrl = "http://localhost:3000",
+	url,
 	close,
 	onReport,
+	onNavigate,
 }: {
-	initialUrl?: string;
+	url: string;
 	close: () => void;
 	onReport?: (report: string) => void;
+	onNavigate: (url: string) => void;
 }) {
-	const [inputUrl, setInputUrl] = useState(initialUrl);
-	const [activeUrl, setActiveUrl] = useState(() => normalizeLocalUrl(initialUrl) ?? "http://localhost:3000");
+	const [inputUrl, setInputUrl] = useState(url);
+	const activeUrl = normalizeLocalUrl(url) ?? "http://localhost:3000";
 	const [reloadKey, setReloadKey] = useState(0);
 	const [mobile, setMobile] = useState(false);
 	const [error, setError] = useState("");
 	const [checking, setChecking] = useState(false);
-	const [result, setResult] = useState<PreviewCheck | null>(null);
+	const [report, setReport] = useState<{ url: string; mobile: boolean; result: PreviewCheck } | null>(null);
+	const result = report?.url === activeUrl && report.mobile === mobile ? report.result : null;
 	const [reachable, setReachable] = useState<boolean | null>(null);
+	useEffect(() => setInputUrl(url), [url]);
 	useEffect(() => {
 		let cancelled = false;
 		setReachable(null);
@@ -52,9 +56,9 @@ export function PreviewPanel({
 	const verify = async () => {
 		setChecking(true);
 		setError("");
-		setResult(null);
+		setReport(null);
 		try {
-			setResult(await window.pi.checkPreview(activeUrl, mobile));
+			setReport({ url: activeUrl, mobile, result: await window.pi.checkPreview(activeUrl, mobile) });
 		} catch (error) {
 			setError(error instanceof Error ? error.message : String(error));
 		} finally {
@@ -70,7 +74,8 @@ export function PreviewPanel({
 			return;
 		}
 		setError("");
-		setActiveUrl(normalized);
+		setReport(null);
+		onNavigate(normalized);
 		setInputUrl(normalized);
 		setReloadKey((k) => k + 1);
 	};

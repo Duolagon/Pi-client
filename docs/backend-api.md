@@ -7,7 +7,9 @@
 ## 输入草稿与队列
 
 - 客户端按会话在本机保存未发送的正文和附件。发送得到 Pi 确认后，客户端从草稿移除已提交的内容。
-- `window.pi.sendPrompt(id, draft, streamingBehavior?)` 接收完整草稿，允许队列操作保留附件名称和内容。`window.pi.actOnQueue(id, action)` 撤回当前尚在排队的草稿，或等当前生成停止后立即重发。重发失败时返回草稿和错误，界面将草稿放回输入框。
+- `window.pi.sendPrompt(id, draft, streamingBehavior?)` 接收完整草稿。运行中的输入可以选择 `followUp`（本轮结束后）或 `steer`（下一工具步骤）。快照与事件的 `queuedPromptGroups` 按时机提供两组可见的待发送指令。
+- `window.pi.actOnQueue(id, action)` 撤回整个待发送队列，或停止当前生成后发送队列。重发失败时，界面将包含附件的原始草稿放回输入框。
+- 文件引用使用会话对应的 `searchFiles` 查找文件和目录。`checkFileReferences` 只返回文件是否可读取的状态，客户端据此在草稿显示文件引用。引用保留在草稿正文里，发送时按项目的授权和上下文预算读取。
 
 ## 接口总览
 
@@ -207,6 +209,12 @@ await window.pi.tasks.viewing(task.id, true); // 详情打开时上报；关闭�
 
 ## 评审、浏览器验证和代码分析
 
+工作区面板的「本轮改动」用会话消息关联的检查点读取差异。缺少该关联时，可以切换到「整个工作区」，查看该会话目录里的全部未提交改动。逐行意见绑定文件、原文件或新文件行号及差异版本，发送前会重新确认版本。合并发送时单独向当前会话提交评审消息，输入框已有草稿继续保存在原处。
+
+Pi 的 Bash 退出码由工具结构化结果写入会话消息的 `details.exitCode`，旧记录仍可显示工具报告的成功或失败。客户端对照后续编辑和可能写入项目的命令标记检查是否过期。「在终端重跑」将命令放入终端输入框，等待用户执行。
+
+计划审批使用本会话成功提交的计划，或用户显式选用的计划草稿。批准前读取文件确认基准版本，保存后检查执行权限和文件内容，然后把已批准的正文随执行请求发给 Pi。
+
 `pi.pullRequest(conversationId, number?)` 使用 `gh` 读取 PR 和 CI 状态。 `pi.createDraftPullRequest(conversationId, { branch, title, body, base? })` 在用户提交表单后从已推送的当前分支创建草稿 PR。
 
 `pi.checkPreview(url, mobile)` 在隔离的 Chromium 会话中访问回环地址并返回 HTTP 状态、标题、耗时和浏览器错误。验证窗口允许同源的 GET、HEAD 和 OPTIONS 请求。
@@ -233,6 +241,8 @@ const result = await window.pi.git.restore({
 
 `conversationId` 可省略，此时使用当前前台会话。`diff` 可另传 `path` 筛选单文件。检查点状态为 `pending / ready / partially-restored / restored`，`changes` 包含新增、修改、删除、类型变化、大小、权限和二进制标记。
 
+预览和恢复只接受属于目标会话的检查点。自动检查点在首条用户消息持久化后记录原生 `userEntryId`，会话可以据此打开准确的检查点。聊天中缺少这个绑定的轮次可从检查点列表浏览。
+
 `restore()` 的正常返回结果包含 `status / checkpoint / restored / skipped / conflicts`。`status` 为 `restored / unchanged / conflict / partial`。冲突应展示给用户，不应当作网络失败盲目重试。
 
 恢复规则：
@@ -246,6 +256,8 @@ const result = await window.pi.git.restore({
 - 单文件上限 64 MB、单次捕获总内容上限 512 MB、路径上限 50,000；超限明确失败。
 
 检查点记录开始到结束期间整个工作树的变化，可能包括外部程序同期修改，不能将它标成“仅 Agent 修改”。恢复前应提供差异审核。`pending` 必须先封存后才能恢复。
+
+单个工作区文件可以调用 `pi.gitDiscardPreview({ conversationId, path, kind })` 取得预览版本。界面显示影响范围并获得确认后，将该版本作为 `expectedVersion` 传给 `pi.gitDiscard`。文件或暂存版本变化时应重新预览。未跟踪文件移到废纸篓，已跟踪文件恢复为暂存版本，并返回一份单文件撤销检查点。
 
 ## PTY 终端
 

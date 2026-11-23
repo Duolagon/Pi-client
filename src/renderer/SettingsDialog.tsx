@@ -83,6 +83,7 @@ export function SettingsDialog({
 	settings,
 	presets,
 	models = [],
+	connectionOnly = false,
 	busy,
 	close,
 	apply,
@@ -93,6 +94,7 @@ export function SettingsDialog({
 	/** Models the active conversation can reach; routing choices are limited to these. */
 	models?: Array<{ provider: string; id: string; name: string }>;
 	busy: boolean;
+	connectionOnly?: boolean;
 	close: () => void;
 	apply: (snapshot: Snapshot) => void;
 	fail: (error: unknown) => void;
@@ -261,6 +263,36 @@ export function SettingsDialog({
 	};
 	const save = async () => {
 		setError("");
+		if (connectionOnly) {
+			if ((mode === "custom" && !modelId.trim()) || typeof parsedHeaders === "string" || (mode === "preset" && !hasKey)) {
+				if (mode === "custom") setAdvanced(true);
+				setError(typeof parsedHeaders === "string" ? parsedHeaders : mode === "custom" ? "请填写自定义模型 ID。" : `请填写 ${preset.name} 的 API Key。`);
+				return;
+			}
+			setTesting(true);
+			try {
+				const verified = await window.pi.testConnection(connectionInput);
+				setTestResult(verified);
+				if (!verified.success) return;
+				setTesting(false);
+				setSaving(true);
+				const next = await window.pi.saveSettings({ permission: settings.permission, theme: settings.theme, ...connectionInput });
+				apply(next);
+				if (next.engineError || !next.models.length) {
+					setError(next.engineError || "模型暂不可用，请检查连接后重试。");
+					return;
+				}
+				onSaved?.();
+				close();
+			} catch (error) {
+				setError(error instanceof Error ? error.message : String(error));
+			} finally {
+				setTesting(false);
+				setSaving(false);
+			}
+			return;
+		}
+
 		if (mode === "custom" && connectionChanged && !modelId.trim()) {
 			setAdvanced(true);
 			setError("请填写自定义接口的模型 ID，或恢复官方预设。");
@@ -413,7 +445,7 @@ export function SettingsDialog({
 	};
 	return (
 		<Modal
-			title="设置与模型连接"
+			title={connectionOnly ? "连接模型" : "设置与模型连接"}
 			close={() => {
 				if (pending) return;
 				if ((generalSettingsChanged || connectionChanged) && !window.confirm("有未保存的设置更改，确定放弃吗？")) return;
@@ -664,7 +696,7 @@ export function SettingsDialog({
 						</div>
 					</div>
 				</details>
-				<details className="live-settings-section" open={Boolean(settings.proxy || settings.caFile) || undefined}>
+				{!connectionOnly && <details className="live-settings-section" open={Boolean(settings.proxy || settings.caFile) || undefined}>
 					<summary>网络与证书</summary>
 					<div className="live-settings-section-content">
 						<label className="field-label">
@@ -707,8 +739,8 @@ export function SettingsDialog({
 							<small>PEM 文件的绝对路径，公司网络做 HTTPS 解密时需要。保存后会重启当前会话的模型进程。</small>
 						</label>
 					</div>
-				</details>
-				<details className="live-settings-section">
+				</details>}
+				{!connectionOnly && <details className="live-settings-section">
 					<summary>权限与外观</summary>
 					<div className="live-settings-section-content">
 						<label className="field-label">
@@ -1115,7 +1147,7 @@ export function SettingsDialog({
 							})}
 						</fieldset>
 					</div>
-				</details>
+				</details>}
 				{testResult && (
 					<div
 						className={testResult.success ? "live-notice" : "live-error"}
@@ -1146,6 +1178,7 @@ export function SettingsDialog({
 					密钥仅在本机加密保存。测试会发送一条模型请求，可能产生用量。
 				</p>
 				<div className="dialog-actions live-settings-actions">
+					{!connectionOnly && <>
 					<button
 						type="button"
 						className="secondary-button"
@@ -1162,12 +1195,13 @@ export function SettingsDialog({
 					>
 						{checkingBalance ? "正在查询…" : "查询余额"}
 					</button>
+					</>}
 					<span />
 					<button type="button" disabled={pending} className="secondary-button" onClick={close}>
 						取消
 					</button>
 					<button disabled={pending || busy} className="primary-button">
-						{saving ? "正在保存…" : connectionChanged ? "保存并使用" : "保存设置"}
+						{saving ? "正在保存…" : connectionOnly ? (testing ? "正在测试…" : "测试并连接") : connectionChanged ? "保存并使用" : "保存设置"}
 					</button>
 				</div>
 			</form>

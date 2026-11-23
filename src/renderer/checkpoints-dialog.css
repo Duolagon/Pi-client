@@ -1,0 +1,27 @@
+.cc-rewind-confirm {
+	display: grid;
+	gap: 8px;
+	padding: 12px;
+	margin: 8px 0;
+	border: 1px solid var(--cl-line);
+	border-radius: 8px;
+}
+
+.cc-rewind-confirm p,
+.cc-rewind-confirm ul {
+	margin: 0;
+}
+
+.cc-rewind-confirm ul {
+	padding-inline-start: 20px;
+	overflow: auto;
+	max-height: 110px;
+	overflow-wrap: anywhere;
+}
+
+.cc-rewind-confirm-actions {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-end;
+	gap: 8px;
+}

@@ -164,3 +164,42 @@ test("a write the user denied is not a tool error", () => {
 	} as unknown as Message;
 	assert.equal(scoreTurn([assistant(null, { tools: [edit()] }), denied]).omen, "unverified");
 });
+
+test("a passing check becomes stale after a later edit", () => {
+	const result = scoreTurn([
+		assistant(null, { tools: [bash("b1", "npm test")] }),
+		toolResult("b1", false),
+		assistant(null, { tools: [edit()] }),
+		toolResult("e1", false),
+	]);
+	assert.equal(result.label, "改动后待验证");
+	assert.deepEqual(result.checks.map(({ command, status }) => ({ command, status })), [{ command: "npm test", status: "stale" }]);
+});
+
+test("echo and compound shell lines cannot certify changes", () => {
+	const result = scoreTurn([
+		assistant(null, { tools: [edit()] }),
+		bashExec('echo "npm test"', 0),
+		bashExec("npm test || true", 0),
+	]);
+	assert.equal(result.signals.verifyRan, false);
+	assert.equal(result.omen, "unverified");
+});
+
+test("later shell writes make checks stale while Git diff does not", () => {
+	const checked = [assistant(null, { tools: [edit(), bash("test", "npm test")] }), toolResult("test", false)];
+	assert.equal(scoreTurn([...checked, bashExec("git diff --stat", 0)]).checks[0].status, "passed");
+	assert.equal(scoreTurn([...checked, bashExec("printf x > src/a.ts", 0)]).checks[0].status, "stale");
+	assert.equal(scoreTurn([...checked, bashExec("npx prettier --write src/a.ts", 0)]).checks[0].status, "stale");
+});
+
+test("an edit still running when a check starts invalidates the result", () => {
+	const check = toolResult("test", false);
+	assert.equal(check.role, "toolResult");
+	const result = scoreTurn([
+		assistant(null, { tools: [edit(), bash("test", "npm test")] }),
+		toolResult("e1", false),
+		{ ...check, timestamp: clock + 10, durationMs: 30 },
+	]);
+	assert.equal(result.checks[0].status, "stale");
+});

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { open, readdir, stat } from "node:fs/promises";
 import { dirname, join, matchesGlob, relative, resolve, sep } from "node:path";
 import { managedDirectory, managedFile } from "./managed-path.ts";
+import { fileReferences, isReferenceablePath } from "./file-references.ts";
 
 export const privateMemoryLabel = "本机项目记忆";
 export const memoryLimit = 24 * 1024;
@@ -30,16 +31,12 @@ export async function readProjectText(root: string, path: string, limit = memory
 }
 
 function references(text: string): string[] {
-	const plain = text.replace(/^```[^\n]*\n[\s\S]*?^```/gm, "").replace(/`[^`\n]*`/g, "");
-	return [...plain.matchAll(/(?:^|[\s(])@(?:"([^"\n]+)"|([\p{L}\p{N}_./-]+))/gu)]
-		.map((match) => match[1] ?? match[2].replace(/[.]$/, ""))
-		.slice(0, 24);
+	return fileReferences(text).slice(0, 24).map(({ path }) => path);
 }
 
 function projectRelative(root: string, parent: string, target: string): string | undefined {
 	const rel = relative(root, resolve(root, parent, target)).split(sep).join("/");
-	if (!/^(?!\.\.(?:\/|$))[^/].*/.test(rel)) return;
-	if (rel.split("/").some((part) => /^(?:\.git|\.env(?:\..*)?|\.ssh|auth\.json|.*\.(?:pem|key))$/i.test(part))) return;
+	if (!isReferenceablePath(rel)) return;
 	return rel;
 }
 

@@ -1,0 +1,183 @@
+.cl-conversation {
+	container: conversation / inline-size;
+	--chat-gutter: clamp(16px, 4cqw, 28px);
+	--chat-width: min(764px, calc(100% - 2 * var(--chat-gutter)));
+}
+.cl-conversation :is(.cl-transcript, .cl-composer, .cl-working, .cc-active-request, .cc-completion-card, .cc-plan-bar, .cc-pinned-todos, .cc-queue) {
+	width: var(--chat-width);
+	max-width: none;
+	margin-inline: auto;
+}
+.cl-conversation :is(.cl-transcript, .cl-composer, .cl-working) {
+	padding-inline: 0;
+}
+.cl-conversation .cl-user-bubble {
+	max-width: none;
+}
+.cl-conversation .cl-transcript > :last-child {
+	margin-block-end: 0;
+}
+.cl-conversation :is(.cc-active-request, .cc-completion-card) {
+	margin-block: 6px 14px;
+}
+.cc-inline-approval,
+.cc-completion-card {
+	border: 1px solid var(--cl-line);
+	border-radius: var(--r-lg);
+	background: var(--cl-surface);
+	padding: 12px 14px;
+}
+.cc-inline-approval > h3 {
+	margin: 0 0 8px;
+	font-size: 14px;
+	line-height: 1.4;
+}
+.cc-inline-approval .simple-dialog {
+	padding: 0;
+}
+.cc-inline-approval .permission-detail {
+	max-height: 200px;
+	overflow: auto;
+}
+.cc-inline-approval .dialog-actions {
+	margin-top: 12px;
+	flex-wrap: wrap;
+}
+.cc-inline-approval :is(.cc-perm-reason, .dialog-actions button) {
+	overflow-wrap: anywhere;
+}
+.cc-inline-approval .dialog-actions button {
+	max-width: 100%;
+	white-space: normal;
+}
+.cc-inline-approval .cc-perm-scroll {
+	max-height: min(220px, 34vh);
+}
+.cc-inline-approval .cc-perm-reason code {
+	display: block;
+}
+@container conversation (max-width: 470px) {
+	.cc-inline-approval .dialog-actions .cc-defer-approval {
+		margin-inline-end: 0;
+	}
+}
+.cc-completion-card,
+.cc-completion-actions {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+.cc-completion-card {
+	justify-content: space-between;
+	flex-wrap: wrap;
+}
+.cc-completion-card small,
+.cc-attention-row small {
+	display: block;
+	color: var(--cl-3);
+}
+.cc-task-attention {
+	padding: 7px 0 10px;
+	border-bottom: 1px solid var(--cl-line);
+}
+.cc-attention-heading,
+.cc-attention-group h3,
+.cc-attention-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+.cc-attention-heading {
+	justify-content: space-between;
+	padding-inline-start: 10px;
+}
+.cc-attention-heading h2,
+.cc-attention-group h3 {
+	margin: 4px 0;
+	font-size: 12px;
+}
+.cc-attention-group + .cc-attention-group {
+	margin-top: 8px;
+}
+.cc-attention-group h3 {
+	padding-inline: 10px 2px;
+	color: var(--cl-3);
+}
+.cc-attention-group h3 span {
+	margin-inline-start: auto;
+	font-variant-numeric: tabular-nums;
+}
+.cc-attention-row {
+	background: transparent;
+	border: 0;
+	border-radius: 6px;
+	color: inherit;
+	justify-content: space-between;
+	width: 100%;
+	text-align: start;
+	padding: 5px 8px 5px 10px;
+}
+.cc-attention-row:hover,
+.cc-attention-row:focus-visible {
+	background: var(--cl-hover);
+}
+.cc-attention-row > span {
+	min-width: 0;
+}
+.cc-attention-row strong,
+.cc-attention-row small {
+	display: block;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.cc-attention-row strong {
+	font-size: 12px;
+}
+.cc-queue-group {
+	padding: 5px;
+}
+.cl-conversation :is(.cc-queue-head, .cc-queue-actions, .cc-plan-bar-actions) {
+	flex-wrap: wrap;
+	min-width: 0;
+	flex-shrink: 1;
+}
+.cc-queue-group > span,
+.cc-turn-checks > summary {
+	font-size: 12px;
+	font-weight: 600;
+}
+.cc-turn-checks {
+	margin: 8px 0 8px 18px;
+}
+.cc-turn-checks > summary {
+	cursor: pointer;
+}
+.cc-turn-checks ul {
+	margin-block: 6px;
+	padding: 0;
+	list-style: none;
+}
+.cc-turn-checks li,
+.cc-plan-error {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+	margin-block: 4px;
+	font-size: 12px;
+}
+.cc-turn-checks code {
+	overflow-wrap: anywhere;
+}
+.cc-tool-error-label,
+.cc-plan-error {
+	color: var(--cl-red);
+}
+.cc-tool-awaiting {
+	color: var(--cl-amber);
+}
+.cc-connect-first {
+	margin-top: 16px;
+}

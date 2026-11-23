@@ -30,7 +30,7 @@ import type {
 } from "./git-types.ts";
 
 const exec = promisify(execFile);
-const maxFileBytes = 64 * 1024 * 1024;
+export const MAX_CHECKPOINT_FILE_BYTES = 64 * 1024 * 1024;
 const maxSnapshotBytes = 512 * 1024 * 1024;
 const maxEntries = 50000;
 type Entry =
@@ -57,22 +57,28 @@ export class GitSnapshots {
 	}
 
 	/** Capture all tracked and nonignored untracked paths before a task starts. */
-	async begin(project: string, conversationId: string, label = "任务前快照"): Promise<GitCheckpoint> {
+	async begin(project: string, conversationId: string, label = "任务前快照", discardPath?: string): Promise<GitCheckpoint> {
 		const root = await this.projectRoot(project);
 		return this.serialize(root, async () => {
 			const createdAt = Date.now();
+			const beforeHead = await this.head(root);
+			const before = discardPath === undefined
+				? await this.capture(root)
+				: await this.capturePaths(root, new Set([discardPath, ...parents(discardPath)]));
+			if (discardPath !== undefined && ["excluded", "directory"].includes(before[discardPath].kind))
+				throw new Error("无法为这个文件保存撤销检查点。请先备份修改。");
 			const checkpoint: GitCheckpoint = {
 				id: randomUUID(),
 				project: root,
 				conversationId,
 				label: label.trim().slice(0, 160) || "任务前快照",
+				kind: discardPath === undefined ? undefined : "discard-undo",
 				createdAt,
 				status: "pending",
-				beforeHead: await this.head(root),
+				beforeHead,
 				changes: [],
 				restoredPaths: [],
 			};
-			const before = await this.capture(root);
 			checkpoint.excludedFiles = excludedPaths(before).size || undefined;
 			await this.save({ version: 1, checkpoint, before });
 			return structuredClone(checkpoint);
@@ -80,12 +86,16 @@ export class GitSnapshots {
 	}
 
 	/** Seal the after-state; subsequent changes are treated as external edits during restore. */
-	async finish(project: string, id: string): Promise<GitCheckpoint> {
+	async finish(project: string, id: string, options?: { conversationId?: string; userEntryId?: string }): Promise<GitCheckpoint> {
 		const root = await this.projectRoot(project);
 		return this.serialize(root, async () => {
-			const manifest = await this.load(root, id);
+			const manifest = await this.load(root, id, options?.conversationId);
 			if (manifest.after) return structuredClone(manifest.checkpoint);
-			manifest.after = await this.capture(root, Object.keys(manifest.before));
+			const paths = Object.keys(manifest.before);
+			manifest.after = manifest.checkpoint.kind === "discard-undo"
+				? await this.capturePaths(root, new Set(paths))
+				: await this.capture(root, paths);
+			manifest.checkpoint.userEntryId = options?.userEntryId;
 			manifest.checkpoint.finishedAt = Date.now();
 			manifest.checkpoint.afterHead = await this.head(root);
 			const excluded = excludedPaths(manifest.before, manifest.after);
@@ -94,6 +104,16 @@ export class GitSnapshots {
 			manifest.checkpoint.status = "ready";
 			await this.save(manifest);
 			return structuredClone(manifest.checkpoint);
+		});
+	}
+
+	/** Remove a backup for an operation refused before it touched the worktree. */
+	async abandonDiscard(project: string, id: string, conversationId: string): Promise<void> {
+		const root = await this.queryRoot(project);
+		await this.serialize(root, async () => {
+			const { checkpoint, after } = await this.load(root, id, conversationId);
+			if (checkpoint.kind === "discard-undo" && !after)
+				await unlink(join(this.directory(root), `${id}.json`));
 		});
 	}
 
@@ -119,10 +139,10 @@ export class GitSnapshots {
 	}
 
 	/** Return unified before/after differences, including binary and mode summaries. */
-	async diff(project: string, id: string, path?: string): Promise<GitCheckpointDiff> {
+	async diff(project: string, id: string, path?: string, conversationId?: string): Promise<GitCheckpointDiff> {
 		const root = await this.queryRoot(project);
 		return this.serialize(root, async () => {
-			const manifest = await this.load(root, id);
+			const manifest = await this.load(root, id, conversationId);
 			if (!manifest.after) throw new Error("任务尚未结束，请先完成快照。");
 			if (path !== undefined) checkPath(path);
 			const selected =
@@ -181,10 +201,10 @@ export class GitSnapshots {
 	}
 
 	/** Restore selected changed paths only if their current state still matches this checkpoint. */
-	async restore(project: string, id: string, paths?: string[]): Promise<GitRestoreResult> {
+	async restore(project: string, id: string, paths?: string[], conversationId?: string): Promise<GitRestoreResult> {
 		const root = await this.projectRoot(project);
 		return this.serialize(root, async () => {
-			const manifest = await this.load(root, id);
+			const manifest = await this.load(root, id, conversationId);
 			if (!manifest.after) throw new Error("任务尚未结束，不能撤销未完成的快照。");
 			const changed = new Set(manifest.checkpoint.changes.map((item) => item.path));
 			const selected = [...new Set(paths ?? changed)];
@@ -361,6 +381,10 @@ export class GitSnapshots {
 			paths.add(path);
 			for (const parent of parents(path)) paths.add(parent);
 		}
+		return this.capturePaths(project, paths);
+	}
+
+	private async capturePaths(project: string, paths: Set<string>): Promise<Record<string, Entry>> {
 		if (paths.size > maxEntries) throw new Error("快照路径超过 50000 项，请先配置 Git 忽略规则。");
 		const result: Record<string, Entry> = Object.create(null);
 		let size = 0;
@@ -372,7 +396,7 @@ export class GitSnapshots {
 		return result;
 	}
 
-	private async inspect(project: string, path: string, persist = false, remainingBytes = maxFileBytes): Promise<Entry> {
+	private async inspect(project: string, path: string, persist = false, remainingBytes = MAX_CHECKPOINT_FILE_BYTES): Promise<Entry> {
 		checkPath(path);
 		for (const parent of parents(path)) {
 			try {
@@ -399,7 +423,7 @@ export class GitSnapshots {
 			bytes = Buffer.from(await readlink(target));
 		} else if (info.isFile()) {
 			kind = "file";
-			if (info.size > Math.min(maxFileBytes, remainingBytes)) return excluded;
+			if (info.size > Math.min(MAX_CHECKPOINT_FILE_BYTES, remainingBytes)) return excluded;
 			const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
 			try {
 				const before = await handle.stat();
@@ -419,7 +443,7 @@ export class GitSnapshots {
 				await handle.close();
 			}
 		} else throw new Error(`不支持为特殊文件创建快照：${path}`);
-		if (bytes.length > Math.min(maxFileBytes, remainingBytes)) return excluded;
+		if (bytes.length > Math.min(MAX_CHECKPOINT_FILE_BYTES, remainingBytes)) return excluded;
 		const digest = hash(bytes);
 		if (persist)
 			await writeFile(join(this.dataDir, "blobs", digest), bytes, { flag: "wx", mode: 0o600 }).catch(
@@ -503,10 +527,13 @@ export class GitSnapshots {
 		}
 	}
 
-	private async load(project: string, id: string): Promise<Manifest> {
+	private async load(project: string, id: string, conversationId?: string): Promise<Manifest> {
 		if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error("快照 ID 无效。");
 		const input: unknown = JSON.parse(await readFile(join(this.directory(project), `${id}.json`), "utf8"));
-		return validateManifest(input, project, id);
+		const manifest = validateManifest(input, project, id);
+		if (conversationId !== undefined && manifest.checkpoint.conversationId !== conversationId)
+			throw new Error("检查点不属于当前会话。");
+		return manifest;
 	}
 
 	private async fileDiff(path: string, before: Entry, after: Entry): Promise<{ diff: string; truncated: boolean }> {
@@ -643,6 +670,8 @@ function validateManifest(input: unknown, project: string, id: string): Manifest
 		typeof value.checkpoint.conversationId !== "string" ||
 		typeof value.checkpoint.createdAt !== "number" ||
 		typeof value.checkpoint.label !== "string" ||
+		(value.checkpoint.userEntryId !== undefined && (typeof value.checkpoint.userEntryId !== "string" || !/^[a-zA-Z0-9._-]{1,200}$/.test(value.checkpoint.userEntryId))) ||
+		(value.checkpoint.kind !== undefined && value.checkpoint.kind !== "discard-undo") ||
 		!["pending", "ready", "partially-restored", "restored"].includes(value.checkpoint.status) ||
 		!Array.isArray(value.checkpoint.restoredPaths)
 	)
@@ -665,7 +694,7 @@ function validateManifest(input: unknown, project: string, id: string): Manifest
 				(!/^[a-f0-9]{64}$/.test(entry.hash) ||
 					!Number.isInteger(entry.size) ||
 					entry.size < 0 ||
-					entry.size > maxFileBytes ||
+					entry.size > MAX_CHECKPOINT_FILE_BYTES ||
 					typeof entry.binary !== "boolean")
 			)
 				throw new Error("快照文件内容索引无效。");

@@ -141,13 +141,6 @@
 .live-app.cl-side-hidden {
 	grid-template-columns: minmax(0, 1fr);
 }
-.live-app.has-inspector {
-	grid-template-columns: var(--cl-side-w) minmax(0, 1fr) minmax(320px, 400px);
-}
-.live-app.has-inspector.cl-side-hidden {
-	grid-template-columns: minmax(0, 1fr) minmax(320px, 400px);
-}
-
 /* ── Sidebar (Claude Code warm parchment / charcoal rail) ── */
 .cl-side {
 	display: flex;
@@ -502,6 +495,7 @@
 	background: var(--cl-bg);
 }
 .cl-top {
+	container: chat-header / inline-size;
 	height: 48px;
 	display: flex;
 	align-items: center;
@@ -527,6 +521,11 @@
 	gap: 6px;
 	min-width: 0;
 	flex: 1;
+}
+.cl-top-title > .icon-button {
+	width: 28px;
+	height: 28px;
+	flex: none;
 }
 .cl-top-sep {
 	color: var(--cl-line);
@@ -2000,6 +1999,14 @@
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
+.cc-ws-branch svg {
+	flex: none;
+}
+.cc-ws-branch span {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
 .cc-ws-caret {
 	color: var(--cl-3);
 	flex-shrink: 0;
@@ -2601,47 +2608,17 @@
 
 /* ── Responsive ── */
 @media (max-width: 1180px) {
-	.live-app,
-	.live-app.has-inspector {
+	.live-app {
 		--cl-side-w: 224px;
 	}
 }
 @media (max-width: 1000px) {
-	.live-app,
-	.live-app.has-inspector {
+	.live-app {
 		--cl-side-w: 204px;
-		grid-template-columns: var(--cl-side-w) minmax(0, 1fr);
-	}
-	.live-app.cl-side-hidden,
-	.live-app.has-inspector.cl-side-hidden {
-		grid-template-columns: minmax(0, 1fr);
-	}
-	.live-app .inspector {
-		position: fixed;
-		right: 0;
-		top: 48px;
-		bottom: 0;
-		width: 330px;
-		max-width: 86vw;
-		z-index: 45;
-		box-shadow: var(--shadow);
-		border-left: 1px solid var(--cl-line);
 	}
 	.cl-top {
 		gap: 8px;
 		padding: 0 10px 0 12px;
-	}
-	.cc-ws-topbar-btn {
-		max-width: 170px;
-	}
-	.cc-ws-branch {
-		display: none;
-	}
-	.cc-top-btn {
-		padding: 0 7px;
-	}
-	.cc-top-btn > span {
-		display: none;
 	}
 	.cl-transcript,
 	.cl-composer {
@@ -4520,23 +4497,57 @@ button:disabled,
 /* Topbar: workspace chip and title shrink together instead of overlapping. */
 .cc-ws-picker-topbar {
 	flex: 0 1 auto;
-	min-width: 72px;
+	min-width: 46px;
+	max-width: min(58%, 320px);
 }
 .cc-ws-picker-topbar .cc-ws-topbar-btn {
-	max-width: min(280px, 100%);
+	max-width: 100%;
 	min-width: 0;
 }
 .cc-ws-picker-topbar .cc-ws-name {
 	min-width: 0;
 }
 .cc-ws-picker-topbar .cc-ws-branch {
-	flex: 0 1 auto;
+	flex: 0 0 auto;
 	min-width: 0;
+	max-width: min(105px, 45%);
 }
 .cl-top-title > .cl-title-button {
 	flex: 0 1 auto;
-	min-width: 48px;
+	min-width: 0;
 	max-width: none;
+}
+@container chat-header (max-width: 620px) {
+	.cl-top-title,
+	.cl-top-tools {
+		gap: 4px;
+	}
+	.cl-top-tools .cc-top-btn,
+	.cl-top-tools .cc-theme-pill {
+		padding-inline: 6px;
+	}
+	.cl-top-tools .cc-more-btn {
+		padding-inline: 0;
+	}
+	.cl-top-tools .cc-top-btn > span,
+	.cl-top-tools .cc-theme-pill > span,
+	.cc-ws-picker-topbar .cc-ws-name,
+	.cc-ws-picker-topbar .cc-ws-branch {
+		display: none;
+	}
+	.cc-ws-picker-topbar {
+		flex: 0 0 auto;
+		min-width: 0;
+	}
+}
+@container chat-header (max-width: 380px) {
+	.cl-top-title .cl-top-sep,
+	.cl-top-title .cl-title-button {
+		display: none;
+	}
+	.cc-ws-picker-topbar {
+		max-width: 100%;
+	}
 }
 /* Diff panel change rows: left aligned, status badge separated from the path. */
 .cc-change-row .cc-change-open {
@@ -4583,6 +4594,40 @@ button:disabled,
 .live-app.has-inspector.cl-side-hidden {
 	grid-template-columns: minmax(0, 1fr) var(--inspector-w, 400px);
 }
+.live-app.has-inspector.has-compact-inspector {
+	grid-template-columns: minmax(0, 1fr) clamp(300px, 44vw, var(--inspector-w, 400px));
+}
+.live-app.has-inspector.has-compact-inspector.is-review-pane {
+	grid-template-columns: minmax(0, 1fr) minmax(380px, 49vw);
+}
+.live-app.has-inspector > .inspector {
+	position: relative;
+	inset: auto;
+	width: auto;
+	max-width: none;
+	border-top: 0;
+	box-shadow: none;
+	z-index: 4;
+}
+.live-app.has-inspector > .inspector > .inspector-header {
+	height: 48px;
+}
+.live-app.has-inspector.is-full-review {
+	grid-template-columns: minmax(0, 1fr);
+}
+.live-app.is-full-review > .cl-main {
+	display: none;
+}
+.live-app.is-full-review > .inspector {
+	border-left: 0;
+}
+.live-app.is-full-review > .inspector > .inspector-header {
+	padding-left: var(--traffic-clear);
+	-webkit-app-region: drag;
+}
+.live-app.is-full-review .inspector-header button {
+	-webkit-app-region: no-drag;
+}
 .cc-inspector-resize {
 	position: absolute;
 	top: 0;
@@ -4614,17 +4659,6 @@ body.cc-resizing {
 }
 body.cc-resizing iframe {
 	pointer-events: none;
-}
-@media (max-width: 1000px) {
-	.live-app.has-inspector {
-		grid-template-columns: var(--cl-side-w) minmax(0, 1fr);
-	}
-	.live-app.has-inspector.cl-side-hidden {
-		grid-template-columns: minmax(0, 1fr);
-	}
-	.cc-inspector-resize {
-		display: none;
-	}
 }
 /* Sub-agent fold control sits inside the parent row card. */
 .cl-conv-row {
@@ -4693,6 +4727,7 @@ body.cc-resizing iframe {
 .inspector-header [role="tablist"] {
 	display: inline-flex;
 	align-items: center;
+	height: auto;
 	gap: 2px;
 	padding: 2px;
 	border-radius: var(--r-md);
@@ -4833,29 +4868,6 @@ body.cc-resizing iframe {
 		display: none;
 	}
 }
-/* Narrow windows: the side panel takes the sidebar's place instead of covering the composer. */
-@media (max-width: 1000px) {
-	.live-app.has-inspector,
-	.live-app.has-inspector.cl-side-hidden {
-		grid-template-columns: minmax(0, 1fr) clamp(300px, 44vw, var(--inspector-w, 400px));
-	}
-	.live-app.has-inspector > .cl-side {
-		display: none;
-	}
-	.live-app.has-inspector .cl-top {
-		padding-left: var(--traffic-clear);
-	}
-	.live-app.has-inspector .inspector {
-		position: relative;
-		top: auto;
-		right: auto;
-		bottom: auto;
-		width: auto;
-		max-width: none;
-		box-shadow: none;
-		z-index: 4;
-	}
-}
 /* Empty states */
 .cc-empty-state {
 	display: flex;
@@ -4896,16 +4908,6 @@ body.cc-resizing iframe {
 .cl-main > .cc-flash {
 	position: absolute;
 }
-/* Sidebar entry points stay reachable when the narrow layout hides the sidebar for a side panel. */
-.live-app:not(.cl-side-hidden):not(.has-inspector) .cl-narrow-only {
-	display: none;
-}
-@media (min-width: 1001px) {
-	.live-app:not(.cl-side-hidden) .cl-narrow-only {
-		display: none;
-	}
-}
-
 /* /doctor environment diagnosis */
 .cc-doctor { display: flex; flex-direction: column; gap: 10px; }
 .cc-doctor-summary { margin: 0; font-weight: 600; }

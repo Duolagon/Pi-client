@@ -1,18 +1,20 @@
 import { draftPrompt, mergeDrafts, type ComposerDraft, type Prompt } from "./composer-draft.ts";
 import { QueuedPrompts, type NativeQueue } from "./queued-prompts.ts";
-import type { DesktopPromptResult, QueueActionResult } from "./shared.ts";
+import type { DesktopPromptResult, FileReferenceAvailability, QueueActionResult, QueuedPromptGroups } from "./shared.ts";
+import { searchWorkspaceFiles } from "./workspace-file-search.ts";
+import { isReferenceablePath } from "./file-references.ts";
 import { createDraftPullRequest, readPullRequest, readPullRequestComments, setPullRequestAutoMerge, type DraftPullRequest } from "./review-service.ts";
 import { managedFile, writeManagedFile } from "./managed-path.ts";
 import { execFile } from "node:child_process";
 import { randomBytes, randomUUID, createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, writeFile, rename, realpath, stat, readdir, rm } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, readFile, writeFile, rename, realpath, stat, readdir, rm } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { summarizeEngineError, tildify } from "./desktop-log.ts";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { AgentProcess } from "./rpc.ts";
-import { GitSnapshots } from "./git-snapshots.ts";
+import { GitSnapshots, MAX_CHECKPOINT_FILE_BYTES } from "./git-snapshots.ts";
 import {
 	annotateDiff,
 	buildBlindPrompt,
@@ -106,6 +108,8 @@ import type {
 	Snapshot,
 	ThinkingLevel,
 	Workspace,
+	GitDiscardInput,
+	GitDiscardResult,
 	ConnectionInput,
 	ConnectionProtocol,
 	ConnectionTestResult,
@@ -120,7 +124,7 @@ import type {
 } from "./shared.ts";
 import { connectionMode, validateEndpoint } from "./model-connections.ts";
 import { providerModels, providerPresets } from "./provider-presets.ts";
-import { memoryLimit, memoryName, privateMemoryLabel } from "./project-memory.ts";
+import { memoryLimit, memoryName, privateMemoryLabel, readProjectText } from "./project-memory.ts";
 import { codeIntelligence, formatCodeIntelligence, formatLspDiagnostics, isLspSupportedFile, type CodePosition } from "./language-service.ts";
 import { buildGoalInitialPrompt, DEFAULT_GOAL_MAX_TURNS, evaluateGoalContinuation, MAX_GOAL_TURNS } from "./goal-mode.ts";
 import { buildLaunchShellCommand, launchConfigUrl, readLaunchConfigurations, validateLocalPreviewUrl } from "./launch-config.ts";
@@ -199,14 +203,16 @@ export function piToolArgs(
 	const delegationTools = options?.canDelegate
 		? ["Agent", "SendMessage", "AgentSend", "TaskOutput", "TaskStop", "TaskList", "WorktreeList"].filter((name) => !disallowed.has(name))
 		: [];
+	const planTools = policyMode === "plan" && !disallowed.has("ExitPlanMode") &&
+		(!task?.allowedTools || task.allowedTools.includes("ExitPlanMode")) ? ["ExitPlanMode"] : [];
 	if (definedTools !== undefined) {
 		// An explicit empty allowlist must deny all built-in tools instead of
 		// falling back to Pi's unrestricted default.
-		const list = definedTools.length > 0 ? [...definedTools, ...delegationTools] : definedTools;
+		const list = [...definedTools, ...planTools, ...(definedTools.length > 0 ? delegationTools : [])];
 		return ["--tools", list.join(","), ...(policyMode === "read" || policyMode === "plan" ? ["--exclude-tools", "mcp__*"] : [])];
 	}
 	if (policyMode === "read") return ["--tools", ["read", "grep", "find", "ls", ...delegationTools].join(","), "--exclude-tools", "mcp__*"];
-	if (policyMode === "plan") return ["--tools", ["read", "grep", "find", "ls", "write", "edit", ...delegationTools].join(","), "--exclude-tools", "mcp__*"];
+	if (policyMode === "plan") return ["--tools", ["read", "grep", "find", "ls", "write", "edit", ...planTools, ...delegationTools].join(","), "--exclude-tools", "mcp__*"];
 	return [];
 }
 function finiteCount(value: unknown): number {
@@ -264,6 +270,7 @@ interface SessionRuntime {
 	/** Recently answered UI request ids in this runtime, so duplicate replies are idempotent. */
 	answeredUI: Set<string>;
 	checkpointId?: string;
+	checkpointUserAnchor?: { previousEntryId: string | null; observedPrompt: boolean };
 	settling?: Promise<void>;
 	userQueue?: QueuedPrompts;
 	loading?: Promise<void>;
@@ -1968,13 +1975,17 @@ export class DesktopService {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 			throw error;
 		}
+		await this.moveToTrash(filePath);
+	}
+
+	private async moveToTrash(filePath: string): Promise<void> {
 		if (this.options.trashItem) {
 			await this.options.trashItem(filePath);
 			return;
 		}
 		const trashDir = join(this.options.dataDir, "trash");
 		await mkdir(trashDir, { recursive: true });
-		const target = join(trashDir, `${Date.now()}-${basename(filePath)}`);
+		const target = join(trashDir, `${randomUUID()}-${basename(filePath)}`);
 		await rename(filePath, target);
 	}
 
@@ -3080,7 +3091,7 @@ export class DesktopService {
 					hook.additionalContext && !command.message.includes(hook.additionalContext)
 						? { ...command, message: `${command.message}\n\n[Hook Context]\n${hook.additionalContext}` }
 						: command;
-				if (!alreadyRunning) await this.startCheckpoint(runtime, command.message);
+				if (!alreadyRunning) await this.startCheckpoint(runtime, command.message, true);
 				// Definitions edited outside the app take effect on this run's agent listing.
 				if (!alreadyRunning) await this.writeAgentListing(runtime).catch(() => {});
 				if (this.closed || (launch !== undefined && this.launches.get(active.id) !== launch))
@@ -3216,6 +3227,27 @@ export class DesktopService {
 			.sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name));
 	}
 
+	async searchFiles(conversationId: string, query: string): Promise<FileEntry[]> {
+		await this.operation;
+		const { project } = this.conversation(conversationId);
+		return searchWorkspaceFiles(project, query, this.options.env ?? process.env);
+	}
+
+	async checkFileReferences(conversationId: string, paths: string[]): Promise<FileReferenceAvailability[]> {
+		await this.operation;
+		const { project } = this.conversation(conversationId);
+		const trustDecision = this.store.projectTrust?.[this.trustProjectFor(project)];
+		const task = this.store.tasks.find((item) => item.conversationId === conversationId);
+		if (trustDecision !== "trusted") return paths.map(() => "untrusted");
+		if (task?.omitClaudeMd) return paths.map(() => "unavailable");
+		return Promise.all(paths.map(async (candidate): Promise<FileReferenceAvailability> => {
+			const path = candidate.replace(/^\.\//, "");
+			if (!isReferenceablePath(path)) return "unavailable";
+			const content = await readProjectText(project, path);
+			return content?.trim() ? "ready" : "unavailable";
+		}));
+	}
+
 	async inspectCode(conversationId: string, path: string, at?: CodePosition) {
 		await this.operation;
 		const { project } = this.conversation(conversationId);
@@ -3237,29 +3269,34 @@ export class DesktopService {
 	async workspace(conversationId?: string): Promise<Workspace> {
 		const cwd = this.conversation(conversationId).project;
 		try {
-			const [{ stdout: branch }, { stdout: status }] = await Promise.all([
+			const [{ stdout: branch }, { stdout: status }, { stdout: gitPrefix }] = await Promise.all([
 				exec("git", ["branch", "--show-current"], { cwd, maxBuffer: 2 * 1024 * 1024, timeout: 10000 }),
-				exec("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+				exec("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."], {
 					cwd,
 					maxBuffer: 2 * 1024 * 1024,
 					timeout: 10000,
 				}),
+				exec("git", ["rev-parse", "--show-prefix"], { cwd, timeout: 10000 }),
 			]);
+			// Porcelain uses repository-relative names even when Git runs in a project subdirectory.
+			const prefix = gitPrefix.replace(/\r?\n$/, "");
 			const fields = status.split("\0");
 			const changes: Workspace["changes"] = [];
 			for (let index = 0; index < fields.length; index++) {
 				const field = fields[index];
 				if (!field) continue;
 				const code = field.slice(0, 2);
+				const path = field.slice(3);
+				if (code.includes("R") || code.includes("C")) index++;
+				if (!path.startsWith(prefix)) continue;
 				const x = code[0] ?? " ";
 				const y = code[1] ?? " ";
 				changes.push({
 					status: code.trim() || "M",
-					path: field.slice(3),
+					path: path.slice(prefix.length),
 					staged: x !== " " && x !== "?",
 					unstaged: y !== " " || code === "??",
 				});
-				if (code.includes("R") || code.includes("C")) index++;
 			}
 			return { branch: branch.trim() || "HEAD", changes, isGit: true };
 		} catch (error) {
@@ -3274,7 +3311,7 @@ export class DesktopService {
 		// Git paths can name deleted files, so enforce lexical containment before calling Git.
 		const absolute = resolve(cwd, path);
 		if (!inside(cwd, absolute)) throw new Error("文件路径超出项目目录。");
-		const projectPath = relative(cwd, absolute);
+		const projectPath = relative(cwd, absolute).split(sep).join("/");
 		const workspace = await this.workspace(conversationId);
 		const change = workspace.changes.find((item) => item.path === projectPath);
 		if (!change) return "此文件没有未提交的修改。";
@@ -3286,12 +3323,12 @@ export class DesktopService {
 				.join("\n")}`;
 		}
 		const [{ stdout: unstaged }, { stdout: staged }] = await Promise.all([
-			exec("git", ["diff", "--no-ext-diff", "--no-textconv", "--", projectPath], {
+			exec("git", ["--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--", projectPath], {
 				cwd,
 				maxBuffer: 2 * 1024 * 1024,
 				timeout: 10000,
 			}),
-			exec("git", ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--", projectPath], {
+			exec("git", ["--literal-pathspecs", "diff", "--cached", "--no-ext-diff", "--no-textconv", "--", projectPath], {
 				cwd,
 				maxBuffer: 2 * 1024 * 1024,
 				timeout: 10000,
@@ -3308,8 +3345,8 @@ export class DesktopService {
 			if (!p || p.includes("\0")) throw new Error("文件路径格式错误。");
 			const abs = resolve(cwd, p);
 			if (!inside(cwd, abs)) throw new Error("文件路径超出项目目录。");
-			const rel = relative(cwd, abs);
-			if (!rel || rel === ".git" || rel.startsWith(`.git${sep}`) || rel.startsWith(".git/"))
+			const rel = relative(cwd, abs).split(sep).join("/");
+			if (!rel || rel.split("/").some((part) => part.toLowerCase() === ".git"))
 				throw new Error("不允许操作 .git 元数据目录。");
 			return rel;
 		});
@@ -3319,7 +3356,7 @@ export class DesktopService {
 		this.assertWritableMode("修改 Git 暂存区", conversationId);
 		const cwd = this.conversation(conversationId).project;
 		const rels = paths?.length ? this.gitPaths(cwd, paths) : [];
-		const args = rels.length ? ["add", "--", ...rels] : ["add", "-A"];
+		const args = ["--literal-pathspecs", "add", "-A", "--", ...(rels.length ? rels : ["."])];
 		await exec("git", args, { cwd, maxBuffer: 2 * 1024 * 1024, timeout: 10000 });
 		return this.workspace(conversationId);
 	}
@@ -3328,8 +3365,9 @@ export class DesktopService {
 		this.assertWritableMode("修改 Git 暂存区", conversationId);
 		const cwd = this.conversation(conversationId).project;
 		const rels = paths?.length ? this.gitPaths(cwd, paths) : [];
+		const targets = rels.length ? rels : ["."];
 		try {
-			await exec("git", rels.length ? ["reset", "-q", "HEAD", "--", ...rels] : ["reset", "-q", "HEAD"], {
+			await exec("git", ["--literal-pathspecs", "reset", "-q", "HEAD", "--", ...targets], {
 				cwd,
 				maxBuffer: 2 * 1024 * 1024,
 				timeout: 10000,
@@ -3338,7 +3376,7 @@ export class DesktopService {
 			// Unborn repository (no commits yet) has no HEAD; unstage via git rm --cached.
 			const stderr = (error as { stderr?: string }).stderr ?? "";
 			if (/ambiguous argument 'HEAD'|unknown revision|bad default revision/i.test(stderr)) {
-				await exec("git", rels.length ? ["rm", "--cached", "-r", "-q", "--", ...rels] : ["rm", "--cached", "-r", "-q", "."], {
+				await exec("git", ["--literal-pathspecs", "rm", "--cached", "-r", "-q", "--", ...targets], {
 					cwd,
 					maxBuffer: 2 * 1024 * 1024,
 					timeout: 10000,
@@ -3350,24 +3388,85 @@ export class DesktopService {
 		return this.workspace(conversationId);
 	}
 
-	async gitDiscard(paths: string[], conversationId?: string): Promise<Workspace> {
-		this.assertWritableMode("还原工作区文件", conversationId);
-		if (!paths.length) throw new Error("请指定要还原的文件路径。");
-		const cwd = this.conversation(conversationId).project;
+	async gitDiscardPreview(input: GitDiscardInput): Promise<{ version: string }> {
+		await this.operation;
+		const { version } = await this.gitDiscardTarget(input);
+		return { version };
+	}
+
+	private async gitDiscardTarget(input: GitDiscardInput) {
+		const { id, project: cwd } = this.conversation(input.conversationId);
+		this.assertWritableMode("还原工作区文件", id);
 		this.assertProjectIdle(cwd);
-		const rels = this.gitPaths(cwd, paths);
-		const ws = await this.workspace(conversationId);
-		const untracked = new Set(ws.changes.filter((c) => c.status === "??").map((c) => c.path));
-		const toRemove = rels.filter((r) => untracked.has(r));
-		const toCheckout = rels.filter((r) => !untracked.has(r));
-		for (const item of toRemove) {
-			const target = await this.scopedPath(item, conversationId);
-			await rm(target, { recursive: true, force: true });
+		const [path] = this.gitPaths(cwd, [input.path]);
+		const workspace = await this.workspace(id);
+		const change = workspace.changes.find((item) => item.path === path);
+		if (!change?.unstaged || (change.status === "??") !== (input.kind === "untracked"))
+			throw new Error("此文件的 Git 状态已改变。请刷新改动列表，再确认操作。");
+		const target = resolve(cwd, path);
+		// Resolve only ancestors. Moving a symlink must move the link itself.
+		const parent = dirname(target);
+		const canonicalParent = await realpath(parent).catch((error: NodeJS.ErrnoException) => {
+			if (input.kind === "tracked" && error.code === "ENOENT") return undefined;
+			throw error;
+		});
+		if (canonicalParent !== undefined && canonicalParent !== parent)
+			throw new Error("文件的父目录已改变。请确认工作区路径后重试。");
+		let indexEntry = "";
+		let indexedObject: string | undefined;
+		if (input.kind === "tracked") {
+			if (["DD", "AU", "UD", "UA", "DU", "AA", "UU"].includes(change.status))
+				throw new Error("请先解决合并冲突，再还原此文件。");
+			({ stdout: indexEntry } = await exec("git", ["--literal-pathspecs", "ls-files", "--stage", "-z", "--", path], {
+				cwd, timeout: 10000,
+			}));
+			const index = /^([0-7]{6}) ([a-f0-9]{40,64}) 0\t/.exec(indexEntry);
+			if (!index || index[1] === "160000") throw new Error("此路径没有可恢复的文件暂存版本。");
+			indexedObject = index[2];
 		}
-		if (toCheckout.length) {
-			await exec("git", ["checkout", "--", ...toCheckout], { cwd, maxBuffer: 2 * 1024 * 1024, timeout: 10000 });
-		}
-		return this.workspace(conversationId);
+		const info = await lstat(target, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
+			if (input.kind === "tracked" && error.code === "ENOENT") return undefined;
+			throw error;
+		});
+		if (info && !info.isFile() && !info.isSymbolicLink()) throw new Error("此操作只能用于单个文件。");
+		// Inode and nanosecond metadata distinguish replacements, edits and renames made
+		// between confirmation and execution, even if the porcelain status is unchanged.
+		const metadata = info ? [info.dev, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].join(":") : "missing";
+		const version = createHash("sha256").update([id, path, input.kind, change.status, indexEntry, metadata].join("\0")).digest("hex");
+		return { id, cwd, path, target, indexedObject, version };
+	}
+
+	gitDiscard(input: GitDiscardInput & { expectedVersion: string }): Promise<GitDiscardResult> {
+		return this.serialize(async () => {
+			const current = await this.gitDiscardTarget(input);
+			if (current.version !== input.expectedVersion) throw new Error("文件在确认后发生变化，请重新查看并确认。");
+			const { id, cwd, path, target, indexedObject } = current;
+			if (!indexedObject) {
+				await this.moveToTrash(target);
+				return { disposition: "trashed", workspace: await this.workspace(id) };
+			}
+			// The undo snapshot must also be able to verify the replacement against the index.
+			const { stdout } = await exec("git", ["cat-file", "-s", indexedObject], { cwd, timeout: 10000 });
+			if (Number(stdout.trim()) > MAX_CHECKPOINT_FILE_BYTES)
+				throw new Error("暂存版本超过撤销检查点容量。请先备份此文件。");
+			const before = await this.git.begin(cwd, id, `还原前备份 · ${path}`, path);
+			try {
+				if ((await this.gitDiscardTarget(input)).version !== input.expectedVersion)
+					throw new Error("文件在确认后发生变化，请重新查看并确认。");
+			} catch (error) {
+				await this.git.abandonDiscard(cwd, before.id, id).catch(() => {});
+				throw error;
+			}
+			try {
+				await exec("git", ["--literal-pathspecs", "checkout", "--", path], { cwd, maxBuffer: 2 * 1024 * 1024, timeout: 10000 });
+			} catch (error) {
+				// Seal the undo backup even if a Git checkout filter failed after starting a write.
+				await this.git.finish(cwd, before.id, { conversationId: id }).catch(() => {});
+				throw error;
+			}
+			const undoCheckpoint = await this.git.finish(cwd, before.id, { conversationId: id });
+			return { disposition: "restored", workspace: await this.workspace(id), undoCheckpoint };
+		});
 	}
 
 	async gitCommit(message: string, conversationId?: string): Promise<GitCommitResult> {
@@ -3901,7 +4000,7 @@ export class DesktopService {
 		const since = record.sealedAt.at(-1) ?? 0;
 		const workspace = await this.workspace(conversation.id).catch(() => undefined);
 		const checkpoints = workspace?.isGit ? await this.git.list(conversation.project, conversation.id).catch(() => []) : [];
-		const first = checkpoints.filter((item) => item.createdAt >= since).at(-1);
+		const first = checkpoints.filter((item) => item.kind !== "discard-undo" && item.createdAt >= since).at(-1);
 		return { wish: record.sealedAt.length, since, checkpoint: first };
 	}
 
@@ -5434,7 +5533,7 @@ export class DesktopService {
 		return this.serialize(async () => {
 			const conversation = this.conversation(conversationId);
 			this.assertProjectIdle(conversation.project);
-			return this.git.finish(conversation.project, id);
+			return this.git.finish(conversation.project, id, { conversationId: conversation.id });
 		});
 	}
 
@@ -5446,7 +5545,8 @@ export class DesktopService {
 
 	async checkpointDiff(id: string, conversationId?: string, path?: string): Promise<GitCheckpointDiff> {
 		await this.operation;
-		return this.git.diff(this.conversation(conversationId).project, id, path);
+		const conversation = this.conversation(conversationId);
+		return this.git.diff(conversation.project, id, path, conversation.id);
 	}
 
 	async restoreCheckpoint(id: string, conversationId?: string, paths?: string[]): Promise<GitRestoreResult> {
@@ -5460,7 +5560,7 @@ export class DesktopService {
 					.some((terminal) => terminal.status !== "exited" && overlaps(terminal.project, conversation.project))
 			)
 				throw new Error("请先关闭此项目的交互终端，再恢复文件。");
-			return this.git.restore(conversation.project, id, paths);
+			return this.git.restore(conversation.project, id, paths, conversation.id);
 		});
 	}
 
@@ -5686,7 +5786,7 @@ export class DesktopService {
 	private assertProjectIdle(project: string): void {
 		this.assertPathAvailable(project);
 	}
-	private async startCheckpoint(runtime: SessionRuntime, label: string): Promise<void> {
+	private async startCheckpoint(runtime: SessionRuntime, label: string, trackPrompt = false): Promise<void> {
 		if (this.isReadRestricted(runtime.conversationId) || this.store.tasks.some((task) => task.conversationId === runtime.conversationId && task.readOnly)) return;
 		if (runtime.checkpointId) return;
 		const workspace = await this.workspace(runtime.conversationId);
@@ -5694,6 +5794,11 @@ export class DesktopService {
 		const conversation = this.conversation(runtime.conversationId);
 		const checkpoint = await this.git.begin(conversation.project, conversation.id, label.slice(0, 160));
 		runtime.checkpointId = checkpoint.id;
+		if (trackPrompt) {
+			const before = await runtime.agent?.request<{ messages: { entryId: string }[] }>({ type: "get_fork_messages" })
+				.catch(() => undefined);
+			if (before) runtime.checkpointUserAnchor = { previousEntryId: before.messages.at(-1)?.entryId ?? null, observedPrompt: false };
+		}
 		const task = this.store.tasks.find((item) => item.conversationId === conversation.id);
 		if (task) task.checkpointId = checkpoint.id;
 	}
@@ -5701,8 +5806,23 @@ export class DesktopService {
 		this.clearTaskProgressTimer(runtime);
 		try {
 			if (runtime.checkpointId) {
-				await this.git.finish(this.conversation(runtime.conversationId).project, runtime.checkpointId);
+				const checkpointId = runtime.checkpointId;
+				const anchor = runtime.checkpointUserAnchor;
 				runtime.checkpointId = undefined;
+				runtime.checkpointUserAnchor = undefined;
+				let userEntryId: string | undefined;
+				if (anchor?.observedPrompt) {
+					const after = await runtime.agent?.request<{ messages: { entryId: string }[] }>({ type: "get_fork_messages" })
+						.catch(() => undefined);
+					if (after) {
+						const index = after.messages.findIndex((entry) => entry.entryId === anchor.previousEntryId);
+						// The first native entry after the pre-run cursor started this checkpoint.
+						// A missing cursor after a session change does not identify any prompt.
+						if (index >= 0 || anchor.previousEntryId === null) userEntryId = after.messages[index + 1]?.entryId;
+					}
+				}
+				const conversation = this.conversation(runtime.conversationId);
+				await this.git.finish(conversation.project, checkpointId, { conversationId: conversation.id, userEntryId });
 			}
 			await this.syncState(runtime).catch(() => {});
 			await this.saveSessionLeaf(runtime).catch(() => {});
@@ -6482,11 +6602,15 @@ export class DesktopService {
 		runtime.eventSequence = sequence;
 		runtime.lastActivity = Date.now();
 		runtime.liveTranscript = applyLiveEvent(runtime.liveTranscript, event);
+		let queuedPromptGroups: QueuedPromptGroups | undefined;
 		if (event.type === "queue_update") {
 			const queue = runtime.userQueue ??= new QueuedPrompts();
 			queue.update(event);
+			queuedPromptGroups = queue.groups();
 			if (runtime.state) runtime.state.pendingMessageCount = event.steering.length + event.followUp.length;
 		}
+		if (event.type === "message_end" && event.message.role === "user" && runtime.checkpointUserAnchor)
+			runtime.checkpointUserAnchor.observedPrompt = true;
 		// Deltas change the live projection, but not the finalized get_messages list.
 		if (
 			[
@@ -6616,7 +6740,7 @@ export class DesktopService {
 			const conversation = this.conversation(conversationId);
 			if (conversation && event.name) conversation.title = event.name;
 		}
-		this.emit({ conversationId, event, sequence });
+		this.emit({ conversationId, event, sequence, ...(queuedPromptGroups ? { queuedPromptGroups } : {}) });
 	}
 
 	private emit(event: DesktopEvent): void {
@@ -6739,6 +6863,7 @@ export class DesktopService {
 			bashBusy: runtime?.bashBusy ?? false,
 			liveTranscript,
 			queuedMessages: runtime?.userQueue?.preview(),
+			queuedPromptGroups: runtime?.userQueue?.groups(),
 			projects: this.store.projects,
 			conversations,
 			active: conversationId ? annotateConversation(this.conversation(conversationId)) : undefined,

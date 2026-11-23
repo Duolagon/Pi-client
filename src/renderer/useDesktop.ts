@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Command, DesktopAPI, DesktopEvent, DesktopPromptResult, Snapshot, RpcExtensionUIRequest, BashResult, SessionActivity } from "../shared.ts";
 import { emptyDraft, mergeDrafts, type ComposerAttachment, type ComposerDraft, type Prompt } from "../composer-draft.ts";
 import { readDraft, writeDraft } from "./draft-storage.ts";
+import { phaseFromEvent, phaseFromSnapshot, type RunPhase } from "./run-status.ts";
 import { applyEvent, transcript, type Transcript } from "./messages.ts";
 
 export function useDesktop(api: DesktopAPI) {
@@ -17,6 +18,7 @@ export function useDesktop(api: DesktopAPI) {
 	const [draft, putDraft] = useState(emptyDraft);
 	const [draftLoading, setDraftLoading] = useState(false);
 	const [activity, setActivity] = useState<Record<string, SessionActivity>>({});
+	const [runPhases, setRunPhases] = useState<Record<string, RunPhase>>({});
 	const drafts = useRef(new Map<string, Partial<ComposerDraft>>());
 	const loadedDrafts = useRef(new Set<string>());
 	const getDraft = (id: string) => ({ ...emptyDraft, ...drafts.current.get(id) });
@@ -84,6 +86,14 @@ export function useDesktop(api: DesktopAPI) {
 		appliedSequence.current = sequence;
 		setSnapshot(next);
 		setActivity(next.activity ?? {});
+		const currentPhase = next.pendingUI.length ? "approval"
+			: next.engineStatus === "error" ? "failed"
+			: next.state?.isCompacting ? "compacting"
+			: phaseFromSnapshot(next.messages, next.liveTranscript?.tools ?? {}, Boolean(next.state?.isStreaming));
+		if (id && currentPhase) setRunPhases((previous) => ({
+			...previous,
+			[id]: currentPhase === "running" && previous[id] === "retrying" ? "retrying" : currentPhase,
+		}));
 		setBashBusy(Boolean(next.bashBusy));
 		setHistory(transcript(next.messages, next.liveTranscript));
 		setRunning(Boolean(next.state?.isStreaming || next.state?.isCompacting));
@@ -123,7 +133,7 @@ export function useDesktop(api: DesktopAPI) {
 	}, [api, apply, fail]);
 	refreshLatest.current = refresh;
 	listener.current = (packet, replay = false) => {
-		const { conversationId, event, sequence } = packet;
+		const { conversationId, event, sequence, queuedPromptGroups } = packet;
 		if (!replay && sequence !== undefined) {
 			const bytes = JSON.stringify(packet).length * 2;
 			buffered.current.push({ packet, bytes });
@@ -148,6 +158,12 @@ export function useDesktop(api: DesktopAPI) {
 				if (ended) delete next[conversationId];
 				else next[conversationId] = interactive ? "approval" : "running";
 				return next;
+			});
+		}
+		if (event.type !== "message_update" && event.type !== "tool_execution_update") {
+			setRunPhases((previous) => {
+				const phase = phaseFromEvent(previous[conversationId], event);
+				return phase && phase !== previous[conversationId] ? { ...previous, [conversationId]: phase } : previous;
 			});
 		}
 		if (!replay && event.type === "bash_execution_update") appendTerminal(conversationId, event.delta);
@@ -217,6 +233,7 @@ export function useDesktop(api: DesktopAPI) {
 							...previous,
 							state: { ...previous.state, pendingMessageCount: event.steering.length + event.followUp.length },
 							queuedMessages: [...event.steering, ...event.followUp],
+							queuedPromptGroups: queuedPromptGroups ?? { steering: [...event.steering], followUp: [...event.followUp] },
 						}
 					: previous,
 			);
@@ -268,7 +285,7 @@ export function useDesktop(api: DesktopAPI) {
 			fail(cause);
 		}
 	};
-	const send = async (value: Prompt, input?: ComposerDraft) => {
+	const send = async (value: Prompt, input?: ComposerDraft, delivery?: Prompt["streamingBehavior"]) => {
 		const id = activeId.current;
 		if (!id) return;
 		const previous = running;
@@ -277,7 +294,7 @@ export function useDesktop(api: DesktopAPI) {
 		setNotice("");
 		setRunning(true);
 		try {
-			const streamingBehavior = previous ? "steer" : undefined;
+			const streamingBehavior = delivery ?? (previous ? "steer" : undefined);
 			const result = input
 				? await api.sendPrompt(id, input, streamingBehavior)
 				: await api.command({ ...value, streamingBehavior }, id) as DesktopPromptResult;
@@ -331,6 +348,7 @@ export function useDesktop(api: DesktopAPI) {
 		forgetDraft,
 		snapshot,
 		activity,
+		runPhases,
 		history,
 		running,
 		changing,

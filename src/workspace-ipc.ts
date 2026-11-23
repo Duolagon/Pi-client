@@ -1,5 +1,5 @@
 import type { DesktopService } from "./backend.ts";
-import type { Command, RpcExtensionUIResponse, TaskStartInput, WorktreeCreateInput } from "./shared.ts";
+import type { Command, GitDiscardInput, RpcExtensionUIResponse, TaskStartInput, WorktreeCreateInput } from "./shared.ts";
 import { MAX_SEND_MESSAGE } from "./delegation-limits.ts";
 
 type Handle = (channel: string, action: (...args: unknown[]) => Promise<unknown>) => void;
@@ -138,7 +138,13 @@ export function installWorkspaceHandlers(
 	handle("pi:worktree:merge", (worktreeId) => service.mergeWorktree(id(worktreeId)));
 	handle("pi:workspace:stage", (paths) => service.gitStage(optionalPathArray(paths)));
 	handle("pi:workspace:unstage", (paths) => service.gitUnstage(optionalPathArray(paths)));
-	handle("pi:workspace:discard", (paths) => service.gitDiscard(pathArray(paths)));
+	handle("pi:workspace:discard:preview", (value) => service.gitDiscardPreview(discardInput(value)));
+	handle("pi:workspace:discard", (value) => {
+		const input = discardInput(value);
+		const expectedVersion = string(object(value).expectedVersion, "已确认文件版本", 64);
+		if (!/^[a-f0-9]{64}$/.test(expectedVersion)) throw new Error("请先确认要操作的文件版本。");
+		return service.gitDiscard({ ...input, expectedVersion });
+	});
 	handle("pi:workspace:commit", (message) => service.gitCommit(string(message, "提交说明", 32768)));
 	handle("pi:workspace:read-memory", () => service.readMemory());
 	handle("pi:workspace:write-memory", (file, content) => {
@@ -173,6 +179,14 @@ function pathArray(value: unknown): string[] {
 }
 function optionalPathArray(value: unknown): string[] | undefined {
 	return value === undefined ? undefined : pathArray(value);
+}
+
+function discardInput(value: unknown): GitDiscardInput {
+	const input = object(value);
+	if (input.kind !== "tracked" && input.kind !== "untracked") throw new Error("文件操作类型无效。");
+	const path = string(input.path, "文件路径");
+	if (!path) throw new Error("请指定文件路径。");
+	return { path, kind: input.kind, conversationId: optionalId(input.conversationId) };
 }
 
 function object(value: unknown): Record<string, unknown> {

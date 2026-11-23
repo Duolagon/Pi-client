@@ -1,49 +1,14 @@
 import { useMemo } from "react";
 import { highlightCode } from "./highlight.tsx";
 
-interface DiffLine {
-	type: "hunk" | "add" | "del" | "ctx" | "meta";
+import { parseUnifiedDiff, type DiffLine } from "./diff-lines.ts";
+
+export interface DiffReviewAnchor {
+	side: "old" | "new";
+	line: number;
 	text: string;
-	oldNum?: number;
-	newNum?: number;
-}
-
-/** Parse a unified git diff string into structured lines with line numbers. */
-function parseUnifiedDiff(raw: string): DiffLine[] {
-	const lines = raw.split("\n");
-	const out: DiffLine[] = [];
-	let oldLine = 0;
-	let newLine = 0;
-
-	for (const line of lines) {
-		if (
-			line.startsWith("diff --git ") ||
-			line.startsWith("index ") ||
-			line.startsWith("--- ") ||
-			line.startsWith("+++ ") ||
-			line.startsWith("# ")
-		) {
-			out.push({ type: "meta", text: line });
-			continue;
-		}
-		const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
-		if (hunk) {
-			oldLine = Number(hunk[1]);
-			newLine = Number(hunk[2]);
-			out.push({ type: "hunk", text: line });
-			continue;
-		}
-		if (line.startsWith("+")) {
-			out.push({ type: "add", text: line.slice(1), newNum: newLine++ });
-		} else if (line.startsWith("-")) {
-			out.push({ type: "del", text: line.slice(1), oldNum: oldLine++ });
-		} else if (line.startsWith(" ")) {
-			out.push({ type: "ctx", text: line.slice(1), oldNum: oldLine++, newNum: newLine++ });
-		} else if (line.length > 0) {
-			out.push({ type: "meta", text: line });
-		}
-	}
-	return out;
+	section?: string;
+	hunk?: number;
 }
 
 /** Compute a simple line-level diff between oldText and newText for inline Edit tool cards. */
@@ -106,14 +71,19 @@ export function UnifiedDiffView({
 	diff,
 	mode = "unified",
 	className = "",
+	hideFileHeader = false,
 	onReview,
 }: {
 	diff: string;
 	mode?: "unified" | "split";
 	className?: string;
-	onReview?: (side: "old" | "new", line: number) => void;
+	hideFileHeader?: boolean;
+	onReview?: (anchor: DiffReviewAnchor) => void;
 }) {
-	const parsed = useMemo(() => parseUnifiedDiff(diff), [diff]);
+	const parsed = useMemo(() => {
+		const lines = parseUnifiedDiff(diff);
+		return hideFileHeader ? lines.filter((line) => line.type !== "meta" || !/^(?:diff --git |index |--- |\+\+\+ )/.test(line.text)) : lines;
+	}, [diff, hideFileHeader]);
 	const splitRows = useMemo(() => {
 		if (mode !== "split") return [];
 		const rows: Array<{ left?: DiffLine; right?: DiffLine; meta?: DiffLine }> = [];
@@ -138,10 +108,18 @@ export function UnifiedDiffView({
 		return rows;
 	}, [parsed, mode]);
 
-	const number = (side: "old" | "new", line?: number) =>
-		onReview && line !== undefined
-			? <button type="button" className="cc-diff-num cc-review-line" aria-label={`评审${side === "old" ? "原" : "新"}行 ${line}`} onClick={() => onReview(side, line)}>{line}</button>
+	const number = (side: "old" | "new", row?: DiffLine) => {
+		const line = side === "old" ? row?.oldNum : row?.newNum;
+		return onReview && row && line !== undefined
+			? <button
+				type="button"
+				className="cc-diff-num cc-review-line"
+				aria-label={`评审${side === "old" ? "原" : "新"}行 ${line}`}
+				title="添加逐行评审意见"
+				onClick={() => onReview({ side, line, text: row.text, section: row.section, hunk: row.hunk })}
+			>{line}</button>
 			: <span className="cc-diff-num">{line ?? ""}</span>;
+	};
 
 	if (!diff.trim()) {
 		return <div className={`cc-diff empty ${className}`}>此文件没有可显示的文本差异。</div>;
@@ -151,18 +129,18 @@ export function UnifiedDiffView({
 			<div className={`cc-diff cc-diff-split ${className}`}>
 				{splitRows.map((row, idx) =>
 					row.meta ? (
-						<div key={idx} className={`cc-diff-line cc-diff-${row.meta.type}`}>
+						<div key={idx} className={`cc-diff-line cc-diff-${row.meta.type}`} data-diff-hunk={row.meta.hunk}>
 							<span className="cc-diff-code">{row.meta.text || " "}</span>
 						</div>
 					) : (
 						<div key={idx} className="cc-diff-split-row">
 							<div className={`cc-diff-split-cell ${row.left ? `cc-diff-${row.left.type}` : "cc-diff-pad"}`}>
-								{number("old", row.left?.oldNum)}
+								{number("old", row.left)}
 								<span className="cc-diff-sign">{row.left?.type === "del" ? "-" : " "}</span>
 								<span className="cc-diff-code">{row.left ? highlightCode(row.left.text || " ") : ""}</span>
 							</div>
 							<div className={`cc-diff-split-cell ${row.right ? `cc-diff-${row.right.type}` : "cc-diff-pad"}`}>
-								{number("new", row.right?.newNum)}
+								{number("new", row.right)}
 								<span className="cc-diff-sign">{row.right?.type === "add" ? "+" : " "}</span>
 								<span className="cc-diff-code">{row.right ? highlightCode(row.right.text || " ") : ""}</span>
 							</div>
@@ -175,9 +153,9 @@ export function UnifiedDiffView({
 	return (
 		<div className={`cc-diff ${className}`}>
 			{parsed.map((line, idx) => (
-				<div key={idx} className={`cc-diff-line cc-diff-${line.type}`}>
-					{number("old", line.oldNum)}
-					{number("new", line.newNum)}
+				<div key={idx} className={`cc-diff-line cc-diff-${line.type}`} data-diff-hunk={line.type === "hunk" ? line.hunk : undefined}>
+					{number("old", line)}
+					{number("new", line)}
 					<span className="cc-diff-sign">
 						{line.type === "add" ? "+" : line.type === "del" ? "-" : line.type === "ctx" ? " " : ""}
 					</span>

@@ -18,6 +18,9 @@ export interface GitCheckpoint {
 	project: string;
 	conversationId: string;
 	label: string;
+	/** Native Pi entry for the prompt that started this run. Older and manual checkpoints omit it. */
+	userEntryId?: string;
+	kind?: "discard-undo";
 	createdAt: number;
 	finishedAt?: number;
 	status: GitCheckpointStatus;

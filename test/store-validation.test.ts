@@ -78,6 +78,16 @@ async function seededStore() {
 
 const quarantinedIds = ["comma-tools", "huge-turns", "forged-parent", "mismatch", "cycle-a", "bad-status"];
 
+test("Plan sessions can submit a plan while task tool restrictions remain enforced", () => {
+	const tools = (task: Parameters<typeof piToolArgs>[0], mode: "plan" | "read") => piToolArgs(task, mode)[1].split(",");
+	assert.ok(tools(undefined, "plan").includes("ExitPlanMode"));
+	assert.ok(!tools(undefined, "plan").includes("bash"));
+	assert.ok(!tools(undefined, "read").includes("ExitPlanMode"));
+	assert.ok(!tools({ allowedTools: ["read"] }, "plan").includes("ExitPlanMode"));
+	assert.deepEqual(tools({ allowedTools: ["read", "ExitPlanMode"] }, "plan"), ["read", "ExitPlanMode"]);
+	assert.ok(!tools({ disallowedTools: ["ExitPlanMode"] }, "plan").includes("ExitPlanMode"));
+});
+
 test("tampered delegated records are quarantined read-only instead of becoming root conversations", async () => {
 	const seeded = await seededStore();
 	try {

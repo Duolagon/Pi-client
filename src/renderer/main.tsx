@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { createRoot } from "react-dom/client";
 import { copyText } from "./clipboard.ts";
 import {
@@ -90,6 +90,14 @@ import { resolveEditorPath } from "../editor-path.ts";
 import "../prototype/style.css";
 import "./style.css";
 import "./grail-theme.css";
+import "./task-flow.css";
+import { checkpointByEntry, matchUserEntries, submittedPlan } from "./turn-state.ts";
+import { runLabels } from "./run-status.ts";
+import { TaskAttention, type AttentionItem } from "./TaskAttention.tsx";
+import { fileReferences, formatFileReference } from "../file-references.ts";
+import { useSessionWorkspace } from "./session-workspace.ts";
+import type { GitCheckpoint } from "../git-types.ts";
+import type { SessionEntriesResult } from "../session-types.ts";
 
 function formatTime(timestamp: number): string {
 	return new Date(timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
@@ -99,9 +107,9 @@ function projectName(snapshot: Snapshot, path: string): string {
 	return found?.name ?? path.split("/").filter(Boolean).pop() ?? path;
 }
 
-function clampInspector(width: number): number {
-	const max = Math.max(320, Math.min(1000, window.innerWidth - 560));
-	return Math.round(Math.min(max, Math.max(320, width)));
+function savedInspectorWidth(key: string, fallback: number): number {
+	const stored = Number(localStorage.getItem(key));
+	return Number.isFinite(stored) && stored >= 320 ? stored : fallback;
 }
 
 function Desktop({ api }: { api: DesktopAPI }) {
@@ -109,30 +117,40 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const { snapshot, history, running, changing, bashBusy } = app;
 	const [sidebar, setSidebar] = useState(true);
 	const [settings, setSettings] = useState(false);
+	const [connecting, setConnecting] = useState(false);
 	const [searching, setSearching] = useState(false);
 	const [query, setQuery] = useState("");
 	const [searchIndex, setSearchIndex] = useState(0);
-	const [inspectorWidth, setInspectorWidth] = useState(() => {
-		const stored = Number(localStorage.getItem("pi.inspectorWidth"));
-		return Number.isFinite(stored) && stored >= 320 ? stored : 400;
-	});
-	const [pane, setPane] = useState<"changes" | "files" | null>(null);
-	const [terminalOpen, setTerminalOpen] = useState(false);
+	const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+	const [inspectorWidth, setInspectorWidth] = useState(() => savedInspectorWidth("pi.inspectorWidth", 400));
+	const [reviewWidth, setReviewWidth] = useState(() => savedInspectorWidth("pi.reviewInspectorWidth", 500));
+	const { pane, setPane, previewUrl, setPreviewUrl, terminalOpen, setTerminalOpen, focusReview, toggleReviewFocus } = useSessionWorkspace(snapshot?.active?.id);
+	useEffect(() => {
+		const resize = () => setViewportWidth(window.innerWidth);
+		window.addEventListener("resize", resize);
+		return () => window.removeEventListener("resize", resize);
+	}, []);
+	const [rerun, setRerun] = useState<{ conversationId: string; command: string; requestId: number }>();
+	const [turnData, setTurnData] = useState<{ conversationId: string; entries: SessionEntriesResult; checkpoints: GitCheckpoint[] }>();
 	const [deferredApproval, setDeferredApproval] = useState<string>();
 	const [focusedTerminal, setFocusedTerminal] = useState<{ conversationId: string; terminalId: string }>();
 	const [controlsTab, setControlsTab] = useState<ControlsTab | null>(null);
 	const [checkpointsOpen, setCheckpointsOpen] = useState(false);
-	const [rewindQuery, setRewindQuery] = useState<string | undefined>(undefined);
+	const [rewindTarget, setRewindTarget] = useState<{ checkpointId: string; path?: string }>();
 	const [tasksOpen, setTasksOpen] = useState(false);
 	const [taskInitialId, setTaskInitialId] = useState<string | undefined>(undefined);
 	const [sessionsOpen, setSessionsOpen] = useState(false);
 	const [memoryTab, setMemoryTab] = useState<"memory" | "context" | "status" | null>(null);
-	const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 	const [paletteOpen, setPaletteOpen] = useState(false);
 	const [planMode, setPlanMode] = useState(false);
 	const [planState, setPlanState] = useState<PlanFileState | null>(null);
 	const [planEditorOpen, setPlanEditorOpen] = useState(false);
 	const [planDraft, setPlanDraft] = useState("");
+	const [planError, setPlanError] = useState("");
+	const [planApplying, setPlanApplying] = useState(false);
+	const planApplyingRef = useRef(false);
+	const [manualPlan, setManualPlan] = useState(false);
+	const planDraftEdited = useRef(false);
 	const [btwState, setBtwState] = useState<{ loading: boolean; question: string; answer?: string; error?: string; model?: string } | null>(null);
 	const [findOpen, setFindOpen] = useState(false);
 	const [findQuery, setFindQuery] = useState("");
@@ -183,6 +201,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const moreMenuRef = useRef<HTMLDivElement>(null);
 	const scroll = useRef<HTMLDivElement>(null);
 	const stickToEnd = useRef(true);
+	const savedScroll = useRef(new Map<string, { top: number; stick: boolean }>());
 	useEffect(() => {
 		let mounted = true;
 		void api.sandboxStatus().then((status) => {
@@ -207,12 +226,32 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			window.removeEventListener("keydown", onKeyDown);
 		};
 	}, [moreMenuOpen]);
-	useEffect(() => {
-		stickToEnd.current = true;
-		setShowJump(false);
+	useLayoutEffect(() => {
+		const id = snapshot?.active?.id;
+		const position = id ? savedScroll.current.get(id) : undefined;
+		stickToEnd.current = position?.stick ?? true;
+		if (position && scroll.current) scroll.current.scrollTop = position.top;
+		setShowJump(Boolean(position && !position.stick));
 		setDeferredApproval(undefined);
 		setFocusedSubagentTaskId(null);
+		setPlanEditorOpen(false);
+		setManualPlan(false);
+		setPlanError("");
+		setPlanState(null);
+		setPlanDraft("");
+		planDraftEdited.current = false;
 	}, [snapshot?.active?.id]);
+	useEffect(() => {
+		const id = snapshot?.active?.id;
+		if (!id || running || changing) return;
+		let disposed = false;
+		void Promise.all([api.sessions.entries({ conversationId: id }), api.git.list(id)]).then(([entries, checkpoints]) => {
+			if (!disposed) setTurnData({ conversationId: id, entries, checkpoints });
+		}).catch(() => {
+			if (!disposed) setTurnData(undefined);
+		});
+		return () => { disposed = true; };
+	}, [api, snapshot?.active?.id, running, changing, app.revision]);
 	useEffect(() => {
 		setTrustOpen(false);
 	}, [snapshot?.active?.project]);
@@ -539,23 +578,32 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		setTaskInitialId(taskId);
 		setTasksOpen(true);
 	};
-	const blocked = running || changing || bashBusy;
+	const blocked = running || changing || bashBusy || planApplying;
 	const project = snapshot?.projects.find((item) => item.path === snapshot.active?.project);
 	const taskList = [...Object.values(tasksMap), ...Object.values(externalTasksMap)];
 	const activeTaskCount = taskList.filter((t) => t.status === "running" || t.status === "queued").length;
 	const waitingTaskCount = taskList.filter((t) => t.status === "waiting_for_input").length;
 	const switchTo = (operation: () => ReturnType<DesktopAPI["snapshot"]>) => {
+		if (planApplyingRef.current) return;
 		setSearching(false);
-		setPane(null);
 		void app.switchTo(operation);
 	};
 	const savePermission = async (permission: PermissionMode) => {
 		if (!snapshot) return;
-		if (permission !== "plan" && planMode) setPlanMode(false);
-		if (permission === "plan" && !planMode) setPlanMode(true);
-		await app.switchTo(() => api.saveSettings({ permission, theme: snapshot.settings.theme }));
-		if (permission === "auto" && snapshot.settings.permission !== "auto")
-			setFlash(snapshot.settings.sandbox ? "已切换为全部放行，命令仍在 Seatbelt 沙箱中运行" : "已切换为全部放行，Pi 将不经询问执行命令");
+		if (permission === "auto" && snapshot.settings.permission !== "auto" &&
+			!window.confirm("为客户端启用「全部放行」？模型工具将按规则执行，常规操作不再逐项询问。")) return;
+		let saved = false;
+		await app.switchTo(async () => {
+			const next = await api.saveSettings({ permission, theme: snapshot.settings.theme });
+			saved = next.settings.permission === permission && next.engineStatus === "ready";
+			return next;
+		});
+		if (saved) {
+			setPlanMode(permission === "plan");
+			if (permission === "plan") setPlanError("");
+			if (permission === "auto") setFlash("已切换为全部放行");
+		}
+		return saved;
 	};
 	const saveSandbox = async (next: { sandbox: boolean; sandboxOffline: boolean }) => {
 		if (!snapshot) return;
@@ -618,26 +666,53 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		if (!snapshot) return;
 		const inPlan = planMode || snapshot.settings.permission === "plan";
 		if (inPlan) {
-			setPlanMode(false);
+			if (!await savePermission("ask")) return;
 			setPlanEditorOpen(false);
+			setManualPlan(false);
 			if (app.draft.trim() === PLAN_TEMPLATE.trim()) app.setDraft("");
-			await savePermission("ask");
 		} else {
-			setPlanMode(true);
-			if (snapshot.settings.permission !== "plan") await savePermission("plan");
+			if (!await savePermission("plan")) return;
 			if (!app.draft.trim()) app.setDraft(PLAN_TEMPLATE);
 		}
 	};
-	const approvePlanAndExecute = async (mode: PermissionMode) => {
-		if (!snapshot) return;
-		setPlanMode(false);
-		setPlanEditorOpen(false);
-		if (planDraft.trim() && planDraft !== planState?.content) {
-			await api.writePlan(planDraft).catch(() => {});
+	const approvePlanAndExecute = async (mode: "ask" | "acceptEdits") => {
+		const id = snapshot?.active?.id;
+		if (!id || planApplyingRef.current || !planDraft.trim() || !planState) return;
+		planApplyingRef.current = true;
+		setPlanApplying(true);
+		setPlanError("");
+		let modeChanged = false;
+		try {
+			const current = await api.readPlan(id);
+			if (current.exists !== planState.exists || current.content !== planState.content)
+				throw new Error("计划文件在编辑期间发生了变化。请重新读取，再确认要执行的版本。");
+			const saved = current.content === planDraft && current.exists ? current : await api.writePlan(planDraft, id);
+			if (!saved.exists || saved.content !== planDraft) throw new Error("计划保存结果不完整，请重试。");
+			setPlanState(saved);
+			const updated = await api.saveSettings({ permission: mode, theme: snapshot.settings.theme });
+			modeChanged = updated.settings.permission === mode;
+			if (!modeChanged || updated.active?.id !== id || updated.engineStatus !== "ready")
+				throw new Error("执行模式尚未就绪。请返回计划后重试。");
+			const approved = await api.readPlan(id);
+			if (!approved.exists || approved.content !== saved.content)
+				throw new Error("审批期间计划文件已更新。请重新读取，再确认要执行的版本。");
+			await api.command({
+				type: "prompt",
+				message: `计划已批准（存档：${saved.relativePath}）。请按以下已批准的正文实施并运行相关检查。\n\n${saved.content}`,
+			}, id);
+			modeChanged = false;
+			setPlanMode(false);
+			setManualPlan(false);
+			planDraftEdited.current = false;
+			setPlanEditorOpen(false);
+			await app.refresh();
+		} catch (error) {
+			if (modeChanged) await api.saveSettings({ permission: "plan", theme: snapshot.settings.theme }).then(app.apply).catch(app.fail);
+			setPlanError(error instanceof Error ? error.message : String(error));
+		} finally {
+			planApplyingRef.current = false;
+			setPlanApplying(false);
 		}
-		await app.switchTo(() => api.saveSettings({ permission: mode, theme: snapshot.settings.theme }));
-		const planRef = planState?.exists ? `（计划文件：${planState.relativePath}）` : "";
-		await app.send({ type: "prompt", message: `计划已批准${planRef}。请严格按上述计划实施代码修改并运行相关测试验证。`, images: [] });
 	};
 	const sendInitPrompt = () => {
 		app.setDraft("请分析当前项目结构、构建脚本、测试命令和代码规范，创建或更新根目录的 AGENTS.md 项目指南文件。");
@@ -848,7 +923,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		} else if (action === "mcp") {
 			setMcpOpen(true);
 		} else if (action === "rewind") {
-			setRewindQuery(undefined);
+			setRewindTarget(undefined);
 			setCheckpointsOpen(true);
 		} else if (action === "tasks") {
 			setTaskInitialId(undefined);
@@ -957,12 +1032,14 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		}
 		let mounted = true;
 		void api.readPlan(activeConvId).then((res) => {
-			if (!mounted) return;
+			if (!mounted || planDraftEdited.current) return;
 			setPlanState(res);
 			setPlanDraft(res.content);
-		}).catch(() => {});
+		}).catch((error) => {
+			if (mounted) setPlanError(error instanceof Error ? error.message : String(error));
+		});
 		return () => { mounted = false; };
-	}, [activeConvId, planMode, activePermMode, app.revision, running]);
+	}, [api, activeConvId, planMode, activePermMode, app.revision, running]);
 	const pinnedTodoState = (() => {
 		const startedById = new Map<string, number>();
 		const completedById = new Map<string, number>();
@@ -1024,7 +1101,6 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				startedAt: item.startedAt ?? startedById.get(item.id),
 				completedAt: item.completedAt ?? completedById.get(item.id),
 			}));
-
 		let userTurnsAfter = 0;
 		if (!hasLiveWriteTool) {
 			if (useShared && latestSharedTs > 0) {
@@ -1079,6 +1155,14 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		setDismissedTodoSig((prev) => ({ ...prev, [convId]: pinnedTodoState.sig }));
 		setTodoExpanded(false);
 	};
+	const currentTurnData = turnData?.conversationId === snapshot?.active?.id ? turnData : undefined;
+	const entryIds = useMemo(() => currentTurnData ? matchUserEntries(history.messages, currentTurnData.entries) : {}, [history.messages, currentTurnData]);
+	const checkpointsByEntry = useMemo(() => checkpointByEntry(currentTurnData?.checkpoints ?? []), [currentTurnData]);
+	const checkpointIds = useMemo(() => Object.fromEntries(Array.from(checkpointsByEntry, ([entry, point]) => [entry, point.id])), [checkpointsByEntry]);
+	const lastUserIndex = history.messages.findLastIndex((message) => message.role === "user");
+	const lastCheckpoint = checkpointsByEntry.get(entryIds[lastUserIndex]);
+	const currentEntryId = entryIds[lastUserIndex];
+	const planSubmission = useMemo(() => submittedPlan(history.messages), [history.messages]);
 	if (!snapshot)
 		return (
 			<div className="cl-start">
@@ -1098,13 +1182,21 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const focusedSubagentTask = focusedSubagentTaskId ? tasksMap[focusedSubagentTaskId] : undefined;
 	const liveChildApprovals = collectDescendantApprovals(Object.values(tasksMap), snapshot.active?.id);
 	const childApprovals = liveChildApprovals.length > 0 ? liveChildApprovals : (snapshot.childApprovals ?? []);
-	const lastMessage = history.messages[history.messages.length - 1];
 	const inPlanMode = planMode || snapshot.settings.permission === "plan";
-	const showPlanApproval =
-		inPlanMode &&
-		!running &&
-		!blocked &&
-		Boolean(planState?.exists || (lastMessage && lastMessage.role === "assistant"));
+	const showPlanApproval = inPlanMode && !running && !changing;
+	const planReady = Boolean(planState && planDraft.trim() &&
+		(manualPlan || (planSubmission && planState.exists && planState.content === planSubmission.content)));
+	const activePhase = snapshot.active && app.runPhases[snapshot.active.id];
+	const waitingForInput = app.requests.length > 0;
+	const activeRequest = app.requests[0];
+	const approvalExpanded = Boolean(activeRequest && activeRequest.id !== deferredApproval);
+	const approvalTool = approvalExpanded && activeRequest?.method === "confirm"
+		? /^允许执行\s+([^\s？?]+)[？?]?$/.exec(activeRequest.title)?.[1] : undefined;
+	const openCheckpoint = (checkpointId?: string, path?: string) => {
+		setRewindTarget(checkpointId ? { checkpointId, path } : undefined);
+		setCheckpointsOpen(true);
+	};
+
 	const jumpFindMatch = (nextIdx: number) => {
 		const container = scroll.current;
 		const term = findQuery.trim().toLowerCase();
@@ -1124,7 +1216,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		{ id: "sandbox", label: "命令沙箱设置 (/sandbox)", keywords: "sandbox seatbelt offline isolation", run: () => setSandboxOpen(true) },
 		{ id: "theme", label: "切换外观主题（浅色 / 深色 / 圣杯二次元）", keywords: "theme light dark grail anime 圣杯 二次元", disabled: blocked, run: () => void cycleTheme() },
 		{ id: "plan", label: inPlanMode ? "退出 Plan 计划模式" : "进入 Plan 计划模式", keywords: "plan mode readonly", disabled: blocked, run: () => void togglePlanMode() },
-		{ id: "rewind", label: "检查点与代码回滚 (/rewind)", keywords: "git checkpoint restore", disabled: !snapshot.active, run: () => { setRewindQuery(undefined); setCheckpointsOpen(true); } },
+		{ id: "rewind", label: "检查点与代码回滚 (/rewind)", keywords: "git checkpoint restore", disabled: !snapshot.active, run: () => { openCheckpoint(); } },
 		{ id: "tasks", label: "后台任务、子 Agent 与 Worktree (/tasks)", keywords: "subagent external codex claude kimi antigravity agy", run: () => { setTaskInitialId(undefined); setTasksOpen(true); } },
 		{ id: "agents", label: "Agents 与子 Agent (/agents)", keywords: "agents subagent custom reviewer", run: () => setAgentsOpen(true) },
 		{ id: "mcp", label: "MCP 服务器管理 (/mcp)", keywords: "mcp servers oauth", run: () => setMcpOpen(true) },
@@ -1139,11 +1231,39 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		{ id: "init", label: "/init 生成项目 AGENTS.md 指南", keywords: "init onboard agents.md", disabled: !snapshot.active, run: () => sendInitPrompt() },
 		{ id: "preview", label: previewUrl ? "关闭本地网页预览" : "打开本地网页预览 (/preview)", keywords: "web preview localhost", run: () => { setPane(null); setPreviewUrl((v) => (v ? null : "http://localhost:3000")); } },
 		{ id: "terminal", label: terminalOpen ? "关闭终端面板" : "打开终端 / PTY 面板", keywords: "terminal bash pty", run: () => setTerminalOpen((v) => !v) },
-		{ id: "changes", label: "查看 Git 修改与暂存提交", keywords: "git diff stage commit", run: () => { setPreviewUrl(null); setPane(pane === "changes" ? null : "changes"); } },
-		{ id: "files", label: "浏览项目文件", keywords: "files explorer", run: () => { setPreviewUrl(null); setPane(pane === "files" ? null : "files"); } },
+		{ id: "changes", label: "查看 Git 修改与暂存提交", keywords: "git diff stage commit", run: () => { setPane(pane === "changes" ? null : "changes"); } },
+		{ id: "files", label: "浏览项目文件", keywords: "files explorer", run: () => { setPane(pane === "files" ? null : "files"); } },
 		{ id: "compact", label: "压缩会话上下文 (/compact)", keywords: "compact context", disabled: blocked || !history.messages.length, run: () => void app.command({ type: "compact" }) },
 		{ id: "settings", label: "打开客户端与模型设置", keywords: "settings model api key theme", run: () => setSettings(true) },
 	];
+	const openTaskManager = () => { setTaskInitialId(undefined); setTasksOpen(true); };
+	const attention: AttentionItem[] = snapshot.conversations
+		.filter((conversation) => !conversation.archived && !conversation.parentConversationId && (app.activity[conversation.id] || app.runPhases[conversation.id]))
+		.sort((a, b) => b.updatedAt - a.updatedAt)
+		.map((conversation) => {
+			const activity = app.activity[conversation.id];
+			const phase = activity === "approval" ? "approval" : app.runPhases[conversation.id] ?? "running";
+			return {
+				id: conversation.id, title: conversation.title, detail: `${projectName(snapshot, conversation.project)} · ${runLabels[phase]}`,
+				state: activity === "approval" ? "approval" : activity ? "running" : "done",
+				open: () => {
+					if (snapshot.active?.id === conversation.id) {
+						setDeferredApproval(undefined);
+						requestAnimationFrame(() => document.querySelector<HTMLElement>(".cc-inline-approval")?.focus());
+					} else switchTo(() => api.selectConversation(conversation.id));
+				},
+			};
+		});
+	for (const task of taskList) {
+		if (task.status !== "waiting_for_input" && task.status !== "running" && task.status !== "queued") continue;
+		if (attention.some((item) => item.id === task.id)) continue;
+		attention.push({
+			id: task.id, title: task.title,
+			detail: task.status === "waiting_for_input" ? "子任务待确认" : task.status === "queued" ? "子任务排队中" : "子任务运行中",
+			state: task.status === "waiting_for_input" ? "approval" : "running",
+			open: () => openSubagent(task.id),
+		});
+	}
 	const isGrail = snapshot.settings.theme === "grail";
 	const grailText = grailWording(isGrail);
 	const latestGrailVerdict = latestVerdict(grail);
@@ -1151,48 +1271,62 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const grailBest = grail?.verdicts.filter((verdict) => verdict.grade === "grail").at(-1);
 	const grailReportVerdict = grailReportId ? grail?.verdicts.find((verdict) => verdict.id === grailReportId) : undefined;
 	const servant = isGrail ? getServantInfo(snapshot.state?.model?.id) : null;
+	const inspectorOpen = Boolean(pane || previewUrl);
+	const reviewing = pane === "changes";
+	const fullReview = reviewing && (focusReview || viewportWidth <= 860);
+	const compactInspector = inspectorOpen && !fullReview && viewportWidth <= (reviewing ? 1179 : 1000);
+	const sidebarVisible = sidebar && !compactInspector && !fullReview;
+	const sidebarWidth = sidebarVisible ? (viewportWidth <= 1180 ? 224 : 256) : 0;
+	const maxInspectorWidth = Math.max(320, Math.min(1000, viewportWidth - sidebarWidth - 430));
+	const clampInspector = (width: number) => Math.round(Math.min(maxInspectorWidth, Math.max(320, width)));
+	const dockedWidth = clampInspector(reviewing ? reviewWidth : inspectorWidth);
+	const changeInspectorWidth = reviewing ? setReviewWidth : setInspectorWidth;
+	const inspectorWidthKey = reviewing ? "pi.reviewInspectorWidth" : "pi.inspectorWidth";
+	const saveInspectorWidth = (width: number) => localStorage.setItem(inspectorWidthKey, String(width));
 	return (
 		<div
-			className={`desktop-app live-app ${sidebar ? "" : "cl-side-hidden"} ${pane || previewUrl ? "has-inspector" : ""}`}
-			style={{ "--inspector-w": `${inspectorWidth}px` } as CSSProperties}
+			className={`desktop-app live-app ${sidebarVisible ? "" : "cl-side-hidden"} ${inspectorOpen ? "has-inspector" : ""} ${compactInspector ? "has-compact-inspector" : ""} ${reviewing ? "is-review-pane" : ""} ${fullReview ? "is-full-review" : ""}`}
+			style={{ "--inspector-w": `${dockedWidth}px` } as CSSProperties}
 		>
-			{(pane || previewUrl) && (
+			{inspectorOpen && !compactInspector && !fullReview && (
 				<div
 					className="cc-inspector-resize"
 					role="separator"
 					aria-orientation="vertical"
 					aria-label="调整右侧面板宽度"
 					aria-valuemin={320}
-					aria-valuemax={1000}
-					aria-valuenow={inspectorWidth}
+					aria-valuemax={maxInspectorWidth}
+					aria-valuenow={dockedWidth}
 					tabIndex={0}
 					onKeyDown={(event) => {
 						if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
 						event.preventDefault();
-						const next = clampInspector(inspectorWidth + (event.key === "ArrowLeft" ? 32 : -32));
-						setInspectorWidth(next);
-						localStorage.setItem("pi.inspectorWidth", String(next));
+						const next = clampInspector(dockedWidth + (event.key === "ArrowLeft" ? 32 : -32));
+						changeInspectorWidth(next);
+						saveInspectorWidth(next);
 					}}
 					onDoubleClick={() => {
-						setInspectorWidth(400);
-						localStorage.setItem("pi.inspectorWidth", "400");
+						const fallback = reviewing ? 500 : 400;
+						changeInspectorWidth(fallback);
+						saveInspectorWidth(fallback);
 					}}
 					onPointerDown={(event) => {
 						event.preventDefault();
 						const handle = event.currentTarget;
 						handle.setPointerCapture(event.pointerId);
 						document.body.classList.add("cc-resizing");
-						let latest = inspectorWidth;
+						const start = event.clientX;
+						let latest = dockedWidth;
 						const move = (e: PointerEvent) => {
-							latest = clampInspector(window.innerWidth - e.clientX);
-							setInspectorWidth(latest);
+							latest = clampInspector(dockedWidth + start - e.clientX);
+							changeInspectorWidth(latest);
 						};
 						const up = () => {
 							handle.removeEventListener("pointermove", move);
 							handle.removeEventListener("pointerup", up);
 							handle.removeEventListener("pointercancel", up);
 							document.body.classList.remove("cc-resizing");
-							localStorage.setItem("pi.inspectorWidth", String(latest));
+							saveInspectorWidth(latest);
 						};
 						handle.addEventListener("pointermove", move);
 						handle.addEventListener("pointerup", up);
@@ -1201,7 +1335,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					title="拖动调整宽度，双击恢复默认"
 				/>
 			)}
-			{sidebar && (
+			{sidebarVisible && (
 				<aside className="cl-side" aria-label="项目与会话">
 					<div className="cl-side-head">
 						<span className="cl-side-brand">
@@ -1257,6 +1391,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						</div>
 					</div>
 					<div className="cl-side-scroll">
+						<TaskAttention items={attention} openAll={openTaskManager} />
 						{snapshot.projects.length > 0 && (
 							<section className="cl-group cl-side-workspaces" aria-label="工作目录">
 								<div className="cl-group-label">工作目录</div>
@@ -1315,7 +1450,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 																待确认 {childWaiting}
 															</span>
 														) : app.activity[session.id] === "running" ? (
-															<span className="cl-conv-status run">运行中</span>
+															<span className="cl-conv-status run">{runLabels[app.runPhases[session.id] ?? "running"]}</span>
 														) : null}
 													</span>
 													<span className="cl-conv-sub">
@@ -1461,27 +1596,25 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					</div>
 				)}
 				{isGrail && <MagicCircleBackdrop />}
-				<header className={`cl-top ${sidebar ? "" : "cl-top-collapsed"}`}>
+				<header className={`cl-top ${sidebarVisible ? "" : "cl-top-collapsed"}`}>
 					<div className="cl-top-title">
-						{(!sidebar || pane || previewUrl) && (
+						{!sidebarVisible && (
 							<>
 								<IconButton
 									icon={PanelLeftOpen}
 									label="展开侧栏"
-									className="cl-narrow-only"
 									onClick={() => {
-										if (sidebar) {
-											// Narrow layout hid the sidebar for the side panel; close the panel to bring it back.
+										if (compactInspector) {
 											setPane(null);
 											setPreviewUrl(null);
-										} else setSidebar(true);
+										}
+										setSidebar(true);
 										requestAnimationFrame(() => document.querySelector<HTMLElement>('[aria-label="收起侧栏"]')?.focus());
 									}}
 								/>
 								<IconButton
 									icon={SquarePen}
 									label="新建会话"
-									className="cl-narrow-only"
 									disabled={changing || !snapshot.active}
 									onClick={() => startNewConversation()}
 								/>
@@ -1532,7 +1665,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								className={`cc-top-btn ${pane === "changes" ? "active" : ""}`}
 								aria-label="代码修改"
 								title="代码修改与 Git Diff"
-								onClick={() => { setPreviewUrl(null); setPane(pane === "changes" ? null : "changes"); }}
+								onClick={() => { setPane(pane === "changes" ? null : "changes"); }}
 							>
 								<GitCompareArrows size={14} />
 								<span>差异</span>
@@ -1543,7 +1676,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								className={`cc-top-btn ${pane === "files" ? "active" : ""}`}
 								aria-label="项目文件"
 								title="浏览项目文件"
-								onClick={() => { setPreviewUrl(null); setPane(pane === "files" ? null : "files"); }}
+								onClick={() => { setPane(pane === "files" ? null : "files"); }}
 							>
 								<Files size={14} />
 								<span>文件</span>
@@ -1635,7 +1768,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											disabled={!snapshot.active}
 											onClick={() => {
 												setMoreMenuOpen(false);
-												setRewindQuery(undefined);
+												setRewindTarget(undefined);
 												setCheckpointsOpen(true);
 											}}
 										>
@@ -1762,11 +1895,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											<Download size={14} />
 											<span>导出会话</span>
 										</button>
-										{(!sidebar || pane || previewUrl) && (
+										{!sidebarVisible && (
 											<button
 												type="button"
 												role="menuitem"
-												className="cc-more-item cl-narrow-only"
+												className="cc-more-item"
 												onClick={() => {
 													setMoreMenuOpen(false);
 													setSettings(true);
@@ -1838,13 +1971,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						</button>
 					</div>
 				)}
-				{!snapshot.models.length && (
-					<div className="cl-connect">
-						<ShieldCheck size={17} />
-						<span>尚未找到可用模型。可复用 Pi 的登录配置，或在设置中连接模型服务。</span>
-						<button className="secondary-button" onClick={() => setSettings(true)}>
-							模型连接设置
-						</button>
+
+				{history.messages.length > 0 && !snapshot.models.length && (
+					<div className="cl-connect"><span>连接模型后即可继续此会话。</span>
+						<button type="button" className="primary-button" onClick={() => { setConnecting(true); setSettings(true); }}>连接模型</button>
 					</div>
 				)}
 				<div className="cl-body">
@@ -1902,6 +2032,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										stickToEnd.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
 										const far = element.scrollHeight - element.scrollTop - element.clientHeight > 240;
 										if (far !== showJump) setShowJump(far);
+											const id = snapshot.active?.id;
+											if (id) savedScroll.current.set(id, { top: element.scrollTop, stick: stickToEnd.current });
 									}}
 								>
 									{history.messages.length ? (
@@ -1914,23 +2046,19 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											onBackgroundTask={(id) => void backgroundSubagent(id)}
 											onStopTask={(id, kind) => void stopSubagent(id, kind)}
 											onOpenFile={openInEditor}
-											onRewindPrompt={(promptText) => {
-												setRewindQuery(promptText);
-												setCheckpointsOpen(true);
+											entryIds={entryIds}
+											checkpointIds={checkpointIds}
+											approvalTool={approvalTool}
+											onRewindPrompt={(checkpointId) => openCheckpoint(checkpointId)}
+											onForkPrompt={(entryId) => {
+												const conversationId = snapshot.active?.id;
+												if (conversationId) switchTo(async () => (await api.sessions.fork({ conversationId, entryId, activate: true })).snapshot);
 											}}
-											onForkPrompt={(promptText) => {
-												void api.sessions
-													.forkMessages(snapshot.active?.id)
-													.then(async ({ messages }) => {
-														const match = messages.find((m) => m.text.trim() === promptText.trim() || promptText.includes(m.text.slice(0, 40)));
-														if (match) {
-															await api.sessions.fork({ conversationId: snapshot.active?.id, entryId: match.entryId, activate: true });
-															await app.refresh();
-														} else {
-															setSessionsOpen(true);
-														}
-													})
-													.catch(app.fail);
+											onRerunCheck={(command) => {
+												const conversationId = snapshot.active?.id;
+												if (!conversationId) return;
+												setRerun({ conversationId, command, requestId: Date.now() });
+												setTerminalOpen(true);
 											}}
 											onOpenPreview={(url) => {
 												setPane(null);
@@ -1950,7 +2078,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 												{snapshot.active
 													? isGrail
 														? "向圣杯许下你的编程愿望"
-														: "今天想一起做什么？"
+														: snapshot.models.length ? "今天想一起做什么？" : "连接模型，开始第一个任务"
 													: isGrail
 														? "选择召唤结界（工作目录）"
 														: "选择工作目录开始"}
@@ -1965,17 +2093,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 													{snapshot.state?.model?.id && <span>({snapshot.state.model.name || snapshot.state.model.id})</span>}
 												</div>
 											)}
-											{snapshot.active ? (
+											{snapshot.active && snapshot.models.length ? (
 												<>
-													<div className="cc-empty-workspace">
-														<Folder size={14} />
-														<span className="cc-empty-ws-path" title={snapshot.active.project}>
-															<bdi>{snapshot.active.project}</bdi>
-														</span>
-														<button type="button" className="cc-empty-ws-btn" disabled={changing} onClick={openWorkspace}>
-															切换目录
-														</button>
-													</div>
 													<div className="cc-starter-chips">
 														<button
 															type="button"
@@ -2021,18 +2140,29 @@ function Desktop({ api }: { api: DesktopAPI }) {
 													</button>
 												</>
 											)}
-											<div className="cc-empty-hints">
+											{snapshot.active && !snapshot.models.length ? <button type="button" className="primary-button cc-connect-first" onClick={() => { setConnecting(true); setSettings(true); }}>连接模型</button> : <div className="cc-empty-hints">
 												<span><kbd>⌘N</kbd> 新建会话</span>
 												<span><kbd>⌘K</kbd> 搜索会话</span>
 												<span><kbd>/</kbd> 斜杠命令</span>
 												<span><kbd>@</kbd> 引用文件</span>
-											</div>
+											</div>}
 										</div>
 									)}
-									{running && (
+									{app.requests[0] && (
+									<div className="cc-active-request">
+										{app.requests[0].id === deferredApproval ? (
+											<button type="button" className="secondary-button" onClick={() => setDeferredApproval(undefined)}>继续处理审批</button>
+										) : (
+											<PermissionDialog inline key={app.requests[0].id} request={app.requests[0]}
+												conversationId={snapshot.active?.id} project={snapshot.active?.project}
+												respond={app.respond} defer={() => setDeferredApproval(app.requests[0]?.id)} fail={app.fail} />
+										)}
+									</div>
+								)}
+								{running && !approvalExpanded && (
 										<div className="cl-working" role="status">
-											{isGrail ? <MagicCircleLoader size={16} /> : <span className="cl-spinner" />}
-											{isGrail ? "从者正在咏唱与执行…" : "Pi 正在工作"}
+											{waitingForInput ? <ShieldCheck size={15} /> : isGrail ? <MagicCircleLoader size={16} /> : <span className="cl-spinner" />}
+											{waitingForInput ? "等待你处理审批" : activePhase && activePhase !== "completed" ? runLabels[activePhase] : "正在处理任务"}
 										</div>
 									)}
 									{!!snapshot.state?.pendingMessageCount && (
@@ -2040,7 +2170,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											<div className="cc-queue-head">
 												<span>
 													{running
-														? `${snapshot.state.pendingMessageCount} 条指令排队中，当前步骤结束后发送`
+														? `${snapshot.state.pendingMessageCount} 条待发送指令`
 														: `已停止，${snapshot.state.pendingMessageCount} 条指令还在排队，会和下一条消息一起发送`}
 												</span>
 												<span className="cc-queue-actions">
@@ -2048,18 +2178,32 @@ function Desktop({ api }: { api: DesktopAPI }) {
 														撤回到输入框
 													</button>
 													{running && (
-														<button type="button" className="cc-mini-btn primary" title="停止当前步骤，立即发送这条指令" disabled={Boolean(queueActionId)} onClick={() => void actOnQueue("send")}>
-															立即发送
+														<button type="button" className="cc-mini-btn primary" title="中止现在的任务并发送所有排队指令" disabled={Boolean(queueActionId)} onClick={() => void actOnQueue("send")}>
+															停止并发送队列
 														</button>
 													)}
 												</span>
 											</div>
-											{(snapshot.queuedMessages ?? []).map((text, index) => (
-												<p key={`${index}-${text.slice(0, 16)}`} className="cc-queue-item" title={text}>
-													{text}
-												</p>
-											))}
-										</div>
+											{([
+											["下一工具步骤", snapshot.queuedPromptGroups?.steering ?? snapshot.queuedMessages ?? []],
+											["本轮结束后", snapshot.queuedPromptGroups?.followUp ?? []],
+										] as const).map(([label, messages]) => messages.length > 0 && (
+											<div className="cc-queue-group" key={label}>
+												<span>{label}</span>
+												{messages.map((value, index) => <p className="cc-queue-item" key={index}>{value}</p>)}
+											</div>
+										))}
+									</div>
+								)}
+									{!running && currentEntryId && lastCheckpoint && lastCheckpoint.changes.length > 0 && (
+										<section className="cc-completion-card" aria-label="本轮结果">
+											<div><strong>{activePhase === "failed" ? "任务失败，已有改动可检查" : activePhase === "stopped" ? "任务已停止，已有改动可检查" : "本轮改动可审查"}</strong>
+												<small>{lastCheckpoint.changes.filter((file) => file.afterKind !== "directory" && file.beforeKind !== "directory").length} 个文件 · {lastCheckpoint.excludedFiles ? `${lastCheckpoint.excludedFiles} 个文件超出快照容量` : "已记录检查点"}</small></div>
+											<div className="cc-completion-actions">
+												<button type="button" className="secondary-button" onClick={() => openCheckpoint(lastCheckpoint.id)}>查看回滚选项</button>
+												<button type="button" className="primary-button" onClick={() => setPane("changes")}>审查本轮改动</button>
+											</div>
+										</section>
 									)}
 									{showJump && (
 										<button
@@ -2163,54 +2307,41 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							</div>
 						)}
 						{showPlanApproval && (
-							<div className="cc-plan-bar" role="region" aria-label="计划审批">
+							<section className="cc-plan-bar" role="region" aria-label="计划审批">
 								<div className="cc-plan-bar-top">
-									<span>
-										Plan 模式调研已完成{planState?.exists ? `（已保存 ${planState.relativePath}）` : ""}，是否按计划开始实施？
-									</span>
+									<strong>{planReady ? "计划待批准" : "计划草稿"}</strong>
 									<div className="cc-plan-bar-actions">
-										<button
-											type="button"
-											className="cc-mini-btn"
-											onClick={() => setPlanEditorOpen((v) => !v)}
-										>
+										<button type="button" className="cc-mini-btn" disabled={planApplying} onClick={() => setPlanEditorOpen((previous) => !previous)}>
 											{planEditorOpen ? "收起计划正文" : planState?.exists ? "查看/编辑计划" : "编写计划正文"}
 										</button>
-										<button
-											type="button"
-											className="primary-button"
-											title="项目内文件编辑自动允许；命令仍按规则询问"
-											onClick={() => void approvePlanAndExecute("acceptEdits")}
-										>
-											批准计划 · 接受编辑
-										</button>
-										<button type="button" className="secondary-button" onClick={() => void approvePlanAndExecute("ask")}>
-											批准计划 · 逐项确认
-										</button>
-										<button
-											type="button"
-											className="cc-mini-btn"
-											title="除规则外不再询问；命令以本机权限运行"
-											onClick={() => void approvePlanAndExecute("auto")}
-										>
-											全部放行（危险）
-										</button>
-										<button type="button" className="cc-mini-btn" onClick={() => void togglePlanMode()}>
-											退出 Plan
-										</button>
+										{planReady ? <>
+											<button type="button" className="primary-button" disabled={planApplying} onClick={() => void approvePlanAndExecute("acceptEdits")}>
+												{planApplying ? "正在准备执行…" : "批准计划 · 接受编辑"}
+											</button>
+											<button type="button" className="secondary-button" disabled={planApplying} onClick={() => void approvePlanAndExecute("ask")}>批准计划 · 逐项确认</button>
+										</> : planEditorOpen && planDraft.trim() && (
+											<button type="button" className="secondary-button" onClick={() => setManualPlan(true)}>使用这份计划</button>
+										)}
+										<button type="button" className="cc-mini-btn" disabled={planApplying} onClick={() => void togglePlanMode()}>退出 Plan</button>
 									</div>
 								</div>
-								{planEditorOpen && (
-									<textarea
-										className="cc-plan-editor"
-										rows={6}
-										aria-label="编辑计划内容"
-										placeholder="可在此审查或补充计划正文，点击批准时自动写入 .pi/plans/…"
-										value={planDraft}
-										onChange={(e) => setPlanDraft(e.target.value)}
-									/>
-								)}
-							</div>
+								{planEditorOpen && <textarea className="cc-plan-editor" rows={6} aria-label="编辑计划内容"
+									placeholder="审查或补充实施步骤" value={planDraft} disabled={planApplying || !planState}
+									onChange={(event) => { planDraftEdited.current = true; setPlanDraft(event.target.value); }} />}
+								{planError && <div role="alert" className="cc-plan-error">
+									{planError}
+									<button type="button" className="cc-mini-btn" onClick={() => {
+										if (planDraftEdited.current && !window.confirm("重新读取会替换当前计划草稿，继续吗？")) return;
+										void api.readPlan(snapshot.active?.id).then((current) => {
+											planDraftEdited.current = false;
+											setPlanState(current);
+											setPlanDraft(current.content);
+											setManualPlan(false);
+											setPlanError("");
+										}).catch((error) => setPlanError(String(error)));
+									}}>重新读取计划</button>
+								</div>}
+							</section>
 						)}
 						{heldCount > 0 && (
 							<div className="cc-plan-bar cc-held-results" role="region" aria-label="待交付的子 Agent 结果">
@@ -2347,7 +2478,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							updateAttachments={(update) => { if (snapshot.active) app.updateAttachments(snapshot.active.id, update); }}
 							setDraft={app.setDraft}
 							running={running}
-							changing={changing || bashBusy}
+							changing={changing || bashBusy || planApplying || app.draftLoading || queueActionId === snapshot.active?.id && queueActionId !== undefined}
 							planMode={inPlanMode}
 							onTogglePlanMode={() => void togglePlanMode()}
 							send={app.send}
@@ -2360,7 +2491,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							sandboxOpen={sandboxOpen}
 							setSandboxOpen={setSandboxOpen}
 							onUpdateSandbox={saveSandbox}
-							openSettings={() => setSettings(true)}
+							openSettings={() => { setConnecting(!snapshot.models.length); setSettings(true); }}
 							onBuiltinSlash={handleBuiltinSlash}
 							onCompactInstructions={(customInstructions) => void app.command({ type: "compact", customInstructions })}
 							onBtw={(q) => void runBtw(q)}
@@ -2384,9 +2515,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							readOnly={snapshot.settings.permission === "read" || snapshot.settings.permission === "plan"}
 							bashBusy={bashBusy}
 							bashOutput={app.terminal}
+							prefill={rerun?.conversationId === snapshot.active?.id ? rerun : undefined}
 							onRunBash={(cmd) => app.bash(cmd)}
 							onAbortBash={() => void app.command({ type: "abort_bash" })}
-							onClose={() => setTerminalOpen(false)}
+							onClose={() => { setRerun(undefined); setTerminalOpen(false); }}
 							fail={app.fail}
 						/>
 					)}
@@ -2394,10 +2526,19 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			</main>
 			{pane && (
 				<WorkspacePanel
-					key={`${snapshot.active?.id}-${pane}`}
+					key={snapshot.active?.id}
 					pane={pane}
 					conversationId={snapshot.active?.id}
-					onReviewNote={(note) => app.setDraft([app.draft, note].filter(Boolean).join("\n\n"))}
+					checkpointId={lastCheckpoint?.id}
+					focusReview={focusReview}
+					onToggleReviewFocus={toggleReviewFocus}
+					onOpenCheckpoint={openCheckpoint}
+					onSendReview={async (message) => {
+						const id = snapshot.active?.id;
+						if (!id) throw new Error("请先打开会话。");
+						await api.command({ type: "prompt", message, ...(running ? { streamingBehavior: "followUp" as const } : {}) }, id);
+						await app.refresh();
+					}}
 					setPane={setPane}
 					close={() => setPane(null)}
 					revision={app.revision}
@@ -2405,8 +2546,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					readOnly={snapshot.settings.permission === "read" || snapshot.settings.permission === "plan"}
 					onOpenInEditor={openInEditor}
 					onReferenceFile={(filePath) => {
-						const ref = `@${/\s/.test(filePath) ? JSON.stringify(filePath) : filePath}`;
-						const already = app.draft.split(/\s+/).includes(ref);
+						const ref = formatFileReference(filePath);
+						const already = fileReferences(app.draft).some((reference) => reference.path === filePath);
 						if (!already) {
 							const prefix = app.draft && !app.draft.endsWith(" ") && !app.draft.endsWith("\n") ? `${app.draft} ` : app.draft;
 							app.setDraft(`${prefix}${ref} `);
@@ -2424,7 +2565,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			)}
 			{!pane && previewUrl && (
 				<PreviewPanel
-					initialUrl={previewUrl}
+					key={snapshot.active?.id}
+					url={previewUrl}
+					onNavigate={setPreviewUrl}
 					onReport={(report) => app.setDraft([app.draft, report].filter(Boolean).join("\n\n"))}
 					close={() => setPreviewUrl(null)}
 				/>
@@ -2467,8 +2610,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					presets={snapshot.providerPresets}
 					models={snapshot.models}
 					busy={blocked}
-					close={() => setSettings(false)}
-					onSaved={() => setFlash("设置已保存")}
+					connectionOnly={connecting}
+					close={() => { setSettings(false); setConnecting(false); }}
+					onSaved={() => {
+						setFlash(connecting ? "模型已连接" : "设置已保存");
+						if (connecting) requestAnimationFrame(() => composerInputRef.current?.focus());
+					}}
 					apply={app.apply}
 					fail={app.fail}
 				/>
@@ -2729,20 +2876,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					</form>
 				</Modal>
 			)}
-			{app.requests[0]?.id === deferredApproval && deferredApproval && (
-				<button type="button" className="secondary-button cc-return-approval" onClick={() => setDeferredApproval(undefined)}>继续处理审批</button>
-			)}
-			{app.requests[0] && app.requests[0].id !== deferredApproval && (
-				<PermissionDialog
-					key={app.requests[0].id}
-					request={app.requests[0]}
-					conversationId={snapshot.active?.id}
-					project={snapshot.active?.project}
-					respond={app.respond}
-					defer={() => setDeferredApproval(app.requests[0]?.id)}
-					fail={app.fail}
-				/>
-			)}
+
 			{(!app.requests[0] || app.requests[0].id === deferredApproval) && snapshot.active && childApprovals.length > 0 && (
 				<SubagentApprovals
 					approvals={childApprovals}
@@ -2780,13 +2914,14 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			{checkpointsOpen && (
 				<CheckpointsDialog
 					conversationId={snapshot.active?.id}
-					initialQuery={rewindQuery}
+					initialCheckpointId={rewindTarget?.checkpointId}
+					initialPath={rewindTarget?.path}
 					close={() => setCheckpointsOpen(false)}
 					onRestored={(msg) => {
 						app.setNotice(msg);
 						void app.refresh();
 					}}
-					fail={app.fail}
+					readOnly={snapshot.settings.permission === "read" || snapshot.settings.permission === "plan"}
 				/>
 			)}
 			{tasksOpen && (
