@@ -10,6 +10,7 @@ import {
 	formatDurationBrief,
 	formatDurationClock,
 	formatRunningToolTimer,
+	isChecklistStaleOnIdle,
 } from "../src/task-eta.ts";
 import { TodoService } from "../src/todo-service.ts";
 import { validateDesktopToolInput } from "../src/tool-control-types.ts";
@@ -43,7 +44,7 @@ test("computeTodoTiming handles pending, in_progress, overdue, and completed sta
 });
 
 test("computeChecklistEta sums explicit estimates and extrapolates missing items from completed average", () => {
-	const now = 1_000_000;
+	const now = 10_000_000;
 	const explicit = computeChecklistEta(
 		[
 			{ id: "1", status: "in_progress", startedAt: now - 60_000, estimatedSeconds: 300 }, // 4m left
@@ -64,6 +65,26 @@ test("computeChecklistEta sums explicit estimates and extrapolates missing items
 	);
 	assert.equal(extrapolated.approximate, true);
 	assert.equal(extrapolated.summaryLabel, "约剩 ~4m");
+
+	// Never show misleading "约剩 ~0s" when an item runs longer than the completed average
+	const zeroRemaining = computeChecklistEta(
+		[
+			{ id: "1", status: "completed", startedAt: now - 60_000, completedAt: now }, // 1m avg
+			{ id: "2", status: "in_progress", startedAt: now - 3_600_000 }, // 1h elapsed
+		],
+		now,
+	);
+	assert.equal(zeroRemaining.summaryLabel, undefined);
+
+	// Idle session must show "已暂停" instead of an endlessly ticking 21-hour stopwatch
+	const paused = computeTodoTiming({ id: "2", status: "in_progress", startedAt: now - 3_600_000 }, now, false);
+	assert.equal(paused.label, "已暂停");
+
+	// Stale checklist from earlier turns auto-hides once idle
+	assert.equal(isChecklistStaleOnIdle({ isRunning: false, userTurnsAfterLastUpdate: 1, allCompleted: false }), true);
+	assert.equal(isChecklistStaleOnIdle({ isRunning: false, userTurnsAfterLastUpdate: 0, allCompleted: false }), false);
+	assert.equal(isChecklistStaleOnIdle({ isRunning: true, userTurnsAfterLastUpdate: 2, allCompleted: false }), false);
+	assert.equal(isChecklistStaleOnIdle({ isRunning: true, userTurnsAfterLastUpdate: 0, allCompleted: true }), true);
 });
 
 test("computeMonitorTiming detects silence/stale status and timeout ceiling", () => {

@@ -59,7 +59,7 @@ export function formatDurationClock(ms: number): string {
 }
 
 /** Compute per-item elapsed/ETA label for a checklist item. */
-export function computeTodoTiming(item: TimedTodoLike, now: number): TodoTiming {
+export function computeTodoTiming(item: TimedTodoLike, now: number, isRunning = true): TodoTiming {
 	const estimatedMs =
 		typeof item.estimatedSeconds === "number" && Number.isFinite(item.estimatedSeconds) && item.estimatedSeconds > 0
 			? item.estimatedSeconds * 1000
@@ -82,6 +82,13 @@ export function computeTodoTiming(item: TimedTodoLike, now: number): TodoTiming 
 	}
 
 	if (item.status === "in_progress") {
+		if (!isRunning) {
+			return {
+				estimatedMs,
+				overdue: false,
+				label: estimatedMs !== undefined ? `已暂停 · 预计 ~${formatDurationBrief(estimatedMs)}` : "已暂停",
+			};
+		}
 		const elapsedMs = typeof item.startedAt === "number" && item.startedAt > 0 ? Math.max(0, now - item.startedAt) : undefined;
 		const overdue = elapsedMs !== undefined && estimatedMs !== undefined && elapsedMs > estimatedMs;
 		let label: string | undefined;
@@ -109,14 +116,14 @@ export function computeTodoTiming(item: TimedTodoLike, now: number): TodoTiming 
  * Uses explicit `estimatedSeconds` when present, and softly extrapolates missing items from the
  * average actual duration of completed items (marking `approximate: true` so users know it's rough).
  */
-export function computeChecklistEta(items: readonly TimedTodoLike[], now: number): ChecklistEta {
+export function computeChecklistEta(items: readonly TimedTodoLike[], now: number, isRunning = true): ChecklistEta {
 	const completedDurations: number[] = [];
 	let activeElapsedMs: number | undefined;
 	for (const item of items) {
 		if (item.status === "completed" && item.startedAt && item.completedAt && item.completedAt >= item.startedAt) {
 			completedDurations.push(item.completedAt - item.startedAt);
 		}
-		if (item.status === "in_progress" && item.startedAt && activeElapsedMs === undefined) {
+		if (isRunning && item.status === "in_progress" && item.startedAt && activeElapsedMs === undefined) {
 			activeElapsedMs = Math.max(0, now - item.startedAt);
 		}
 	}
@@ -139,13 +146,13 @@ export function computeChecklistEta(items: readonly TimedTodoLike[], now: number
 				? item.estimatedSeconds * 1000
 				: undefined;
 		const elapsedMs =
-			item.status === "in_progress" && typeof item.startedAt === "number" && item.startedAt > 0
+			isRunning && item.status === "in_progress" && typeof item.startedAt === "number" && item.startedAt > 0
 				? Math.max(0, now - item.startedAt)
 				: 0;
 
 		if (estMs !== undefined) {
 			hasEstimate = true;
-			if (item.status === "in_progress" && elapsedMs > estMs) anyOverdue = true;
+			if (isRunning && item.status === "in_progress" && elapsedMs > estMs) anyOverdue = true;
 			totalRemainingMs += Math.max(0, estMs - elapsedMs);
 		} else if (avgCompletedMs !== undefined) {
 			hasEstimate = true;
@@ -165,9 +172,9 @@ export function computeChecklistEta(items: readonly TimedTodoLike[], now: number
 		};
 	}
 
-	let summaryLabel: string;
-	if (totalRemainingMs <= 0 && anyOverdue) {
-		summaryLabel = "已超预计";
+	let summaryLabel: string | undefined;
+	if (totalRemainingMs <= 0) {
+		summaryLabel = anyOverdue ? "已超预计" : undefined;
 	} else if (approximate) {
 		summaryLabel = `约剩 ~${formatDurationBrief(totalRemainingMs)}`;
 	} else {
@@ -181,6 +188,20 @@ export function computeChecklistEta(items: readonly TimedTodoLike[], now: number
 		activeElapsedMs,
 		summaryLabel,
 	};
+}
+
+/**
+ * Determine whether a checklist from an earlier turn should be hidden automatically so stale
+ * incomplete checklists do not linger forever after the user has moved on to newer turns.
+ */
+export function isChecklistStaleOnIdle(opts: {
+	isRunning: boolean;
+	userTurnsAfterLastUpdate: number;
+	allCompleted: boolean;
+}): boolean {
+	if (opts.allCompleted) return true;
+	if (opts.isRunning) return false;
+	return opts.userTurnsAfterLastUpdate >= 1;
 }
 
 /** Compute live elapsed + silence/activity status for a background shell or monitor. */

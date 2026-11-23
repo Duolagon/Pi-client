@@ -3310,8 +3310,13 @@ body {
 	background: var(--cl-clay);
 	transition: width 220ms ease;
 }
+.cc-pinned-todos-bar {
+	display: flex;
+	align-items: center;
+}
 .cc-pinned-todos-head {
-	width: 100%;
+	flex: 1;
+	min-width: 0;
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
@@ -3319,6 +3324,26 @@ body {
 	padding: 6px 12px;
 	font-size: var(--fs-sm);
 	color: var(--cl-2);
+}
+.cc-pinned-todos-toggle {
+	white-space: nowrap;
+	flex-shrink: 0;
+}
+.cc-pinned-todos-dismiss {
+	padding: 4px 10px;
+	margin-right: 8px;
+	border-radius: var(--r-md);
+	border: 1px solid var(--cl-line);
+	background: transparent;
+	color: var(--cl-2);
+	font-size: 11px;
+	white-space: nowrap;
+	flex-shrink: 0;
+	cursor: pointer;
+}
+.cc-pinned-todos-dismiss:hover {
+	background: var(--cl-soft);
+	color: var(--cl-1);
 }
 .cc-pinned-todos-head:hover {
 	background: var(--cl-soft);

@@ -61,7 +61,7 @@ import { grailWording, latestVerdict, revealDecision } from "./grail-view.ts";
 import { IconButton, Modal, PiMark, menuKeyNav } from "../prototype/ui.tsx";
 import { useDesktop } from "./useDesktop.ts";
 import { TranscriptView, type TodoItem } from "./TranscriptView.tsx";
-import { computeChecklistEta, computeTodoTiming } from "../task-eta.ts";
+import { computeChecklistEta, computeTodoTiming, isChecklistStaleOnIdle } from "../task-eta.ts";
 import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
 import { parseGoalCommand } from "../goal-mode.ts";
 import { WorkspacePicker } from "./WorkspacePicker.tsx";
@@ -151,6 +151,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [agentsOpen, setAgentsOpen] = useState(false);
 	const [mcpOpen, setMcpOpen] = useState(false);
 	const [todoExpanded, setTodoExpanded] = useState(false);
+	const [dismissedTodoSig, setDismissedTodoSig] = useState<Record<string, string>>({});
 	const [sharedTodos, setSharedTodos] = useState<TodoRecord[]>([]);
 	const [workflows, setWorkflows] = useState<WorkflowRecord[]>([]);
 	const [tasksMap, setTasksMap] = useState<Record<string, DesktopTask>>({});
@@ -996,11 +997,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		}).catch(() => {});
 		return () => { mounted = false; };
 	}, [activeConvId, planMode, activePermMode, app.revision, running]);
-	const latestTodos: TodoItem[] = (() => {
+	const pinnedTodoState = (() => {
 		const startedById = new Map<string, number>();
 		const completedById = new Map<string, number>();
 		let latestWrite: TodoItem[] = [];
 		let latestWriteTs = 0;
+		let latestWriteMsgIndex = -1;
 		for (let i = 0; i < history.messages.length; i++) {
 			const msg = history.messages[i];
 			if (msg.role !== "assistant") continue;
@@ -1016,10 +1018,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						}
 						latestWrite = todos;
 						latestWriteTs = Math.max(latestWriteTs, ts);
+						latestWriteMsgIndex = i;
 					}
 				}
 			}
 		}
+		let hasLiveWriteTool = false;
 		for (const activeTool of Object.values(history.tools ?? {})) {
 			if (activeTool.name === "TodoWrite" && activeTool.args && typeof activeTool.args === "object") {
 				const todos = (activeTool.args as { todos?: TodoItem[] }).todos;
@@ -1031,12 +1035,14 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					}
 					latestWrite = todos;
 					latestWriteTs = Math.max(latestWriteTs, ts);
+					hasLiveWriteTool = true;
 				}
 			}
 		}
 		const latestSharedTs = sharedTodos.reduce((max, item) => Math.max(max, item.updatedAt || item.createdAt || 0), 0);
-		if (sharedTodos.length > 0 && latestSharedTs >= latestWriteTs) {
-			return sharedTodos.map((item) => ({
+		const useShared = sharedTodos.length > 0 && latestSharedTs >= latestWriteTs;
+		const items: TodoItem[] = useShared
+			? sharedTodos.map((item) => ({
 				id: item.id,
 				content:
 					(item.status === "in_progress" && item.activeForm ? item.activeForm : item.subject) +
@@ -1046,15 +1052,35 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				estimatedSeconds: item.estimatedSeconds,
 				startedAt: item.startedAt,
 				completedAt: item.completedAt,
+			}))
+			: latestWrite.map((item) => ({
+				...item,
+				startedAt: item.startedAt ?? startedById.get(item.id),
+				completedAt: item.completedAt ?? completedById.get(item.id),
 			}));
+
+		let userTurnsAfter = 0;
+		if (!hasLiveWriteTool) {
+			if (useShared && latestSharedTs > 0) {
+				for (const msg of history.messages) {
+					if (msg.role === "user" && typeof msg.timestamp === "number" && msg.timestamp > latestSharedTs) userTurnsAfter += 1;
+				}
+			} else if (!useShared && latestWriteMsgIndex >= 0) {
+				for (let i = latestWriteMsgIndex + 1; i < history.messages.length; i++) {
+					if (history.messages[i].role === "user") userTurnsAfter += 1;
+				}
+			}
 		}
-		return latestWrite.map((item) => ({
-			...item,
-			startedAt: item.startedAt ?? startedById.get(item.id),
-			completedAt: item.completedAt ?? completedById.get(item.id),
-		}));
+
+		const sig = `${useShared ? "shared" : "write"}:${useShared ? latestSharedTs : latestWriteTs}:${items.map((t) => `${t.id}=${t.status}`).join(",")}`;
+		const activeConvKey = snapshot?.active?.id ?? "__none__";
+		const dismissed = dismissedTodoSig[activeConvKey] === sig;
+		const allCompleted = items.length === 0 || items.every((t) => t.status === "completed");
+		const hidden = dismissed || isChecklistStaleOnIdle({ isRunning: running, userTurnsAfterLastUpdate: userTurnsAfter, allCompleted });
+		return { items: hidden ? [] : items, useShared, sig };
 	})();
-	const hasActiveTodo = latestTodos.some((t) => t.status === "in_progress");
+	const latestTodos = pinnedTodoState.items;
+	const hasActiveTodo = running && latestTodos.some((t) => t.status === "in_progress");
 	const [todoClock, setTodoClock] = useState(() => Date.now());
 	useEffect(() => {
 		if (!hasActiveTodo) return;
@@ -1062,7 +1088,19 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		const timer = setInterval(() => setTodoClock(Date.now()), 1000);
 		return () => clearInterval(timer);
 	}, [hasActiveTodo]);
-	const checklistEta = latestTodos.length > 0 ? computeChecklistEta(latestTodos, todoClock) : undefined;
+	const checklistEta = latestTodos.length > 0 ? computeChecklistEta(latestTodos, todoClock, running) : undefined;
+	const completeAndDismissTodos = () => {
+		const convId = snapshot?.active?.id;
+		if (!convId) return;
+		if (pinnedTodoState.useShared && api.todos?.update) {
+			const openShared = sharedTodos.filter((item) => item.status !== "completed" && item.status !== "deleted");
+			void Promise.all(openShared.map((item) => api.todos.update(convId, { id: item.id, status: "completed" })))
+				.then(() => api.todos.list(convId).then(setSharedTodos))
+				.catch(() => {});
+		}
+		setDismissedTodoSig((prev) => ({ ...prev, [convId]: pinnedTodoState.sig }));
+		setTodoExpanded(false);
+	};
 	if (!snapshot)
 		return (
 			<div className="cl-start">
@@ -2063,42 +2101,54 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						{latestTodos.length > 0 && !latestTodos.every((t) => t.status === "completed") && (() => {
 							const doneCount = latestTodos.filter((t) => t.status === "completed").length;
 							const activeTodo = latestTodos.find((t) => t.status === "in_progress");
-							const activeTiming = activeTodo ? computeTodoTiming(activeTodo, todoClock) : undefined;
+							const activeTiming = activeTodo ? computeTodoTiming(activeTodo, todoClock, running) : undefined;
 							const pct = Math.min(100, Math.max(0, Math.round((doneCount / latestTodos.length) * 100)));
 							return (
 							<div className="cc-pinned-todos">
 								<div className="cc-pinned-todos-progress" aria-hidden="true">
 									<div className="cc-pinned-todos-progress-fill" style={{ width: `${pct}%` }} />
 								</div>
-								<button type="button" className="cc-pinned-todos-head" onClick={() => setTodoExpanded((v) => !v)}>
-									<span className="cc-pinned-todos-title">
-										<span>
-											任务进度 ({doneCount}/{latestTodos.length})
-											{activeTodo ? ` · ${activeTodo.content}` : ""}
+								<div className="cc-pinned-todos-bar">
+									<button type="button" className="cc-pinned-todos-head" onClick={() => setTodoExpanded((v) => !v)}>
+										<span className="cc-pinned-todos-title">
+											<span>
+												任务进度 ({doneCount}/{latestTodos.length})
+												{activeTodo ? ` · ${activeTodo.content}` : ""}
+											</span>
+											{activeTiming?.label && (
+												<span className={`cc-eta-pill ${activeTiming.overdue ? "overdue" : ""}`}>
+													{activeTiming.label}
+												</span>
+											)}
+											{checklistEta?.summaryLabel && checklistEta.summaryLabel !== activeTiming?.label && (
+												<span className={`cc-eta-pill ${checklistEta.anyOverdue ? "overdue" : ""}`}>
+													{checklistEta.summaryLabel}
+												</span>
+											)}
 										</span>
-										{activeTiming?.label && (
-											<span className={`cc-eta-pill ${activeTiming.overdue ? "overdue" : ""}`}>
-												{activeTiming.label}
-											</span>
-										)}
-										{checklistEta?.summaryLabel && checklistEta.summaryLabel !== activeTiming?.label && (
-											<span className={`cc-eta-pill ${checklistEta.anyOverdue ? "overdue" : ""}`}>
-												{checklistEta.summaryLabel}
-											</span>
-										)}
-									</span>
-									<span>{todoExpanded ? "收起" : "展开"}</span>
-								</button>
+										<span className="cc-pinned-todos-toggle">{todoExpanded ? "收起" : "展开"}</span>
+									</button>
+									{!running && (
+										<button
+											type="button"
+											className="cc-pinned-todos-dismiss"
+											title="标记为全部完成并收起，等待新任务"
+											onClick={completeAndDismissTodos}
+										>
+											完成并收起
+										</button>
+									)}
+								</div>
 								{todoExpanded && (
 									<div className="cc-pinned-todos-list">
 										{latestTodos.map((item) => {
-											const timing = computeTodoTiming(item, todoClock);
+											const timing = computeTodoTiming(item, todoClock, running);
 											return (
 												<div key={item.id} className={`cc-todo-row ${item.status}`}>
 													{item.status === "completed" ? (
 														<Check size={12} className="ok" />
 													) : item.status === "in_progress" ? (
-														<LoaderCircle size={12} className="spin run" />
+														<LoaderCircle size={12} className={running ? "spin run" : "pending"} />
 													) : (
 														<Circle size={11} className="pending" />
 													)}
