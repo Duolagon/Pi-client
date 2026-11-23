@@ -3964,6 +3964,7 @@ export class DesktopService {
 		if (!checkpoint) return unjudgeable("这个愿望没有 Git 快照（不是 Git 项目或还没有改动），无法取得 diff。");
 		if (!requirement.length) return unjudgeable("这个愿望里没有用户需求消息。");
 		const diff = await this.git.diffToWorktree(conversation.project, checkpoint.id);
+		if (diff.excludedFiles) return unjudgeable("有文件超出 Git 快照容量，无法完整鉴定改动。");
 		files = diff.files.map((file) => ({ path: file.path, status: file.status }));
 		if (!diff.files.length) return unjudgeable("这个愿望没有代码改动。");
 		const lines = parseDiffLines(diff.files);
@@ -5640,7 +5641,7 @@ export class DesktopService {
 		this.assertPathAvailable(project);
 	}
 	private async startCheckpoint(runtime: SessionRuntime, label: string): Promise<void> {
-		if (this.store.tasks.some((task) => task.conversationId === runtime.conversationId && task.readOnly)) return;
+		if (this.isReadRestricted(runtime.conversationId) || this.store.tasks.some((task) => task.conversationId === runtime.conversationId && task.readOnly)) return;
 		if (runtime.checkpointId) return;
 		const workspace = await this.workspace(runtime.conversationId);
 		if (!workspace.isGit) return;

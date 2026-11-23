@@ -210,7 +210,7 @@ await window.pi.tasks.viewing(task.id, true); // 详情打开时上报；关闭�
 
 ## Git 检查点
 
-每次新的 Pi 提示和直接 RPC `bash` 命令都会自动创建、封存检查点；同一轮运行中的引导／follow-up 共用该轮检查点。非 Git 目录不自动创建检查点。PTY 的任意交互输入没有可靠的命令边界，应使用手动检查点：
+可写模式下，新一轮 Pi 提示和直接 RPC `bash` 命令会在 Git 项目自动创建、封存检查点。同一轮运行中的引导／follow-up 共用该轮检查点。只读和 Plan 会话跳过自动检查点。PTY 的交互输入可以配合手动检查点。
 
 ```ts
 const checkpoint = await window.pi.git.begin({ conversationId: task.conversationId, label: "手动调整前" });
@@ -233,7 +233,7 @@ const result = await window.pi.git.restore({
 恢复规则：
 
 - 保存并恢复工作文件，Git 索引和 HEAD 保持不变；用户原先未提交的修改属于恢复基线。
-- 覆盖跟踪文件及未忽略的未跟踪文件；不捕获 `.git` 和忽略文件。
+- 覆盖跟踪文件及未忽略的未跟踪文件，跳过 `.git` 和忽略文件。超出单文件或总容量限制的文件会从可恢复列表排除，检查点的 `excludedFiles` 字段提供数量，回滚面板显示此限制。
 - 当前内容、类型、可执行权限必须仍匹配检查点的结束状态；已等于开始状态则跳过。
 - 先检查整批路径、HEAD、目录结构及内容完整性。后续外部编辑或符号链接逃逸会产生冲突。
 - 跨文件恢复不是操作系统事务；执行期间发生新冲突时停止并返回 `partial` 和已恢复路径。

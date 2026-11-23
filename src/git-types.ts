@@ -24,11 +24,13 @@ export interface GitCheckpoint {
 	beforeHead?: string;
 	afterHead?: string;
 	changes: GitSnapshotChange[];
+	excludedFiles?: number;
 	restoredPaths: string[];
 }
 
 export interface GitCheckpointDiff {
 	checkpointId: string;
+	excludedFiles?: number;
 	files: (GitSnapshotChange & { diff: string; truncated: boolean })[];
 }
 
