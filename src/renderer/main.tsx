@@ -172,8 +172,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [groupEdit, setGroupEdit] = useState<{ id: string; value: string } | null>(null);
 	const [archivedOpen, setArchivedOpen] = useState(false);
 	const [convMenu, setConvMenu] = useState<{ id: string; x: number; y: number } | null>(null);
-	/** Text the user sent while a run was active, per conversation; Pi only exposes a count. */
-	const [queued, setQueued] = useState<Record<string, string[]>>({});
+	const [queueActionId, setQueueActionId] = useState<string>();
+	const queueAction = useRef<string | undefined>(undefined);
 	const [showJump, setShowJump] = useState(false);
 	const [sandboxStatus, setSandboxStatus] = useState<SandboxStatus | null>(null);
 	const [sandboxOpen, setSandboxOpen] = useState(false);
@@ -216,62 +216,28 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	useEffect(() => {
 		setTrustOpen(false);
 	}, [snapshot?.active?.project]);
-	useEffect(() => {
-		const id = snapshot?.active?.id;
-		if (!id || snapshot?.state?.pendingMessageCount) return;
-		setQueued((prev) => (prev[id]?.length ? { ...prev, [id]: [] } : prev));
-	}, [snapshot?.active?.id, snapshot?.state?.pendingMessageCount, queued]);
 	const focusFirstMenuItem = useCallback((node: HTMLDivElement | null) => {
 		node?.querySelector<HTMLElement>('[role="menuitem"]:not([disabled])')?.focus();
 	}, []);
-	const sendPrompt: typeof app.send = async (value) => {
+	const actOnQueue = async (action: "withdraw" | "send") => {
 		const id = snapshot?.active?.id;
-		const wasRunning = running;
-		const result = await app.send(value);
-		if (wasRunning && id && result?.disposition === "queued" && value.message.trim())
-			setQueued((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), value.message.trim()] }));
-		return result;
-	};
-	const withdrawQueued = async () => {
-		const id = snapshot?.active?.id;
-		if (!id) return;
+		if (!id || queueAction.current) return;
+		queueAction.current = id;
+		setQueueActionId(id);
 		try {
-			const result = (await api.command({ type: "clear_queue" }, id)) as { steering?: string[]; followUp?: string[] } | undefined;
-			const texts = [...(result?.steering ?? []), ...(result?.followUp ?? [])].filter((text) => text.trim());
-			const restored = texts.length ? texts : queued[id] ?? [];
-			if (restored.length) app.prependDraft(id, restored.join("\n\n"));
-			setQueued((prev) => ({ ...prev, [id]: [] }));
-			await app.refresh();
-			setFlash(restored.length ? "排队的指令已放回输入框" : "队列已清空");
-			composerInputRef.current?.focus();
-		} catch (error) {
-			app.fail(error);
-		}
-	};
-
-	// Send now: pull the queued text out, stop the current step, then send it as a fresh prompt.
-	const sendQueuedNow = async () => {
-		const id = snapshot?.active?.id;
-		if (!id) return;
-		try {
-			const result = (await api.command({ type: "clear_queue" }, id)) as { steering?: string[]; followUp?: string[] } | undefined;
-			const texts = [...(result?.steering ?? []), ...(result?.followUp ?? [])].filter((text) => text.trim());
-			const message = (texts.length ? texts : queued[id] ?? []).join("\n\n").trim();
-			setQueued((prev) => ({ ...prev, [id]: [] }));
-			if (!message) {
-				await app.refresh();
-				return;
+			const { drafts, error } = await api.actOnQueue(id, action);
+			if (drafts.length) {
+				await app.prependDrafts(id, drafts);
+				setFlash("排队的指令已放回输入框");
+				composerInputRef.current?.focus();
 			}
-			await api.command({ type: "abort" }, id);
-			for (let i = 0; i < 50; i++) {
-				const next = await api.snapshot();
-				if (next.active?.id !== id || !(next.state?.isStreaming || next.state?.isCompacting)) break;
-				await new Promise((resolve) => setTimeout(resolve, 100));
-			}
-			await api.command({ type: "prompt", message }, id);
+			if (error) app.fail(new Error(error));
 			await app.refresh();
 		} catch (error) {
 			app.fail(error);
+		} finally {
+			queueAction.current = undefined;
+			setQueueActionId(undefined);
 		}
 	};
 
@@ -641,7 +607,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	};
 	/** Reuses the current session when it is still empty, instead of stacking blank "新会话" rows. */
 	const startNewConversation = () => {
-		if (snapshot?.active && !running && history.messages.length === 0 && !app.draft.trim()) {
+		if (snapshot?.active && !running && history.messages.length === 0 && !app.draft.trim() && !app.attachments.length && !app.draftLoading) {
 			composerInputRef.current?.focus();
 			return;
 		}
@@ -2078,17 +2044,17 @@ function Desktop({ api }: { api: DesktopAPI }) {
 														: `已停止，${snapshot.state.pendingMessageCount} 条指令还在排队，会和下一条消息一起发送`}
 												</span>
 												<span className="cc-queue-actions">
-													<button type="button" className="cc-mini-btn" onClick={() => void withdrawQueued()}>
+													<button type="button" className="cc-mini-btn" disabled={Boolean(queueActionId)} onClick={() => void actOnQueue("withdraw")}>
 														撤回到输入框
 													</button>
 													{running && (
-														<button type="button" className="cc-mini-btn primary" title="停止当前步骤，立即发送这条指令" onClick={() => void sendQueuedNow()}>
+														<button type="button" className="cc-mini-btn primary" title="停止当前步骤，立即发送这条指令" disabled={Boolean(queueActionId)} onClick={() => void actOnQueue("send")}>
 															立即发送
 														</button>
 													)}
 												</span>
 											</div>
-											{(queued[snapshot.active?.id ?? ""] ?? []).map((text, index) => (
+											{(snapshot.queuedMessages ?? []).map((text, index) => (
 												<p key={`${index}-${text.slice(0, 16)}`} className="cc-queue-item" title={text}>
 													{text}
 												</p>
@@ -2377,12 +2343,14 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							snapshot={snapshot}
 							activeProject={project}
 							draft={app.draft}
+							attachments={app.attachments}
+							updateAttachments={(update) => { if (snapshot.active) app.updateAttachments(snapshot.active.id, update); }}
 							setDraft={app.setDraft}
 							running={running}
 							changing={changing || bashBusy}
 							planMode={inPlanMode}
 							onTogglePlanMode={() => void togglePlanMode()}
-							send={sendPrompt}
+							send={app.send}
 							stop={() => void app.command({ type: "abort" })}
 							command={app.command}
 							setPermission={(permission) => void savePermission(permission)}
@@ -2681,6 +2649,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									void api
 										.removeConversation(target.id)
 										.then((next) => {
+											app.forgetDraft(target.id);
 											app.apply(next);
 											setFlash("会话已移到废纸篓");
 										})

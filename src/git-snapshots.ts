@@ -36,6 +36,7 @@ const maxEntries = 50000;
 type Entry =
 	| { kind: "missing" }
 	| { kind: "directory"; mode: number }
+	| { kind: "excluded" }
 	| { kind: "file" | "symlink"; mode: number; hash: string; size: number; binary: boolean };
 interface Manifest {
 	version: 1;
@@ -44,6 +45,7 @@ interface Manifest {
 	after?: Record<string, Entry>;
 }
 const missing: Entry = { kind: "missing" };
+const excluded: Entry = { kind: "excluded" };
 
 /** Persist worktree snapshots without changing the Git index, HEAD, or stash. */
 export class GitSnapshots {
@@ -71,6 +73,7 @@ export class GitSnapshots {
 				restoredPaths: [],
 			};
 			const before = await this.capture(root);
+			checkpoint.excludedFiles = excludedPaths(before).size || undefined;
 			await this.save({ version: 1, checkpoint, before });
 			return structuredClone(checkpoint);
 		});
@@ -85,7 +88,9 @@ export class GitSnapshots {
 			manifest.after = await this.capture(root, Object.keys(manifest.before));
 			manifest.checkpoint.finishedAt = Date.now();
 			manifest.checkpoint.afterHead = await this.head(root);
-			manifest.checkpoint.changes = changes(manifest.before, manifest.after);
+			const excluded = excludedPaths(manifest.before, manifest.after);
+			manifest.checkpoint.excludedFiles = excluded.size || undefined;
+			manifest.checkpoint.changes = changes(manifest.before, manifest.after, excluded);
 			manifest.checkpoint.status = "ready";
 			await this.save(manifest);
 			return structuredClone(manifest.checkpoint);
@@ -145,12 +150,13 @@ export class GitSnapshots {
 			const manifest = await this.load(root, id);
 			const current = await this.capture(root, Object.keys(manifest.before));
 			const files: GitCheckpointDiff["files"] = [];
-			for (const change of changes(manifest.before, current)) {
+			const excluded = excludedPaths(manifest.before, current);
+			for (const change of changes(manifest.before, current, excluded)) {
 				if (change.beforeKind === "directory" || change.afterKind === "directory") continue;
 				const result = await this.fileDiff(change.path, manifest.before[change.path] ?? missing, current[change.path] ?? missing);
 				files.push({ ...change, ...result });
 			}
-			return { checkpointId: id, files };
+			return excluded.size ? { checkpointId: id, files, excludedFiles: excluded.size } : { checkpointId: id, files };
 		});
 	}
 
@@ -261,7 +267,7 @@ export class GitSnapshots {
 							},
 						);
 						await chmod(join(root, path), before.mode);
-					} else
+					} else if (before.kind === "file" || before.kind === "symlink")
 						await this.replace(root, path, before, removed.has(path) ? missing : (manifest.after[path] ?? missing));
 					restored.push(path);
 				}
@@ -359,15 +365,14 @@ export class GitSnapshots {
 		const result: Record<string, Entry> = Object.create(null);
 		let size = 0;
 		for (const path of [...paths].sort()) {
-			const entry = await this.inspect(project, path, true);
+			const entry = await this.inspect(project, path, true, maxSnapshotBytes - size);
 			if (entry.kind === "file" || entry.kind === "symlink") size += entry.size;
-			if (size > maxSnapshotBytes) throw new Error("快照内容超过 512 MB，请缩小工作区或配置 Git 忽略规则。");
 			result[path] = entry;
 		}
 		return result;
 	}
 
-	private async inspect(project: string, path: string, persist = false): Promise<Entry> {
+	private async inspect(project: string, path: string, persist = false, remainingBytes = maxFileBytes): Promise<Entry> {
 		checkPath(path);
 		for (const parent of parents(path)) {
 			try {
@@ -394,7 +399,7 @@ export class GitSnapshots {
 			bytes = Buffer.from(await readlink(target));
 		} else if (info.isFile()) {
 			kind = "file";
-			if (info.size > maxFileBytes) throw new Error(`文件 ${path} 超过 64 MB，无法创建安全快照。`);
+			if (info.size > Math.min(maxFileBytes, remainingBytes)) return excluded;
 			const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
 			try {
 				const before = await handle.stat();
@@ -414,6 +419,7 @@ export class GitSnapshots {
 				await handle.close();
 			}
 		} else throw new Error(`不支持为特殊文件创建快照：${path}`);
+		if (bytes.length > Math.min(maxFileBytes, remainingBytes)) return excluded;
 		const digest = hash(bytes);
 		if (persist)
 			await writeFile(join(this.dataDir, "blobs", digest), bytes, { flag: "wx", mode: 0o600 }).catch(
@@ -504,6 +510,7 @@ export class GitSnapshots {
 	}
 
 	private async fileDiff(path: string, before: Entry, after: Entry): Promise<{ diff: string; truncated: boolean }> {
+		if (before.kind === "excluded" || after.kind === "excluded") throw new Error("此路径未纳入快照。");
 		if (before.kind === "directory" || after.kind === "directory")
 			return { diff: `路径类型：${before.kind} → ${after.kind}`, truncated: false };
 		const temporary = await mkdtemp(join(tmpdir(), "pi-checkpoint-diff-"));
@@ -557,10 +564,15 @@ export class GitSnapshots {
 	}
 }
 
-function changes(before: Record<string, Entry>, after: Record<string, Entry>): GitSnapshotChange[] {
+function excludedPaths(...states: Record<string, Entry>[]): Set<string> {
+	return new Set(states.flatMap((state) => Object.keys(state).filter((path) => state[path].kind === "excluded")));
+}
+
+function changes(before: Record<string, Entry>, after: Record<string, Entry>, excluded: Set<string>): GitSnapshotChange[] {
 	return [...new Set([...Object.keys(before), ...Object.keys(after)])].sort().flatMap((path) => {
 		const previous = before[path] ?? missing;
 		const next = after[path] ?? missing;
+		if (previous.kind === "excluded" || next.kind === "excluded" || parents(path).some((parent) => excluded.has(parent))) return [];
 		if (equal(previous, next)) return [];
 		return [
 			{
@@ -587,6 +599,7 @@ function changes(before: Record<string, Entry>, after: Record<string, Entry>): G
 function equal(a: Entry, b: Entry): boolean {
 	if (a.kind !== b.kind) return false;
 	if (a.kind === "missing" || b.kind === "missing") return true;
+	if (a.kind === "excluded" || b.kind === "excluded") return false;
 	if (a.mode !== b.mode) return false;
 	if (a.kind === "directory" || b.kind === "directory") return true;
 	return a.hash === b.hash && a.size === b.size;
@@ -643,9 +656,9 @@ function validateManifest(input: unknown, project: string, id: string): Manifest
 		const entries: Record<string, Entry> = Object.create(null);
 		for (const [path, entry] of Object.entries(map)) {
 			checkPath(path);
-			if (!entry || typeof entry !== "object" || !["missing", "file", "symlink", "directory"].includes(entry.kind))
+			if (!entry || typeof entry !== "object" || !["missing", "file", "symlink", "directory", "excluded"].includes(entry.kind))
 				throw new Error("快照文件元数据无效。");
-			if (entry.kind !== "missing" && (!Number.isInteger(entry.mode) || entry.mode < 0 || entry.mode > 0o777))
+			if (entry.kind !== "missing" && entry.kind !== "excluded" && (!Number.isInteger(entry.mode) || entry.mode < 0 || entry.mode > 0o777))
 				throw new Error("快照文件权限无效。");
 			if (
 				(entry.kind === "file" || entry.kind === "symlink") &&
@@ -661,6 +674,8 @@ function validateManifest(input: unknown, project: string, id: string): Manifest
 		value[key] = entries;
 	}
 	for (const path of value.checkpoint.restoredPaths) checkPath(path);
-	value.checkpoint.changes = value.after ? changes(value.before!, value.after) : [];
+	const excluded = excludedPaths(value.before, value.after ?? {});
+	value.checkpoint.excludedFiles = excluded.size || undefined;
+	value.checkpoint.changes = value.after ? changes(value.before, value.after, excluded) : [];
 	return value as Manifest;
 }

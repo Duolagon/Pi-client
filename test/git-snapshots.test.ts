@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -283,6 +283,31 @@ test("materializeBefore reconstructs files, directories, and symlinks from the w
 		assert.equal(await readlink(join(destination, "link")), "target.txt");
 	} finally {
 		await rm(copy, { recursive: true, force: true });
+		await cleanup();
+	}
+});
+
+test("oversized files stay out of rollback even if they later fit within the snapshot", async () => {
+	const { project, data, service, cleanup } = await fixture();
+	const oversized = join(project, "large.bin");
+	try {
+		await writeFile(oversized, "");
+		await truncate(oversized, 65 * 1024 * 1024);
+		const start = await service.begin(project, "oversized");
+		assert.equal(start.excludedFiles, 1);
+		await writeFile(oversized, "new contents that must remain");
+		await writeFile(join(project, "tracked.txt"), "agent edit");
+		const finished = await service.finish(project, start.id);
+		assert.equal(finished.excludedFiles, 1);
+		assert.deepEqual(finished.changes.map((item) => item.path), ["tracked.txt"]);
+		const reloaded = new GitSnapshots(data);
+		assert.equal((await reloaded.list(project, "oversized"))[0].excludedFiles, 1);
+		assert.equal((await reloaded.diffToWorktree(project, start.id)).excludedFiles, 1);
+		await assert.rejects(reloaded.restore(project, start.id, ["large.bin"]), /实际发生变化/);
+		assert.equal((await reloaded.restore(project, start.id)).status, "restored");
+		assert.equal(await readFile(oversized, "utf8"), "new contents that must remain");
+		assert.equal(await readFile(join(project, "tracked.txt"), "utf8"), "user's unstaged work\n");
+	} finally {
 		await cleanup();
 	}
 });

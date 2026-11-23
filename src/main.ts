@@ -1,3 +1,4 @@
+import { maximumImageDataLength, maximumPromptLength, type ComposerAttachment, type PromptImage } from "./composer-draft.ts";
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, safeStorage, shell } from "electron";
 import { join } from "node:path";
 import { mkdir, stat } from "node:fs/promises";
@@ -254,6 +255,32 @@ function installHandlers() {
 	});
 	handle("pi:goal:stop", (id) => service.stopGoal(string(id, "会话 ID", 200)));
 	handle("pi:command", (input, id) => service.command(command(input), id === undefined ? undefined : string(id, "会话 ID", 200)));
+	handle("pi:send-prompt", (id, input, streamingBehavior) => {
+		const draft = object(input);
+		if (streamingBehavior !== undefined && streamingBehavior !== "steer" && streamingBehavior !== "followUp")
+			throw new Error("排队模式无效。");
+		if (!Array.isArray(draft.attachments)) throw new Error("附件格式无效。");
+		const attachments = draft.attachments.map((input): ComposerAttachment => {
+			const attachment = object(input);
+			const name = string(attachment.name, "附件名称", 1024);
+			if (attachment.image !== undefined) {
+				const block = object(attachment.image);
+				if (block.type !== "image") throw new Error("图片格式无效。");
+				const image: PromptImage = {
+					type: "image",
+					data: string(block.data, "图片", maximumImageDataLength),
+					mimeType: string(block.mimeType, "图片类型", 100),
+				};
+				return { name, image };
+			}
+			return { name, text: string(attachment.text, "附件内容", 1024 * 1024) };
+		});
+		return service.sendComposerPrompt(string(id, "会话 ID", 200), { text: string(draft.text, "消息", maximumPromptLength), attachments }, streamingBehavior);
+	});
+	handle("pi:queue-action", (id, action) => {
+		if (action !== "withdraw" && action !== "send") throw new Error("队列操作无效。");
+		return service.actOnQueue(string(id, "会话 ID", 200), action);
+	});
 	handle("pi:respond", async (input, id) => {
 		const record = object(input);
 		string(record.id, "确认 ID", 300);

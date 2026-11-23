@@ -131,6 +131,9 @@ export function CheckpointsDialog({
 							<div>
 								<strong>{activeCp.label || "检查点"}</strong>
 								<span className="cc-rewind-sub"> · {activeCp.changes.length} 个文件</span>
+								{Boolean(activeCp.excludedFiles) && (
+									<p className="subtle-note">有 {activeCp.excludedFiles} 个文件超出快照容量，无法通过此检查点恢复。</p>
+								)}
 							</div>
 							<button
 								type="button"

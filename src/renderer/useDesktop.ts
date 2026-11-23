@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Command, DesktopAPI, DesktopEvent, Snapshot, RpcExtensionUIRequest, BashResult, SessionActivity } from "../shared.ts";
+import type { Command, DesktopAPI, DesktopEvent, DesktopPromptResult, Snapshot, RpcExtensionUIRequest, BashResult, SessionActivity } from "../shared.ts";
+import { emptyDraft, mergeDrafts, type ComposerAttachment, type ComposerDraft, type Prompt } from "../composer-draft.ts";
+import { readDraft, writeDraft } from "./draft-storage.ts";
 import { applyEvent, transcript, type Transcript } from "./messages.ts";
 
 export function useDesktop(api: DesktopAPI) {
@@ -12,18 +14,34 @@ export function useDesktop(api: DesktopAPI) {
 	const appendTerminal = (id: string, delta: string) => setTerminalOutput((output) => ({ ...output, [id]: ((output[id] ?? "") + delta).slice(-200000) }));
 	const [error, setError] = useState("");
 	const [notice, setNotice] = useState("");
-	const [draft, putDraft] = useState("");
+	const [draft, putDraft] = useState(emptyDraft);
+	const [draftLoading, setDraftLoading] = useState(false);
 	const [activity, setActivity] = useState<Record<string, SessionActivity>>({});
-	const drafts = useRef(new Map<string, string>());
-	const setDraft = (value: string) => {
-		const id = activeId.current;
-		if (id) drafts.current.set(id, value);
-		putDraft(value);
-	};
-	const prependDraft = (id: string, text: string) => {
-		const next = [text, drafts.current.get(id) ?? ""].filter((part) => part.trim()).join("\n\n");
+	const drafts = useRef(new Map<string, Partial<ComposerDraft>>());
+	const loadedDrafts = useRef(new Set<string>());
+	const getDraft = (id: string) => ({ ...emptyDraft, ...drafts.current.get(id) });
+	const updateDraft = (id: string, patch: Partial<ComposerDraft>) => {
+		const next = { ...drafts.current.get(id), ...patch };
 		drafts.current.set(id, next);
-		if (activeId.current === id) putDraft(next);
+		if (activeId.current === id) putDraft({ ...emptyDraft, ...next });
+		void writeDraft(id, patch).catch(() => {
+			if (activeId.current === id) fail(new Error("无法保存草稿，内容暂时保留在当前窗口。"));
+		});
+	};
+	const setDraft = (text: string) => {
+		if (activeId.current) updateDraft(activeId.current, { text });
+	};
+	const updateAttachments = (id: string, update: (items: ComposerAttachment[]) => ComposerAttachment[]) => {
+		updateDraft(id, { attachments: update(getDraft(id).attachments) });
+	};
+	const prependDrafts = async (id: string, restored: ComposerDraft[]) => {
+		if (!loadedDrafts.current.has(id)) await loadDraft(id);
+		updateDraft(id, mergeDrafts([...restored, getDraft(id)]));
+	};
+	const forgetDraft = (id: string) => {
+		drafts.current.delete(id);
+		loadedDrafts.current.delete(id);
+		void writeDraft(id, emptyDraft).catch(fail);
 	};
 	const [requests, setRequests] = useState<RpcExtensionUIRequest[]>([]);
 	const [revision, setRevision] = useState(0);
@@ -39,6 +57,20 @@ export function useDesktop(api: DesktopAPI) {
 	const fail = useCallback((cause: unknown) => {
 		setError(cause instanceof Error ? cause.message : String(cause));
 	}, []);
+	const loadDraft = useCallback(async (id: string) => {
+		try {
+			const saved = await readDraft(id);
+			if (loadedDrafts.current.has(id)) return;
+			const next = { ...saved, ...drafts.current.get(id) };
+			drafts.current.set(id, next);
+			loadedDrafts.current.add(id);
+			if (activeId.current === id) putDraft(next);
+		} catch {
+			if (activeId.current === id) fail(new Error("无法读取保存的草稿。"));
+		} finally {
+			if (activeId.current === id) setDraftLoading(false);
+		}
+	}, [fail]);
 	const apply = useCallback((next: Snapshot) => {
 		const id = next.active?.id;
 		const sequence = next.eventSequence ?? 0;
@@ -57,7 +89,9 @@ export function useDesktop(api: DesktopAPI) {
 		setRunning(Boolean(next.state?.isStreaming || next.state?.isCompacting));
 		setRequests(next.pendingUI.filter((request) => ["confirm", "select", "input", "editor"].includes(request.method)));
 		if (changed) {
-			putDraft(id ? drafts.current.get(id) ?? "" : "");
+			putDraft(id ? { ...emptyDraft, ...drafts.current.get(id) } : emptyDraft);
+			setDraftLoading(Boolean(id && !loadedDrafts.current.has(id)));
+			if (id && !loadedDrafts.current.has(id)) void loadDraft(id);
 			setNotice("");
 		}
 		if (id && next.eventSequence !== undefined) {
@@ -76,7 +110,7 @@ export function useDesktop(api: DesktopAPI) {
 			}
 		}
 		setRevision((value) => value + 1);
-	}, []);
+	}, [loadDraft]);
 	const refresh = useCallback(async () => {
 		if (selecting.current) return;
 		const token = ++generation.current;
@@ -136,7 +170,7 @@ export function useDesktop(api: DesktopAPI) {
 				if (event.notifyType === "error") fail(event.message);
 				else setNotice(event.message);
 			} else if (event.method === "setStatus") setNotice(event.statusText ?? "");
-			else if (event.method === "set_editor_text") setDraft(event.text);
+			else if (event.method === "set_editor_text") updateDraft(conversationId, { text: event.text });
 			return;
 		}
 		if (event.type === "agent_start" || event.type === "compaction_start") setRunning(true);
@@ -182,6 +216,7 @@ export function useDesktop(api: DesktopAPI) {
 					? {
 							...previous,
 							state: { ...previous.state, pendingMessageCount: event.steering.length + event.followUp.length },
+							queuedMessages: [...event.steering, ...event.followUp],
 						}
 					: previous,
 			);
@@ -233,22 +268,28 @@ export function useDesktop(api: DesktopAPI) {
 			fail(cause);
 		}
 	};
-	const send = async (value: Extract<Command, { type: "prompt" }>) => {
+	const send = async (value: Prompt, input?: ComposerDraft) => {
 		const id = activeId.current;
+		if (!id) return;
 		const previous = running;
-		const submittedDraft = draft;
+		const submittedDraft = getDraft(id);
 		setError("");
 		setNotice("");
 		setRunning(true);
 		try {
-			const result = (await api.command({ ...value, streamingBehavior: previous ? "steer" : undefined }, id)) as {
-				disposition: "started" | "handled" | "queued";
-			};
-			if (id && drafts.current.get(id) === submittedDraft) {
-				drafts.current.delete(id);
-				if (activeId.current === id) putDraft("");
+			const streamingBehavior = previous ? "steer" : undefined;
+			const result = input
+				? await api.sendPrompt(id, input, streamingBehavior)
+				: await api.command({ ...value, streamingBehavior }, id) as DesktopPromptResult;
+			const remaining = getDraft(id);
+			const patch: Partial<ComposerDraft> = {};
+			if (remaining.text === submittedDraft.text) patch.text = "";
+			if (input?.attachments.length) {
+				const submitted = new Set(input.attachments);
+				patch.attachments = remaining.attachments.filter((item) => !submitted.has(item));
 			}
-			if (activeId.current === id && result.disposition === "handled") {
+			if (Object.keys(patch).length) updateDraft(id, patch);
+			if (activeId.current === id && (result.disposition === "handled" || result.disposition === "forked_skill")) {
 				setRunning(previous);
 				await refresh();
 			}
@@ -285,7 +326,9 @@ export function useDesktop(api: DesktopAPI) {
 		}
 	};
 	return {
-		prependDraft,
+		prependDrafts,
+		updateAttachments,
+		forgetDraft,
 		snapshot,
 		activity,
 		history,
@@ -295,7 +338,9 @@ export function useDesktop(api: DesktopAPI) {
 		terminal: snapshot?.active?.id ? terminalOutput[snapshot.active.id] ?? "" : "",
 		error,
 		notice,
-		draft,
+		draft: draft.text,
+		attachments: draft.attachments,
+		draftLoading,
 		requests,
 		revision,
 		fail,

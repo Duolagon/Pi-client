@@ -1,3 +1,6 @@
+import { draftPrompt, mergeDrafts, type ComposerDraft, type Prompt } from "./composer-draft.ts";
+import { QueuedPrompts, type NativeQueue } from "./queued-prompts.ts";
+import type { DesktopPromptResult, QueueActionResult } from "./shared.ts";
 import { createDraftPullRequest, readPullRequest, readPullRequestComments, setPullRequestAutoMerge, type DraftPullRequest } from "./review-service.ts";
 import { managedFile, writeManagedFile } from "./managed-path.ts";
 import { execFile } from "node:child_process";
@@ -262,6 +265,7 @@ interface SessionRuntime {
 	answeredUI: Set<string>;
 	checkpointId?: string;
 	settling?: Promise<void>;
+	userQueue?: QueuedPrompts;
 	loading?: Promise<void>;
 	lastError?: string;
 	stopping: boolean;
@@ -2898,8 +2902,8 @@ export class DesktopService {
 	respondExternal(id: string, requestId: string, response: ExternalApprovalResponse) { return this.external.respond(id, requestId, response); }
 	replayExternal(id: string, afterSequence?: number) { return this.external.replay(id, afterSequence); }
 
-	command(command: Command, conversationId?: string, launch?: number): Promise<unknown> {
-		const result = this.executeCommand(command, conversationId, launch);
+	command(command: Command, conversationId?: string, launch?: number, draft?: ComposerDraft): Promise<unknown> {
+		const result = this.executeCommand(command, conversationId, launch, draft);
 		this.commands.add(result);
 		void result.then(
 			() => this.commands.delete(result),
@@ -2908,7 +2912,48 @@ export class DesktopService {
 		return result;
 	}
 
-	private async executeCommand(command: Command, conversationId?: string, launch?: number): Promise<unknown> {
+	async sendComposerPrompt(conversationId: string, draft: ComposerDraft, streamingBehavior?: Prompt["streamingBehavior"]): Promise<DesktopPromptResult> {
+		return await this.command({ ...draftPrompt(draft), streamingBehavior }, conversationId, undefined, draft) as DesktopPromptResult;
+	}
+
+	async actOnQueue(conversationId: string, action: "withdraw" | "send"): Promise<QueueActionResult> {
+		await this.operation;
+		const runtime = this.runtimes.get(this.conversation(conversationId).id);
+		if (!runtime) return { drafts: [] };
+		const agent = this.requireAgent(runtime);
+		const queue = runtime.userQueue ??= new QueuedPrompts();
+		const drafts = await queue.take(() => agent.request<NativeQueue>({ type: "clear_queue" }));
+		if (action === "withdraw" || !drafts.length) return { drafts };
+		try {
+			const draft = mergeDrafts(drafts);
+			// Prepare the replacement before interrupting the current run.
+			const next = draftPrompt(draft);
+			await this.command({ type: "abort" }, conversationId);
+			await runtime.settling;
+			await this.command(next, conversationId, undefined, draft);
+			return { drafts: [] };
+		} catch (error) {
+			return { drafts, error: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	private requestQueuedInput(
+		runtime: SessionRuntime,
+		agent: AgentProcess,
+		command: Prompt | Extract<Command, { type: "steer" | "follow_up" }>,
+		draft?: ComposerDraft,
+	) {
+		const queue = runtime.userQueue ??= new QueuedPrompts();
+		const lane = command.type === "follow_up" || (command.type === "prompt" && command.streamingBehavior === "followUp")
+			? "followUp" : "steering";
+		const original = draft ?? {
+			text: command.message,
+			attachments: command.images?.map((image, index) => ({ image, name: `图片 ${index + 1}` })) ?? [],
+		};
+		return queue.send(lane, original, () => agent.request<DesktopPromptResult>(command));
+	}
+
+	private async executeCommand(command: Command, conversationId?: string, launch?: number, draft?: ComposerDraft): Promise<unknown> {
 		await this.operation;
 		if (this.closed) throw new Error("桌面服务已关闭。");
 		const active = this.conversation(conversationId);
@@ -3048,7 +3093,7 @@ export class DesktopService {
 				await this.persist();
 				if (this.closed || (launch !== undefined && this.launches.get(active.id) !== launch))
 					throw new Error("任务已取消。");
-				const result = await agent.request<{ disposition: string }>(promptToSend);
+				const result = await this.requestQueuedInput(runtime, agent, promptToSend, draft);
 				if (result.disposition === "handled") {
 					if (!alreadyRunning) {
 						runtime.busy = false;
@@ -3067,6 +3112,7 @@ export class DesktopService {
 				throw error;
 			}
 		}
+		if (command.type === "steer" || command.type === "follow_up") return this.requestQueuedInput(runtime, agent, command);
 		const result = await agent.request(command);
 		if (command.type === "set_model" || command.type === "set_thinking_level" || command.type === "compact") {
 			await this.syncState(runtime);
@@ -3964,6 +4010,7 @@ export class DesktopService {
 		if (!checkpoint) return unjudgeable("这个愿望没有 Git 快照（不是 Git 项目或还没有改动），无法取得 diff。");
 		if (!requirement.length) return unjudgeable("这个愿望里没有用户需求消息。");
 		const diff = await this.git.diffToWorktree(conversation.project, checkpoint.id);
+		if (diff.excludedFiles) return unjudgeable("有文件超出 Git 快照容量，无法完整鉴定改动。");
 		files = diff.files.map((file) => ({ path: file.path, status: file.status }));
 		if (!diff.files.length) return unjudgeable("这个愿望没有代码改动。");
 		const lines = parseDiffLines(diff.files);
@@ -5640,7 +5687,7 @@ export class DesktopService {
 		this.assertPathAvailable(project);
 	}
 	private async startCheckpoint(runtime: SessionRuntime, label: string): Promise<void> {
-		if (this.store.tasks.some((task) => task.conversationId === runtime.conversationId && task.readOnly)) return;
+		if (this.isReadRestricted(runtime.conversationId) || this.store.tasks.some((task) => task.conversationId === runtime.conversationId && task.readOnly)) return;
 		if (runtime.checkpointId) return;
 		const workspace = await this.workspace(runtime.conversationId);
 		if (!workspace.isGit) return;
@@ -6435,6 +6482,11 @@ export class DesktopService {
 		runtime.eventSequence = sequence;
 		runtime.lastActivity = Date.now();
 		runtime.liveTranscript = applyLiveEvent(runtime.liveTranscript, event);
+		if (event.type === "queue_update") {
+			const queue = runtime.userQueue ??= new QueuedPrompts();
+			queue.update(event);
+			if (runtime.state) runtime.state.pendingMessageCount = event.steering.length + event.followUp.length;
+		}
 		// Deltas change the live projection, but not the finalized get_messages list.
 		if (
 			[
@@ -6686,6 +6738,7 @@ export class DesktopService {
 			)),
 			bashBusy: runtime?.bashBusy ?? false,
 			liveTranscript,
+			queuedMessages: runtime?.userQueue?.preview(),
 			projects: this.store.projects,
 			conversations,
 			active: conversationId ? annotateConversation(this.conversation(conversationId)) : undefined,
