@@ -89,6 +89,16 @@ export function WorkspacePanel({
 	const [undo, setUndo] = useState<{ checkpoint: GitCheckpoint; path: string }>();
 	const scroller = useRef<HTMLDivElement>(null);
 	const noteEditor = useRef<HTMLTextAreaElement>(null);
+	const focusNoteOnMount = useRef<Element | null>(null);
+	const focusNoteEditor = () => {
+		if (noteEditor.current) noteEditor.current.focus();
+		else focusNoteOnMount.current = document.activeElement;
+	};
+	useLayoutEffect(() => {
+		const origin = focusNoteOnMount.current;
+		focusNoteOnMount.current = null;
+		if (origin && document.activeElement === origin) noteEditor.current?.focus();
+	}, [view.draft?.id]);
 	const requestId = JSON.stringify([viewKey, pane, source, selectedPath, refresh, turnReview ? 0 : revision]);
 	const content = loaded?.requestId === requestId ? loaded : undefined;
 	const activeCheckpoint = checkpoint?.id === checkpointId ? checkpoint : undefined;
@@ -252,6 +262,7 @@ export function WorkspacePanel({
 
 	const addReview = async (anchor: DiffReviewAnchor) => {
 		if (!content || !source) return;
+		const origin = document.activeElement;
 		try {
 			const version = await reviewRevision(content.text);
 			const match = (note: NonNullable<ReviewView["draft"]>) =>
@@ -263,6 +274,7 @@ export function WorkspacePanel({
 				return;
 			}
 			setError("");
+			if (document.activeElement === origin) focusNoteEditor();
 			updateView((current) => {
 				const existing = current.notes.find(match);
 				const draft = current.draft && match(current.draft) ? current.draft : undefined;
@@ -272,7 +284,6 @@ export function WorkspacePanel({
 					note: draft?.note ?? existing?.note ?? "",
 				} };
 			});
-			requestAnimationFrame(() => noteEditor.current?.focus());
 		} catch (cause) {
 			setError(errorMessage(cause));
 		}
@@ -560,7 +571,7 @@ export function WorkspacePanel({
 												<div><strong>{reviewLocation(note)}</strong><p>{note.note}</p></div>
 												<div>
 													<button type="button" className="cc-mini-btn" disabled={sending || (!!view.draft?.note.trim() && view.draft.id !== note.id)} aria-label={`编辑意见 ${reviewLocation(note)}`}
-														onClick={() => { updateView((current) => ({ ...current, draft: note })); requestAnimationFrame(() => noteEditor.current?.focus()); }}>编辑</button>
+																onClick={() => { focusNoteEditor(); updateView((current) => ({ ...current, draft: note })); }}>编辑</button>
 													<button type="button" className="cc-mini-btn" disabled={sending} aria-label={`移除意见 ${reviewLocation(note)}`}
 														onClick={() => updateView((current) => ({ ...current, notes: current.notes.filter((item) => item.id !== note.id), draft: current.draft?.id === note.id ? undefined : current.draft }))}>移除</button>
 												</div>
