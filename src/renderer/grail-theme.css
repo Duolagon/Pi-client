@@ -141,31 +141,14 @@
 }
 
 :root[data-theme="grail"] .cl-side-new {
-	background: linear-gradient(135deg, rgba(242, 201, 107, 0.16) 0%, rgba(142, 162, 255, 0.11) 100%);
-	border: 1px solid rgba(242, 201, 107, 0.34);
+	background: color-mix(in srgb, var(--cl-clay) 10%, var(--cl-surface));
+	border-color: color-mix(in srgb, var(--cl-clay) 24%, var(--cl-line));
 	color: #fff5d6;
-	box-shadow: 0 2px 12px rgba(242, 201, 107, 0.12);
 }
 
 :root[data-theme="grail"] .cl-side-new:hover:not(:disabled) {
-	border-color: rgba(242, 201, 107, 0.72);
-	box-shadow: 0 0 18px rgba(242, 201, 107, 0.24);
-}
-
-:root[data-theme="grail"] .cl-ws-chip.active {
-	background: rgba(242, 201, 107, 0.14);
-	border-color: rgba(242, 201, 107, 0.5);
-	color: #ffe89e;
-}
-
-:root[data-theme="grail"] .cl-conv.selected {
-	background: linear-gradient(135deg, rgba(242, 201, 107, 0.15) 0%, rgba(142, 162, 255, 0.1) 100%);
-	box-shadow: 0 0 16px rgba(242, 201, 107, 0.14), inset 0 0 0 1px rgba(242, 201, 107, 0.36);
-}
-
-:root[data-theme="grail"] .cl-conv.selected::before {
-	background: linear-gradient(180deg, #ffe1a0 0%, #8ea2ff 100%);
-	box-shadow: 0 0 8px var(--grail-gold-glow);
+	background: color-mix(in srgb, var(--cl-clay) 15%, var(--cl-surface));
+	border-color: color-mix(in srgb, var(--cl-clay) 44%, var(--cl-line));
 }
 
 :root[data-theme="grail"] .cl-side-foot {

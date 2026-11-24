@@ -160,8 +160,16 @@
 
 /* ── 2. Architectural Canvas, Sidebar & Panel Choreography ── */
 
-.cl-side {
-	border-right: 1px solid var(--cl-line);
+.cc-sidebar-track > .cl-side > * {
+	transition: opacity var(--dur-fast) var(--ease);
+}
+.cc-sidebar-track[data-open="false"] > .cl-side > * {
+	opacity: 0.4;
+}
+@starting-style {
+	.cc-sidebar-track[data-open="true"] > .cl-side > * {
+		opacity: 0.4;
+	}
 }
 
 .cl-main {
@@ -266,22 +274,6 @@ body.cc-resizing .live-app {
 	color: var(--cl-1);
 }
 
-/* Sidebar conversation cards: softer selection pill instead of harsh box */
-.cl-conv {
-	border-radius: 9px;
-	transition: background var(--dur-fast) ease, transform var(--dur-micro) ease;
-}
-
-.cl-conv.selected {
-	background: var(--cl-surface);
-	box-shadow: var(--elev-1);
-}
-
-:root[data-theme="dark"] .cl-conv.selected {
-	background: var(--cl-active);
-	box-shadow: none;
-}
-
 /* ── 3. Modals, Popovers & Tactile Micro-interactions ── */
 
 .modal[open] .modal-shell {
@@ -301,11 +293,18 @@ body.cc-resizing .live-app {
 }
 
 .cc-more-menu,
-.cc-ws-menu,
-.cc-conv-menu {
+.cc-ws-menu {
 	animation: cc-popover-down 170ms var(--ease-out-expo) both;
 	border-color: var(--cl-line);
 	box-shadow: var(--elev-3);
+}
+
+@keyframes cc-conversation-menu-in {
+	from { opacity: 0.45; }
+	to { opacity: 1; }
+}
+.cc-conv-menu {
+	animation: cc-conversation-menu-in var(--dur-fast) var(--ease) both;
 }
 
 button:not(:disabled):active {
@@ -1033,19 +1032,6 @@ button:not(:disabled):active {
 	transform: rotate(90deg);
 }
 
-/* Soften sidebar task attention block so active session stays focal */
-.cc-task-attention {
-	border-bottom-color: var(--cl-line-soft);
-	margin-bottom: 6px;
-}
-
-.cc-attention-heading h2 {
-	font-size: 11px;
-	font-weight: 600;
-	color: var(--cl-3);
-	letter-spacing: 0.02em;
-}
-
 /* ═══════════════════════════════════════════════════════════════════════════
    6. Modal exit and content transitions
    ═══════════════════════════════════════════════════════════════════════════ */
@@ -1443,51 +1429,6 @@ button:not(:disabled):active {
 	.cc-starter-card {
 		padding-block: 8px;
 	}
-}
-
-/* Sidebar active left accent bar & collapsible polish */
-.cl-conv {
-	position: relative;
-}
-
-.cl-conv.selected::before {
-	content: "";
-	position: absolute;
-	left: 3px;
-	top: 8px;
-	bottom: 8px;
-	width: 3px;
-	border-radius: 99px;
-	background: var(--cl-clay);
-}
-
-.cl-conv-fold-icon {
-	transition: transform 180ms var(--ease-spring);
-}
-
-.cl-conv-fold-icon.open {
-	transform: rotate(90deg);
-}
-
-.cl-archived-toggle {
-	display: flex;
-	align-items: center;
-	gap: 5px;
-	width: 100%;
-	padding: 5px 8px;
-	border-radius: 6px;
-	text-align: left;
-	cursor: pointer;
-	transition: background var(--dur-fast) ease, color var(--dur-fast) ease;
-}
-
-.cl-archived-toggle:hover {
-	background: var(--cl-hover);
-	color: var(--cl-1);
-}
-
-.cl-archived-list {
-	padding-top: 2px;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -2147,6 +2088,8 @@ button:not(:disabled):active {
 @media (prefers-reduced-motion: reduce) {
 	.live-app,
 	.cc-terminal-track,
+	.cc-sidebar-track > .cl-side > *,
+	.cl-side :is(button, .cl-conv-row, .cl-conv-fold-icon),
 	.cc-smooth-collapse,
 	.cc-seg-glider.is-animated {
 		transition: none !important;
@@ -2154,6 +2097,7 @@ button:not(:disabled):active {
 	.cc-shimmer-text,
 	.cl-think.thinking-active summary .cc-think-label,
 	.cl-tool-group.running .cc-tool-group-summary,
+	.cc-conv-menu,
 	.cl-transcript,
 	.cc-tab-panel,
 	.cc-settings-pane {

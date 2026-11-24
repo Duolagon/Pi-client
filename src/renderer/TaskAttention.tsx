@@ -1,4 +1,6 @@
-import { ArrowRight, CircleCheck, Clock3, ShieldCheck } from "lucide-react";
+import { useId } from "react";
+import { ChevronRight, Clock3, ShieldAlert } from "lucide-react";
+import { SmoothCollapse } from "./SmoothCollapse.tsx";
 
 export interface AttentionItem {
 	id: string;
@@ -8,30 +10,62 @@ export interface AttentionItem {
 	open: () => void;
 }
 
-export function TaskAttention({ items, openAll }: { items: AttentionItem[]; openAll: () => void }) {
+function AttentionRows({ items }: { items: AttentionItem[] }) {
+	return items.slice(0, 4).map((item) => (
+		<button type="button" className="cc-attention-row" key={item.id} onClick={item.open} title={item.title}>
+			<span><strong>{item.title}</strong><small>{item.detail}</small></span>
+			<ChevronRight size={13} className="cc-attention-row-arrow" aria-hidden="true" />
+		</button>
+	));
+}
+
+export function TaskAttention({ items, openAll, showFinished, toggleFinished }: {
+	items: AttentionItem[];
+	openAll: () => void;
+	showFinished: boolean;
+	toggleFinished: () => void;
+}) {
+	const finishedId = useId();
 	if (!items.length) return null;
+	const finished = items.filter((item) => item.state === "done");
 	return (
 		<section className="cl-group cc-task-attention" aria-label="任务动态">
 			<div className="cc-attention-heading">
 				<h2>任务动态</h2>
-				<button type="button" className="cc-mini-btn" onClick={openAll}>全部任务</button>
+				<button type="button" className="cc-attention-all" onClick={openAll}>全部任务</button>
 			</div>
 			{([
-				["approval", "待我处理", ShieldCheck],
+				["approval", "待我处理", ShieldAlert],
 				["running", "进行中", Clock3],
-				["done", "最近结束", CircleCheck],
 			] as const).map(([state, label, Icon]) => {
 				const group = items.filter((item) => item.state === state);
 				if (!group.length) return null;
-				return <div key={state} className="cc-attention-group">
-					<h3><Icon size={13} aria-hidden="true" />{label} <span>{group.length}</span></h3>
-					{group.slice(0, 4).map((item) => (
-						<button type="button" className="cc-attention-row" key={item.id} onClick={item.open} title={item.title}>
-							<span><strong>{item.title}</strong><small>{item.detail}</small></span><ArrowRight size={13} aria-hidden="true" />
-						</button>
-					))}
-				</div>;
+				return (
+					<div key={state} className="cc-attention-group" data-state={state}>
+						<h3><Icon size={12} aria-hidden="true" />{label}<span className="cc-attention-count">{group.length}</span></h3>
+						<AttentionRows items={group} />
+					</div>
+				);
 			})}
+			{finished.length > 0 && (
+				<div className="cc-attention-group cc-attention-finished">
+					<button
+						type="button"
+						className="cc-attention-disclosure"
+						aria-expanded={showFinished}
+						aria-controls={finishedId}
+						onClick={toggleFinished}
+					>
+						<ChevronRight size={12} className="cc-attention-disclosure-arrow" aria-hidden="true" />
+						最近结束<span className="cc-attention-count">{finished.length}</span>
+					</button>
+					<div id={finishedId}>
+						<SmoothCollapse open={showFinished}>
+							<AttentionRows items={finished} />
+						</SmoothCollapse>
+					</div>
+				</div>
+			)}
 		</section>
 	);
 }

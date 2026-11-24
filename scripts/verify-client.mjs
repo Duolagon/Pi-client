@@ -999,6 +999,7 @@ try {
 		(proj) => window.pi.permissions.upsert({ id: "e2e-allow-agent", scope: "project", project: proj, action: "allow", tool: "Agent" }),
 		originalSession.project,
 	);
+	const sidebarParentId = (await snapshot()).active.id;
 	await submit("子Agent审批面板验证");
 	await page.getByRole("region", { name: "子 Agent 面板", exact: true }).waitFor();
 	await page.locator(".cc-subagent-row").filter({ hasText: "E2E 子审批" }).waitFor();
@@ -1026,6 +1027,21 @@ try {
 	}, "bubbled child approval completion");
 	await idle();
 	await page.evaluate(() => window.pi.permissions.remove("e2e-allow-agent"));
+	const parentRow = page.locator(`[data-conv-id=${JSON.stringify(sidebarParentId)}]`);
+	const childFold = parentRow.locator("..").getByRole("button", { name: /子 Agent 会话/ });
+	if (await childFold.getAttribute("aria-expanded") !== "true") await childFold.click();
+	const childListId = await childFold.getAttribute("aria-controls");
+	assert.ok(childListId, "The child fold button identifies its owned list");
+	const childRow = page.locator(`[id=${JSON.stringify(childListId)}]`).locator(".cl-conv-child");
+	await childRow.click();
+	await until(async () => (await snapshot()).active?.parentConversationId === sidebarParentId, "switch to the child from the sidebar");
+	const activeChildId = (await snapshot()).active.id;
+	await childFold.click();
+	assert.equal(await childFold.getAttribute("aria-expanded"), "false", "A selected child does not override the user's collapse");
+	await childRow.waitFor({ state: "hidden" });
+	assert.equal((await snapshot()).active.id, activeChildId);
+	await parentRow.click();
+	await until(async () => (await snapshot()).active?.id === sidebarParentId, "return from the collapsed child to its parent");
 	checks.push("SubagentPanel, sidebar (+N) folding, SubagentTranscriptView and SubagentApprovals E2E UI");
 
 	// P8 UI & Electron utilityProcess Workflow E2E check
@@ -1331,6 +1347,56 @@ try {
 		tableGeometry.transcriptContentWidth <= tableGeometry.transcriptViewportWidth + 1,
 		`Wide tables should scroll without spreading the conversation. ${JSON.stringify(tableGeometry)}`);
 	checks.push("running command cards collapse and wide GFM tables scroll independently");
+
+	const sidebarWindow = await application.browserWindow(page);
+	const sidebarWindowSize = await sidebarWindow.evaluate((win) => win.getSize());
+	await sidebarWindow.evaluate((win) => win.setSize(1024, 620));
+	await page.waitForFunction(() => window.innerWidth === 1024 && window.innerHeight === 620);
+	const sidebar = page.getByRole("complementary", { name: "项目与会话", exact: true });
+	const workspaceFold = sidebar.getByRole("button", { name: "工作目录", exact: true });
+	const workspaceExpanded = await workspaceFold.getAttribute("aria-expanded");
+	assert.ok(workspaceExpanded === "true" || workspaceExpanded === "false");
+	await workspaceFold.click();
+	assert.notEqual(await workspaceFold.getAttribute("aria-expanded"), workspaceExpanded);
+	await workspaceFold.click();
+	const finishedTasks = sidebar.getByRole("button", { name: /^最近结束/ });
+	await finishedTasks.waitFor();
+	assert.equal(await finishedTasks.getAttribute("aria-expanded"), "false");
+	await finishedTasks.click();
+	await sidebar.locator(".cc-attention-finished .cc-attention-row").first().waitFor();
+
+	const activeTitle = (await snapshot()).active.title;
+	const menuTrigger = sidebar.getByRole("button", { name: `会话操作：${activeTitle}`, exact: true });
+	await sidebar.locator(".cl-conv[aria-current='page']").hover();
+	await menuTrigger.click();
+	const sessionMenu = page.getByRole("menu", { name: `会话「${activeTitle}」操作`, exact: true });
+	await sessionMenu.getByRole("menuitem", { name: "重命名", exact: true }).waitFor();
+	await page.keyboard.press("Escape");
+	await sessionMenu.waitFor({ state: "hidden" });
+	await until(() => menuTrigger.evaluate((trigger) => trigger === document.activeElement), "restore focus to the session menu trigger");
+
+	const sidebarScroll = sidebar.locator(".cl-side-scroll");
+	const previousOffset = await sidebarScroll.evaluate(async (element) => {
+		element.scrollTop = element.scrollHeight - element.clientHeight;
+		await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+		return element.scrollTop;
+	});
+	assert.ok(previousOffset > 0, "The sidebar fixture needs an overflowing conversation list");
+	await sidebar.getByRole("button", { name: "收起侧栏", exact: true }).click();
+	await page.locator(".cc-sidebar-track").waitFor({ state: "detached" });
+	await page.getByRole("button", { name: "展开侧栏", exact: true }).click();
+	await until(() => sidebarScroll.evaluate((element, offset) =>
+		Math.abs(element.scrollTop - offset) <= 1, previousOffset), "restore the sidebar list scroll position");
+	assert.equal(await finishedTasks.getAttribute("aria-expanded"), "true");
+	await sidebarWindow.evaluate((win) => win.setSize(950, 620));
+	await page.waitForFunction(() => window.innerWidth === 950);
+	await page.waitForFunction(() => {
+		const title = document.querySelector(".cl-side-title");
+		return title && title.scrollWidth <= title.clientWidth;
+	});
+	await sidebarWindow.evaluate((win, size) => win.setSize(...size), sidebarWindowSize);
+	await sidebarWindow.dispose();
+	checks.push("sidebar disclosures, discoverable session menu and scroll restoration after collapse");
 
 	assert.deepEqual(pageErrors, []);
 	if (capture)

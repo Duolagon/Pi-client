@@ -1,6 +1,6 @@
 import "../prototype/style.css";
 import "./style.css";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { copyText } from "./clipboard.ts";
 import { useConfirmation } from "./ConfirmationDialog.tsx";
@@ -45,6 +45,8 @@ import {
 	Moon,
 	Sun,
 	Pin,
+	MessageSquare,
+	CornerDownRight,
 } from "lucide-react";
 import type {
 	Conversation,
@@ -121,6 +123,51 @@ function savedInspectorWidth(key: string, fallback: number): number {
 	return Number.isFinite(stored) && stored >= 320 ? stored : fallback;
 }
 
+function SidebarConversationRow({
+	conversation, subtitle, current, disabled, child = false, status, actions, onSelect, onMenu,
+}: {
+	conversation: Conversation;
+	subtitle: string;
+	current: boolean;
+	disabled: boolean;
+	child?: boolean;
+	status?: ReactNode;
+	actions?: ReactNode;
+	onSelect: () => void;
+	onMenu?: (anchor: HTMLButtonElement, point?: { x: number; y: number }) => void;
+}) {
+	const Icon = child ? CornerDownRight : conversation.pinned ? Pin : MessageSquare;
+	return (
+		<div className={`cl-conv-row ${current ? "selected" : ""}`.trim()}>
+			<button
+				type="button"
+				data-conv-id={conversation.id}
+				className={`cl-conv${child ? " cl-conv-child" : ""}${current ? " selected" : ""}`}
+				aria-current={current ? "page" : undefined}
+				title={conversation.title}
+				disabled={disabled}
+				onClick={onSelect}
+				onContextMenu={onMenu && ((event) => {
+					event.preventDefault();
+					onMenu(event.currentTarget, event.clientX || event.clientY ? { x: event.clientX, y: event.clientY } : undefined);
+				})}
+			>
+				<Icon size={14} className="cl-conv-icon" aria-hidden="true" />
+				<span className="cl-conv-copy">
+					<span className="cl-conv-line">
+						<span className="cl-conv-title">{conversation.title}</span>
+						{status}
+					</span>
+					<span className="cl-conv-sub">
+						<span>{subtitle}</span><i aria-hidden="true">·</i><span>{formatTime(conversation.updatedAt)}</span>
+					</span>
+				</span>
+			</button>
+			{actions && <div className="cl-conv-actions">{actions}</div>}
+		</div>
+	);
+}
+
 function Desktop({ api }: { api: DesktopAPI }) {
 	const { confirm, confirmation } = useConfirmation();
 	const app = useDesktop(api);
@@ -134,6 +181,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const stopInProgress = useRef<string | undefined>(undefined);
 	const [stoppingRunId, setStoppingRunId] = useState<string>();
 	const [sidebar, setSidebar] = useState(true);
+	const [workspacesOpen, setWorkspacesOpen] = useState(true);
+	const [finishedTasksOpen, setFinishedTasksOpen] = useState(false);
+	const sidebarScrollTop = useRef(0);
+	const restoreSidebarScroll = useCallback((element: HTMLDivElement | null) => {
+		if (element) element.scrollTop = sidebarScrollTop.current;
+	}, []);
 	const [settings, setSettings] = useState(false);
 	const [connecting, setConnecting] = useState(false);
 	const [searching, setSearching] = useState(false);
@@ -208,6 +261,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [archivedOpen, setArchivedOpen] = useState(false);
 	const [convMenu, setConvMenu] = useState<{ id: string; x: number; y: number } | null>(null);
 	const conversationMenuRef = useRef<HTMLDivElement>(null);
+	const conversationMenuOpener = useRef<HTMLButtonElement | null>(null);
 	const [queueActionId, setQueueActionId] = useState<string>();
 	const queueAction = useRef<string | undefined>(undefined);
 	const [showJump, setShowJump] = useState(false);
@@ -1376,6 +1430,25 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		{ id: "settings", label: "打开客户端与模型设置", keywords: "settings model api key theme", run: () => setSettings(true) },
 	];
 	const openTaskManager = () => { setTaskInitialId(undefined); setTasksOpen(true); };
+	const openConversationMenu = (id: string, anchor: HTMLButtonElement, point?: { x: number; y: number }) => {
+		const box = anchor.getBoundingClientRect();
+		conversationMenuOpener.current = anchor;
+		setConvMenu({ id, ...(point ?? { x: box.left, y: box.bottom + 4 }) });
+	};
+	const conversationMenuButton = (session: Conversation) => (
+		<button
+			type="button"
+			className="cl-conv-more"
+			aria-label={`会话操作：${session.title}`}
+			title="会话操作"
+			aria-haspopup="menu"
+			aria-expanded={convMenu?.id === session.id}
+			disabled={changing}
+			onClick={(event) => openConversationMenu(session.id, event.currentTarget)}
+		>
+			<MoreHorizontal size={15} aria-hidden="true" />
+		</button>
+	);
 	const attention: AttentionItem[] = snapshot.conversations
 		.filter((conversation) => !conversation.archived && !conversation.parentConversationId && (app.activity[conversation.id] || app.runPhases[conversation.id]))
 		.sort((a, b) => b.updatedAt - a.updatedAt)
@@ -1558,60 +1631,78 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							</button>
 						</div>
 					</div>
-					<div className="cl-side-scroll">
-						<TaskAttention items={attention} openAll={openTaskManager} />
+					<div
+						className="cl-side-scroll"
+						ref={restoreSidebarScroll}
+						onScroll={(event) => { sidebarScrollTop.current = event.currentTarget.scrollTop; }}
+					>
+						<TaskAttention
+							items={attention}
+							openAll={openTaskManager}
+							showFinished={finishedTasksOpen}
+							toggleFinished={() => setFinishedTasksOpen((open) => !open)}
+						/>
 						{snapshot.projects.length > 0 && (
-							<section className="cl-group cl-side-workspaces" aria-label="工作目录">
-								<div className="cl-group-label">工作目录</div>
-								<div className="cl-ws-chips">
-									{snapshot.projects.map((item) => {
-										const isCurrent = item.path === project?.path;
-										return (
-											<button
-												key={item.path}
-												type="button"
-												className={`cl-ws-chip ${isCurrent ? "active" : ""}`}
-												title={item.path}
-												disabled={changing}
-												onClick={() => {
-													if (!isCurrent) selectWorkspace(item.path);
-												}}
-											>
-												<Folder size={13} />
-												<span>{item.name}</span>
-											</button>
-										);
-									})}
+							<section className="cl-side-workspaces" aria-label="工作目录">
+								<button
+									type="button"
+									className="cl-section-toggle"
+									aria-expanded={workspacesOpen}
+									aria-controls="sidebar-workspaces"
+									onClick={() => setWorkspacesOpen((value) => !value)}
+								>
+									<span>工作目录</span>
+									<ChevronRight size={13} className={`cl-conv-fold-icon ${workspacesOpen ? "open" : ""}`} aria-hidden="true" />
+								</button>
+								<div id="sidebar-workspaces">
+									<SmoothCollapse open={workspacesOpen}>
+										<div className="cl-workspace-list">
+											{snapshot.projects.map((item) => {
+												const isCurrent = item.path === project?.path;
+												const Icon = isCurrent ? FolderOpen : Folder;
+												return (
+													<button
+														key={item.path}
+														type="button"
+														className={`cl-workspace-row ${isCurrent ? "active" : ""}`}
+														aria-current={isCurrent ? "true" : undefined}
+														title={item.path}
+														disabled={changing}
+														onClick={() => { if (!isCurrent) selectWorkspace(item.path); }}
+													>
+														<Icon size={14} aria-hidden="true" />
+														<span>{item.name}</span>
+													</button>
+												);
+											})}
+										</div>
+									</SmoothCollapse>
 								</div>
 							</section>
 						)}
-						{groups.map((group) => (
-							<section className="cl-group" key={group.label}>
-								<div className="cl-group-label">{group.label}</div>
-								{group.items.map((session) => {
-									const children = sidebarGroups.childrenByParent.get(session.id) ?? [];
-									const childActive = children.some((c) => c.id === snapshot.active?.id);
-									const childWaiting = children.filter((c) => app.activity[c.id] === "approval").length;
-									const expanded = Boolean(expandedParents[session.id]) || childActive;
-									return (
-										<div key={session.id} className="cl-conv-wrap">
-											<div className={`cl-conv-row ${session.id === snapshot.active?.id ? "selected" : ""}`}>
-												<button
-													data-conv-id={session.id}
-													className={`cl-conv ${session.id === snapshot.active?.id ? "selected" : ""}`}
-													disabled={changing}
-													onClick={() => switchTo(() => api.selectConversation(session.id))}
-													onContextMenu={(event) => {
-														event.preventDefault();
-														const box = event.currentTarget.getBoundingClientRect();
-														const keyboard = event.clientX === 0 && event.clientY === 0;
-														setConvMenu({ id: session.id, x: keyboard ? box.left + 24 : event.clientX, y: keyboard ? box.bottom : event.clientY });
-													}}
-													aria-current={session.id === snapshot.active?.id ? "page" : undefined}
-												>
-													<span className="cl-conv-line">
-														<span className="cl-conv-title">{session.title}</span>
-														{app.activity[session.id] === "approval" ? (
+						{(groups.length > 0 || sidebarGroups.archived.length > 0) && (
+							<section className="cl-side-history" aria-labelledby="sidebar-history-title">
+								<h2 className="cl-side-section-label" id="sidebar-history-title">会话历史</h2>
+								{groups.map((group) => (
+									<section className="cl-group" key={group.label}>
+										<h3 className="cl-group-label">{group.label}</h3>
+										{group.items.map((session) => {
+											const children = sidebarGroups.childrenByParent.get(session.id) ?? [];
+											const childActive = children.some((child) => child.id === snapshot.active?.id);
+											const childWaiting = children.filter((child) => app.activity[child.id] === "approval").length;
+											const expanded = expandedParents[session.id] ?? childActive;
+											const childrenId = `sidebar-children-${session.id}`;
+											const foldLabel = expanded ? "收起子 Agent 会话" : `展开 ${children.length} 个子 Agent 会话`;
+											return (
+												<div key={session.id} className="cl-conv-wrap">
+													<SidebarConversationRow
+														conversation={session}
+														subtitle={projectName(snapshot, session.project)}
+														current={session.id === snapshot.active?.id}
+														disabled={changing}
+														onSelect={() => switchTo(() => api.selectConversation(session.id))}
+														onMenu={(anchor, point) => openConversationMenu(session.id, anchor, point)}
+														status={app.activity[session.id] === "approval" ? (
 															<span className="cl-conv-status warn">待确认</span>
 														) : childWaiting > 0 ? (
 															<span className="cl-conv-status warn" title={`${childWaiting} 个子 Agent 待确认`}>
@@ -1620,99 +1711,87 @@ function Desktop({ api }: { api: DesktopAPI }) {
 														) : app.activity[session.id] === "running" ? (
 															<span className="cl-conv-status run">{runLabels[app.runPhases[session.id] ?? "running"]}</span>
 														) : null}
-													</span>
-													<span className="cl-conv-sub">
-														{projectName(snapshot, session.project)} · {formatTime(session.updatedAt)}
-													</span>
-												</button>
-												{children.length > 0 && (
-													<button
-														type="button"
-														className="cl-conv-fold"
-														title={expanded ? "收起子 Agent 会话" : `展开 ${children.length} 个子 Agent 会话`}
-														aria-label={expanded ? "收起子 Agent 会话" : `展开 ${children.length} 个子 Agent 会话`}
-														aria-expanded={expanded}
-														onClick={(event) => {
-															event.stopPropagation();
-															setExpandedParents((prev) => ({ ...prev, [session.id]: !expanded }));
-														}}
-													>
-														<ChevronRight size={12} className={`cl-conv-fold-icon ${expanded ? "open" : ""}`} aria-hidden="true" />
-														{children.length}
-													</button>
-												)}
-											</div>
-											{children.length > 0 && (
-												<SmoothCollapse open={expanded}>
-													<div className="cl-conv-children">
-														{children.map((child) => (
-															<button
-																key={child.id}
-																className={`cl-conv cl-conv-child ${child.id === snapshot.active?.id ? "selected" : ""}`}
-																disabled={changing}
-																onClick={() => switchTo(() => api.selectConversation(child.id))}
-																aria-current={child.id === snapshot.active?.id ? "page" : undefined}
-															>
-																<span className="cl-conv-line">
-																	<span className="cl-conv-title">{child.title}</span>
-																	{app.activity[child.id] === "approval" ? (
-																		<span className="cl-conv-status warn">待确认</span>
-																	) : app.activity[child.id] === "running" ? (
-																		<span className="cl-conv-status run">运行中</span>
-																	) : null}
-																</span>
-																<span className="cl-conv-sub">子 Agent · {formatTime(child.updatedAt)}</span>
-															</button>
-														))}
-													</div>
-												</SmoothCollapse>
-											)}
-										</div>
-									);
-								})}
-							</section>
-						))}
-						{sidebarGroups.archived.length > 0 && (
-							<section className="cl-group cl-group-archived">
-								<button
-									type="button"
-									className="cl-group-label cl-archived-toggle"
-									aria-expanded={archivedOpen}
-									onClick={() => setArchivedOpen((v) => !v)}
-								>
-									<ChevronRight size={11} className={`cl-conv-fold-icon ${archivedOpen ? "open" : ""}`} aria-hidden="true" />
-									<span>已归档 ({sidebarGroups.archived.length})</span>
-								</button>
-								<SmoothCollapse open={archivedOpen}>
-									<div className="cl-archived-list">
-										{sidebarGroups.archived.map((session) => (
-											<div key={session.id} className="cl-conv-wrap">
-												<div className={`cl-conv-row ${session.id === snapshot.active?.id ? "selected" : ""}`}>
-													<button
-														data-conv-id={session.id}
-														className={`cl-conv ${session.id === snapshot.active?.id ? "selected" : ""}`}
-														disabled={changing}
-														onClick={() => switchTo(() => api.selectConversation(session.id))}
-														onContextMenu={(event) => {
-															event.preventDefault();
-															const box = event.currentTarget.getBoundingClientRect();
-															const keyboard = event.clientX === 0 && event.clientY === 0;
-															setConvMenu({ id: session.id, x: keyboard ? box.left + 24 : event.clientX, y: keyboard ? box.bottom : event.clientY });
-														}}
-														aria-current={session.id === snapshot.active?.id ? "page" : undefined}
-													>
-														<span className="cl-conv-line">
-															<span className="cl-conv-title">{session.title}</span>
-														</span>
-														<span className="cl-conv-sub">
-															{projectName(snapshot, session.project)} · {formatTime(session.updatedAt)}
-														</span>
-													</button>
+														actions={
+															<>
+																{children.length > 0 && (
+																	<button
+																		type="button"
+																		className="cl-conv-fold"
+																		title={foldLabel}
+																		aria-label={foldLabel}
+																		aria-expanded={expanded}
+																		aria-controls={childrenId}
+																		onClick={() => setExpandedParents((prev) => ({ ...prev, [session.id]: !expanded }))}
+																	>
+																		<ChevronRight size={12} className={`cl-conv-fold-icon ${expanded ? "open" : ""}`} aria-hidden="true" />
+																		{children.length}
+																	</button>
+																)}
+																{conversationMenuButton(session)}
+															</>
+														}
+													/>
+													{children.length > 0 && (
+														<div id={childrenId}>
+															<SmoothCollapse open={expanded}>
+																<div className="cl-conv-children">
+																	{children.map((child) => (
+																		<SidebarConversationRow
+																			key={child.id}
+																			conversation={child}
+																			subtitle="子 Agent"
+																			current={child.id === snapshot.active?.id}
+																			disabled={changing}
+																			child
+																			onSelect={() => switchTo(() => api.selectConversation(child.id))}
+																			status={app.activity[child.id] === "approval" ? (
+																				<span className="cl-conv-status warn">待确认</span>
+																			) : app.activity[child.id] === "running" ? (
+																				<span className="cl-conv-status run">运行中</span>
+																			) : null}
+																		/>
+																	))}
+																</div>
+															</SmoothCollapse>
+														</div>
+													)}
 												</div>
-											</div>
-										))}
-									</div>
-								</SmoothCollapse>
+											);
+										})}
+									</section>
+								))}
+								{sidebarGroups.archived.length > 0 && (
+									<section className="cl-group cl-group-archived">
+										<button
+											type="button"
+											className="cl-section-toggle cl-archived-toggle"
+											aria-expanded={archivedOpen}
+											aria-controls="sidebar-archived-conversations"
+											onClick={() => setArchivedOpen((value) => !value)}
+										>
+											<span>已归档 ({sidebarGroups.archived.length})</span>
+											<ChevronRight size={13} className={`cl-conv-fold-icon ${archivedOpen ? "open" : ""}`} aria-hidden="true" />
+										</button>
+										<div id="sidebar-archived-conversations">
+											<SmoothCollapse open={archivedOpen}>
+												<div className="cl-archived-list">
+													{sidebarGroups.archived.map((session) => (
+														<SidebarConversationRow
+															key={session.id}
+															conversation={session}
+															subtitle={projectName(snapshot, session.project)}
+															current={session.id === snapshot.active?.id}
+															disabled={changing}
+															onSelect={() => switchTo(() => api.selectConversation(session.id))}
+															onMenu={(anchor, point) => openConversationMenu(session.id, anchor, point)}
+															actions={conversationMenuButton(session)}
+														/>
+													))}
+												</div>
+											</SmoothCollapse>
+										</div>
+									</section>
+								)}
 							</section>
 						)}
 						{!snapshot.conversations.length && <p className="cl-side-empty">还没有会话。选择一个工作目录开始编码。</p>}
@@ -1753,6 +1832,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							type="button"
 							className={`cl-foot-settings ${settings ? "active" : ""}`}
 							aria-label="设置"
+							title="设置"
 							onClick={() => setSettings(true)}
 						>
 							<Settings size={14} />
@@ -2972,8 +3052,15 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				const target = snapshot.conversations.find((item) => item.id === convMenu.id);
 				if (!target) return null;
 				const closeMenu = (focusRow = true) => {
+					const opener = conversationMenuOpener.current;
+					conversationMenuOpener.current = null;
 					setConvMenu(null);
-					if (focusRow) requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-conv-id="${target.id}"]`)?.focus());
+					if (focusRow) {
+						requestAnimationFrame(() => {
+							const fallback = document.querySelector<HTMLElement>(`[data-conv-id="${CSS.escape(target.id)}"]`);
+							(opener?.isConnected ? opener : fallback)?.focus({ preventScroll: true });
+						});
+					}
 				};
 				const busyHere = app.activity[target.id] === "running" || app.activity[target.id] === "approval";
 				return (
@@ -2992,6 +3079,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							role="menu"
 							aria-label={`会话「${target.title}」操作`}
 							tabIndex={-1}
+							onBlur={(event) => {
+								if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) closeMenu(false);
+							}}
 							onKeyDown={(event) => {
 								if (event.key === "Escape") {
 									event.preventDefault();
