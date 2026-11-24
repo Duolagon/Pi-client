@@ -2,7 +2,7 @@ import { draftPrompt, mergeDrafts, type ComposerDraft, type Prompt } from "./com
 import { QueuedPrompts, type NativeQueue } from "./queued-prompts.ts";
 import type { DesktopPromptResult, FileReferenceAvailability, QueueActionResult, QueuedPromptGroups } from "./shared.ts";
 import { searchWorkspaceFiles } from "./workspace-file-search.ts";
-import { isReferenceablePath, visiblePromptText } from "./file-references.ts";
+import { isDesktopWorkspaceContext, isReferenceablePath, visiblePromptText } from "./file-references.ts";
 import { createDraftPullRequest, readPullRequest, readPullRequestComments, setPullRequestAutoMerge, type DraftPullRequest } from "./review-service.ts";
 import { managedFile, writeManagedFile } from "./managed-path.ts";
 import { execFile } from "node:child_process";
@@ -262,6 +262,15 @@ interface GrailRecord {
 	sealedAt: number[];
 	verdicts: GrailVerdict[];
 }
+interface GrailRun {
+	id: string;
+	controller: AbortController;
+	step: GrailStep;
+	startedAt: number;
+	deadline: number;
+	committing: boolean;
+	finished: Promise<void>;
+}
 interface SessionRuntime {
 	conversationId: string;
 	/** The latest native agent run, retained while its managed shells can still be stopped. */
@@ -418,7 +427,7 @@ export class DesktopService {
 	private connectionCheck?: { agent: AgentProcess; cancel: (error: Error) => void };
 	private connectionTestOperation: Promise<void> = Promise.resolve();
 	private grailListeners = new Set<(event: GrailEvent) => void>();
-	private grailRuns = new Map<string, { id: string; controller: AbortController; step: GrailStep; startedAt: number }>();
+	private grailRuns = new Map<string, GrailRun>();
 	private grailWrites = new Map<string, Promise<void>>();
 	private engineError?: string;
 	private closed = false;
@@ -2039,6 +2048,7 @@ export class DesktopService {
 			}
 			if (this.terminals.list(id).some((terminal) => terminal.status !== "exited"))
 				throw new Error("请先关闭此会话的终端，再移除。");
+			await this.cancelGrail(id);
 			await this.monitors.stopForConversation([id], "user_stop", { includeRoot: true });
 			for (const job of await this.cron.list(id, conversation.project)) await this.cron.delete(job.id, id);
 			if (runtime) await this.stopRuntime(runtime);
@@ -2050,6 +2060,10 @@ export class DesktopService {
 				await this.trashSessionFile(sessionFile).catch((error) => {
 					this.diagnostic("warn", "session.trash.failed", id, error instanceof Error ? error.message : String(error));
 				});
+			}
+			try { await this.trashSessionFile(this.grailFile(id)); }
+			catch (error) {
+				this.diagnostic("warn", "grail.trash.failed", id, error instanceof Error ? error.message : String(error));
 			}
 			if (this.store.activeId === id) {
 				const next =
@@ -4132,7 +4146,10 @@ export class DesktopService {
 	}
 
 	private emitGrail(event: GrailEvent): void {
-		for (const listener of this.grailListeners) listener(event);
+		for (const listener of this.grailListeners) {
+			try { listener(event); }
+			catch (error) { this.diagnostic("warn", "grail.event.failed", event.conversationId, error instanceof Error ? error.message : String(error)); }
+		}
 	}
 
 	private grailFile(conversationId: string): string {
@@ -4151,101 +4168,184 @@ export class DesktopService {
 					sealedAt: record.sealedAt.filter((item): item is number => Number.isFinite(item)),
 					verdicts: record.verdicts.filter((item) => item && typeof item === "object" && typeof item.grade === "string"),
 				};
+			throw new Error("鉴定历史格式无效。");
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+			if (error instanceof SyntaxError) throw new Error("鉴定历史文件无法解析。", { cause: error });
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
 		return { version: 1, sealedAt: [], verdicts: [] };
 	}
 
-	private updateGrail<T>(conversationId: string, change: (record: GrailRecord) => T): Promise<T> {
+	private updateGrail<T>(conversationId: string, change: (record: GrailRecord) => T, beforePublish?: () => void): Promise<T> {
 		const run = (this.grailWrites.get(conversationId) ?? Promise.resolve()).then(async () => {
 			const record = await this.readGrail(conversationId);
 			const result = change(record);
 			await mkdir(join(this.options.dataDir, "grail"), { recursive: true, mode: 0o700 });
-			await this.atomicJson(this.grailFile(conversationId), record);
+			await this.atomicJson(this.grailFile(conversationId), record, beforePublish);
 			return result;
 		});
-		this.grailWrites.set(conversationId, run.then(() => {}, () => {}));
+		const done = run.then(() => {}, () => {});
+		this.grailWrites.set(conversationId, done);
+		void done.then(() => {
+			if (this.grailWrites.get(conversationId) === done) this.grailWrites.delete(conversationId);
+		});
 		return run;
 	}
 
 	/** The wish starts at the conversation start or the last seal; its diff starts at its first checkpoint. */
 	private async grailWish(conversation: Conversation, record: GrailRecord) {
 		const since = record.sealedAt.at(-1) ?? 0;
-		const workspace = await this.workspace(conversation.id).catch(() => undefined);
-		const checkpoints = workspace?.isGit ? await this.git.list(conversation.project, conversation.id).catch(() => []) : [];
-		const first = checkpoints.filter((item) => item.kind !== "discard-undo" && item.createdAt >= since).at(-1);
-		return { wish: record.sealedAt.length, since, checkpoint: first };
+		const wish = record.sealedAt.length;
+		try {
+			const workspace = await this.workspace(conversation.id);
+			if (!workspace.isGit) return { wish, since, readiness: "not-git" as const, reason: "当前项目不在 Git 仓库中，无法比较需求开始前后的改动。" };
+			const checkpoints = await this.git.list(conversation.project, conversation.id);
+			const checkpoint = checkpoints.filter((item) => item.kind !== "discard-undo" && item.createdAt >= since).at(-1);
+			if (!checkpoint) return { wish, since, readiness: "no-checkpoint" as const, reason: "当前需求还没有 Git 检查点。请先在 Git 项目中运行一轮编码任务。" };
+			return { wish, since, readiness: "ready" as const, checkpoint };
+		} catch {
+			return { wish, since, readiness: "snapshot-error" as const, reason: "无法读取 Git 状态或检查点。请确认工作目录和检查点可访问。" };
+		}
 	}
 
 	async grailState(conversationId: string): Promise<GrailState> {
 		await this.operation;
 		const conversation = this.conversation(conversationId);
 		const record = await this.readGrail(conversation.id);
-		const { wish, checkpoint } = await this.grailWish(conversation, record);
+		const scope = await this.grailWish(conversation, record);
 		const running = this.grailRuns.get(conversation.id);
+		let readiness: GrailState["readiness"] = scope.readiness;
+		let readinessReason = scope.reason;
+		if (scope.checkpoint && !running) {
+			try {
+				if (!await this.git.hasWorktreeChanges(conversation.project, scope.checkpoint.id, conversation.id)) {
+					readiness = "clean";
+					readinessReason = "当前代码与需求开始时的快照一致。";
+				}
+			} catch {
+				readiness = "snapshot-error";
+				readinessReason = "无法比较当前代码和 Git 检查点。请确认工作目录和检查点可访问。";
+			}
+		}
 		return {
 			conversationId: conversation.id,
-			wish,
+			wish: scope.wish,
 			running: running && { id: running.id, step: running.step, startedAt: running.startedAt },
 			verdicts: record.verdicts,
-			hasDiff: Boolean(checkpoint),
+			hasDiff: readiness === "ready",
+			readiness,
+			readinessReason,
 		};
 	}
 
-	cancelGrail(conversationId: string): Promise<boolean> {
-		const run = this.grailRuns.get(conversationId);
-		if (!run) return Promise.resolve(false);
-		run.controller.abort();
-		this.grailRuns.delete(conversationId);
-		this.emitGrail({ type: "grail_failed", conversationId, id: run.id, error: "鉴定已取消。", cancelled: true });
-		return Promise.resolve(true);
+	/** Read the selected raw session branch. Compaction only affects the model's context. */
+	private async grailRequirements(conversation: Conversation, since: number, until: number): Promise<string[]> {
+		const agent = this.runtimes.get(conversation.id)?.agent;
+		const history = agent
+			? await agent.request<SessionEntriesResult>({ type: "get_entries" })
+			: conversation.sessionFile ? await this.history.inspect({ sessionFile: conversation.sessionFile, leafId: conversation.sessionLeafId }) : undefined;
+		if (!history?.leafId) return [];
+		const entries = new Map(history.entries.map((entry) => [entry.id, entry]));
+		const requirements: string[] = [];
+		let id: string | null = history.leafId;
+		while (id) {
+			const entry = entries.get(id);
+			if (!entry) throw new Error("会话分支的原始记录不完整，无法确认需求范围。");
+			entries.delete(id);
+			id = entry.parentId;
+			if (entry.type !== "message" || entry.message.role !== "user") continue;
+			const { content, timestamp } = entry.message;
+			if (timestamp < since || timestamp > until) continue;
+			const text = typeof content === "string" ? visiblePromptText(content) : content
+				.flatMap((block) => block.type === "text" && !isDesktopWorkspaceContext(block.text) ? [block.text] : []).join("\n");
+			if (text.trim()) requirements.push(text);
+		}
+		return requirements.reverse();
 	}
 
-	async sealGrailWish(conversationId: string): Promise<GrailState> {
-		await this.operation;
-		const conversation = this.conversation(conversationId);
-		await this.cancelGrail(conversation.id);
-		const wish = await this.updateGrail(conversation.id, (record) => {
-			record.sealedAt.push(Math.max(Date.now(), (record.sealedAt.at(-1) ?? 0) + 1));
-			return record.sealedAt.length;
-		});
-		this.emitGrail({ type: "grail_sealed", conversationId: conversation.id, wish });
-		return this.grailState(conversation.id);
+	async cancelGrail(conversationId: string): Promise<boolean> {
+		const run = this.grailRuns.get(conversationId);
+		if (!run) return false;
+		const cancelled = !run.committing && !run.controller.signal.aborted;
+		if (cancelled) run.controller.abort(new DOMException("鉴定已取消。", "AbortError"));
+		await run.finished;
+		return cancelled;
+	}
+
+	sealGrailWish(conversationId: string): Promise<GrailState> {
+		return this.serialize(async () => {
+			const conversation = this.conversation(conversationId);
+			await this.cancelGrail(conversation.id);
+			const wish = await this.updateGrail(conversation.id, (record) => {
+				record.sealedAt.push(Math.max(Date.now(), (record.sealedAt.at(-1) ?? 0) + 1));
+				return record.sealedAt.length;
+			});
+			this.emitGrail({ type: "grail_sealed", conversationId: conversation.id, wish });
+		}).then(() => this.grailState(conversationId));
 	}
 
 	/** User-initiated Grail judgement; progress and the verdict arrive through subscribeGrail. */
-	async startGrail(conversationId: string): Promise<{ id: string }> {
-		await this.operation;
-		if (this.closed) throw new Error("桌面服务已关闭。");
-		const conversation = this.conversation(conversationId);
-		const active = this.runtimes.get(conversation.id);
-		if (active?.busy || active?.bashBusy || active?.checkpointId) throw new Error("请等待当前任务结束后再发起鉴定。");
-		await this.cancelGrail(conversation.id);
-		const run = { id: randomUUID(), controller: new AbortController(), step: "diff" as GrailStep, startedAt: Date.now() };
-		this.grailRuns.set(conversation.id, run);
-		void this.runGrail(conversation, run).then(
-			async (verdict) => {
-				if (run.controller.signal.aborted) return;
-				await this.updateGrail(conversation.id, (record) => {
-					verdict.previousGrade = record.verdicts.filter((item) => item.wish === verdict.wish).at(-1)?.grade;
-					record.verdicts.push(verdict);
-					record.verdicts.splice(0, Math.max(0, record.verdicts.length - 200));
-				});
-				if (this.grailRuns.get(conversation.id) === run) this.grailRuns.delete(conversation.id);
-				this.emitGrail({ type: "grail_verdict", conversationId: conversation.id, verdict });
-			},
-		).catch((error: unknown) => {
-			if (run.controller.signal.aborted) return;
-			if (this.grailRuns.get(conversation.id) === run) this.grailRuns.delete(conversation.id);
-			this.emitGrail({ type: "grail_failed", conversationId: conversation.id, id: run.id, error: error instanceof Error ? error.message : String(error), cancelled: false });
+	startGrail(conversationId: string): Promise<{ id: string }> {
+		return this.serialize(async () => {
+			const conversation = this.conversation(conversationId);
+			const existing = this.grailRuns.get(conversation.id);
+			if (existing?.controller.signal.aborted) throw new Error("上一次鉴定仍在清理，请稍后重试。");
+			if (existing) return { id: existing.id };
+			const active = this.runtimes.get(conversation.id);
+			if (active?.checkpointId || active?.checkpointStarting) throw new Error("请等待当前任务结束后再发起鉴定。");
+			if (active) this.assertRuntimeIdle(active);
+			const startedAt = Date.now();
+			const run: GrailRun = {
+				id: randomUUID(), controller: new AbortController(), step: "diff", startedAt,
+				deadline: startedAt + (this.store.settings.grailTimeoutSec ?? DEFAULT_GRAIL_TIMEOUT_SEC) * 1000,
+				committing: false,
+				finished: Promise.resolve().then(() => this.finishGrail(conversation, run)),
+			};
+			this.grailRuns.set(conversation.id, run);
+			return { id: run.id };
 		});
-		return { id: run.id };
 	}
 
-	private async runGrail(conversation: Conversation, run: { id: string; controller: AbortController; step: GrailStep; startedAt: number }): Promise<GrailVerdict> {
+	private async finishGrail(conversation: Conversation, run: GrailRun): Promise<void> {
+		const { signal } = run.controller;
+		const timeout = new DOMException("鉴定超时。", "TimeoutError");
+		const timer = setTimeout(() => {
+			if (!run.committing) run.controller.abort(timeout);
+		}, Math.max(0, run.deadline - Date.now()));
+		let terminal: GrailEvent;
+		try {
+			const verdict = await this.runGrail(conversation, run);
+			signal.throwIfAborted();
+			await this.updateGrail(conversation.id, (record) => {
+				verdict.previousGrade = record.verdicts.filter((item) => item.wish === verdict.wish).at(-1)?.grade;
+				record.verdicts.push(verdict);
+				record.verdicts.splice(0, Math.max(0, record.verdicts.length - 200));
+			}, () => {
+				signal.throwIfAborted();
+				if (Date.now() >= run.deadline) throw timeout;
+				// Once the atomic rename is submitted, cancelling cannot retract the report.
+				run.committing = true;
+			});
+			terminal = { type: "grail_verdict", conversationId: conversation.id, verdict };
+		} catch (error) {
+			const reason: unknown = signal.aborted ? signal.reason : error;
+			terminal = {
+				type: "grail_failed", conversationId: conversation.id, id: run.id,
+				error: reason instanceof Error ? reason.message : String(reason),
+				cancelled: signal.aborted && reason instanceof Error && reason.name === "AbortError",
+			};
+		} finally {
+			clearTimeout(timer);
+			this.grailRuns.delete(conversation.id);
+		}
+		this.emitGrail(terminal);
+	}
+
+	private async runGrail(conversation: Conversation, run: GrailRun): Promise<GrailVerdict> {
+		run.controller.signal.throwIfAborted();
 		const workspace = await mkdtemp(join(tmpdir(), "pi-grail-review-"));
 		try {
+			run.controller.signal.throwIfAborted();
 			return await this.reviewGrailSnapshot(conversation, run, workspace);
 		} finally {
 			await rm(workspace, { recursive: true, force: true });
@@ -4254,12 +4354,12 @@ export class DesktopService {
 
 	private async reviewGrailSnapshot(
 		conversation: Conversation,
-		run: { id: string; controller: AbortController; step: GrailStep; startedAt: number },
+		run: GrailRun,
 		workspace: string,
 	): Promise<GrailVerdict> {
 		const signal = run.controller.signal;
 		const settings = this.store.settings;
-		const deadline = run.startedAt + (settings.grailTimeoutSec ?? DEFAULT_GRAIL_TIMEOUT_SEC) * 1000;
+		const deadline = run.deadline;
 		const budget = { spent: 0, max: settings.grailMaxCost ?? DEFAULT_GRAIL_MAX_COST };
 		const step = (name: GrailStep) => {
 			if (signal.aborted) throw new Error("鉴定已取消。");
@@ -4267,15 +4367,10 @@ export class DesktopService {
 			this.emitGrail({ type: "grail_progress", conversationId: conversation.id, id: run.id, step: name });
 		};
 		const record = await this.readGrail(conversation.id);
-		const { wish, since, checkpoint } = await this.grailWish(conversation, record);
+		const { wish, since, checkpoint, reason } = await this.grailWish(conversation, record);
 		const runtime = this.runtimes.get(conversation.id);
 		const model = settings.grailModel ?? runtime?.state?.model ?? settings.defaultModel;
-		const snapshot = await this.buildSnapshot(conversation.id);
-		const requirement = snapshot.messages.flatMap((message) => {
-			if (message.role !== "user" || (message.timestamp ?? 0) < since) return [];
-			const text = typeof message.content === "string" ? message.content : message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
-			return text.trim() ? [text.slice(0, 16000)] : [];
-		});
+		const requirement = checkpoint ? await this.grailRequirements(conversation, since, run.startedAt) : [];
 		const steps: GrailStepResults = {};
 		let files: GrailVerdict["files"] = [];
 		const finish = (): GrailVerdict => ({
@@ -4293,19 +4388,32 @@ export class DesktopService {
 		});
 		step("diff");
 		const unjudgeable = (reason: string): GrailVerdict => ({ ...finish(), grade: "unjudgeable", reasons: [reason] });
-		if (!checkpoint) return unjudgeable("这个愿望没有 Git 快照（不是 Git 项目或还没有改动），无法取得 diff。");
+		if (!checkpoint) return unjudgeable(reason ?? "当前需求没有 Git 检查点。");
 		if (!requirement.length) return unjudgeable("这个愿望里没有用户需求消息。");
-		const diff = await this.git.diffToWorktree(conversation.project, checkpoint.id, workspace);
-		if (diff.excludedFiles) return unjudgeable("有文件超出 Git 快照容量，无法完整鉴定改动。");
+		if (requirement.reduce((size, message) => size + message.length, 0) > 200_000) return unjudgeable("需求原文过长，无法完整鉴定。请封存并用更小的需求范围重新鉴定。");
+		const diff = await this.git.diffToWorktree(conversation.project, checkpoint.id, workspace, signal);
+		signal.throwIfAborted();
 		files = diff.files.map((file) => ({ path: file.path, status: file.status }));
+		if (diff.excludedFiles) return unjudgeable("有文件超出 Git 快照容量，无法完整鉴定改动。");
 		if (!diff.files.length) return unjudgeable("这个愿望没有代码改动。");
+		const truncatedFile = diff.files.find((file) => file.truncated);
+		if (truncatedFile) return unjudgeable(`文件差异超出单文件鉴定容量，无法完整鉴定：${truncatedFile.path}。`);
+		const annotated = annotateDiff(diff.files);
+		if (annotated.truncated) return unjudgeable("改动超出一次鉴定可评审的容量，无法完整鉴定。");
 		const lines = parseDiffLines(diff.files);
-		const prefix = (await exec("git", ["rev-parse", "--show-prefix"], { cwd: conversation.project, timeout: 10000 })).stdout.replace(/\r?\n$/, "");
+		const changedTextFiles = new Set(lines.map((line) => line.file));
+		const nonTextFile = diff.files.find((file) =>
+			!changedTextFiles.has(file.path) || file.binary || file.status === "type-changed" ||
+			file.beforeKind === "symlink" || file.afterKind === "symlink" ||
+			(file.beforeMode !== undefined && file.afterMode !== undefined && file.beforeMode !== file.afterMode),
+		);
+		if (nonTextFile) return unjudgeable(`存在无法完整引用的非文本改动：${nonTextFile.path}。`);
 
 		step("objective");
 		if (this.store.projectTrust?.[this.trustProjectFor(conversation.project)] === "untrusted")
 			steps.objective = { status: "unavailable", reason: "项目被标记为不信任，不执行项目脚本。", runs: [] };
-		else steps.objective = await this.grailObjective(conversation.project, workspace, prefix, deadline, signal);
+		else steps.objective = await this.grailObjective(conversation.project, workspace, deadline, signal);
+		signal.throwIfAborted();
 		if (steps.objective.status !== "pass") return finish();
 
 		step("distortion");
@@ -4320,8 +4428,9 @@ export class DesktopService {
 		// The blind reviewer reads the repository as it was before this wish, never the agent's code.
 		const before = await mkdtemp(join(tmpdir(), "pi-grail-blind-"));
 		try {
-			await this.git.materializeBefore(conversation.project, checkpoint.id, before);
-			const output = await this.grailModelRun(join(before, prefix), model, buildBlindPrompt(requirement), budget, deadline, signal, conversation.id);
+			await this.git.materializeBefore(conversation.project, checkpoint.id, before, signal);
+			signal.throwIfAborted();
+			const output = await this.grailModelRun(before, model, buildBlindPrompt(requirement), budget, deadline, signal, conversation.id);
 			steps.blind = parseBlindSolution(output);
 		} catch (error) {
 			if (signal.aborted) throw error;
@@ -4332,10 +4441,9 @@ export class DesktopService {
 		if (steps.blind.status !== "ok") return finish();
 
 		step("comparison");
-		const annotated = annotateDiff(diff.files);
 		try {
 			const prompt = buildComparisonPrompt(requirement, steps.blind.solution!, annotated.text);
-			steps.comparison = parseComparison(await this.grailModelRun(join(workspace, prefix), model, prompt, budget, deadline, signal, conversation.id), lines);
+			steps.comparison = parseComparison(await this.grailModelRun(workspace, model, prompt, budget, deadline, signal, conversation.id), lines);
 		} catch (error) {
 			if (signal.aborted) throw error;
 			steps.comparison = { status: "unavailable", reason: error instanceof Error ? error.message : String(error), findings: [], dropped: 0 };
@@ -4343,29 +4451,58 @@ export class DesktopService {
 		return finish();
 	}
 
-	private async grailObjective(project: string, workspace: string, prefix: string, deadline: number, signal: AbortSignal): Promise<GrailObjectiveResult> {
+	private async grailObjective(project: string, workspace: string, deadline: number, signal: AbortSignal): Promise<GrailObjectiveResult> {
+		signal.throwIfAborted();
 		let manifest: unknown;
 		try {
-			manifest = JSON.parse(await readFile(join(workspace, prefix, "package.json"), "utf8"));
+			manifest = JSON.parse(await readFile(join(workspace, "package.json"), { encoding: "utf8", signal }));
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-				return { status: "unavailable", reason: "package.json 无法解析。", runs: [] };
+			signal.throwIfAborted();
+			const reason = (error as NodeJS.ErrnoException).code === "ENOENT"
+				? "第一版只支持 Node/TypeScript 项目：项目根目录没有 package.json。"
+				: "package.json 无法解析。";
+			return { status: "unavailable", reason, runs: [] };
 		}
+		const selectedProject = await realpath(project);
+		const { stdout } = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: selectedProject, timeout: 10000, signal });
+		const repository = await realpath(stdout.replace(/\r?\n$/, ""));
+		if (!inside(repository, selectedProject)) return { status: "unavailable", reason: "无法确定所选项目在 Git 仓库中的位置。", runs: [] };
+		const prefix = relative(repository, selectedProject);
 		const scratch = await mkdtemp(join(tmpdir(), "pi-grail-"));
 		try {
 			const objectiveRoot = join(scratch, "workspace");
 			const objectiveProject = join(objectiveRoot, prefix);
-			const copy = { recursive: true, verbatimSymlinks: true, mode: fsConstants.COPYFILE_FICLONE };
-			await cp(workspace, objectiveRoot, copy);
-			const sourceRoot = resolve(project, ...prefix.split("/").filter(Boolean).map(() => ".."));
-			for (const subdir of new Set(["", prefix])) {
+			const copy = {
+				recursive: true,
+				verbatimSymlinks: true,
+				mode: fsConstants.COPYFILE_FICLONE,
+				filter: () => {
+					signal.throwIfAborted();
+					return true;
+				},
+			};
+			// Snapshots are relative to the selected project. Keep its repository depth
+			// only in the disposable test tree so hoisted dependencies resolve normally.
+			await cp(workspace, objectiveProject, copy);
+			const files = await readdir(objectiveProject);
+			const lockfiles = new Set(["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock"]);
+			let hasLockfile = files.some((name) => lockfiles.has(name));
+			for (let source = selectedProject; ; source = dirname(source)) {
 				signal.throwIfAborted();
-				const modules = join(sourceRoot, subdir, "node_modules");
+				const modules = join(source, "node_modules");
 				if (await lstat(modules).then((entry) => entry.isDirectory(), () => false)) {
-					const destination = join(objectiveRoot, subdir, "node_modules");
+					const destination = join(objectiveRoot, relative(repository, source), "node_modules");
 					if (!(await access(destination).then(() => true, () => false))) await cp(modules, destination, copy);
 				}
+				if (source !== selectedProject && !hasLockfile) {
+					// Look for the closest workspace lockfile without reading or copying it.
+					const inheritedLockfiles = (await readdir(source)).filter((name) => lockfiles.has(name));
+					files.push(...inheritedLockfiles);
+					hasLockfile = inheritedLockfiles.length > 0;
+				}
+				if (source === repository) break;
 			}
+			signal.throwIfAborted();
 			let sandboxProfile: string | undefined;
 			if (this.store.settings.sandbox && (await probeSeatbeltSupport()).supported) {
 				sandboxProfile = join(scratch, "grail.sb");
@@ -4374,7 +4511,7 @@ export class DesktopService {
 			return await runObjectiveChecks({
 				project: objectiveProject,
 				manifest,
-				files: [...new Set([...await readdir(objectiveRoot), ...await readdir(objectiveProject)])],
+				files,
 				env: scriptEnvironment({ ...process.env, ...this.options.env }, join(scratch, "npm-cache")),
 				sandboxProfile,
 				deadline,
@@ -4395,6 +4532,12 @@ export class DesktopService {
 		signal: AbortSignal,
 		conversationId: string,
 	): Promise<string> {
+		const assertCanReview = () => {
+			signal.throwIfAborted();
+			if (Date.now() >= deadline) throw new DOMException("鉴定超时。", "TimeoutError");
+			if (budget.spent >= budget.max) throw new Error(`鉴定费用额度已用完（上限 $${budget.max}）。`);
+		};
+		assertCanReview();
 		const traceId = this.options.tracing ? randomUUID() : "";
 		const env: NodeJS.ProcessEnv = {
 			...process.env,
@@ -4403,22 +4546,26 @@ export class DesktopService {
 			PI_DESKTOP_CONNECTION_TEST: "0",
 			PI_DESKTOP_GRAIL_REVIEW: "1",
 			PI_DESKTOP_PERMISSION_MODE: "read",
+			// Reuse the extension's before-provider-request budget check for follow-up tool turns.
+			PI_DESKTOP_MAX_COST: String(budget.max - budget.spent),
 			...networkEnvironment(this.store.settings),
 		};
+		delete env.PI_DESKTOP_MAX_COST_FILE;
 		delete env.PI_DESKTOP_POLICY_FILE;
 		delete env.PI_DESKTOP_SANDBOX_PROFILE;
 		if (this.store.settings.agentDir) env.PI_CODING_AGENT_DIR = this.store.settings.agentDir;
 		env.PI_DESKTOP_CONNECTIONS = JSON.stringify(this.connectionEnvironment(env));
 		const runtimeDir = this.options.runtimeDir ?? dirname(dirname(dirname(this.options.entry!)));
 		let agent: AgentProcess | undefined;
-		let timer: NodeJS.Timeout | undefined;
 		let onAbort: (() => void) | undefined;
+		let outcome: "success" | "error" = "error";
 		const controls = await mkdtemp(join(tmpdir(), "pi-grail-controls-"));
 		try {
 			env.PI_DESKTOP_POLICY_FILE = join(controls, "permission.json");
 			await this.atomicJson(env.PI_DESKTOP_POLICY_FILE, {
 				version: 1, mode: "read", sandbox: true, rules: [], disabledTools: [], project: await realpath(cwd),
 			} satisfies RuntimePermissionPolicy);
+			assertCanReview();
 			let last: Extract<Message, { role: "assistant" }> | undefined;
 			let settle!: () => void;
 			let fail!: (error: Error) => void;
@@ -4446,11 +4593,20 @@ export class DesktopService {
 				],
 				env,
 				onEvent: (event) => {
-					this.options.tracing?.observe(traceId, event, conversationId, undefined, last?.stopReason === "error", "grail");
+					// The host determines the outcome after checking budget and validating the response.
+					if (event.type !== "agent_settled" && event.type !== "desktop_error")
+						this.options.tracing?.observe(traceId, event, conversationId, undefined, undefined, "grail");
 					if (event.type === "message_end" && event.message.role === "assistant") {
 						last = event.message;
-						budget.spent += finiteCount(event.message.usage?.cost?.total);
-						if (budget.spent > budget.max) fail(new Error(`鉴定费用超过上限 $${budget.max}。`));
+						const cost = event.message.usage?.cost?.total;
+						if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) {
+							fail(new Error("评审模型没有返回有效的费用用量，鉴定已停止。"));
+						} else {
+							budget.spent += cost;
+							if (budget.spent > budget.max) fail(new Error(`鉴定费用超过上限 $${budget.max}。`));
+							else if (budget.spent === budget.max && last.stopReason === "toolUse")
+								fail(new Error(`鉴定费用额度已用完（上限 $${budget.max}）。`));
+						}
 					}
 					// Nobody answers dialogs for the reviewer; anything needing approval is refused.
 					if (event.type === "extension_ui_request" && ["confirm", "select", "input", "editor"].includes(event.method))
@@ -4459,19 +4615,19 @@ export class DesktopService {
 					if (event.type === "desktop_error") fail(new Error(event.message));
 				},
 			});
-			timer = setTimeout(() => fail(new Error("鉴定超时。")), Math.max(1, deadline - Date.now()));
-			onAbort = () => fail(new Error("鉴定已取消。"));
+			onAbort = () => fail(signal.reason instanceof Error ? signal.reason : new Error("鉴定已取消。"));
 			signal.addEventListener("abort", onAbort, { once: true });
-			if (signal.aborted) throw new Error("鉴定已取消。");
+			assertCanReview();
 			await Promise.all([agent.request({ type: "prompt", message: prompt }), completion]);
+			signal.throwIfAborted();
 			if (!last || last.stopReason === "error" || last.stopReason === "aborted")
 				throw new Error(last?.errorMessage ?? "评审模型没有返回有效回复。");
+			outcome = "success";
 			return last.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
 		} finally {
-			clearTimeout(timer);
 			if (onAbort) signal.removeEventListener("abort", onAbort);
 			await agent?.stop();
-			this.options.tracing?.finishRun(traceId, signal.aborted ? "aborted" : "error");
+			this.options.tracing?.finishRun(traceId, signal.reason?.name === "AbortError" ? "aborted" : signal.aborted ? "error" : outcome);
 			await rm(controls, { recursive: true, force: true });
 		}
 	}
@@ -4861,10 +5017,11 @@ export class DesktopService {
 		} finally { await rm(temporary, { force: true }); }
 	}
 
-	private async atomicJson(path: string, value: unknown): Promise<void> {
+	private async atomicJson(path: string, value: unknown, beforePublish?: () => void): Promise<void> {
 		const temporary = `${path}.${randomBytes(8).toString("hex")}.tmp`;
 		try {
 			await writeFile(temporary, JSON.stringify(value), { mode: 0o600 });
+			beforePublish?.();
 			await rename(temporary, path);
 		} finally { await rm(temporary, { force: true }); }
 	}
@@ -6040,7 +6197,7 @@ export class DesktopService {
 		this.notifyTimers.clear();
 		await this.toolHost.close();
 		this.connectionCheck?.cancel(new Error("桌面服务已关闭，连接测试已取消。"));
-		for (const conversationId of [...this.grailRuns.keys()]) await this.cancelGrail(conversationId);
+		await Promise.all([...this.grailRuns.keys()].map((conversationId) => this.cancelGrail(conversationId)));
 		await this.operation;
 		await this.external.close();
 		await this.monitors.close();

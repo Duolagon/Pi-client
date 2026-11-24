@@ -18,6 +18,7 @@ import type {
 
 export { GRAIL_CRITERIA };
 const criteria = Object.keys(GRAIL_CRITERIA) as GrailCriterion[];
+const requiredCriteria = ["requirement", "broken", "removable", "missing", "flawless"] as const;
 
 export interface DiffLine {
 	file: string;
@@ -97,6 +98,7 @@ export function annotateDiff(files: { path: string; diff: string }[], maxChars =
 const sourceFile = /\.(?:[cm]?[jt]sx?|vue|svelte)$/i;
 const testFile = /(?:^|\/)(?:test|tests|__tests__|spec)\/|\.(?:test|spec)\.[cm]?[jt]sx?$/i;
 const assertion = /\b(?:assert(?:\.\w+)?|expect)\s*\(|\.should\b|\bt\.(?:is|not|deepEqual|equal|true|false|throws|like|snapshot)\s*\(/;
+const quotedLiteral = /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/g;
 const addedRules: { rule: string; pattern: RegExp; tests?: boolean }[] = [
 	{ rule: "新增 .skip / .only", pattern: /\b(?:describe|it|test|context|suite)\.(?:skip|only)\b|\b(?:xit|xdescribe|fit|fdescribe)\s*\(|\{\s*(?:skip|only)\s*:\s*true\b/ },
 	{ rule: "新增 @ts-ignore / @ts-expect-error", pattern: /@ts-(?:ignore|expect-error|nocheck)\b/ },
@@ -114,7 +116,9 @@ export function scanDistortions(lines: DiffLine[]): GrailDistortionHit[] {
 		if (!sourceFile.test(item.file)) continue;
 		const hit = (rule: string, review?: true) => hits.push({ file: item.file, line: item.line, side: item.side, rule, text: item.text.trim().slice(0, 200), ...(review ? { review } : {}) });
 		if (item.side === "+") {
-			for (const { rule, pattern } of addedRules) if (pattern.test(item.text)) hit(rule);
+			// Inline examples are often data, for instance a help string that shows console.log().
+			const code = item.text.replace(quotedLiteral, (literal) => literal.startsWith("`") && literal.includes("${") ? literal : " ");
+			for (const { rule, pattern } of addedRules) if (pattern.test(code)) hit(rule);
 		} else if (testFile.test(item.file) && assertion.test(item.text)) {
 			const replacements = lines.filter((other) => other.file === item.file && other.side === "+" && assertion.test(other.text));
 			if (replacements.some((other) => other.text.trim() === item.text.trim())) continue;
@@ -125,22 +129,40 @@ export function scanDistortions(lines: DiffLine[]): GrailDistortionHit[] {
 	return hits;
 }
 
-/** Number of tests a runner reported (node --test, vitest, jest, mocha); undefined when unknown. */
-export function parseTestCount(output: string): number | undefined {
+/** Runner totals include skipped tests. Only a passing test proves that a check actually ran. */
+function parseTestSummary(output: string): { total: number; passed?: number; failed?: number } | undefined {
 	const text = output.replace(/\x1b\[[0-9;]*m/g, "");
 	const node = [...text.matchAll(/^\s*(?:#|ℹ)\s*tests\s+(\d+)\s*$/gm)];
-	if (node.length) return node.reduce((sum, match) => sum + Number(match[1]), 0);
-	const jest = /^\s*Tests:\s+.*?(\d+)\s+total/m.exec(text);
-	if (jest) return Number(jest[1]);
-	const vitest = /^\s*Tests\s+.*?\((\d+)\)\s*$/m.exec(text);
-	if (vitest) return Number(vitest[1]);
+	if (node.length) {
+		const pass = [...text.matchAll(/^\s*(?:#|ℹ)\s*pass\s+(\d+)\s*$/gm)];
+		const fail = [...text.matchAll(/^\s*(?:#|ℹ)\s*fail\s+(\d+)\s*$/gm)];
+		const total = node.reduce((sum, match) => sum + Number(match[1]), 0);
+		const passed = pass.length === node.length ? pass.reduce((sum, match) => sum + Number(match[1]), 0) : undefined;
+		const failed = fail.length ? fail.reduce((sum, match) => sum + Number(match[1]), 0) : undefined;
+		return { total, passed, failed };
+	}
+	const jest = /^\s*Tests:\s+([^\r\n]*?)(\d+)\s+total/m.exec(text);
+	const vitest = /^\s*Tests\s+([^\r\n]*?)\((\d+)\)\s*$/m.exec(text);
+	const summary = jest ?? vitest;
+	if (summary) return {
+		total: Number(summary[2]),
+		passed: Number(/\b(\d+)\s+passed\b/.exec(summary[1])?.[1] ?? 0),
+		failed: Number(/\b(\d+)\s+failed\b/.exec(summary[1])?.[1] ?? 0),
+	};
 	const passing = /^\s*(\d+)\s+passing\b/m.exec(text);
 	if (passing) {
 		const failing = /^\s*(\d+)\s+failing\b/m.exec(text);
 		const pending = /^\s*(\d+)\s+pending\b/m.exec(text);
-		return Number(passing[1]) + Number(failing?.[1] ?? 0) + Number(pending?.[1] ?? 0);
+		const passed = Number(passing[1]);
+		const failed = Number(failing?.[1] ?? 0);
+		return { total: passed + failed + Number(pending?.[1] ?? 0), passed, failed };
 	}
 	return undefined;
+}
+
+/** Number of tests a supported runner reported, including any skipped tests. */
+export function parseTestCount(output: string): number | undefined {
+	return parseTestSummary(output)?.total;
 }
 
 /** TypeScript diagnostics count from `tsc` output; 0 when tsc printed none. */
@@ -193,10 +215,12 @@ export function runProcess(
 	command: string,
 	args: string[],
 	options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; signal: AbortSignal },
-): Promise<{ exitCode: number | null; timedOut: boolean; output: string }> {
+): Promise<{ exitCode: number | null; timedOut: boolean; output: string; launchError?: string }> {
 	return new Promise((resolve) => {
+		options.signal.throwIfAborted();
 		let output = "";
 		let timedOut = false;
+		let launchError: string | undefined;
 		const append = (chunk: Buffer | string) => {
 			output = (output + chunk.toString()).slice(-maxOutput);
 		};
@@ -215,16 +239,19 @@ export function runProcess(
 		options.signal.addEventListener("abort", kill, { once: true });
 		child.stdout.on("data", append);
 		child.stderr.on("data", append);
-		child.once("error", (error) => append(`\n${error.message}`));
+		child.once("error", (error) => {
+			launchError = error.message;
+			append(`\n${launchError}`);
+		});
 		child.once("close", (code) => {
 			clearTimeout(timer);
 			options.signal.removeEventListener("abort", kill);
-			resolve({ exitCode: code, timedOut, output });
+			resolve({ exitCode: code, timedOut, output, launchError });
 		});
 	});
 }
 
-/** Step 5.1: run the project's own scripts; only exit codes and the reported test count count. */
+/** Step 5.1: collect test, type-check and lint evidence from the project's own scripts. */
 export async function runObjectiveChecks(options: {
 	project: string;
 	manifest: unknown;
@@ -242,22 +269,42 @@ export async function runObjectiveChecks(options: {
 	const manager = packageManager(options.files);
 	const runs: GrailCheckRun[] = [];
 	for (const { name, script } of scripts) {
-		if (options.signal.aborted) throw new Error("鉴定已取消。");
+		options.signal.throwIfAborted();
+		const displayCommand = `${manager} run ${script}`;
+		const timeoutMs = options.deadline - Date.now();
+		if (timeoutMs <= 0) return { status: "unavailable", reason: `鉴定已超时，未运行 ${displayCommand}。`, runs };
 		const args = ["run", script];
 		const [command, argv] = options.sandboxProfile
 			? ["/usr/bin/sandbox-exec", ["-f", options.sandboxProfile, manager, ...args]]
 			: [manager, args];
-		const result = await runProcess(command, argv, { cwd: options.project, env: options.env, timeoutMs: options.deadline - Date.now(), signal: options.signal });
-		if (options.signal.aborted) throw new Error("鉴定已取消。");
-		const run: GrailCheckRun = { name, script, command: `${manager} ${args.join(" ")}`, exitCode: result.exitCode, timedOut: result.timedOut, output: result.output };
-		if (name === "test") run.testCount = parseTestCount(result.output);
+		const result = await runProcess(command, argv, { cwd: options.project, env: options.env, timeoutMs, signal: options.signal });
+		options.signal.throwIfAborted();
+		const run: GrailCheckRun = { name, script, command: displayCommand, exitCode: result.exitCode, timedOut: result.timedOut, output: result.output };
+		const testSummary = name === "test" ? parseTestSummary(result.output) : undefined;
+		if (testSummary) run.testCount = testSummary.total;
 		if (name === "check") run.errorCount = parseTscErrors(result.output);
 		runs.push(run);
-		if (result.timedOut) return { status: "fail", reason: `${run.command} 超时。`, runs };
-		if (result.exitCode !== 0) return { status: "fail", reason: `${run.command} 退出码 ${result.exitCode ?? "无"}。`, runs };
-		if (name === "test" && run.testCount === undefined)
-			return { status: "unavailable", reason: "测试通过，但无法从输出读取测试数量。", runs };
-		if (name === "test" && run.testCount === 0) return { status: "unavailable", reason: "测试脚本没有运行任何测试（0 个测试不算通过）。", runs };
+		if (result.timedOut) return { status: "unavailable", reason: `${run.command} 超时。`, runs };
+		if (result.launchError) return { status: "unavailable", reason: `无法启动 ${run.command}：${result.launchError}`, runs };
+		if (result.exitCode === null) return { status: "unavailable", reason: `${run.command} 运行中断。`, runs };
+		if (result.exitCode !== 0) {
+			if (result.exitCode === 126 || result.exitCode === 127 || /^\s*(?:sh|bash): .*: (?:command )?not found\s*$/m.test(result.output))
+				return { status: "unavailable", reason: `${run.command} 所需的命令不可用，请检查测试工具和依赖。`, runs };
+			return { status: "fail", reason: `${run.command} 退出码 ${result.exitCode}。`, runs };
+		}
+		if (name === "test") {
+			if (testSummary?.failed)
+				return { status: "fail", reason: `测试结果报告了 ${testSummary.failed} 个失败。`, runs };
+			if (testSummary?.passed === undefined || testSummary.passed > testSummary.total)
+				return { status: "unavailable", reason: "无法从测试输出确认实际通过的测试数量。", runs };
+			if (testSummary.passed === 0)
+				return { status: "unavailable", reason: "没有任何测试实际通过。零测试及全部跳过均无法作为通过证据。", runs };
+		}
+	}
+	const missingChecks = (["check", "lint"] as const).filter((name) => !scripts.some((item) => item.name === name));
+	if (missingChecks.length) {
+		const labels = { check: "类型检查（check/typecheck）", lint: "lint" };
+		return { status: "unavailable", reason: `package.json 缺少可执行脚本：${missingChecks.map((name) => labels[name]).join("、")}。`, runs };
 	}
 	return { status: "pass", runs };
 }
@@ -391,8 +438,11 @@ export function gradeVerdict(steps: GrailStepResults): { grade: GrailGrade; reas
 	}
 	const failed = (key: GrailCriterion) => [`${GRAIL_CRITERIA[key]}：未满足${verdicts.get(key)?.notes.length ? `。${verdicts.get(key)!.notes.join("；")}` : "。"}`];
 	if (verdicts.get("broken")?.pass === false) return { grade: "twisted", reasons: failed("broken") };
-	if (!verdicts.has("requirement")) return { grade: "unjudgeable", reasons: ["评审没有给出带代码引用的需求结论。"] };
-	if (!verdicts.get("requirement")!.pass) return { grade: "unfulfilled", reasons: failed("requirement") };
+	const failedRequired = requiredCriteria.filter((key) => verdicts.get(key)?.pass === false);
+	if (failedRequired.length) return { grade: "unfulfilled", reasons: failedRequired.flatMap(failed) };
+	const missingRequired = requiredCriteria.filter((key) => !verdicts.has(key));
+	if (missingRequired.length)
+		return { grade: "unjudgeable", reasons: missingRequired.map((key) => `${GRAIL_CRITERIA[key]}：评审没有给出带代码引用的底线结论。`) };
 	const reasons = criteria.flatMap((key) => {
 		const verdict = verdicts.get(key);
 		if (!verdict) return [`${GRAIL_CRITERIA[key]}：评审没有给出带代码引用的结论。`];

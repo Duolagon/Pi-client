@@ -173,18 +173,43 @@ export class GitSnapshots {
 		});
 	}
 
-	/** Differences from a checkpoint's before-state to the current worktree (spanning later checkpoints). */
-	async diffToWorktree(project: string, id: string, reviewDirectory?: string): Promise<GitCheckpointDiff> {
-		const root = await this.projectRoot(project);
+	/** Check for an observable worktree change without saving blobs or computing a textual diff. */
+	async hasWorktreeChanges(project: string, id: string, conversationId?: string, signal?: AbortSignal): Promise<boolean> {
+		signal?.throwIfAborted();
+		const root = await this.queryRoot(project);
 		return this.serialize(root, async () => {
+			signal?.throwIfAborted();
+			const manifest = await this.load(root, id, conversationId);
+			const paths = await this.snapshotPaths(root, Object.keys(manifest.before), signal);
+			const excluded = excludedPaths(manifest.before);
+			for (const path of paths) {
+				signal?.throwIfAborted();
+				const previous = manifest.before[path] ?? missing;
+				if (previous.kind === "excluded" || parents(path).some((parent) => excluded.has(parent))) continue;
+				const current = await this.inspect(root, path, false, MAX_CHECKPOINT_FILE_BYTES, signal);
+				// Exclusion here means a previously missing or captured file now exceeds
+				// the per-file limit. The review can explain why it cannot judge this edit.
+				if (current.kind === "excluded") return true;
+				if (hasFileSide(previous.kind, current.kind) && !equal(previous, current)) return true;
+			}
+			return false;
+		});
+	}
+
+	/** Differences from a checkpoint's before-state to the current worktree (spanning later checkpoints). */
+	async diffToWorktree(project: string, id: string, reviewDirectory?: string, signal?: AbortSignal): Promise<GitCheckpointDiff> {
+		const root = await this.projectRoot(project, signal);
+		return this.serialize(root, async () => {
+			signal?.throwIfAborted();
 			const manifest = await this.load(root, id);
-			const current = await this.capture(root, Object.keys(manifest.before));
+			const current = await this.capture(root, Object.keys(manifest.before), signal);
 			const files: GitCheckpointDiff["files"] = [];
 			const excluded = excludedPaths(manifest.before, current);
-			if (reviewDirectory && !excluded.size) await this.materializeEntries(root, reviewDirectory, current);
+			if (reviewDirectory && !excluded.size) await this.materializeEntries(root, reviewDirectory, current, signal);
 			for (const change of changes(manifest.before, current, excluded)) {
-				if (change.beforeKind === "directory" || change.afterKind === "directory") continue;
-				const result = await this.fileDiff(change.path, manifest.before[change.path] ?? missing, current[change.path] ?? missing);
+				signal?.throwIfAborted();
+				if (!hasFileSide(change.beforeKind, change.afterKind)) continue;
+				const result = await this.fileDiff(change.path, manifest.before[change.path] ?? missing, current[change.path] ?? missing, signal);
 				files.push({ ...change, ...result });
 			}
 			return excluded.size ? { checkpointId: id, files, excludedFiles: excluded.size } : { checkpointId: id, files };
@@ -192,18 +217,20 @@ export class GitSnapshots {
 	}
 
 	/** Write a checkpoint's before-state files into an empty directory outside the project (read-only copy). */
-	async materializeBefore(project: string, id: string, target: string): Promise<void> {
-		const root = await this.projectRoot(project);
+	async materializeBefore(project: string, id: string, target: string, signal?: AbortSignal): Promise<void> {
+		const root = await this.projectRoot(project, signal);
 		if (inside(root, resolve(target))) throw new Error("快照副本必须位于项目目录之外。");
 		return this.serialize(root, async () => {
+			signal?.throwIfAborted();
 			const manifest = await this.load(root, id);
-			await this.materializeEntries(root, target, manifest.before);
+			await this.materializeEntries(root, target, manifest.before, signal);
 		});
 	}
 
-	private async materializeEntries(root: string, target: string, entries: Record<string, Entry>): Promise<void> {
+	private async materializeEntries(root: string, target: string, entries: Record<string, Entry>, signal?: AbortSignal): Promise<void> {
 		if (inside(root, resolve(target))) throw new Error("快照副本必须位于项目目录之外。");
 		for (const [path, entry] of Object.entries(entries).sort(([a], [b]) => a.localeCompare(b))) {
+			signal?.throwIfAborted();
 			const destination = join(target, path);
 			if (entry.kind === "directory") await mkdir(destination, { recursive: true, mode: 0o700 });
 			else if (entry.kind === "file") {
@@ -335,11 +362,12 @@ export class GitSnapshots {
 		});
 	}
 
-	private async projectRoot(project: string): Promise<string> {
+	private async projectRoot(project: string, signal?: AbortSignal): Promise<string> {
+		signal?.throwIfAborted();
 		const root = await realpath(project);
 		if (!(await lstat(root)).isDirectory()) throw new Error("项目路径必须是目录。");
 		if (inside(root, this.dataDir)) throw new Error("快照存储目录必须位于项目目录之外。");
-		await exec("git", ["rev-parse", "--show-toplevel"], { cwd: root, timeout: 10000 });
+		await exec("git", ["rev-parse", "--show-toplevel"], { cwd: root, timeout: 10000, signal });
 		await mkdir(join(this.dataDir, "blobs"), { recursive: true, mode: 0o700 });
 		return root;
 	}
@@ -387,11 +415,17 @@ export class GitSnapshots {
 		}
 	}
 
-	private async capture(project: string, include: string[] = []): Promise<Record<string, Entry>> {
+	private async capture(project: string, include: string[] = [], signal?: AbortSignal): Promise<Record<string, Entry>> {
+		return this.capturePaths(project, await this.snapshotPaths(project, include, signal), signal);
+	}
+
+	private async snapshotPaths(project: string, include: string[], signal?: AbortSignal): Promise<Set<string>> {
+		signal?.throwIfAborted();
 		const { stdout } = await exec("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "."], {
 			cwd: project,
 			maxBuffer: 16 * 1024 * 1024,
 			timeout: 10000,
+			signal,
 		});
 		const paths = new Set(include);
 		for (const path of stdout.split("\0")) {
@@ -400,22 +434,24 @@ export class GitSnapshots {
 			paths.add(path);
 			for (const parent of parents(path)) paths.add(parent);
 		}
-		return this.capturePaths(project, paths);
+		if (paths.size > maxEntries) throw new Error("快照路径超过 50000 项，请先配置 Git 忽略规则。");
+		return paths;
 	}
 
-	private async capturePaths(project: string, paths: Set<string>): Promise<Record<string, Entry>> {
+	private async capturePaths(project: string, paths: Set<string>, signal?: AbortSignal): Promise<Record<string, Entry>> {
 		if (paths.size > maxEntries) throw new Error("快照路径超过 50000 项，请先配置 Git 忽略规则。");
 		const result: Record<string, Entry> = Object.create(null);
 		let size = 0;
 		for (const path of [...paths].sort()) {
-			const entry = await this.inspect(project, path, true, maxSnapshotBytes - size);
+			signal?.throwIfAborted();
+			const entry = await this.inspect(project, path, true, maxSnapshotBytes - size, signal);
 			if (entry.kind === "file" || entry.kind === "symlink") size += entry.size;
 			result[path] = entry;
 		}
 		return result;
 	}
 
-	private async inspect(project: string, path: string, persist = false, remainingBytes = MAX_CHECKPOINT_FILE_BYTES): Promise<Entry> {
+	private async inspect(project: string, path: string, persist = false, remainingBytes = MAX_CHECKPOINT_FILE_BYTES, signal?: AbortSignal): Promise<Entry> {
 		checkPath(path);
 		for (const parent of parents(path)) {
 			try {
@@ -446,7 +482,7 @@ export class GitSnapshots {
 			const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
 			try {
 				const before = await handle.stat();
-				bytes = await handle.readFile();
+				bytes = await handle.readFile({ signal });
 				const after = await handle.stat();
 				if (
 					before.ino !== info.ino ||
@@ -462,6 +498,7 @@ export class GitSnapshots {
 				await handle.close();
 			}
 		} else throw new Error(`不支持为特殊文件创建快照：${path}`);
+		signal?.throwIfAborted();
 		if (bytes.length > Math.min(MAX_CHECKPOINT_FILE_BYTES, remainingBytes)) return excluded;
 		const digest = hash(bytes);
 		if (persist)
@@ -555,7 +592,7 @@ export class GitSnapshots {
 		return manifest;
 	}
 
-	private async fileDiff(path: string, before: Entry, after: Entry): Promise<{ diff: string; truncated: boolean }> {
+	private async fileDiff(path: string, before: Entry, after: Entry, signal?: AbortSignal): Promise<{ diff: string; truncated: boolean }> {
 		if (before.kind === "excluded" || after.kind === "excluded") throw new Error("此路径未纳入快照。");
 		if (before.kind === "directory" || after.kind === "directory")
 			return { diff: `路径类型：${before.kind} → ${after.kind}`, truncated: false };
@@ -565,6 +602,7 @@ export class GitSnapshots {
 				["before", before],
 				["after", after],
 			] as const) {
+				signal?.throwIfAborted();
 				if (entry.kind === "missing") continue;
 				const bytes = await this.bytes(entry);
 				if (entry.kind === "symlink") await symlink(bytes.toString(), join(temporary, name));
@@ -585,7 +623,7 @@ export class GitSnapshots {
 			];
 			let output: string;
 			try {
-				output = (await exec("git", args, { cwd: temporary, maxBuffer: 2 * 1024 * 1024, timeout: 10000 })).stdout;
+				output = (await exec("git", args, { cwd: temporary, maxBuffer: 2 * 1024 * 1024, timeout: 10000, signal })).stdout;
 			} catch (error) {
 				const failure = error as { code?: number | string; stdout?: string };
 				if (failure.code === 1) output = failure.stdout ?? "";
@@ -593,9 +631,12 @@ export class GitSnapshots {
 					return { diff: "差异超过 2 MB，请按文件读取。", truncated: true };
 				else throw error;
 			}
+			let inHunk = false;
 			output = output
 				.split("\n")
 				.map((line) => {
+					if (line.startsWith("@@ ")) inHunk = true;
+					if (inHunk) return line;
 					if (line.startsWith("diff --git ")) return `diff --git a/${path} b/${path}`;
 					if (line.startsWith("--- ") && before.kind !== "missing") return `--- a/${path}`;
 					if (line.startsWith("+++ ") && after.kind !== "missing") return `+++ b/${path}`;
@@ -608,6 +649,10 @@ export class GitSnapshots {
 			await rm(temporary, { recursive: true, force: true });
 		}
 	}
+}
+
+function hasFileSide(before: GitSnapshotChange["beforeKind"], after: GitSnapshotChange["afterKind"]): boolean {
+	return before === "file" || before === "symlink" || after === "file" || after === "symlink";
 }
 
 function excludedPaths(...states: Record<string, Entry>[]): Set<string> {

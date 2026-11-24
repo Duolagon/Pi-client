@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { DesktopService } from "../src/backend.ts";
+import type { AgentProcess } from "../src/rpc.ts";
 import type { DesktopEvent, GrailEvent, GrailVerdict } from "../src/shared.ts";
 import { createCoreFixture } from "./fixtures/core-fixture.ts";
 
@@ -13,21 +14,25 @@ const exec = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
 const extension = resolve(here, "../src/permission-extension.ts");
 
-async function setup() {
+async function setup(nested = false) {
 	const fixture = await createCoreFixture();
 	await cp(join(here, "fixtures", "grail-provider.js"), join(fixture.agentDir, "extensions", "grail-provider.js"));
-	const project = fixture.project;
-	await mkdir(join(project, "src"));
+	const project = nested ? join(fixture.project, "packages", "app") : fixture.project;
+	await mkdir(join(project, "src"), { recursive: true });
 	await mkdir(join(project, "test"));
-	await writeFile(join(project, "package.json"), JSON.stringify({ name: "grail-demo", private: true, type: "module", scripts: { test: "node --test" } }));
+	await writeFile(join(project, "package.json"), JSON.stringify({
+		name: "grail-demo", private: true, type: "module",
+		scripts: { test: "node --test", check: "node --check src/add.mjs", lint: "node lint.mjs" },
+	}));
+	await writeFile(join(project, "lint.mjs"), 'import { readFileSync } from "node:fs";\nif (/ +$/m.test(readFileSync("src/add.mjs", "utf8"))) process.exitCode = 1;\n');
 	await writeFile(join(project, "src", "add.mjs"), "export function add(a, b) {\n\treturn 0;\n}\n");
 	await writeFile(
 		join(project, "test", "add.test.mjs"),
 		'import assert from "node:assert/strict";\nimport { writeFileSync } from "node:fs";\nimport { test } from "node:test";\nimport { add } from "../src/add.mjs";\ntest("add", () => { writeFileSync("grail-local-artifact", "test"); assert.equal(add(1, 2), 3); });\n',
 	);
-	await exec("git", ["init", "-q", project]);
-	await exec("git", ["add", "."], { cwd: project });
-	await exec("git", ["-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-qm", "seed"], { cwd: project });
+	await exec("git", ["init", "-q", fixture.project]);
+	await exec("git", ["add", "."], { cwd: fixture.project });
+	await exec("git", ["-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-qm", "seed"], { cwd: fixture.project });
 	const control = join(fixture.root, "grail-mode");
 	const log = join(fixture.root, "grail-log.jsonl");
 	await writeFile(control, "grail");
@@ -43,7 +48,7 @@ async function setup() {
 	const session: DesktopEvent[] = [];
 	service.subscribeGrail((event) => grail.push(event));
 	service.subscribe((event) => session.push(event));
-	return { fixture, service, control, log, grail, session };
+	return { fixture, project, service, control, log, grail, session };
 }
 
 function waitFor<T>(check: () => T | undefined, label: string, timeout = 60000): Promise<T> {
@@ -67,6 +72,7 @@ test("Grail judgement: grail, 愿望达成, failing test, cancel and seal, never
 		await service.saveSettings({ permission: "auto", theme: "light", grailModel: { provider: "grail-test", id: "grail-judge-1" }, grailMaxCost: 1, grailTimeoutSec: 120 });
 		const conversationId = snapshot.active!.id;
 		assert.equal((await service.grailState(conversationId)).hasDiff, false);
+		assert.equal((await service.grailState(conversationId)).readiness, "no-checkpoint");
 		const empty = await service.startGrail(conversationId);
 		const none = await waitFor(() => grail.find((event): event is Extract<GrailEvent, { type: "grail_verdict" }> => event.type === "grail_verdict" && event.verdict.id === empty.id), "empty verdict");
 		assert.equal(none.verdict.grade, "unjudgeable");
@@ -147,6 +153,57 @@ test("Grail judgement: grail, 愿望达成, failing test, cancel and seal, never
 		assert.equal(sealed.wish, 1);
 		assert.equal(sealed.hasDiff, false);
 		assert.equal(sealed.verdicts.length, before);
+	} finally {
+		await service.close();
+		await fixture.cleanup();
+	}
+});
+
+test("nested Git project assesses the entire selected raw branch and rejects truncated diffs", { timeout: 60_000 }, async () => {
+	const { fixture, project, service, grail, session, log } = await setup(true);
+	try {
+		const snapshot = await service.initialize();
+		assert.equal(snapshot.engineStatus, "ready", snapshot.engineError);
+		await service.saveSettings({ permission: "auto", grailModel: { provider: "grail-test", id: "grail-judge-1" } });
+		const conversationId = snapshot.active!.id;
+		const started = Date.now();
+		await service.command({ type: "prompt", message: "Define add using both operands." }, conversationId);
+		await waitFor(() => session.find((event) => event.event.type === "agent_settled"), "agent_settled");
+		const runtime = (service as unknown as { runtimes: Map<string, { agent: AgentProcess; checkpointId?: string }> }).runtimes.get(conversationId)!;
+		await waitFor(() => runtime.checkpointId === undefined || undefined, "checkpoint finished");
+		assert.equal((await service.grailState(conversationId)).readiness, "clean");
+		const command = runtime.agent.request.bind(runtime.agent);
+		// This is the native get_entries response after compaction plus a discarded sibling branch.
+		const message = (id: string, parentId: string | null, content: string) => ({
+			id, parentId, type: "message", timestamp: new Date(started).toISOString(),
+			message: { role: "user", content, timestamp: started },
+		});
+		runtime.agent.request = <T>(input: Record<string, unknown>) => input.type === "get_entries"
+			? Promise.resolve({ leafId: "compact", entries: [
+				message("root", null, "Define add using both operands."),
+				message("other", "root", "Discarded: subtract both operands."),
+				message("selected", "root", "Preserve the sum for negative operands."),
+				{ id: "compact", parentId: "selected", type: "compaction", firstKeptEntryId: "selected" },
+			] } as T)
+			: command<T>(input);
+		await writeFile(join(project, "src", "add.mjs"), "export function add(a, b) {\n\treturn a + b;\n}\n");
+		assert.equal((await service.grailState(conversationId)).readiness, "ready");
+		const judge = async () => {
+			const { id } = await service.startGrail(conversationId);
+			const done = await waitFor(() => grail.find((event) => (event.type === "grail_verdict" && event.verdict.id === id) || (event.type === "grail_failed" && event.id === id)), "verdict");
+			if (done.type !== "grail_verdict") throw new Error(JSON.stringify(done));
+			return done.verdict;
+		};
+		const result = await judge();
+		assert.equal(result.grade, "grail", JSON.stringify(result.reasons));
+		assert.deepEqual(result.requirement, ["Define add using both operands.", "Preserve the sum for negative operands."]);
+		assert.deepEqual(result.steps.objective?.runs.map(({ name }) => name), ["test", "check", "lint"]);
+		const calls = await readFile(log, "utf8");
+		await writeFile(join(project, "z-data.txt"), "y".repeat(210_000));
+		const incomplete = await judge();
+		assert.equal(incomplete.grade, "unjudgeable");
+		assert.match(incomplete.reasons.join(" "), /容量/);
+		assert.equal(await readFile(log, "utf8"), calls, "incomplete diffs must not dispatch paid review stages");
 	} finally {
 		await service.close();
 		await fixture.cleanup();

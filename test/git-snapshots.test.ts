@@ -287,6 +287,59 @@ test("materializeBefore reconstructs files, directories, and symlinks from the w
 	}
 });
 
+test("worktree review readiness checks only the selected project and does not save new blobs", async () => {
+	const { project, data, service, cleanup } = await fixture();
+	try {
+		const selected = join(project, "packages", "app");
+		await mkdir(selected, { recursive: true });
+		const target = join(selected, "feature.txt");
+		await writeFile(target, "before\n");
+		const start = await service.begin(selected, "review-readiness");
+		const blobNames = (await readdir(join(data, "git-snapshots", "blobs"))).sort();
+		assert.equal(await service.hasWorktreeChanges(selected, start.id, "review-readiness"), false);
+
+		await writeFile(join(project, "tracked.txt"), "Edited outside selected project\n");
+		assert.equal(await service.hasWorktreeChanges(selected, start.id), false);
+		await writeFile(target, "after\n");
+		assert.equal(await service.hasWorktreeChanges(selected, start.id), true);
+		assert.deepEqual((await readdir(join(data, "git-snapshots", "blobs"))).sort(), blobNames);
+		await writeFile(target, "before\n");
+		assert.equal(await service.hasWorktreeChanges(selected, start.id), false);
+		await truncate(target, 65 * 1024 * 1024);
+		assert.equal(await service.hasWorktreeChanges(selected, start.id), true);
+		assert.equal((await service.diffToWorktree(selected, start.id)).excludedFiles, 1);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("worktree review retains file-to-directory changes and does not rewrite patch content", async () => {
+	const { project, service, cleanup } = await fixture();
+	try {
+		await writeFile(join(project, ".gitignore"), "ignored/\nstructural/cache.txt\n");
+		const structural = join(project, "structural");
+		await writeFile(structural, "before\n");
+		await writeFile(join(project, "tracked.txt"), "-- previous text\n");
+		const start = await service.begin(project, "review-structure");
+		await rm(structural);
+		await mkdir(structural);
+		await writeFile(join(structural, "cache.txt"), "ignored cache\n");
+		await writeFile(join(project, "tracked.txt"), "++ updated text\n");
+		const result = await service.diffToWorktree(project, start.id);
+		assert.equal(result.files.find((file) => file.path === "structural")?.status, "type-changed");
+		assert.match(result.files.find((file) => file.path === "structural")?.diff ?? "", /file → directory/);
+		assert.match(result.files.find((file) => file.path === "tracked.txt")?.diff ?? "", /\n--- previous text\n\+\+\+ updated text\n/);
+
+		const cancelled = new Error("review cancelled");
+		const signal = AbortSignal.abort(cancelled);
+		await assert.rejects(service.hasWorktreeChanges(project, start.id, undefined, signal), cancelled);
+		await assert.rejects(service.diffToWorktree(project, start.id, undefined, signal), cancelled);
+		await assert.rejects(service.materializeBefore(project, start.id, join(project, "..", "review-copy"), signal), cancelled);
+	} finally {
+		await cleanup();
+	}
+});
+
 test("oversized files stay out of rollback even if they later fit within the snapshot", async () => {
 	const { project, data, service, cleanup } = await fixture();
 	const oversized = join(project, "large.bin");

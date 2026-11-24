@@ -392,13 +392,15 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const activeConversationId = snapshot?.active?.id;
 	const activeConversationRef = useRef(activeConversationId);
 	activeConversationRef.current = activeConversationId;
+	const grailRefresh = useRef(0);
 	const loadGrail = useCallback(
 		(id: string | undefined) => {
+			const refresh = ++grailRefresh.current;
 			if (!id) return setGrail(null);
 			void api.grail
 				.state(id)
 				.then((state) => {
-					if (activeConversationRef.current === id) setGrail(state);
+					if (activeConversationRef.current === id && grailRefresh.current === refresh) setGrail(state);
 				})
 				.catch(() => {});
 		},
@@ -425,7 +427,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				setGrail((prev) => prev && { ...prev, running: { id: event.id, step: event.step, startedAt: prev.running?.id === event.id ? prev.running.startedAt : Date.now() } });
 			else if (event.type === "grail_failed") {
 				setGrail((prev) => (prev && prev.running?.id === event.id ? { ...prev, running: undefined } : prev));
-				if (!event.cancelled) app.fail(new Error(`鉴定失败：${event.error}`));
+					if (!event.cancelled) app.fail(new Error(`鉴定失败：${event.error}`));
+					loadGrail(event.conversationId);
 			} else if (event.type === "grail_verdict") {
 				setGrail((prev) => prev && { ...prev, running: undefined, verdicts: [...prev.verdicts, event.verdict] });
 				const decision = revealDecision({
@@ -464,7 +467,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		setGrailReportId(null);
 		void api.grail
 			.start(id)
-			.then((run) => setGrail((prev) => prev && { ...prev, running: { id: run.id, step: "diff", startedAt: Date.now() } }))
+			.then(() => {
+				if (activeConversationRef.current === id) loadGrail(id);
+			})
 			.catch(app.fail);
 	};
 	const cancelGrail = () => {
@@ -1102,7 +1107,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			setUsageOpen(true);
 		} else if (action === "grail") {
 			if (blocked) app.setNotice("请等待当前任务结束后再发起鉴定。");
-			else if (!grail?.hasDiff) app.setNotice("这个需求还没有代码改动（或不是 Git 项目），暂时无法鉴定。");
+			else if (grail?.running) app.setNotice("当前鉴定尚未结束。");
+			else if (grail?.readiness === "not-git" || grail?.readiness === "no-checkpoint") app.setNotice(grail.readinessReason ?? "当前需求暂时无法鉴定。");
 			else startGrail();
 		}
 	};
@@ -1337,7 +1343,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		});
 	};
 	const inPlanMode = activePermMode === "plan";
-	const showGrailStatus = Boolean(snapshot.active && (grail?.hasDiff || grail?.running || grail?.verdicts.length));
+	const showGrailStatus = Boolean(snapshot.active && grail?.conversationId === snapshot.active.id && (hasTranscript || grail.hasDiff || grail.running || grail.verdicts.length));
 	const showPlanApproval = inPlanMode && !running && !changing;
 	const planReady = Boolean(planState && planDraft.trim() &&
 		(manualPlan || (planSubmission && planState.exists && planState.content === planSubmission.content)));
@@ -1500,7 +1506,6 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const secondaryStatus = [
 		btwState && "侧问",
 		snapshot.active?.goal?.active && `目标 ${snapshot.active.goal.turnsUsed}/${snapshot.active.goal.maxTurns} 轮`,
-		showGrailStatus && grailText.report,
 	].filter(Boolean).join(" · ");
 	const latestGrailVerdict = latestVerdict(grail);
 	// The latest 圣杯显灵 keeps a persistent gold badge even after later verdicts.
@@ -2795,7 +2800,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								</button>
 							</div>
 						)}
-						{showGrailStatus && (
+							</div>
+							</details>}
+							{showGrailStatus && (
 							<div className="cc-grail-bar" role="region" aria-label={grailText.report}>
 								{grail?.running ? (
 									<span className="cc-grail-running" role="status">
@@ -2807,12 +2814,13 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										type="button"
 										className="cc-mini-btn cc-grail-start"
 										disabled={!grail?.hasDiff || blocked}
-										title={grail?.hasDiff ? "鉴定本次需求的全部改动，结果不会发给 Agent" : "这个需求还没有代码改动"}
+										title={blocked ? "请等待当前任务结束后再发起鉴定。" : grail?.readinessReason ?? "独立鉴定本次需求的全部改动，可能产生模型费用。"}
 										onClick={startGrail}
 									>
 										{grailText.start}
 									</button>
 								)}
+								{!grail?.running && !blocked && grail?.readinessReason && <small className="subtle-note">{grail.readinessReason}</small>}
 								{grail?.running && (
 									<button type="button" className="cc-mini-btn" onClick={cancelGrail}>
 										取消
@@ -2828,8 +2836,6 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								</span>
 							</div>
 						)}
-							</div>
-						</details>}
 						<LiveComposer
 							key={snapshot.active?.id ?? "no-conversation"}
 							snapshot={snapshot}

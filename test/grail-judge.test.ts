@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import {
 	annotateDiff,
@@ -11,6 +14,7 @@ import {
 	parseDiffLines,
 	parseTestCount,
 	parseTscErrors,
+	runObjectiveChecks,
 	scanDistortions,
 	scriptEnvironment,
 	GRAIL_CRITERIA,
@@ -79,6 +83,9 @@ test("distortion scan reports every pattern with file and line", () => {
 		scanDistortions(parseDiffLines([diff("src/a.ts", "@@ -1,1 +1,1 @@\n-assert.ok(x);\n+return x;\n"), diff("README.md", "@@ -0,0 +1,1 @@\n+TODO in docs\n")])),
 		[],
 	);
+	assert.deepEqual(scanDistortions(parseDiffLines([
+		diff("src/example.ts", "@@ -0,0 +1,2 @@\n+const help = 'Try console.log(value);';\n+const example = `console.log(value)`;\n"),
+	])), []);
 });
 
 test("test count parsing covers node --test, vitest, jest and mocha output", () => {
@@ -110,6 +117,50 @@ test("script detection reads test, check/typecheck and lint, skipping the npm pl
 	assert.equal(packageManager(["pnpm-lock.yaml"]), "pnpm");
 	assert.equal(packageManager(["yarn.lock"]), "yarn");
 	assert.equal(packageManager(["package-lock.json"]), "npm");
+});
+
+test("objective checks require a passed test and distinguish missing evidence from failure", async (t) => {
+	const project = await mkdtemp(join(tmpdir(), "pi-grail-objective-test-"));
+	t.after(() => rm(project, { recursive: true, force: true }));
+	const testFile = join(project, "example.test.mjs");
+	const manifest = { type: "module", scripts: { test: "node --test" } };
+	const env = scriptEnvironment({ PATH: process.env.PATH, HOME: project }, join(project, "npm-cache"));
+	const run = (overrides: Partial<Parameters<typeof runObjectiveChecks>[0]> = {}) =>
+		runObjectiveChecks({
+			project, manifest, files: ["package.json"], env, deadline: Date.now() + 10000, signal: new AbortController().signal, ...overrides,
+		});
+	await writeFile(join(project, "package.json"), JSON.stringify(manifest));
+	await writeFile(testFile, "import { test } from 'node:test';\ntest.skip('optional integration', () => {});\n");
+	const onlySkipped = await run();
+	assert.equal(onlySkipped.runs[0].testCount, 1);
+	assert.match(onlySkipped.reason!, /全部跳过/);
+	assert.equal(onlySkipped.status, "unavailable");
+
+	await writeFile(testFile, "import { test } from 'node:test';\ntest('passing example', () => {});\n");
+	const missingChecks = await run();
+	assert.equal(missingChecks.status, "unavailable");
+	assert.match(missingChecks.reason!, /类型检查.*lint/);
+	assert.equal(missingChecks.runs[0].exitCode, 0);
+
+	const unavailableRunner = await run({ env: { ...env, PATH: project } });
+	assert.equal(unavailableRunner.status, "unavailable");
+	assert.match(unavailableRunner.reason!, /无法启动/);
+	const timedOut = await run({ deadline: Date.now() + 2 });
+	assert.equal(timedOut.status, "unavailable");
+	assert.match(timedOut.reason!, /超时/);
+
+	await writeFile(testFile, "import { test } from 'node:test';\ntest('failing example', () => { throw new Error('expected failure'); });\n");
+	const failedTest = await run();
+	assert.equal(failedTest.status, "fail");
+	assert.match(failedTest.reason!, /退出码 1/);
+	assert.equal(gradeVerdict({ objective: failedTest }).grade, "unfulfilled");
+
+	const wrappedManifest = { ...manifest, scripts: { test: "node --test || true" } };
+	await writeFile(join(project, "package.json"), JSON.stringify(wrappedManifest));
+	const failedTestWithSuccessfulExit = await run({ manifest: wrappedManifest });
+	assert.equal(failedTestWithSuccessfulExit.runs[0].exitCode, 0);
+	assert.equal(failedTestWithSuccessfulExit.status, "fail");
+	assert.match(failedTestWithSuccessfulExit.reason!, /1 个失败/);
 });
 
 test("script environment strips credentials and host context", () => {
@@ -184,6 +235,12 @@ test("grade function covers every grade and stops at the first veto", () => {
 	// A criterion without a cited conclusion is not proven, so no grail.
 	assert.equal(gradeVerdict({ ...passing, comparison: comparison({}, ["beyond"]) }).grade, "granted");
 	assert.equal(gradeVerdict({ ...passing, comparison: comparison({ broken: false }) }).grade, "twisted");
+	for (const criterion of ["removable", "missing", "flawless"] as const) {
+		assert.equal(gradeVerdict({ ...passing, comparison: comparison({ [criterion]: false }) }).grade, "unfulfilled");
+		assert.equal(gradeVerdict({ ...passing, comparison: comparison({}, [criterion]) }).grade, "unjudgeable");
+	}
+	const onePositiveFinding = { ...comparison(), findings: comparison().findings.filter((item) => item.criterion === "requirement") };
+	assert.equal(gradeVerdict({ ...passing, comparison: onePositiveFinding }).grade, "unjudgeable");
 	const twisted = gradeVerdict({ ...passing, distortion: { hits: [{ file: "a.ts", line: 3, side: "+", rule: "新增 as any", text: "x as any" }] } });
 	assert.equal(twisted.grade, "twisted");
 	assert.deepEqual(twisted.reasons, ["新增 as any：a.ts:3（新增）"]);

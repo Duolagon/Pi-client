@@ -510,8 +510,10 @@ export interface GrailState {
 	running?: { id: string; step: GrailStep; startedAt: number };
 	/** Every verdict of this conversation, oldest first. */
 	verdicts: GrailVerdict[];
-	/** True when the current wish has a git checkpoint (the button can be enabled). */
+	/** Whether the current worktree differs from the wish's baseline. */
 	hasDiff: boolean;
+	readiness: "ready" | "not-git" | "no-checkpoint" | "clean" | "snapshot-error";
+	readinessReason?: string;
 }
 export type GrailEvent =
 	| { type: "grail_progress"; conversationId: string; id: string; step: GrailStep }

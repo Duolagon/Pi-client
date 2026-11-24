@@ -288,7 +288,7 @@
 	overflow-y: auto;
 	padding: 0 6px 4px;
 }
-.cc-conversation-status-body :is(.cc-btw-card, .cc-goal-banner, .cc-grail-bar) {
+.cc-conversation-status-body :is(.cc-btw-card, .cc-goal-banner) {
 	width: auto;
 	margin-inline: 3px;
 }
