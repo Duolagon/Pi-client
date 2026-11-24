@@ -21,13 +21,20 @@ import { EDITOR_CHOICES, editorChoice, editorUrl, launchesCode, parseOpenInEdito
 import { validOutputStyleName } from "./output-styles.ts";
 import { parseGrailModelUpdate, validGrailMaxCost, validGrailTimeout } from "./grail-judge.ts";
 import { createPiTracing, takeLangfuseEnvironment } from "./langfuse-tracing.ts";
+import { loadLocalLangfuseConfig, saveLocalLangfuseConfig } from "./langfuse-local-config.ts";
 
 app.setName("Pi Desktop");
 if (process.env.PI_DESKTOP_DATA_DIR) app.setPath("userData", process.env.PI_DESKTOP_DATA_DIR);
+const tracingCommand = process.argv.includes("--configure-langfuse") ? "configure" :
+	process.argv.includes("--check-langfuse") ? "check" : undefined;
 // Electron keys the lock on the userData directory, so a second launch with the
 // same data focuses the open window while separate data directories still coexist.
 const primaryInstance = app.requestSingleInstanceLock();
-if (!primaryInstance) app.quit();
+if (!primaryInstance) {
+	if (tracingCommand) {
+		process.stderr.write("请退出正在运行的 Pi Desktop，再配置或验证 Langfuse。\n", () => app.exit(1));
+	} else app.quit();
+}
 app.on("second-instance", () => {
 	if (!window || window.isDestroyed()) return;
 	if (window.isMinimized()) window.restore();
@@ -51,6 +58,39 @@ let service: DesktopService;
 let ready: Promise<unknown>;
 let quitting = false;
 const indexPath = join(__dirname, "index.html");
+
+function encryptLocal(value: string): string {
+	if (!safeStorage.isEncryptionAvailable() || (process.platform === "linux" && safeStorage.getSelectedStorageBackend() === "basic_text"))
+		throw new Error("系统安全存储不可用。");
+	return safeStorage.encryptString(value).toString("base64");
+}
+
+function decryptLocal(value: string): string {
+	return safeStorage.decryptString(Buffer.from(value, "base64"));
+}
+
+async function configureLocalTracing(dataDir: string): Promise<void> {
+	const chunks: Buffer[] = [];
+	let size = 0;
+	for await (const chunk of process.stdin) {
+		const bytes = Buffer.from(chunk);
+		size += bytes.length;
+		if (size > 16_384) throw new Error("Langfuse 配置无效。");
+		chunks.push(bytes);
+	}
+	await saveLocalLangfuseConfig(dataDir, JSON.parse(Buffer.concat(chunks).toString("utf8")), encryptLocal);
+}
+
+async function checkLocalTracing(dataDir: string): Promise<string> {
+	const saved = await loadLocalLangfuseConfig(dataDir, decryptLocal);
+	const tracing = createPiTracing({ ...saved, LANGFUSE_RELEASE: app.getVersion() }, () => {});
+	if (!tracing) throw new Error("本机 Langfuse 配置不可用。");
+	const traceId = tracing.startRun("setup", "setup", undefined, "setup");
+	tracing.finishRun("setup", "success");
+	await tracing.close();
+	if (!traceId) throw new Error("无法生成 Langfuse 验证追踪。");
+	return traceId;
+}
 
 function createWindow() {
 	window = new BrowserWindow({
@@ -482,8 +522,23 @@ function updateDock(requestAttention = false) {
 	if (requestAttention && count && !focused && dockBounce === undefined) dockBounce = app.dock.bounce("critical");
 }
 
-void app.whenReady().then(() => {
+void app.whenReady().then(async () => {
 	if (!primaryInstance) return;
+	const dataDir = app.getPath("userData");
+	if (tracingCommand) {
+		try {
+			if (tracingCommand === "configure") {
+				await configureLocalTracing(dataDir);
+				process.stdout.write("Langfuse 配置已加密保存。\n", () => app.exit(0));
+			} else {
+				const traceId = await checkLocalTracing(dataDir);
+				process.stdout.write(`${traceId}\n`, () => app.exit(0));
+			}
+		} catch {
+			process.stderr.write("无法完成 Langfuse 本机配置或验证。\n", () => app.exit(1));
+		}
+		return;
+	}
 	log.info("app-start", {
 		version: app.getVersion(),
 		platform: `${process.platform}-${process.arch}`,
@@ -493,10 +548,18 @@ void app.whenReady().then(() => {
 	});
 	const runtimeDir = app.isPackaged ? join(process.resourcesPath, "runtime") : join(__dirname, "runtime");
 	const environment: NodeJS.ProcessEnv = { ...process.env, ELECTRON_RUN_AS_NODE: "1" };
+	const hasTracingOverride = [tracingEnvironment.LANGFUSE_BASE_URL, tracingEnvironment.LANGFUSE_HOST,
+		tracingEnvironment.LANGFUSE_BASEURL, tracingEnvironment.LANGFUSE_PUBLIC_KEY, tracingEnvironment.LANGFUSE_SECRET_KEY].some(Boolean);
+	const localTracing = hasTracingOverride ? undefined : await loadLocalLangfuseConfig(dataDir, decryptLocal).catch(() => {
+		log.warn("tracing_configuration_unreadable", {});
+		return undefined;
+	});
+	const tracing = createPiTracing({ ...tracingEnvironment, ...localTracing,
+		LANGFUSE_RELEASE: tracingEnvironment.LANGFUSE_RELEASE || app.getVersion() }, () => log.warn("tracing_configuration_invalid", {}));
+	if (tracing) log.info("tracing_enabled", { source: localTracing ? "local" : "environment" });
 	service = new DesktopService({
-		dataDir: app.getPath("userData"),
-		tracing: createPiTracing({ ...tracingEnvironment, LANGFUSE_RELEASE: tracingEnvironment.LANGFUSE_RELEASE || app.getVersion() },
-			() => log.warn("tracing_configuration_invalid", {})),
+		dataDir,
+		tracing,
 		runtimeDir,
 		ptyHelperPath: app.isPackaged ? join(process.resourcesPath, "native/pty-host") : join(__dirname, "native/pty-host"),
 		executable: process.execPath,

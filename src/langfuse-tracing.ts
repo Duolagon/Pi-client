@@ -31,7 +31,7 @@ function identifier(value: unknown): string {
 }
 
 type Outcome = "success" | "error" | "aborted";
-type Source = "agent" | "btw" | "grail";
+type Source = "agent" | "btw" | "grail" | "setup";
 type Generation = { span: Span; firstOutput?: number };
 type Run = { root: Span; attributes: Attributes; generation?: Generation; tools: Map<string, Span> };
 
@@ -71,7 +71,7 @@ export class PiTracing {
 		}
 	}
 
-	startRun(id: string, sessionId: string, parentId?: string, source: Source = "agent"): void {
+	startRun(id: string, sessionId: string, parentId?: string, source: Source = "agent"): string | undefined {
 		if (this.closed) return;
 		this.finishRun(id, "aborted");
 		const parent = parentId && this.runs.get(parentId);
@@ -85,6 +85,7 @@ export class PiTracing {
 			attributes: { ...attributes, "langfuse.observation.type": "agent" },
 		}, parent ? trace.setSpan(ROOT_CONTEXT, parent.root) : ROOT_CONTEXT);
 		this.runs.set(id, { root, attributes, tools: new Map() });
+		return root.spanContext().traceId;
 	}
 
 	startGeneration(id: string): void {

@@ -135,9 +135,9 @@ npm run verify:client -- --screenshots
 
 ## Langfuse 追踪
 
-设置 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` 和 `LANGFUSE_BASE_URL` 后，从同一环境启动 Pi Desktop。自托管地址使用实例根地址，客户端会自动添加 `/api/public/otel/v1/traces`。追踪只在提供地址和两把密钥时启用。地址和密钥由本机启动环境提供。
+Pi Desktop 从本机加密设置读取 Langfuse 地址和两把密钥。自托管地址使用实例根地址，客户端会自动添加 `/api/public/otel/v1/traces`。也可以通过 `LANGFUSE_BASE_URL`、`LANGFUSE_PUBLIC_KEY` 和 `LANGFUSE_SECRET_KEY` 为一次启动指定连接。
 
-从 macOS 的 zsh 终端启动已打包的客户端时，可以用交互式输入避免密钥进入命令历史。先退出正在运行的客户端。
+首次配置或更换密钥前先退出客户端。在 macOS 的 zsh 终端交互式输入，保存后即可从 Dock 正常启动。
 
 ```zsh
 read -r 'LANGFUSE_BASE_URL?Langfuse URL: '
@@ -147,7 +147,8 @@ printf '\n'
 LANGFUSE_BASE_URL="$LANGFUSE_BASE_URL" \
   LANGFUSE_PUBLIC_KEY="$LANGFUSE_PUBLIC_KEY" \
   LANGFUSE_SECRET_KEY="$LANGFUSE_SECRET_KEY" \
-  '/Applications/Pi Desktop.app/Contents/MacOS/Pi Desktop'
+  node -e 'const e=process.env; process.stdout.write(JSON.stringify({baseUrl:e.LANGFUSE_BASE_URL,publicKey:e.LANGFUSE_PUBLIC_KEY,secretKey:e.LANGFUSE_SECRET_KEY}))' \
+  | '/Applications/Pi Desktop.app/Contents/MacOS/Pi Desktop' --configure-langfuse
 unset LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY LANGFUSE_BASE_URL
 ```
 
