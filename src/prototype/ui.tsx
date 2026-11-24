@@ -1,5 +1,6 @@
-import { useEffect, useRef, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { X, type LucideIcon } from "lucide-react";
+import { clearExitGhosts, spawnExitGhost } from "../renderer/Presence.tsx";
 
 export function IconButton({
 	icon: Icon,
@@ -42,11 +43,13 @@ export function Modal({
 	children,
 	close,
 	wide = false,
+	className = "",
 }: {
 	title: string;
 	children: ReactNode;
 	close: () => void;
 	wide?: boolean;
+	className?: string;
 }) {
 	const dialog = useRef<HTMLDialogElement>(null);
 	// Captured during the first render, before any child autoFocus runs, so it is the control that opened the dialog.
@@ -54,6 +57,7 @@ export function Modal({
 	useEffect(() => {
 		const node = dialog.current;
 		if (!node) return;
+		clearExitGhosts("modal");
 		// Children marked with autoFocus cannot take focus while the dialog is still closed, and showModal()
 		// would otherwise focus the header close button. Pick the intended target explicitly after opening.
 		node.showModal();
@@ -76,10 +80,21 @@ export function Modal({
 			}
 		};
 	}, []);
+	useLayoutEffect(() => {
+		const node = dialog.current;
+		return () => {
+			const shell = node?.querySelector<HTMLElement>(".modal-shell") ?? null;
+			spawnExitGhost(shell, "modal", {
+				durationMs: 180,
+				withBackdrop: true,
+				extraClass: `${wide ? "wide" : ""} ${className}`.trim(),
+			});
+		};
+	}, []);
 	return (
 		<dialog
 			ref={dialog}
-			className={`modal ${wide ? "wide" : ""}`}
+			className={`modal ${wide ? "wide" : ""} ${className}`.trim()}
 			onCancel={(event) => {
 				event.preventDefault();
 				close();

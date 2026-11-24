@@ -1,8 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { Plus, Terminal as TerminalIcon, X } from "lucide-react";
+import { Package, Plus, Server, Square, Terminal as TerminalIcon, X } from "lucide-react";
 import { InteractiveTerminal } from "./InteractiveTerminal.tsx";
 import { IconButton } from "../prototype/ui.tsx";
 import { useConfirmation } from "./ConfirmationDialog.tsx";
+import { useExitGhost } from "./Presence.tsx";
+import { SlidingTabList } from "./SegmentedTabs.tsx";
+import { SelectPopover } from "./SelectPopover.tsx";
+import { SmoothCollapse } from "./SmoothCollapse.tsx";
 import type { PiPackageAction, TerminalInfo } from "../shared.ts";
 
 function stripAnsi(input: string): string {
@@ -53,6 +57,8 @@ export function TerminalPanel({
 	const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
 	const [activeId, setActiveId] = useState<string | null>(null);
 	const [ptyOutputs, setPtyOutputs] = useState<Record<string, string>>({});
+	const panelRef = useRef<HTMLElement>(null);
+	useExitGhost(panelRef, "terminal", { durationMs: 185 });
 	const shellRef = useRef<HTMLDivElement>(null);
 	const commandInput = useRef<HTMLInputElement>(null);
 	useEffect(() => {
@@ -143,74 +149,100 @@ export function TerminalPanel({
 	const activePty = terminals.find((t) => t.id === activeId);
 
 	return (
-		<section className="terminal-panel" aria-label="集成终端">
-			<header>
-				<span className="cc-term-title" role="tablist" aria-label="终端模式">
+		<section ref={panelRef} className="terminal-panel" aria-label="集成终端">
+			<header className="cc-term-header">
+				<span className="cc-term-brand">
 					<TerminalIcon size={14} aria-hidden="true" />
-					<button
-						type="button"
-						role="tab"
-						aria-selected={mode === "bash"}
-						className={`cc-term-tab ${mode === "bash" ? "active" : ""}`}
-						onClick={() => setMode("bash")}
-					>
-						单次命令
-					</button>
-					<button
-						type="button"
-						role="tab"
-						aria-selected={mode === "pty"}
-						className={`cc-term-tab ${mode === "pty" ? "active" : ""}`}
-						onClick={() => {
-							setMode("pty");
-							const live = [...terminals].reverse().find((t) => t.status === "running" || t.status === "starting");
-							if (live) setActiveId(live.id);
-							else void createPty();
-						}}
-					>
-						交互 PTY ({terminals.filter((t) => t.status === "running" || t.status === "starting").length})
-					</button>
-				</span>
-				<span className="terminal-demo">{project}</span>
-				{conversationId && <>
-					<button type="button" disabled={readOnly || creating} onClick={() => { setPackageForm(false); setSshForm(!sshForm); }}>SSH</button>
-					<button type="button" disabled={readOnly || creating} onClick={() => { setSshForm(false); setPackageForm(!packageForm); }}>Pi 扩展</button>
-				</>}
-				{mode === "pty" && terminals.length > 1 && <select aria-label="选择交互终端" value={activeId ?? ""} onChange={(event) => void selectTerminal(event.target.value).catch(fail)}>
-					{terminals.map((terminal, index) => <option value={terminal.id} key={terminal.id}>{terminal.label ?? `终端 ${index + 1}`}{terminal.status === "exited" ? " · 已退出" : ""}</option>)}
-				</select>}
-				{mode === "bash" && bashBusy && <button onClick={onAbortBash}>停止命令</button>}
-				{mode === "pty" && (
-					<>
-						<button type="button" disabled={readOnly || creating} onClick={() => void createPty()} title="新建 PTY" aria-label="新建 PTY">
-							<Plus size={13} />
+					<SlidingTabList variant="compact" className="cc-term-title" role="tablist" aria-label="终端模式">
+						<button
+							type="button"
+							role="tab"
+							aria-selected={mode === "bash"}
+							className={`cc-term-tab ${mode === "bash" ? "active" : ""}`}
+							onClick={() => setMode("bash")}
+						>
+							单次命令
 						</button>
-						{activePty && activePty.status === "running" && (
-							<button type="button" onClick={() => void window.pi.terminals.write(activePty.id, "\x03")}>
-								Ctrl-C
+						<button
+							type="button"
+							role="tab"
+							aria-selected={mode === "pty"}
+							className={`cc-term-tab ${mode === "pty" ? "active" : ""}`}
+							onClick={() => {
+								setMode("pty");
+								const live = [...terminals].reverse().find((t) => t.status === "running" || t.status === "starting");
+								if (live) setActiveId(live.id);
+								else void createPty();
+							}}
+						>
+							交互 PTY ({terminals.filter((t) => t.status === "running" || t.status === "starting").length})
+						</button>
+					</SlidingTabList>
+				</span>
+				<span className="terminal-demo" title={project}>{project}</span>
+				<div className="cc-term-actions">
+					{conversationId && <>
+						<button type="button" className={`cc-mini-btn ${sshForm ? "active" : ""}`} disabled={readOnly || creating} onClick={() => { setPackageForm(false); setSshForm(!sshForm); }}>
+							<Server size={12} /> SSH
+						</button>
+						<button type="button" className={`cc-mini-btn ${packageForm ? "active" : ""}`} disabled={readOnly || creating} onClick={() => { setSshForm(false); setPackageForm(!packageForm); }}>
+							<Package size={12} /> Pi 扩展
+						</button>
+					</>}
+					{mode === "pty" && terminals.length > 1 && (
+						<SelectPopover
+							ariaLabel="选择交互终端"
+							direction="down"
+							align="right"
+							value={activeId ?? ""}
+							options={terminals.map((terminal, index) => ({
+								value: terminal.id,
+								label: `${terminal.label ?? `终端 ${index + 1}`}${terminal.status === "exited" ? " · 已退出" : ""}`,
+							}))}
+							onChange={(val) => void selectTerminal(val).catch(fail)}
+						/>
+					)}
+					{mode === "bash" && bashBusy && (
+						<button type="button" className="cc-mini-btn danger" onClick={onAbortBash}>
+							<Square size={11} /> 停止命令
+						</button>
+					)}
+					{mode === "pty" && (
+						<>
+							<button type="button" className="cc-mini-btn" disabled={readOnly || creating} onClick={() => void createPty()} title="新建 PTY" aria-label="新建 PTY">
+								<Plus size={13} />
 							</button>
-						)}
-					</>
-				)}
-				<IconButton icon={X} label="关闭终端" onClick={onClose} />
+							{activePty && activePty.status === "running" && (
+								<button type="button" className="cc-mini-btn" onClick={() => void window.pi.terminals.write(activePty.id, "\x03")}>
+									Ctrl-C
+								</button>
+							)}
+						</>
+					)}
+					<IconButton icon={X} label="关闭终端" onClick={onClose} />
+				</div>
 			</header>
-			{packageForm && <div className="cc-ssh-form">
-				<button type="button" disabled={creating || readOnly} onClick={() => void managePackage("list")}>列出用户扩展包</button>
-				<input aria-label="npm 扩展包" placeholder="npm:包名@版本" value={packageSource} onChange={(event) => setPackageSource(event.target.value)} />
-				<button type="button" disabled={creating || readOnly || !packageSource.trim()} onClick={async () => {
-					if (await confirm({ title: "安装 Pi 扩展包", message: "Pi 扩展包可以在你的账户下运行代码。", confirmLabel: "安装" })) void managePackage("install");
-				}}>安装</button>
-				<button type="button" disabled={creating || readOnly || !packageSource.trim()} onClick={() => void managePackage("update")}>更新</button>
-				<button type="button" disabled={creating || readOnly || !packageSource.trim()} onClick={async () => {
-					if (await confirm({ title: "移除 Pi 扩展包", message: "从 Pi 用户配置中移除此扩展包。", confirmLabel: "移除", destructive: true })) void managePackage("remove");
-				}}>移除</button>
-				<small>在新会话中加载变更。</small>
-			</div>}
-			{sshForm && <form className="cc-ssh-form" onSubmit={(event) => { event.preventDefault(); void createPty(true); }}>
-				<input aria-label="SSH 主机" placeholder="主机别名或 user@host" required value={sshHost} onChange={(event) => setSshHost(event.target.value)} />
-				<label><input type="checkbox" checked={sshPi} onChange={(event) => setSshPi(event.target.checked)} /> 启动远端 Pi</label>
-				<button className="cc-mini-btn" disabled={readOnly || creating}>连接</button>
-			</form>}
+			<SmoothCollapse open={packageForm}>
+				<div className="cc-ssh-form">
+					<button type="button" className="cc-mini-btn" disabled={creating || readOnly} onClick={() => void managePackage("list")}>列出用户扩展包</button>
+					<input aria-label="npm 扩展包" placeholder="npm:包名@版本" value={packageSource} onChange={(event) => setPackageSource(event.target.value)} />
+					<button type="button" className="cc-mini-btn" disabled={creating || readOnly || !packageSource.trim()} onClick={async () => {
+						if (await confirm({ title: "安装 Pi 扩展包", message: "Pi 扩展包可以在你的账户下运行代码。", confirmLabel: "安装" })) void managePackage("install");
+					}}>安装</button>
+					<button type="button" className="cc-mini-btn" disabled={creating || readOnly || !packageSource.trim()} onClick={() => void managePackage("update")}>更新</button>
+					<button type="button" className="cc-mini-btn danger" disabled={creating || readOnly || !packageSource.trim()} onClick={async () => {
+						if (await confirm({ title: "移除 Pi 扩展包", message: "从 Pi 用户配置中移除此扩展包。", confirmLabel: "移除", destructive: true })) void managePackage("remove");
+					}}>移除</button>
+					<small>在新会话中加载变更。</small>
+				</div>
+			</SmoothCollapse>
+			<SmoothCollapse open={sshForm}>
+				<form className="cc-ssh-form" onSubmit={(event) => { event.preventDefault(); void createPty(true); }}>
+					<input aria-label="SSH 主机" placeholder="主机别名或 user@host" required value={sshHost} onChange={(event) => setSshHost(event.target.value)} />
+					<label className="live-setting-toggle cc-ssh-toggle"><input type="checkbox" checked={sshPi} onChange={(event) => setSshPi(event.target.checked)} /> <span>启动远端 Pi</span></label>
+					<button className="cc-mini-btn primary" disabled={readOnly || creating}>连接</button>
+				</form>
+			</SmoothCollapse>
 
 			{mode === "bash" ? (
 				<div className="terminal-output" ref={shellRef}>

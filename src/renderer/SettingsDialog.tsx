@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Bell, Bot, Globe, Plug, Route, ShieldCheck } from "lucide-react";
 import type {
 	ConnectionInput,
 	ConnectionMode,
@@ -17,6 +18,8 @@ import type {
 } from "../shared.ts";
 import { Modal } from "../prototype/ui.tsx";
 import { useConfirmation } from "./ConfirmationDialog.tsx";
+import { SelectPopover } from "./SelectPopover.tsx";
+import { SmoothCollapse } from "./SmoothCollapse.tsx";
 import { parseForegroundMinutes } from "./settings-input.ts";
 import { MODEL_ROUTING_ROLES, type ModelRoutingRole } from "../agent-types.ts";
 
@@ -182,6 +185,7 @@ export function SettingsDialog({
 	const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
 	const [makeDefault, setMakeDefault] = useState(false);
 	const [savedMessage, setSavedMessage] = useState("");
+	const [section, setSection] = useState<"connection" | "appearance" | "budget" | "agents" | "routing" | "network">("connection");
 	const connectionDrafts = useRef(new Map<Provider, ConnectionDraft>());
 	const { confirm, confirmation } = useConfirmation();
 	useEffect(() => {
@@ -329,6 +333,7 @@ export function SettingsDialog({
 		}
 
 		if (mode === "custom" && connectionChanged && !modelId.trim()) {
+			setSection("connection");
 			setAdvanced(true);
 			setError("请填写自定义接口的模型 ID，或恢复官方预设。");
 			return;
@@ -339,47 +344,56 @@ export function SettingsDialog({
 			return;
 		}
 		if (!hasKey && mode === "preset" && connectionChanged) {
+			setSection("connection");
 			setError(`请填写 ${preset.name} 的 API Key。`);
 			return;
 		}
 		// An emptied field is invalid rather than 0 ("wait without limit").
 		const minutes = parseForegroundMinutes(foregroundMinutes);
 		if (minutes === undefined) {
+			setSection("agents");
 			setError("前台子 Agent 等待时长需为 0–1440 分钟的整数。");
 			return;
 		}
 		if (typeof parsedHeaders === "string") {
+			setSection("connection");
 			setAdvanced(true);
 			setError(parsedHeaders);
 			return;
 		}
 		const maxCost = maxCostText.trim() ? Number(maxCostText.trim()) : null;
 		if (maxCost !== null && (!Number.isFinite(maxCost) || maxCost < 0.01 || maxCost > 100000)) {
+			setSection("budget");
 			setError("费用上限需为 0.01–100000 美元，留空表示不限制。");
 			return;
 		}
 		const grailCost = grailCostText.trim() ? Number(grailCostText.trim()) : null;
 		if (grailCost !== null && (!Number.isFinite(grailCost) || grailCost < 0.01 || grailCost > 1000)) {
+			setSection("routing");
 			setError("单次鉴定费用上限需为 0.01–1000 美元，留空表示默认 2 美元。");
 			return;
 		}
 		const grailTimeout = grailTimeoutText.trim() ? Number(grailTimeoutText.trim()) : null;
 		if (grailTimeout !== null && (!/^\d+$/.test(grailTimeoutText.trim()) || grailTimeout < 30 || grailTimeout > 7200)) {
+			setSection("routing");
 			setError("鉴定超时需为 30–7200 秒的整数，留空表示默认 900 秒。");
 			return;
 		}
 		const minBalance = minBalanceText.trim() ? Number(minBalanceText.trim()) : null;
 		if (minBalance !== null && (!Number.isFinite(minBalance) || minBalance < 0.01 || minBalance > 1000000)) {
+			setSection("budget");
 			setError("余额底线需为 0.01–1000000，留空表示不检查。");
 			return;
 		}
 		const depthNum = Number(maxSubagentDepthText.trim());
 		if (!/^\d+$/.test(maxSubagentDepthText.trim()) || !Number.isSafeInteger(depthNum) || depthNum < 1 || depthNum > 3) {
+			setSection("agents");
 			setError("子 Agent 最大嵌套深度需为 1–3 的整数。");
 			return;
 		}
 		const concurrentNum = Number(maxConcurrentText.trim());
 		if (!/^\d+$/.test(maxConcurrentText.trim()) || !Number.isSafeInteger(concurrentNum) || concurrentNum < 1 || concurrentNum > 20) {
+			setSection("agents");
 			setError("最大并发子 Agent 数量需为 1–20 的整数。");
 			return;
 		}
@@ -484,19 +498,55 @@ export function SettingsDialog({
 			setTesting(false);
 		}
 	};
+	const activeSection = connectionOnly ? "connection" : section;
+	const navItems = [
+		{ id: "connection" as const, label: "连接与模型", icon: Plug },
+		{ id: "appearance" as const, label: "权限与外观", icon: ShieldCheck },
+		{ id: "agents" as const, label: "Agent 与自动化", icon: Bot },
+		{ id: "routing" as const, label: "模型路由与评审", icon: Route },
+		{ id: "budget" as const, label: "预算与通知", icon: Bell },
+		{ id: "network" as const, label: "网络与证书", icon: Globe },
+	];
+
 	return (
 		<>
 		<Modal
 			title={connectionOnly ? "连接模型" : "设置与模型连接"}
+			wide={!connectionOnly}
+			className={connectionOnly ? "" : "cc-settings-modal"}
 			close={() => void requestClose()}
 		>
 			<form
-				className="simple-dialog live-settings"
+				className={`simple-dialog live-settings ${connectionOnly ? "" : "cc-settings-layout"}`.trim()}
 				onSubmit={(event) => {
 					event.preventDefault();
 					void save();
 				}}
 			>
+				{!connectionOnly && (
+					<nav className="cc-settings-nav" aria-label="设置分类">
+						{navItems.map((item) => {
+							const Icon = item.icon;
+							const active = activeSection === item.id;
+							return (
+								<button
+									key={item.id}
+									type="button"
+									className={`cc-settings-nav-btn ${active ? "active" : ""}`}
+									aria-current={active ? "page" : undefined}
+									onClick={() => setSection(item.id)}
+								>
+									<Icon size={15} aria-hidden="true" />
+									<span>{item.label}</span>
+								</button>
+							);
+						})}
+					</nav>
+				)}
+				<div className="cc-settings-main">
+				<div key={activeSection} className="cc-settings-pane">
+				{activeSection === "connection" && (
+				<>
 				<div className="live-settings-intro">
 					<h3>连接模型服务</h3>
 					<p className="subtle-note">选择服务商并填写 API Key，即可使用预设模型。已有 Pi 配置会自动读取。</p>
@@ -506,22 +556,22 @@ export function SettingsDialog({
 						</p>
 					)}
 				</div>
-				<label className="field-label">
+				<div className="field-label">
 					模型服务商
-					<select
-						aria-label="模型服务商"
+					<SelectPopover
+						ariaLabel="模型服务商"
+						field
+						direction="down"
 						value={provider}
 						disabled={pending}
-						onChange={(event) => selectProvider(event.target.value as Provider)}
-					>
-						{presets.map((item) => (
-							<option key={item.provider} value={item.provider}>
-								{item.name}
-								{settings.configuredProviders.includes(item.provider) ? " · 已连接" : ""}
-							</option>
-						))}
-					</select>
-				</label>
+						options={presets.map((item) => ({
+							value: item.provider,
+							label: `${item.name}${settings.configuredProviders.includes(item.provider) ? " · 已连接" : ""}`,
+							hint: settings.configuredProviders.includes(item.provider) ? "已连接" : undefined,
+						}))}
+						onChange={(val) => selectProvider(val as Provider)}
+					/>
+				</div>
 				<label className="field-label">
 					<span className="live-setting-label">
 						API Key {storedKey && <span className="live-setting-saved">已保存</span>}
@@ -539,14 +589,22 @@ export function SettingsDialog({
 						}}
 					/>
 				</label>
-				<label className="field-label">
+				<div className="field-label">
 					默认模型
-					<select
-						aria-label="默认模型"
+					<SelectPopover
+						ariaLabel="默认模型"
+						field
+						direction="down"
 						value={customModel ? "" : modelId}
 						disabled={pending}
-						onChange={(event) => {
-							const value = event.target.value;
+						options={[
+							...preset.models.map((item) => ({
+								value: item.id,
+								label: `${item.name}${item.id === preset.defaultModelId ? "（推荐）" : ""}`,
+							})),
+							{ value: "", label: "自定义模型…" },
+						]}
+						onChange={(value) => {
 							setCustomModel(value === "");
 							if (value) {
 								setModelId(value);
@@ -558,16 +616,8 @@ export function SettingsDialog({
 							}
 							clearResult();
 						}}
-					>
-						{preset.models.map((item) => (
-							<option key={item.id} value={item.id}>
-								{item.name}
-								{item.id === preset.defaultModelId ? "（推荐）" : ""}
-							</option>
-						))}
-						<option value="">自定义模型…</option>
-					</select>
-				</label>
+					/>
+				</div>
 				{mode === "preset" ? (
 					<div className="live-provider-summary">
 						<strong>{preset.name} 官方接口已预设</strong>
@@ -585,12 +635,24 @@ export function SettingsDialog({
 						<p>现有地址、协议和模型已保留，可在高级设置中调整。</p>
 					</div>
 				)}
-				<details
-					className="live-settings-section"
-					open={advanced}
-					onToggle={(event) => setAdvanced(event.currentTarget.open)}
-				>
-					<summary>高级设置{mode === "custom" ? " · 自定义接口" : ""}</summary>
+				{!connectionOnly && !isDefaultProvider && settings.defaultModel && hasKey && (
+					<label className="live-setting-toggle">
+						<input type="checkbox" checked={makeDefault} disabled={pending || busy}
+							onChange={(event) => setMakeDefault(event.target.checked)} />
+						<span>将此连接设为默认模型</span>
+					</label>
+				)}
+				<div className="live-settings-section">
+					<button
+						type="button"
+						className="cc-settings-accordion-btn"
+						aria-expanded={advanced}
+						onClick={() => setAdvanced((v) => !v)}
+					>
+						<span>高级设置{mode === "custom" ? " · 自定义接口" : ""}</span>
+						<span className={`cc-settings-chevron ${advanced ? "open" : ""}`} aria-hidden="true">›</span>
+					</button>
+					<SmoothCollapse open={advanced}>
 					<div className="live-settings-section-content">
 						<label className="live-setting-toggle">
 							<input
@@ -606,7 +668,7 @@ export function SettingsDialog({
 									} else restorePreset();
 								}}
 							/>
-							使用自定义接口或模型
+							<span>使用自定义接口或模型</span>
 						</label>
 						{mode === "custom" ? (
 							<>
@@ -624,24 +686,21 @@ export function SettingsDialog({
 										}}
 									/>
 								</label>
-								<label className="field-label">
+								<div className="field-label">
 									接口协议
-									<select
-										aria-label="接口协议"
+									<SelectPopover
+										ariaLabel="接口协议"
+										field
+										direction="down"
 										value={api}
 										disabled={pending}
-										onChange={(event) => {
-											setApi(event.target.value as ConnectionProtocol);
+										options={protocols.map((item) => ({ value: item.value, label: item.label }))}
+										onChange={(val) => {
+											setApi(val as ConnectionProtocol);
 											clearResult();
 										}}
-									>
-										{protocols.map((item) => (
-											<option key={item.value} value={item.value}>
-												{item.label}
-											</option>
-										))}
-									</select>
-								</label>
+									/>
+								</div>
 								<label className="field-label">
 									自定义模型 ID
 									<input
@@ -713,7 +772,7 @@ export function SettingsDialog({
 										clearResult();
 									}}
 								/>
-								清除已保存的请求头
+								<span>清除已保存的请求头</span>
 							</label>
 						)}
 						<div className="live-settings-config-dir">
@@ -733,10 +792,16 @@ export function SettingsDialog({
 							<p className="subtle-note">留空使用 Pi 标准目录，已有模型和登录配置继续生效。</p>
 						</div>
 					</div>
-				</details>
-				{!connectionOnly && <details className="live-settings-section" open={Boolean(settings.proxy || settings.caFile) || undefined}>
-					<summary>网络与证书</summary>
-					<div className="live-settings-section-content">
+					</SmoothCollapse>
+				</div>
+				</>
+				)}
+				{activeSection === "network" && (
+					<div className="cc-settings-card">
+						<div className="live-settings-intro">
+							<h3>网络代理与 TLS 证书</h3>
+							<p className="subtle-note">配置模型连接与 WebFetch 使用的本地代理、绕过规则和企业自定义根证书。</p>
+						</div>
 						<label className="field-label">
 							代理地址
 							<input
@@ -777,71 +842,87 @@ export function SettingsDialog({
 							<small>PEM 文件的绝对路径，公司网络做 HTTPS 解密时需要。保存后会重启当前会话的模型进程。</small>
 						</label>
 					</div>
-				</details>}
-				{!connectionOnly && <details className="live-settings-section">
-					<summary>权限与外观</summary>
-					<div className="live-settings-section-content">
-						<label className="field-label">
+				)}
+				{activeSection === "appearance" && (
+					<div className="cc-settings-card">
+						<div className="live-settings-intro">
+							<h3>权限策略与界面外观</h3>
+							<p className="subtle-note">管理新建会话的默认权限、客户端主题色、输出风格与 Seatbelt 系统级沙箱隔离。</p>
+						</div>
+						<div className="field-label">
 							默认权限
-							<select
+							<SelectPopover
+								ariaLabel="默认权限"
+								field
+								direction="down"
 								value={permission}
 								disabled={pending || busy}
-								onChange={(event) => setPermission(event.target.value as PermissionMode)}
-							>
-								<option value="ask">手动确认：写文件和运行工具前询问</option>
-								<option value="acceptEdits">接受编辑：项目内文件编辑自动允许，命令仍按规则询问</option>
-								<option value="plan">计划模式：只读调研、子 Agent 与写入 .pi/plans/，批准后实施</option>
-								<option value="auto">全部放行（危险）：除规则外不再询问，命令以本机权限运行</option>
-								<option value="dontAsk">不询问（未放行即拒绝）：不弹审批，规则或安全默认未放行的操作直接拒绝</option>
-								<option value="read">只读：仅允许读取与搜索</option>
-							</select>
+								options={[
+									{ value: "ask", label: "手动确认：写文件和运行工具前询问" },
+									{ value: "acceptEdits", label: "接受编辑：项目内文件编辑自动允许，命令仍按规则询问" },
+									{ value: "plan", label: "计划模式：只读调研、子 Agent 与写入 .pi/plans/，批准后实施" },
+									{ value: "auto", label: "全部放行（危险）：除规则外不再询问，命令以本机权限运行" },
+									{ value: "dontAsk", label: "不询问（未放行即拒绝）：不弹审批，规则或安全默认未放行的操作直接拒绝" },
+									{ value: "read", label: "只读：仅允许读取与搜索" },
+								]}
+								onChange={(val) => setPermission(val as PermissionMode)}
+							/>
 							<small>为未单独设置权限的会话使用。输入框旁的权限选择只影响当前会话。</small>
-						</label>
-						<label className="field-label">
+						</div>
+						<div className="field-label">
 							外观
-							<select
+							<SelectPopover
+								ariaLabel="外观"
+								field
+								direction="down"
 								value={theme}
 								disabled={pending}
-								onChange={(event) => setTheme(event.target.value as Settings["theme"])}
-							>
-								<option value="light">浅色</option>
-								<option value="dark">深色</option>
-								<option value="grail">圣杯（二次元）</option>
-								<option value="system">跟随系统</option>
-							</select>
-						</label>
-						<label className="field-label">
+								options={[
+									{ value: "light", label: "浅色（雾白 Mist）" },
+									{ value: "dark", label: "深色（石墨 Graphite）" },
+									{ value: "grail", label: "圣杯（二次元星夜）" },
+									{ value: "system", label: "跟随系统" },
+								]}
+								onChange={(val) => setTheme(val as Settings["theme"])}
+							/>
+						</div>
+						<div className="field-label">
 							输出风格
-							<select
+							<SelectPopover
+								ariaLabel="输出风格"
+								field
+								direction="down"
 								value={outputStyle}
 								disabled={pending}
-								onChange={(event) => setOutputStyle(event.target.value)}
-							>
-								{!outputStyles.some((style) => style.name === outputStyle) && (
-									<option value={outputStyle}>{outputStyle}</option>
-								)}
-								{outputStyles.map((style) => (
-									<option key={style.name} value={style.name}>
-										{style.name}
-										{style.description ? `：${style.description}` : ""}
-										{style.source === "user" ? "（用户）" : style.source === "project" ? "（项目）" : ""}
-									</option>
-								))}
-							</select>
+								options={[
+									...(!outputStyles.some((style) => style.name === outputStyle)
+										? [{ value: outputStyle, label: outputStyle }]
+										: []),
+									...outputStyles.map((style) => ({
+										value: style.name,
+										label: `${style.name}${style.description ? `：${style.description}` : ""}${style.source === "user" ? "（用户）" : style.source === "project" ? "（项目）" : ""}`,
+									})),
+								]}
+								onChange={(val) => setOutputStyle(val)}
+							/>
 							<small>只作用于主会话，子 Agent 不受影响。自定义风格放在 ~/.claude/output-styles 或已信任项目的 .claude/output-styles（Markdown）。下一轮对话生效。</small>
-						</label>
-						<label className="field-label">
+						</div>
+						<div className="field-label">
 							打开文件的编辑器
-							<select
+							<SelectPopover
+								ariaLabel="打开文件的编辑器"
+								field
+								direction="down"
 								value={editor}
 								disabled={pending}
-								onChange={(event) => setEditor(event.target.value as EditorChoice)}
-							>
-								<option value="vscode">VS Code</option>
-								<option value="cursor">Cursor</option>
-								<option value="system">系统默认应用</option>
-							</select>
-						</label>
+								options={[
+									{ value: "vscode", label: "VS Code" },
+									{ value: "cursor", label: "Cursor" },
+									{ value: "system", label: "系统默认应用" },
+								]}
+								onChange={(val) => setEditor(val as EditorChoice)}
+							/>
+						</div>
 						<label className="live-setting-toggle">
 							<input
 								type="checkbox"
@@ -850,7 +931,7 @@ export function SettingsDialog({
 								disabled={pending || busy}
 								onChange={(event) => setWebSearchEnabled(event.target.checked)}
 							/>
-							启用网络搜索（WebSearch：DeepSeek 模型自动使用免费内置搜索；其他模型走 DeepSeek Search API，约 $0.75 / 1000 次）
+							<span>启用网络搜索（WebSearch：DeepSeek 模型自动使用免费内置搜索；其他模型走 DeepSeek Search API，约 $0.75 / 1000 次）</span>
 						</label>
 						{webSearchEnabled && (
 							<div className="live-setting-sub">
@@ -899,7 +980,7 @@ export function SettingsDialog({
 								disabled={pending || busy || (!sandbox && sandboxInfo?.supported === false)}
 								onChange={(event) => setSandbox(event.target.checked)}
 							/>
-							macOS Seatbelt 命令沙箱与内置文件保护
+							<span>macOS Seatbelt 命令沙箱与内置文件保护</span>
 						</label>
 						{sandbox && (
 							<div className="live-setting-sub">
@@ -911,7 +992,7 @@ export function SettingsDialog({
 										disabled={pending || busy}
 										onChange={(event) => setSandboxOffline(event.target.checked)}
 									/>
-									禁止 Bash 命令访问网络
+									<span>禁止 Bash 命令访问网络</span>
 								</label>
 								<small>适用于模型的 Bash 和单次命令。交互终端、MCP、Hooks 和模型连接使用各自的权限。</small>
 							</div>
@@ -920,10 +1001,13 @@ export function SettingsDialog({
 							<p className="subtle-note">当前运行环境不支持嵌套 Seatbelt 沙箱：{sandboxInfo.reason}</p>
 						)}
 					</div>
-				</details>}
-				{!connectionOnly && <details className="live-settings-section">
-					<summary>预算与通知</summary>
-					<div className="live-settings-section-content">
+				)}
+				{activeSection === "budget" && (
+					<div className="cc-settings-card">
+						<div className="live-settings-intro">
+							<h3>费用预算与桌面通知</h3>
+							<p className="subtle-note">设置单会话累计消费熔断阈值、账户余额止损底线与后台提醒。</p>
+						</div>
 						<label className="live-setting-toggle">
 							<input
 								type="checkbox"
@@ -932,7 +1016,7 @@ export function SettingsDialog({
 								disabled={pending || busy}
 								onChange={(event) => setNotifications(event.target.checked)}
 							/>
-							窗口未聚焦时发送任务完成/待审批系统通知
+							<span>窗口未聚焦时发送任务完成/待审批系统通知</span>
 						</label>
 						<label className="field-label">
 							单个会话费用上限（美元，可选）
@@ -970,13 +1054,16 @@ export function SettingsDialog({
 								disabled={pending || busy}
 								onChange={(event) => setStatusBalance(event.target.checked)}
 							/>
-							状态栏显示账户余额（支持余额查询的服务商，每分钟最多查询一次）
+							<span>状态栏显示账户余额（支持余额查询的服务商，每分钟最多查询一次）</span>
 						</label>
 					</div>
-				</details>}
-				{!connectionOnly && <details className="live-settings-section">
-					<summary>Agent 与自动化</summary>
-					<div className="live-settings-section-content">
+				)}
+				{activeSection === "agents" && (
+					<div className="cc-settings-card">
+						<div className="live-settings-intro">
+							<h3>Agent 编排与自动化</h3>
+							<p className="subtle-note">配置子 Agent 并发、嵌套深度、Worktree 沙箱限制、定时唤醒与多成员协作。</p>
+						</div>
 						<label className="live-setting-toggle">
 							<input
 								type="checkbox"
@@ -985,21 +1072,8 @@ export function SettingsDialog({
 								disabled={pending || busy}
 								onChange={(event) => setDisableAllHooks(event.target.checked)}
 							/>
-							停用全部 Hooks（.claude/settings.json 与 .pi/hooks.json 中的 Hook 都不再运行）
+							<span>停用全部 Hooks（.claude/settings.json 与 .pi/hooks.json 中的 Hook 都不再运行）</span>
 						</label>
-						<div className="field-label">
-							本地日志
-							<div>
-								<button
-									type="button"
-									className="secondary-button"
-									onClick={() => void window.pi.openLogDirectory().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)))}
-								>
-									打开日志目录
-								</button>
-							</div>
-							<small>崩溃和引擎错误记录在本机，已去除密钥和用户目录，不含对话内容，不会上传。</small>
-						</div>
 						<label className="live-setting-toggle">
 							<input
 								type="checkbox"
@@ -1008,20 +1082,7 @@ export function SettingsDialog({
 								disabled={pending}
 								onChange={(event) => setSubagentBackground(event.target.checked)}
 							/>
-							子 Agent 默认后台运行（结果完成后自动送回主会话；非 Git 项目中的可写子 Agent 仍在前台运行）
-						</label>
-						<label className="field-label">
-							前台子 Agent 最长等待（分钟）
-							<input
-								type="number"
-								min={0}
-								max={1440}
-								step={1}
-								value={foregroundMinutes}
-								disabled={pending}
-								onChange={(event) => setForegroundMinutes(event.target.value)}
-							/>
-							<small>超时后子 Agent 转为后台继续运行，结果稍后送达；0 表示一直等待。非 Git 项目中的可写子 Agent 始终等待完成。</small>
+							<span>子 Agent 默认后台运行（结果完成后自动送回主会话；非 Git 项目中的可写子 Agent 仍在前台运行）</span>
 						</label>
 						<label className="live-setting-toggle">
 							<input
@@ -1031,7 +1092,7 @@ export function SettingsDialog({
 								disabled={pending}
 								onChange={(event) => setForkSubagent(event.target.checked)}
 							/>
-							允许模型使用 fork 方式继承当前对话上下文创建子 Agent
+							<span>允许模型使用 fork 方式继承当前对话上下文创建子 Agent</span>
 						</label>
 						<label className="live-setting-toggle">
 							<input
@@ -1041,22 +1102,37 @@ export function SettingsDialog({
 								disabled={pending}
 								onChange={(event) => setConfineSubagentBash(event.target.checked)}
 							/>
-							可写 worktree 子 Agent 在 macOS 上默认启用 Seatbelt，将 Bash 写操作限制在 worktree 目录内
+							<span>可写 worktree 子 Agent 在 macOS 上默认启用 Seatbelt，将 Bash 写操作限制在 worktree 目录内</span>
 						</label>
-						<label className="field-label">
-							最大嵌套深度 maxSubagentDepth（1–3）
-							<input
-								type="number"
-								aria-label="子 Agent 最大嵌套深度"
-								min={1}
-								max={3}
-								step={1}
-								value={maxSubagentDepthText}
-								disabled={pending}
-								onChange={(event) => setMaxSubagentDepthText(event.target.value)}
-							/>
-							<small>默认为 1（仅允许主会话委派）；调大至 2–3 允许子 Agent 继续委派下级子 Agent。</small>
-						</label>
+						<div className="cc-settings-grid-2">
+							<label className="field-label">
+								前台子 Agent 最长等待（分钟）
+								<input
+									type="number"
+									min={0}
+									max={1440}
+									step={1}
+									value={foregroundMinutes}
+									disabled={pending}
+									onChange={(event) => setForegroundMinutes(event.target.value)}
+								/>
+								<small>超时自动转入后台；0 表示一直等待。</small>
+							</label>
+							<label className="field-label">
+								最大嵌套深度（1–3）
+								<input
+									type="number"
+									aria-label="子 Agent 最大嵌套深度"
+									min={1}
+									max={3}
+									step={1}
+									value={maxSubagentDepthText}
+									disabled={pending}
+									onChange={(event) => setMaxSubagentDepthText(event.target.value)}
+								/>
+								<small>默认 1（仅主会话委派）；2–3 允许递归委派。</small>
+							</label>
+						</div>
 						<label className="field-label">
 							每个父会话最大并发子 Agent 数（1–20）
 							<input
@@ -1079,9 +1155,9 @@ export function SettingsDialog({
 								disabled={pending}
 								onChange={(event) => setCronEnabled(event.target.checked)}
 							/>
-							启用定时唤醒与 /loop 自动任务（Cron / ScheduleWakeup）
+							<span>启用定时唤醒与 /loop 自动任务（Cron / ScheduleWakeup）</span>
 						</label>
-						<p className="subtle-note" role="note">
+						<p className="subtle-note cc-settings-callout" role="note">
 							注意：开启定时唤醒后，到点且会话空闲时会自动触发模型回合，<strong>会自动消耗额度</strong>；任务默认 7 天后自动过期，对子 Agent 禁用。
 						</p>
 						<label className="live-setting-toggle">
@@ -1092,83 +1168,105 @@ export function SettingsDialog({
 								disabled={pending || busy}
 								onChange={(event) => setAgentTeams(event.target.checked)}
 							/>
-							启用实验性 Agent Teams 多成员协作（TeamCreate / TeamDelete 与结构化团队消息）
+							<span>启用实验性 Agent Teams 多成员协作（TeamCreate / TeamDelete 与结构化团队消息）</span>
 						</label>
+						<div className="field-label">
+							本地诊断日志
+							<div>
+								<button
+									type="button"
+									className="secondary-button"
+									onClick={() => void window.pi.openLogDirectory().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)))}
+								>
+									打开日志目录
+								</button>
+							</div>
+							<small>崩溃和引擎错误记录在本机，已去除密钥和用户目录，不含对话内容，不会上传。</small>
+						</div>
 					</div>
-				</details>}
-				{!connectionOnly && <details className="live-settings-section">
-					<summary>模型路由与评审</summary>
-					<div className="live-settings-section-content">
-						<label className="field-label">
+				)}
+				{activeSection === "routing" && (
+					<div className="cc-settings-card">
+						<div className="live-settings-intro">
+							<h3>模型路由与独立评审</h3>
+							<p className="subtle-note">为容灾回退、Explore / Plan / Review 子角色与代码质量鉴定分别指定最优模型。</p>
+						</div>
+						<div className="field-label">
 							备用模型（主模型过载时仅接手当前回合）
-							<select
-								aria-label="备用模型"
+							<SelectPopover
+								ariaLabel="备用模型"
+								field
+								direction="down"
 								value={fallbackModel}
 								disabled={pending}
-								onChange={(event) => setFallbackModel(event.target.value)}
-							>
-								<option value="">不使用</option>
-								{fallbackModel && !models.some((m) => `${m.provider}/${m.id}` === fallbackModel) && (
-									<option value={fallbackModel}>{fallbackModel}（当前不可用）</option>
-								)}
-								{models.map((m) => (
-									<option key={`${m.provider}/${m.id}`} value={`${m.provider}/${m.id}`}>
-										{m.name || m.id} · {m.provider}
-									</option>
-								))}
-							</select>
-							<small>主模型因过载、限流或服务端错误在自动重试后仍失败时，切换到这里的模型并继续一次。认证、请求格式、上下文超限、费用上限和余额底线不会触发切换。</small>
-						</label>
+								options={[
+									{ value: "", label: "不使用" },
+									...(fallbackModel && !models.some((m) => `${m.provider}/${m.id}` === fallbackModel)
+										? [{ value: fallbackModel, label: `${fallbackModel}（当前不可用）` }]
+										: []),
+									...models.map((m) => ({
+										value: `${m.provider}/${m.id}`,
+										label: `${m.name || m.id} · ${m.provider}`,
+									})),
+								]}
+								onChange={(val) => setFallbackModel(val)}
+							/>
+							<small>主模型因过载、限流或服务端错误在自动重试后仍失败时，切换到这里的模型并继续一次。</small>
+						</div>
 						<fieldset className="live-routing">
 							<legend>{theme === "grail" ? "圣杯鉴定" : "质量鉴定"}</legend>
-							<label className="field-label">
+							<div className="field-label">
 								评审模型
-								<select
-									aria-label="鉴定评审模型"
+								<SelectPopover
+									ariaLabel="鉴定评审模型"
+									field
+									direction="down"
 									value={grailModel}
 									disabled={pending}
-									onChange={(event) => setGrailModel(event.target.value)}
-								>
-									<option value="">跟随当前会话</option>
-									{grailModel && !models.some((m) => `${m.provider}/${m.id}` === grailModel) && (
-										<option value={grailModel}>{grailModel}（当前不可用）</option>
-									)}
-									{models.map((m) => (
-										<option key={`${m.provider}/${m.id}`} value={`${m.provider}/${m.id}`}>
-											{m.name || m.id} · {m.provider}
-										</option>
-									))}
-								</select>
+									options={[
+										{ value: "", label: "跟随当前会话" },
+										...(grailModel && !models.some((m) => `${m.provider}/${m.id}` === grailModel)
+											? [{ value: grailModel, label: `${grailModel}（当前不可用）` }]
+											: []),
+										...models.map((m) => ({
+											value: `${m.provider}/${m.id}`,
+											label: `${m.name || m.id} · ${m.provider}`,
+										})),
+									]}
+									onChange={(val) => setGrailModel(val)}
+								/>
 								<small>建议选当前最强、且不同于写代码的模型。鉴定只在你主动发起时运行，结果不会发给写代码的 Agent。</small>
-							</label>
-							<label className="field-label">
-								单次鉴定费用上限（美元）
-								<input
-									type="number"
-									aria-label="单次鉴定费用上限"
-									min={0.01}
-									max={1000}
-									step="0.01"
-									placeholder="默认 2"
-									value={grailCostText}
-									disabled={pending}
-									onChange={(event) => setGrailCostText(event.target.value)}
-								/>
-							</label>
-							<label className="field-label">
-								鉴定超时（秒）
-								<input
-									type="number"
-									aria-label="鉴定超时"
-									min={30}
-									max={7200}
-									step="1"
-									placeholder="默认 900"
-									value={grailTimeoutText}
-									disabled={pending}
-									onChange={(event) => setGrailTimeoutText(event.target.value)}
-								/>
-							</label>
+							</div>
+							<div className="cc-settings-grid-2">
+								<label className="field-label">
+									单次鉴定费用上限（美元）
+									<input
+										type="number"
+										aria-label="单次鉴定费用上限"
+										min={0.01}
+										max={1000}
+										step="0.01"
+										placeholder="默认 2"
+										value={grailCostText}
+										disabled={pending}
+										onChange={(event) => setGrailCostText(event.target.value)}
+									/>
+								</label>
+								<label className="field-label">
+									鉴定超时（秒）
+									<input
+										type="number"
+										aria-label="鉴定超时"
+										min={30}
+										max={7200}
+										step="1"
+										placeholder="默认 900"
+										value={grailTimeoutText}
+										disabled={pending}
+										onChange={(event) => setGrailTimeoutText(event.target.value)}
+									/>
+								</label>
+							</div>
 						</fieldset>
 						<fieldset className="live-routing">
 							<legend>子 Agent 模型路由</legend>
@@ -1179,92 +1277,91 @@ export function SettingsDialog({
 								const value = routing[role];
 								const known = !value || models.some((m) => `${m.provider}/${m.id}` === value);
 								return (
-									<label className="field-label" key={role}>
+									<div className="field-label" key={role}>
 										{ROUTING_LABELS[role].title}
-										<select
-											aria-label={`${ROUTING_LABELS[role].title} 模型`}
+										<SelectPopover
+											ariaLabel={`${ROUTING_LABELS[role].title} 模型`}
+											field
+											direction="down"
 											value={value}
 											disabled={pending}
-											onChange={(event) => setRouting((current) => ({ ...current, [role]: event.target.value }))}
-										>
-											<option value="">继承主会话模型</option>
-											{!known && <option value={value}>{value}（当前不可用）</option>}
-											{models.map((m) => (
-												<option key={`${m.provider}/${m.id}`} value={`${m.provider}/${m.id}`}>
-													{m.name || m.id} · {m.provider}
-												</option>
-											))}
-										</select>
+											options={[
+												{ value: "", label: "继承主会话模型" },
+												...(!known ? [{ value, label: `${value}（当前不可用）` }] : []),
+												...models.map((m) => ({
+													value: `${m.provider}/${m.id}`,
+													label: `${m.name || m.id} · ${m.provider}`,
+												})),
+											]}
+											onChange={(val) => setRouting((current) => ({ ...current, [role]: val }))}
+										/>
 										<small>{ROUTING_LABELS[role].hint}</small>
-									</label>
+									</div>
 								);
 							})}
 						</fieldset>
 					</div>
-				</details>}
-				{!connectionOnly && !isDefaultProvider && settings.defaultModel && hasKey && (
-					<label className="live-setting-toggle">
-						<input type="checkbox" checked={makeDefault} disabled={pending || busy}
-							onChange={(event) => setMakeDefault(event.target.checked)} />
-						将此连接设为默认模型
-					</label>
 				)}
-				{savedMessage && <p role="status" className="subtle-note">{savedMessage}</p>}
-				{testResult && (
-					<div
-						className={testResult.success ? "live-notice" : "live-error"}
-						role={testResult.success ? "status" : "alert"}
-					>
-						<span>
-							{testResult.message}
-							{testResult.success && testResult.model ? ` · ${testResult.model}` : ""}
-							{testResult.success && testResult.latencyMs !== undefined ? ` · ${testResult.latencyMs} ms` : ""}
-						</span>
+				</div>
+				<div className="cc-settings-footer">
+					{savedMessage && <p role="status" className="subtle-note">{savedMessage}</p>}
+					{testResult && (
+						<div
+							className={testResult.success ? "live-notice" : "live-error"}
+							role={testResult.success ? "status" : "alert"}
+						>
+							<span>
+								{testResult.message}
+								{testResult.success && testResult.model ? ` · ${testResult.model}` : ""}
+								{testResult.success && testResult.latencyMs !== undefined ? ` · ${testResult.latencyMs} ms` : ""}
+							</span>
+						</div>
+					)}
+					{balance && (
+						<div
+							className={balance.success ? "live-notice" : "live-error"}
+							role={balance.success ? "status" : "alert"}
+						>
+							<span>{balanceText(balance)}</span>
+						</div>
+					)}
+					{busy && connectionChanged && <p className="subtle-note">连接改动需等当前任务结束后保存。</p>}
+					{error && (
+						<div className="live-error" role="alert">
+							{error}
+						</div>
+					)}
+					<p className="subtle-note live-settings-security">
+						密钥仅在本机加密保存。测试会发送一条模型请求，可能产生用量。
+					</p>
+					<div className="dialog-actions live-settings-actions">
+						{!connectionOnly && activeSection === "connection" && <>
+						<button
+							type="button"
+							className="secondary-button"
+							disabled={pending}
+							onClick={() => void testConnection()}
+						>
+							{testing ? "正在测试…" : "测试连接"}
+						</button>
+						<button
+							type="button"
+							className="secondary-button"
+							disabled={pending || !hasKey}
+							onClick={() => void checkBalance()}
+						>
+							{checkingBalance ? "正在查询…" : "查询余额"}
+						</button>
+						</>}
+						<span />
+						<button type="button" disabled={pending} className="secondary-button" onClick={() => void requestClose()}>
+							取消
+						</button>
+						<button disabled={pending} className="primary-button">
+							{saving ? "正在保存…" : connectionOnly ? (testing ? "正在测试…" : "测试并连接") : connectionChanged && useAsDefault ? "保存并使用" : "保存设置"}
+						</button>
 					</div>
-				)}
-				{balance && (
-					<div
-						className={balance.success ? "live-notice" : "live-error"}
-						role={balance.success ? "status" : "alert"}
-					>
-						<span>{balanceText(balance)}</span>
-					</div>
-				)}
-				{busy && connectionChanged && <p className="subtle-note">连接改动需等当前任务结束后保存。</p>}
-				{error && (
-					<div className="live-error" role="alert">
-						{error}
-					</div>
-				)}
-				<p className="subtle-note live-settings-security">
-					密钥仅在本机加密保存。测试会发送一条模型请求，可能产生用量。
-				</p>
-				<div className="dialog-actions live-settings-actions">
-					{!connectionOnly && <>
-					<button
-						type="button"
-						className="secondary-button"
-						disabled={pending}
-						onClick={() => void testConnection()}
-					>
-						{testing ? "正在测试…" : "测试连接"}
-					</button>
-					<button
-						type="button"
-						className="secondary-button"
-						disabled={pending || !hasKey}
-						onClick={() => void checkBalance()}
-					>
-						{checkingBalance ? "正在查询…" : "查询余额"}
-					</button>
-					</>}
-					<span />
-					<button type="button" disabled={pending} className="secondary-button" onClick={() => void requestClose()}>
-						取消
-					</button>
-					<button disabled={pending} className="primary-button">
-						{saving ? "正在保存…" : connectionOnly ? (testing ? "正在测试…" : "测试并连接") : connectionChanged && useAsDefault ? "保存并使用" : "保存设置"}
-					</button>
+				</div>
 				</div>
 			</form>
 		</Modal>

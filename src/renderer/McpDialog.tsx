@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Plug, Plus, Save, Trash2 } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
 import { useConfirmation } from "./ConfirmationDialog.tsx";
+import { SelectPopover } from "./SelectPopover.tsx";
 import type { McpSaveInput, McpServerInfo } from "../shared.ts";
 
 function emptyForm(): McpSaveInput {
@@ -232,41 +233,53 @@ export function McpDialog({
 								onChange={(event) => setForm((value) => ({ ...value, name: event.target.value }))}
 							/>
 						</label>
-						<label className="field-label">
+						<div className="field-label">
 							作用域
-							<select
+							<SelectPopover
+								ariaLabel="作用域"
+								field
+								direction="down"
 								value={form.scope}
 								disabled={busy}
-								onChange={(event) => setForm((value) => ({ ...value, scope: event.target.value as McpSaveInput["scope"] }))}
-							>
-								<option value="project">项目 .pi/mcp.json</option>
-								<option value="user">用户 ~/.pi/agent/mcp.json</option>
-							</select>
-						</label>
+								options={[
+									{ value: "project", label: "项目 .pi/mcp.json" },
+									{ value: "user", label: "用户 ~/.pi/agent/mcp.json" },
+								]}
+								onChange={(val) => setForm((value) => ({ ...value, scope: val as McpSaveInput["scope"] }))}
+							/>
+						</div>
 					</div>
 					<div className="cc-agent-row">
-						<label className="field-label">
+						<div className="field-label">
 							传输方式
-							<select
+							<SelectPopover
+								ariaLabel="传输方式"
+								field
+								direction="down"
 								value={form.transport}
 								disabled={busy || overrideOnly}
-								onChange={(event) => setForm((value) => ({ ...value, transport: event.target.value as McpSaveInput["transport"] }))}
-							>
-								<option value="stdio">stdio</option>
-								<option value="http">HTTP</option>
-							</select>
-						</label>
-						<label className="field-label">
+								options={[
+									{ value: "stdio", label: "stdio" },
+									{ value: "http", label: "HTTP" },
+								]}
+								onChange={(val) => setForm((value) => ({ ...value, transport: val as McpSaveInput["transport"] }))}
+							/>
+						</div>
+						<div className="field-label">
 							状态
-							<select
+							<SelectPopover
+								ariaLabel="服务器状态"
+								field
+								direction="down"
 								value={form.enabled === false ? "off" : "on"}
 								disabled={busy}
-								onChange={(event) => setForm((value) => ({ ...value, enabled: event.target.value === "on" }))}
-							>
-								<option value="on">启用</option>
-								<option value="off">停用</option>
-							</select>
-						</label>
+								options={[
+									{ value: "on", label: "启用" },
+									{ value: "off", label: "停用" },
+								]}
+								onChange={(val) => setForm((value) => ({ ...value, enabled: val === "on" }))}
+							/>
+						</div>
 					</div>
 					{form.transport === "stdio" ? (
 						<>

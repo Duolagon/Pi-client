@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Archive, BookOpen, Info, Layers, Plus, Save, Sparkles, Trash2 } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
+import { SlidingTabList } from "./SegmentedTabs.tsx";
 import type { ContextBreakdown, ContextMemorySource, DesktopToolInfo, Snapshot } from "../shared.ts";
 
 const promptStateLabels: Record<NonNullable<ContextMemorySource["promptState"]>, string> = {
@@ -174,7 +175,7 @@ export function MemoryStatusDialog({
 	return (
 		<Modal title="项目记忆与会话状态" close={close} wide>
 			<div className="simple-dialog">
-				<div className="cc-modal-tabs" role="tablist">
+				<SlidingTabList className="cc-modal-tabs" role="tablist">
 					<button type="button" role="tab" aria-selected={tab === "memory"} onClick={() => setTab("memory")}>
 						<BookOpen size={14} /> 项目记忆 (/memory)
 					</button>
@@ -184,8 +185,9 @@ export function MemoryStatusDialog({
 					<button type="button" role="tab" aria-selected={tab === "status"} onClick={() => setTab("status")}>
 						<Info size={14} /> 运行状态 (/status)
 					</button>
-				</div>
+				</SlidingTabList>
 
+				<div key={tab} className="cc-tab-panel">
 				{tab === "memory" && (
 					<div className="cc-controls-body">
 						<div className="cc-rewind-head">
@@ -394,6 +396,7 @@ export function MemoryStatusDialog({
 						</div>
 					</div>
 				)}
+				</div>
 			</div>
 		</Modal>
 	);

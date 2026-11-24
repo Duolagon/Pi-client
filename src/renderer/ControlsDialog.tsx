@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { BookMarked, Cpu, Download, Play, Plus, ShieldCheck, Trash2, Upload, Webhook, Wrench } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
+import { SlidingTabList } from "./SegmentedTabs.tsx";
+import { SelectPopover } from "./SelectPopover.tsx";
 import type {
 	DesktopAPI,
 	DesktopToolInfo,
@@ -307,7 +309,7 @@ export function ControlsDialog({
 	return (
 		<Modal title="工具、MCP 与权限规则" close={close} wide>
 			<div className="simple-dialog">
-				<div className="cc-modal-tabs" role="tablist">
+				<SlidingTabList className="cc-modal-tabs" role="tablist">
 					<button type="button" role="tab" aria-selected={tab === "tools"} onClick={() => setTab("tools")}>
 						<Wrench size={14} /> 工具与 MCP ({tools.length})
 					</button>
@@ -323,25 +325,28 @@ export function ControlsDialog({
 					<button type="button" role="tab" aria-selected={tab === "executors"} onClick={() => setTab("executors")}>
 						<Cpu size={14} /> 外部执行器 ({executors.filter((e) => e.available).length}/{executors.length})
 					</button>
-				</div>
+				</SlidingTabList>
 
 				{(tab === "tools" || tab === "permissions") && (
 					<div className="cc-modal-scope">
 						<span>作用域：</span>
-						<select aria-label="规则作用域" value={scope} onChange={(e) => setScope(e.target.value as PermissionScope)}>
-							<option value="conversation" disabled={!conversationId}>
-								当前会话
-							</option>
-							<option value="project" disabled={!project}>
-								当前项目
-							</option>
-							<option value="global">全局默认</option>
-						</select>
+						<SelectPopover
+							ariaLabel="规则作用域"
+							direction="down"
+							value={scope}
+							options={[
+								{ value: "conversation", label: "当前会话", disabled: !conversationId },
+								{ value: "project", label: "当前项目", disabled: !project },
+								{ value: "global", label: "全局默认" },
+							]}
+							onChange={(val) => setScope(val as PermissionScope)}
+						/>
 					</div>
 				)}
 
 				{loading && <p className="subtle-note">正在加载…</p>}
 
+				<div key={tab} className="cc-tab-panel">
 				{tab === "tools" && (
 					<div className="cc-controls-body">
 						<input
@@ -391,11 +396,17 @@ export function ControlsDialog({
 				{tab === "permissions" && perms && (
 					<div className="cc-controls-body">
 						<form className="cc-rule-form" onSubmit={(e) => void addRule(e)}>
-							<select aria-label="规则动作" value={ruleAction} onChange={(e) => setRuleAction(e.target.value as PermissionAction)}>
-								<option value="allow">允许 (allow)</option>
-								<option value="ask">询问 (ask)</option>
-								<option value="deny">禁止 (deny)</option>
-							</select>
+							<SelectPopover
+								ariaLabel="规则动作"
+								direction="down"
+								value={ruleAction}
+								options={[
+									{ value: "allow", label: "允许 (allow)" },
+									{ value: "ask", label: "询问 (ask)" },
+									{ value: "deny", label: "禁止 (deny)" },
+								]}
+								onChange={(val) => setRuleAction(val as PermissionAction)}
+							/>
 							<input aria-label="工具匹配" placeholder="工具 (如 bash, read, mcp__*)" value={ruleTool} onChange={(e) => setRuleTool(e.target.value)} />
 							<input aria-label="路径匹配" placeholder="路径 glob (可选，如 **/.env)" value={rulePath} onChange={(e) => setRulePath(e.target.value)} />
 							<input aria-label="命令匹配" placeholder="命令前缀 (可选，如 npm test)" value={ruleCmd} onChange={(e) => setRuleCmd(e.target.value)} />
@@ -442,19 +453,33 @@ export function ControlsDialog({
 				{tab === "hooks" && (
 					<div className="cc-controls-body">
 						<form className="cc-hook-form cc-hook-form-wide" onSubmit={(e) => void addHook(e)}>
-							<select aria-label="Hook 事件" value={hookEvent} onChange={(e) => setHookEvent(e.target.value as HookEventName)}>
-								{HOOK_EVENTS.map((ev) => (
-									<option key={ev} value={ev}>{ev}</option>
-								))}
-							</select>
-							<select aria-label="Hook 类型" value={hookType} onChange={(e) => setHookType(e.target.value as HookHandlerType)}>
-								<option value="command">Shell 命令</option>
-								<option value="http">HTTP Webhook</option>
-							</select>
-							<select aria-label="Hook 作用域" value={hookScope} onChange={(e) => setHookScope(e.target.value as "project" | "user")}>
-								<option value="project" disabled={!project}>当前项目 (.pi/hooks.json)</option>
-								<option value="user">全局用户</option>
-							</select>
+							<SelectPopover
+								ariaLabel="Hook 事件"
+								direction="down"
+								value={hookEvent}
+								options={HOOK_EVENTS.map((ev) => ({ value: ev, label: ev }))}
+								onChange={(val) => setHookEvent(val as HookEventName)}
+							/>
+							<SelectPopover
+								ariaLabel="Hook 类型"
+								direction="down"
+								value={hookType}
+								options={[
+									{ value: "command", label: "Shell 命令" },
+									{ value: "http", label: "HTTP Webhook" },
+								]}
+								onChange={(val) => setHookType(val as HookHandlerType)}
+							/>
+							<SelectPopover
+								ariaLabel="Hook 作用域"
+								direction="down"
+								value={hookScope}
+								options={[
+									{ value: "project", label: "当前项目 (.pi/hooks.json)", disabled: !project },
+									{ value: "user", label: "全局用户" },
+								]}
+								onChange={(val) => setHookScope(val as "project" | "user")}
+							/>
 							<input aria-label="Hook 匹配器" placeholder="Matcher 正则 (可选，如 Bash|Write)" value={hookMatcher} onChange={(e) => setHookMatcher(e.target.value)} />
 							{hookType === "http" ? (
 								<>
@@ -508,10 +533,17 @@ export function ControlsDialog({
 						<form className="cc-skill-form" onSubmit={(e) => void addSkill(e)}>
 							<div className="cc-skill-form-row">
 								<input aria-label="Skill 名称" placeholder="名称 (小写字母/数字/连字符，如 lint-check)" value={skillName} onChange={(e) => setSkillName(e.target.value)} />
-								<select aria-label="Skill 作用域" value={skillScope} onChange={(e) => setSkillScope(e.target.value as "project" | "user")}>
-									<option value="project" disabled={!project}>当前项目 (.pi/skills)</option>
-									<option value="user">用户全局</option>
-								</select>
+								<SelectPopover
+									ariaLabel="Skill 作用域"
+									direction="down"
+									align="right"
+									value={skillScope}
+									options={[
+										{ value: "project", label: "当前项目 (.pi/skills)", disabled: !project },
+										{ value: "user", label: "用户全局" },
+									]}
+									onChange={(val) => setSkillScope(val as "project" | "user")}
+								/>
 							</div>
 							<input aria-label="Skill 描述" placeholder="简述何时使用此 Skill…" value={skillDesc} onChange={(e) => setSkillDesc(e.target.value)} />
 							<textarea aria-label="Skill 指令正文" rows={3} placeholder="SKILL.md 正文步骤与要求…" value={skillBody} onChange={(e) => setSkillBody(e.target.value)} />
@@ -601,6 +633,7 @@ export function ControlsDialog({
 						</div>
 					</div>
 				)}
+				</div>
 			</div>
 		</Modal>
 	);

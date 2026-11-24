@@ -21,6 +21,7 @@ import {
 	ShieldAlert,
 	SquarePen,
 	ArrowDown,
+	ArrowUpRight,
 	Trash2,
 	Archive,
 	History,
@@ -38,6 +39,7 @@ import {
 	MoreHorizontal,
 	ChevronRight,
 	Folder,
+	GitBranch,
 	Sparkles,
 	WifiOff,
 	Moon,
@@ -93,6 +95,7 @@ import { AgentsDialog } from "./AgentsDialog.tsx";
 import { McpDialog } from "./McpDialog.tsx";
 import { resolveEditorPath } from "../editor-path.ts";
 import { SmoothCollapse } from "./SmoothCollapse.tsx";
+import { useExitGhost } from "./Presence.tsx";
 import "./grail-theme.css";
 import "./task-flow.css";
 import "./motion-and-polish.css";
@@ -116,6 +119,16 @@ function projectName(snapshot: Snapshot, path: string): string {
 function savedInspectorWidth(key: string, fallback: number): number {
 	const stored = Number(localStorage.getItem(key));
 	return Number.isFinite(stored) && stored >= 320 ? stored : fallback;
+}
+
+function SidebarAside({ children }: { children: React.ReactNode }) {
+	const ref = useRef<HTMLElement>(null);
+	useExitGhost(ref, "side", { skipOnResize: true, durationMs: 190 });
+	return (
+		<aside ref={ref} className="cl-side" aria-label="项目与会话">
+			{children}
+		</aside>
+	);
 }
 
 function Desktop({ api }: { api: DesktopAPI }) {
@@ -1426,7 +1439,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				/>
 			)}
 			{sidebarVisible && (
-				<aside className="cl-side" aria-label="项目与会话">
+				<SidebarAside>
 					<div className="cl-side-head">
 						<span className="cl-side-brand">
 							{isGrail ? <HolyGrailIcon width={18} height={18} /> : <PiMark />}
@@ -1564,28 +1577,30 @@ function Desktop({ api }: { api: DesktopAPI }) {
 													</button>
 												)}
 											</div>
-											{expanded && children.length > 0 && (
-												<div className="cl-conv-children">
-													{children.map((child) => (
-														<button
-															key={child.id}
-															className={`cl-conv cl-conv-child ${child.id === snapshot.active?.id ? "selected" : ""}`}
-															disabled={changing}
-															onClick={() => switchTo(() => api.selectConversation(child.id))}
-															aria-current={child.id === snapshot.active?.id ? "page" : undefined}
-														>
-															<span className="cl-conv-line">
-																<span className="cl-conv-title">{child.title}</span>
-																{app.activity[child.id] === "approval" ? (
-																	<span className="cl-conv-status warn">待确认</span>
-																) : app.activity[child.id] === "running" ? (
-																	<span className="cl-conv-status run">运行中</span>
-																) : null}
-															</span>
-															<span className="cl-conv-sub">子 Agent · {formatTime(child.updatedAt)}</span>
-														</button>
-													))}
-												</div>
+											{children.length > 0 && (
+												<SmoothCollapse open={expanded}>
+													<div className="cl-conv-children">
+														{children.map((child) => (
+															<button
+																key={child.id}
+																className={`cl-conv cl-conv-child ${child.id === snapshot.active?.id ? "selected" : ""}`}
+																disabled={changing}
+																onClick={() => switchTo(() => api.selectConversation(child.id))}
+																aria-current={child.id === snapshot.active?.id ? "page" : undefined}
+															>
+																<span className="cl-conv-line">
+																	<span className="cl-conv-title">{child.title}</span>
+																	{app.activity[child.id] === "approval" ? (
+																		<span className="cl-conv-status warn">待确认</span>
+																	) : app.activity[child.id] === "running" ? (
+																		<span className="cl-conv-status run">运行中</span>
+																	) : null}
+																</span>
+																<span className="cl-conv-sub">子 Agent · {formatTime(child.updatedAt)}</span>
+															</button>
+														))}
+													</div>
+												</SmoothCollapse>
 											)}
 										</div>
 									);
@@ -1596,40 +1611,43 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							<section className="cl-group cl-group-archived">
 								<button
 									type="button"
-									className="cl-group-label"
-									style={{ background: "none", border: "none", padding: 0, cursor: "pointer", display: "flex", alignItems: "center", gap: "4px", width: "100%", textAlign: "left" }}
+									className="cl-group-label cl-archived-toggle"
 									aria-expanded={archivedOpen}
 									onClick={() => setArchivedOpen((v) => !v)}
 								>
 									<ChevronRight size={11} className={`cl-conv-fold-icon ${archivedOpen ? "open" : ""}`} aria-hidden="true" />
 									<span>已归档 ({sidebarGroups.archived.length})</span>
 								</button>
-								{archivedOpen && sidebarGroups.archived.map((session) => (
-									<div key={session.id} className="cl-conv-wrap">
-										<div className={`cl-conv-row ${session.id === snapshot.active?.id ? "selected" : ""}`}>
-											<button
-												data-conv-id={session.id}
-												className={`cl-conv ${session.id === snapshot.active?.id ? "selected" : ""}`}
-												disabled={changing}
-												onClick={() => switchTo(() => api.selectConversation(session.id))}
-												onContextMenu={(event) => {
-													event.preventDefault();
-													const box = event.currentTarget.getBoundingClientRect();
-													const keyboard = event.clientX === 0 && event.clientY === 0;
-													setConvMenu({ id: session.id, x: keyboard ? box.left + 24 : event.clientX, y: keyboard ? box.bottom : event.clientY });
-												}}
-												aria-current={session.id === snapshot.active?.id ? "page" : undefined}
-											>
-												<span className="cl-conv-line">
-													<span className="cl-conv-title">{session.title}</span>
-												</span>
-												<span className="cl-conv-sub">
-													{projectName(snapshot, session.project)} · {formatTime(session.updatedAt)}
-												</span>
-											</button>
-										</div>
+								<SmoothCollapse open={archivedOpen}>
+									<div className="cl-archived-list">
+										{sidebarGroups.archived.map((session) => (
+											<div key={session.id} className="cl-conv-wrap">
+												<div className={`cl-conv-row ${session.id === snapshot.active?.id ? "selected" : ""}`}>
+													<button
+														data-conv-id={session.id}
+														className={`cl-conv ${session.id === snapshot.active?.id ? "selected" : ""}`}
+														disabled={changing}
+														onClick={() => switchTo(() => api.selectConversation(session.id))}
+														onContextMenu={(event) => {
+															event.preventDefault();
+															const box = event.currentTarget.getBoundingClientRect();
+															const keyboard = event.clientX === 0 && event.clientY === 0;
+															setConvMenu({ id: session.id, x: keyboard ? box.left + 24 : event.clientX, y: keyboard ? box.bottom : event.clientY });
+														}}
+														aria-current={session.id === snapshot.active?.id ? "page" : undefined}
+													>
+														<span className="cl-conv-line">
+															<span className="cl-conv-title">{session.title}</span>
+														</span>
+														<span className="cl-conv-sub">
+															{projectName(snapshot, session.project)} · {formatTime(session.updatedAt)}
+														</span>
+													</button>
+												</div>
+											</div>
+										))}
 									</div>
-								))}
+								</SmoothCollapse>
 							</section>
 						)}
 						{!snapshot.conversations.length && <p className="cl-side-empty">还没有会话。选择一个工作目录开始编码。</p>}
@@ -1676,7 +1694,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							<span>设置</span>
 						</button>
 					</div>
-				</aside>
+				</SidebarAside>
 			)}
 			<main className="cl-main">
 				{flash && (
@@ -2129,6 +2147,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								>
 									{history.messages.length ? (
 										<TranscriptView
+											key={snapshot.active?.id ?? "transcript"}
 											transcript={history}
 											backgroundMonitors={activeShellRecords}
 											tasks={Object.values(tasksMap)}
@@ -2159,22 +2178,37 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										/>
 									) : (
 										<div className="cl-empty">
-											{isGrail ? (
-												<GrailEmblem />
-											) : (
-												<div className="cl-empty-emblem">
-													<PiMark />
-												</div>
-											)}
-											<h1>
-												{snapshot.active
-													? !snapshot.models.length
-														? "连接模型，开始第一个任务"
-														: isGrail ? "向圣杯许下你的编程愿望" : "今天想一起做什么？"
-													: isGrail
-														? "选择召唤结界（工作目录）"
-														: "选择工作目录开始"}
-											</h1>
+											<div className="cc-empty-hero">
+												{isGrail ? (
+													<GrailEmblem />
+												) : (
+													<div className="cl-empty-emblem">
+														<PiMark />
+													</div>
+												)}
+												<h1>
+													{snapshot.active
+														? !snapshot.models.length
+															? "连接模型，开始第一个任务"
+															: isGrail ? "向圣杯许下你的编程愿望" : "今天想一起构建什么？"
+														: isGrail
+															? "选择召唤结界（工作目录）"
+															: "选择工作目录开始"}
+												</h1>
+												{snapshot.active && project && (
+													<div className="cc-empty-context-pill">
+														<Folder size={12} />
+														<span>{project.name}</span>
+														{gitSummary?.isGit && gitSummary.branch && (
+															<>
+																<i className="cc-empty-dot" aria-hidden="true" />
+																<GitBranch size={11} />
+																<code>{gitSummary.branch}</code>
+															</>
+														)}
+													</div>
+												)}
+											</div>
 											{isGrail && servant && (
 												<div className="grail-servant-badge">
 													<span className="grail-servant-rarity">{servant.rarity}</span>
@@ -2186,43 +2220,59 @@ function Desktop({ api }: { api: DesktopAPI }) {
 												</div>
 											)}
 											{snapshot.active && snapshot.models.length ? (
-												<>
-													<div className="cc-starter-chips">
-														<button
-															type="button"
-															className="cc-starter-chip"
-															onClick={() => {
-																app.setDraft("请先梳理当前项目的目录结构、核心模块与运行方式。");
-																composerInputRef.current?.focus();
-															}}
-														>
-															<Sparkles size={13} />
-															<span>梳理项目结构</span>
-														</button>
-														<button
-															type="button"
-															className="cc-starter-chip"
-															onClick={() => {
-																app.setDraft("请检查当前工作区的 Git 改动并总结潜在风险。");
-																composerInputRef.current?.focus();
-															}}
-														>
-															<GitCompareArrows size={13} />
-															<span>检查代码变更</span>
-														</button>
-														<button
-															type="button"
-															className="cc-starter-chip"
-															onClick={() => {
-																app.setDraft("请运行当前项目的测试或类型检查并汇报结果。");
-																composerInputRef.current?.focus();
-															}}
-														>
-															<TerminalIcon size={13} />
-															<span>运行测试检查</span>
-														</button>
-													</div>
-												</>
+												<div className="cc-starter-grid">
+													<button
+														type="button"
+														className="cc-starter-chip cc-starter-card"
+														onClick={() => {
+															app.setDraft("请先梳理当前项目的目录结构、核心模块与运行方式。");
+															composerInputRef.current?.focus();
+														}}
+													>
+														<span className="cc-starter-icon tone-blue">
+															<Sparkles size={15} />
+														</span>
+														<span className="cc-starter-copy">
+															<strong>梳理项目架构</strong>
+															<small>分析目录结构、核心模块与运行链路</small>
+														</span>
+														<ArrowUpRight size={14} className="cc-starter-arrow" aria-hidden="true" />
+													</button>
+													<button
+														type="button"
+														className="cc-starter-chip cc-starter-card"
+														onClick={() => {
+															app.setDraft("请检查当前工作区的 Git 改动并总结潜在风险。");
+															composerInputRef.current?.focus();
+														}}
+													>
+														<span className="cc-starter-icon tone-emerald">
+															<GitCompareArrows size={15} />
+														</span>
+														<span className="cc-starter-copy">
+															<strong>检查代码变更</strong>
+															<small>审阅当前工作区 Diff 与潜在边界风险</small>
+														</span>
+														<ArrowUpRight size={14} className="cc-starter-arrow" aria-hidden="true" />
+													</button>
+													<button
+														type="button"
+														className="cc-starter-chip cc-starter-card"
+														onClick={() => {
+															app.setDraft("请运行当前项目的测试或类型检查并汇报结果。");
+															composerInputRef.current?.focus();
+														}}
+													>
+														<span className="cc-starter-icon tone-amber">
+															<TerminalIcon size={15} />
+														</span>
+														<span className="cc-starter-copy">
+															<strong>运行测试检查</strong>
+															<small>执行类型检查与测试套件并汇总诊断</small>
+														</span>
+														<ArrowUpRight size={14} className="cc-starter-arrow" aria-hidden="true" />
+													</button>
+												</div>
 											) : snapshot.active ? (
 												<button type="button" className="primary-button cc-connect-first" onClick={() => { setConnecting(true); setSettings(true); }}>连接模型</button>
 											) : (
@@ -2237,6 +2287,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											{(!snapshot.active || snapshot.models.length > 0) && <div className="cc-empty-hints">
 												<span><kbd>⌘N</kbd> 新建会话</span>
 												<span><kbd>⌘K</kbd> 搜索会话</span>
+												<span><kbd>⌘P</kbd> 命令面板</span>
 												<span><kbd>/</kbd> 斜杠命令</span>
 												<span><kbd>@</kbd> 引用文件</span>
 											</div>}
@@ -2327,6 +2378,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										</button>
 									)}
 								</div>
+						<div className="cc-composer-dock-stack">
 						{latestTodos.length > 0 && !latestTodos.every((t) => t.status === "completed") && (() => {
 							const doneCount = latestTodos.filter((t) => t.status === "completed").length;
 							const activeTodo = latestTodos.find((t) => t.status === "in_progress");
@@ -2635,6 +2687,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							gitBranch={gitSummary?.isGit && gitSummary.branch ? gitSummary.branch : undefined}
 							fail={app.fail}
 						/>
+						</div>
 							</>
 						)}
 					</div>

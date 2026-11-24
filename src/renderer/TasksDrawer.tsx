@@ -5,6 +5,8 @@ import { useConfirmation } from "./ConfirmationDialog.tsx";
 import { TranscriptView } from "./TranscriptView.tsx";
 import { ExternalApprovalCard } from "./ExternalApprovalCard.tsx";
 import { CheckpointsDialog } from "./CheckpointsDialog.tsx";
+import { SlidingTabList } from "./SegmentedTabs.tsx";
+import { SelectPopover } from "./SelectPopover.tsx";
 import { applyEvent, transcript, type Transcript } from "./messages.ts";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
 import { computeChecklistEta, computeMonitorTiming, computeTodoTiming } from "../task-eta.ts";
@@ -360,7 +362,7 @@ export function TasksDrawer({
 	return (
 		<Modal title="后台任务、子 Agent 与 Worktree (/tasks)" close={close} wide>
 			<div className="simple-dialog">
-				<div className="cc-modal-tabs" role="tablist">
+				<SlidingTabList className="cc-modal-tabs" role="tablist">
 					<button type="button" role="tab" aria-selected={tab === "tasks"} onClick={() => setTab("tasks")}>
 						任务与子 Agent ({totalTasks})
 					</button>
@@ -381,10 +383,10 @@ export function TasksDrawer({
 					<button type="button" role="tab" aria-selected={tab === "worktrees"} onClick={() => setTab("worktrees")}>
 						<GitBranch size={13} /> Worktrees ({worktrees.length})
 					</button>
-				</div>
+				</SlidingTabList>
 
 				{tab === "tasks" && (
-					<div className="cc-controls-body">
+					<div className="cc-controls-body cc-tab-panel">
 						{backgroundCount > 0 && !detailTranscript && !extDetail && (
 							<div className="cc-task-stop-all">
 								<span>当前会话有 {backgroundCount} 项活跃后台任务。</span>
@@ -406,10 +408,18 @@ export function TasksDrawer({
 								onChange={(e) => setNewPrompt(e.target.value)}
 								disabled={busy || !project}
 							/>
-							<select aria-label="隔离模式" value={isolation} onChange={(e) => setIsolation(e.target.value as "worktree" | "shared")}>
-								<option value="worktree">Worktree 隔离</option>
-								<option value="shared">共享目录</option>
-							</select>
+							<SelectPopover
+								ariaLabel="隔离模式"
+								direction="down"
+								align="right"
+								value={isolation}
+								disabled={busy || !project}
+								options={[
+									{ value: "worktree", label: "Worktree 隔离" },
+									{ value: "shared", label: "共享目录" },
+								]}
+								onChange={(val) => setIsolation(val as "worktree" | "shared")}
+							/>
 							<button type="submit" className="primary-button" disabled={busy || !newPrompt.trim() || !project}>
 								<Play size={13} /> 启动
 							</button>

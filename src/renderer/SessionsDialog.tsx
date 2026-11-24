@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Bot, Copy, GitFork, Import } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
+import { SlidingTabList } from "./SegmentedTabs.tsx";
 import type { CliSessionHistoryItem, Conversation, SessionTreeResult, Snapshot } from "../shared.ts";
 
 type TreeNode = SessionTreeResult["tree"][number];
@@ -163,7 +164,7 @@ export function SessionsDialog({
 	return (
 		<Modal title="会话分支树与 CLI 历史导入 (/sessions)" close={close} wide>
 			<div className="simple-dialog">
-			<div className="cc-modal-tabs" role="tablist">
+			<SlidingTabList className="cc-modal-tabs" role="tablist">
 				<button type="button" role="tab" aria-selected={tab === "tree"} onClick={() => setTab("tree")}>
 					会话分支树
 				</button>
@@ -173,8 +174,9 @@ export function SessionsDialog({
 				<button type="button" role="tab" aria-selected={tab === "subagents"} onClick={() => setTab("subagents")}>
 					<Bot size={13} /> 子 Agent ({allSubagents.length})
 				</button>
-			</div>
+			</SlidingTabList>
 
+			<div key={tab} className="cc-tab-panel">
 			{tab === "tree" && (
 				<div className="cc-controls-body">
 					<div className="cc-rewind-head">
@@ -270,6 +272,7 @@ export function SessionsDialog({
 					</div>
 				</div>
 			)}
+			</div>
 			</div>
 		</Modal>
 	);

@@ -1,7 +1,8 @@
 import type { PreviewCheck } from "../shared.ts";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ExternalLink, Globe, Monitor, RefreshCw, Smartphone, X } from "lucide-react";
 import { IconButton } from "../prototype/ui.tsx";
+import { useExitGhost } from "./Presence.tsx";
 import { DEFAULT_LOCAL_PREVIEW_URL } from "../preview-check-types.ts";
 
 function normalizeLocalUrl(raw: string): string | null {
@@ -37,6 +38,8 @@ export function PreviewPanel({
 	const [report, setReport] = useState<{ url: string; mobile: boolean; result: PreviewCheck } | null>(null);
 	const result = report?.url === activeUrl && report.mobile === mobile ? report.result : null;
 	const [reachable, setReachable] = useState<boolean | null>(null);
+	const asideRef = useRef<HTMLElement>(null);
+	useExitGhost(asideRef, "inspector", { skipOnResize: true, durationMs: 195 });
 	useEffect(() => setInputUrl(url), [url]);
 	useEffect(() => {
 		let cancelled = false;
@@ -82,9 +85,10 @@ export function PreviewPanel({
 	};
 
 	return (
-		<aside className="inspector cc-preview-panel" aria-label="本地应用预览">
+		<aside ref={asideRef} className="inspector cc-preview-panel" aria-label="本地应用预览">
 			<header className="inspector-header">
 				<span className="cc-preview-heading">
+					<span className={`cc-preview-dot ${reachable === true ? "ok" : reachable === false ? "err" : "pending"}`} aria-hidden="true" />
 					<Globe size={14} /> 本地预览
 				</span>
 				<div>

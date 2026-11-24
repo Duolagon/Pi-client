@@ -5,6 +5,8 @@ import type { Change, CodeIntelligence, CodePosition, FileEntry, GitCheckpoint, 
 import { CodeLines, UnifiedDiffView, type DiffReviewAnchor } from "./DiffView.tsx";
 import { diffHunkCount } from "./diff-lines.ts";
 import { PullRequestPanel } from "./PullRequestPanel.tsx";
+import { useExitGhost } from "./Presence.tsx";
+import { SlidingTabList } from "./SegmentedTabs.tsx";
 import { formatReviewNotes, readReviewView, reviewLocation, reviewRevision, saveReviewView, type ReviewPosition, type ReviewView } from "./workspace-review-state.ts";
 import "./workspace-review.css";
 
@@ -88,6 +90,8 @@ export function WorkspacePanel({
 	const [discardVersion, setDiscardVersion] = useState<string>();
 	const [undo, setUndo] = useState<{ checkpoint: GitCheckpoint; path: string }>();
 	const scroller = useRef<HTMLDivElement>(null);
+	const asideRef = useRef<HTMLElement>(null);
+	useExitGhost(asideRef, "inspector", { skipOnResize: true, durationMs: 195 });
 	const noteEditor = useRef<HTMLTextAreaElement>(null);
 	const focusNoteOnMount = useRef<Element | null>(null);
 	const focusNoteEditor = () => {
@@ -381,44 +385,59 @@ export function WorkspacePanel({
 		}
 	};
 
-	const renderWorkspaceFile = (change: Change, staged: boolean) => (
-		<div key={`${staged ? "staged" : "unstaged"}-${change.path}`} className="cc-change-row">
-			<button type="button" className="cc-change-open" aria-current={change.path === selectedPath ? "true" : undefined} onClick={() => open(change.path)}>
-				<FileCode2 size={14} />
-				<span className="file-name" title={change.path}>{change.path}</span>
-				<span>{change.status === "??" ? "未跟踪" : (worktreeStatuses[staged ? change.status[0] : change.status.at(-1)!] ?? "修改")}</span>
-			</button>
-			{onOpenInEditor && <OpenInEditorButton path={change.path} open={onOpenInEditor} />}
-			{!readOnly && (
-				<div className="cc-git-row-btns">
-					<button type="button" className="cc-git-icon" title={staged ? "取消暂存" : "暂存修改"}
-						aria-label={`${staged ? "取消暂存" : "暂存"} ${change.path}`} disabled={mutating}
-						onClick={() => void runGit(() => staged ? window.pi.gitUnstage([change.path]) : window.pi.gitStage([change.path]))}>
-						{staged ? <Minus size={13} /> : <Plus size={13} />}
-					</button>
-					{!staged && <button type="button" className="cc-git-icon danger"
-						title={change.status === "??" ? "移到废纸篓" : "还原未暂存修改"}
-						aria-label={`${change.status === "??" ? "移到废纸篓" : "还原未暂存修改"} ${change.path}`}
-						disabled={mutating} onClick={() => { setError(""); setDiscardVersion(undefined); setDiscard(change); }}>
-						{change.status === "??" ? <Trash2 size={13} /> : <RotateCcw size={13} />}
-					</button>}
-				</div>
-			)}
-		</div>
-	);
+	const splitPath = (fullPath: string) => {
+		const idx = fullPath.lastIndexOf("/");
+		return idx === -1 ? { dir: "", base: fullPath } : { dir: fullPath.slice(0, idx + 1), base: fullPath.slice(idx + 1) };
+	};
+
+	const statusTone = (label: string) =>
+		label === "新增" ? "added" : label === "删除" ? "deleted" : label === "未跟踪" ? "untracked" : "modified";
+
+	const renderWorkspaceFile = (change: Change, staged: boolean) => {
+		const statusLabel = change.status === "??" ? "未跟踪" : (worktreeStatuses[staged ? change.status[0] : change.status.at(-1)!] ?? "修改");
+		const parts = splitPath(change.path);
+		return (
+			<div key={`${staged ? "staged" : "unstaged"}-${change.path}`} className="cc-change-row">
+				<button type="button" className="cc-change-open" aria-current={change.path === selectedPath ? "true" : undefined} onClick={() => open(change.path)}>
+					<FileCode2 size={14} />
+					<span className="file-name" title={change.path}>
+						{parts.dir && <em className="cc-file-dir">{parts.dir}</em>}
+						<strong className="cc-file-base">{parts.base}</strong>
+					</span>
+					<span className={`cc-status-tag status-${statusTone(statusLabel)}`}>{statusLabel}</span>
+				</button>
+				{onOpenInEditor && <OpenInEditorButton path={change.path} open={onOpenInEditor} />}
+				{!readOnly && (
+					<div className="cc-git-row-btns">
+						<button type="button" className="cc-git-icon" title={staged ? "取消暂存" : "暂存修改"}
+							aria-label={`${staged ? "取消暂存" : "暂存"} ${change.path}`} disabled={mutating}
+							onClick={() => void runGit(() => staged ? window.pi.gitUnstage([change.path]) : window.pi.gitStage([change.path]))}>
+							{staged ? <Minus size={13} /> : <Plus size={13} />}
+						</button>
+						{!staged && <button type="button" className="cc-git-icon danger"
+							title={change.status === "??" ? "移到废纸篓" : "还原未暂存修改"}
+							aria-label={`${change.status === "??" ? "移到废纸篓" : "还原未暂存修改"} ${change.path}`}
+							disabled={mutating} onClick={() => { setError(""); setDiscardVersion(undefined); setDiscard(change); }}>
+							{change.status === "??" ? <Trash2 size={13} /> : <RotateCcw size={13} />}
+						</button>}
+					</div>
+				)}
+			</div>
+		);
+	};
 
 	return (
-		<aside className={`inspector workspace-review ${pane === "changes" ? "workspace-review-changes" : ""}`} aria-label="真实项目工作区">
+		<aside ref={asideRef} className={`inspector workspace-review ${pane === "changes" ? "workspace-review-changes" : ""}`} aria-label="真实项目工作区">
 			<header className="inspector-header workspace-review-header">
 				{pane === "changes" && (
 					<button type="button" className="cc-mini-btn workspace-review-back" onClick={close}>
 						<ArrowLeft size={13} /> 返回聊天
 					</button>
 				)}
-				<div className="workspace-review-tabs" role="tablist" aria-label="工作区视图">
+				<SlidingTabList variant="compact" className="workspace-review-tabs" role="tablist" aria-label="工作区视图">
 					<button role="tab" aria-selected={pane === "changes"} onClick={() => setPane("changes")}>改动</button>
 					<button role="tab" aria-selected={pane === "files"} onClick={() => setPane("files")}>文件</button>
-				</div>
+				</SlidingTabList>
 				<div className="workspace-review-header-actions">
 					{pane === "changes" && onToggleReviewFocus && <IconButton icon={focusReview ? Minimize2 : Maximize2}
 						label={focusReview ? "返回并排视图" : "专注审查"} onClick={onToggleReviewFocus} active={focusReview}
@@ -431,10 +450,12 @@ export function WorkspacePanel({
 			{pane === "changes" && (
 				<>
 					<div className="workspace-review-scopes" role="group" aria-label="查看改动范围">
-						<button type="button" className="cc-mini-btn" aria-pressed={scope === "turn"}
-							onClick={() => { setListError(""); updateView((current) => ({ ...current, scope: "turn" })); }}>本轮改动</button>
-						<button type="button" className="cc-mini-btn" aria-pressed={scope === "workspace"}
-							onClick={() => { setListError(""); updateView((current) => ({ ...current, scope: "workspace" })); }}>整个工作区</button>
+						<SlidingTabList variant="pill" className="cc-scope-pill-group">
+							<button type="button" className="cc-scope-pill-btn" aria-pressed={scope === "turn"}
+								onClick={() => { setListError(""); updateView((current) => ({ ...current, scope: "turn" })); }}>本轮改动</button>
+							<button type="button" className="cc-scope-pill-btn" aria-pressed={scope === "workspace"}
+								onClick={() => { setListError(""); updateView((current) => ({ ...current, scope: "workspace" })); }}>整个工作区</button>
+						</SlidingTabList>
 						{turnReview && activeCheckpoint?.finishedAt && <time title={activeCheckpoint.label} dateTime={new Date(activeCheckpoint.finishedAt).toISOString()}>
 							{new Date(activeCheckpoint.finishedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
 						</time>}
@@ -487,15 +508,22 @@ export function WorkspacePanel({
 							{turnReview ? (
 								<>
 									{filteredTurnFiles.length > 0 && <div className="cc-change-section">本轮变更 · {filteredTurnFiles.length} 个文件</div>}
-									{filteredTurnFiles.map((change) => (
-										<div key={change.path} className="cc-change-row">
-											<button type="button" className="cc-change-open" aria-current={change.path === selectedPath ? "true" : undefined} onClick={() => open(change.path)}>
-												<FileCode2 size={14} />
-												<span className="file-name" title={change.path}>{change.path}</span>
-												<span>{{ added: "新增", modified: "修改", deleted: "删除", "type-changed": "类型变化" }[change.status]}</span>
-											</button>
-										</div>
-									))}
+									{filteredTurnFiles.map((change) => {
+										const statusLabel = { added: "新增", modified: "修改", deleted: "删除", "type-changed": "类型变化" }[change.status];
+										const parts = splitPath(change.path);
+										return (
+											<div key={change.path} className="cc-change-row">
+												<button type="button" className="cc-change-open" aria-current={change.path === selectedPath ? "true" : undefined} onClick={() => open(change.path)}>
+													<FileCode2 size={14} />
+													<span className="file-name" title={change.path}>
+														{parts.dir && <em className="cc-file-dir">{parts.dir}</em>}
+														<strong className="cc-file-base">{parts.base}</strong>
+													</span>
+													<span className={`cc-status-tag status-${statusTone(statusLabel)}`}>{statusLabel}</span>
+												</button>
+											</div>
+										);
+									})}
 									{activeCheckpoint && !filteredTurnFiles.length && <p className="subtle-note">本轮没有可审查的文件改动。</p>}
 								</>
 							) : (

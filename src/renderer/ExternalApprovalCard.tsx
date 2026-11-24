@@ -1,6 +1,8 @@
 import { useState, type FormEvent } from "react";
+import { Bot, HelpCircle } from "lucide-react";
 import type { ExternalApprovalRequest, ExternalApprovalResponse, ExternalTask } from "../external-types.ts";
 import { externalQuestionFields } from "./external-questions.ts";
+import { SelectPopover } from "./SelectPopover.tsx";
 import "./external-approval.css";
 
 export function ExternalApprovalCard({
@@ -48,7 +50,12 @@ export function ExternalApprovalCard({
 		onClick={() => void respond({ decision: question ? "cancel" : "deny" })}>{question ? "取消回答" : "拒绝"}</button>;
 	return (
 		<section className="cc-inline-approval cc-external-approval" aria-label={question ? "外部 Agent 提问" : "外部 Agent 审批"}>
-			<h3>{task.executor} · {task.title} · {question ? "需要回答" : request.toolName}</h3>
+			<div className="cc-inline-approval-head">
+				<span className="cc-inline-approval-icon" aria-hidden="true">
+					{question ? <HelpCircle size={15} /> : <Bot size={15} />}
+				</span>
+				<h3>{task.executor} · {task.title} · {question ? "需要回答" : request.toolName}</h3>
+			</div>
 			{request.description && <p className="subtle-note">{request.description}</p>}
 			{detailText && <pre className="permission-detail cc-bash-out">{detailText}</pre>}
 			{fields ? (
@@ -60,16 +67,25 @@ export function ExternalApprovalCard({
 								<legend>{field.label}</legend>
 								{field.description && <p className="subtle-note">{field.description}</p>}
 								{field.multiple ? field.options.map((option) => (
-									<label key={option.value}>
+									<label key={option.value} className="live-setting-toggle cc-external-check">
 										<input type="checkbox" checked={Array.isArray(answer) && answer.includes(option.value)}
-											onChange={(event) => selectMultiple(field.id, option.value, event.target.checked)} /> {option.label}
+											onChange={(event) => selectMultiple(field.id, option.value, event.target.checked)} />
+										<span>{option.label}</span>
 									</label>
 								)) : field.options.length ? (
-									<select aria-label={field.label} value={typeof answer === "string" ? answer : ""}
-										onChange={(event) => setAnswers({ ...answers, [field.id]: event.target.value })}>
-										<option value="">请选择</option>
-										{field.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-									</select>
+									<SelectPopover
+										ariaLabel={field.label}
+										field
+										direction="down"
+										placeholder="请选择"
+										value={typeof answer === "string" ? answer : ""}
+										disabled={pending}
+										options={[
+											{ value: "", label: "请选择" },
+											...field.options.map((option) => ({ value: option.value, label: option.label })),
+										]}
+										onChange={(val) => setAnswers({ ...answers, [field.id]: val })}
+									/>
 								) : (
 									<input type="text" aria-label={field.label} value={typeof answer === "string" ? answer : ""} maxLength={32768}
 										onChange={(event) => setAnswers({ ...answers, [field.id]: event.target.value })} />

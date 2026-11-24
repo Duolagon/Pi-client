@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ShieldCheck } from "lucide-react";
+import { Check, FileCode2, HelpCircle, ShieldCheck, Terminal } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
 import { CodeLines, InlineEditDiff } from "./DiffView.tsx";
 import type { DesktopAPI, RpcExtensionUIRequest, TaskPendingApproval } from "../shared.ts";
@@ -338,8 +338,13 @@ export function PermissionDialog({
 													onClick={() => toggleOption(opt.label)}
 													disabled={pending}
 												>
-													<strong>{opt.label}</strong>
-													{opt.description && <span>{opt.description}</span>}
+													<span className={`cc-ask-check ${q.multiSelect ? "multi" : "single"} ${checked ? "checked" : ""}`} aria-hidden="true">
+														{checked && <Check size={11} strokeWidth={2.6} />}
+													</span>
+													<span className="cc-ask-copy">
+														<strong>{opt.label}</strong>
+														{opt.description && <span>{opt.description}</span>}
+													</span>
 												</button>
 											);
 										})}
@@ -403,9 +408,21 @@ export function PermissionDialog({
 		</>
 	);
 	if (inline) {
+		const HeaderIcon = isAskQuestions
+			? HelpCircle
+			: inferredTool === "bash"
+				? Terminal
+				: inferredTool === "edit" || inferredTool === "write"
+					? FileCode2
+					: ShieldCheck;
 		return (
-			<section className="cc-inline-approval" role="region" aria-label={modalTitle} tabIndex={-1}>
-				<h3>{modalTitle}</h3>
+			<section className={`cc-inline-approval ${isAskQuestions ? "is-question" : ""}`.trim()} role="region" aria-label={modalTitle} tabIndex={-1}>
+				<div className="cc-inline-approval-head">
+					<span className="cc-inline-approval-icon" aria-hidden="true">
+						<HeaderIcon size={15} />
+					</span>
+					<h3>{modalTitle}</h3>
+				</div>
 				{controls}
 			</section>
 		);

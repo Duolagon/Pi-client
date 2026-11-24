@@ -907,6 +907,22 @@ button:not(:disabled):active {
 }
 
 @container conversation (max-width: 680px) {
+	.cl-composer.is-running .cc-dock-toolbar {
+		flex-wrap: wrap;
+	}
+	.cl-composer.is-running .cc-dock-left {
+		flex-basis: 100%;
+		flex-wrap: wrap;
+	}
+	.cl-composer.is-running .cc-dock-right {
+		margin-inline-start: auto;
+	}
+	.cl-composer.is-running .cc-status-line {
+		display: none;
+	}
+}
+
+@container conversation (max-width: 520px) {
 	.cc-dock-toolbar {
 		flex-wrap: wrap;
 	}
@@ -1017,14 +1033,1156 @@ button:not(:disabled):active {
 	letter-spacing: 0.02em;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   6. Bidirectional Exit Ghost Engine (Modals, Sidebar, Inspector, Terminal)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@keyframes cc-backdrop-out {
+	from { opacity: 1; }
+	to { opacity: 0; }
+}
+
+@keyframes cc-modal-out {
+	from {
+		opacity: 1;
+		transform: translateY(0) scale(1);
+	}
+	to {
+		opacity: 0;
+		transform: translateY(8px) scale(0.972);
+	}
+}
+
+@keyframes cc-slide-left-out {
+	from {
+		opacity: 1;
+		transform: translateX(0);
+	}
+	to {
+		opacity: 0;
+		transform: translateX(-20px);
+	}
+}
+
+@keyframes cc-slide-right-out {
+	from {
+		opacity: 1;
+		transform: translateX(0);
+	}
+	to {
+		opacity: 0;
+		transform: translateX(24px);
+	}
+}
+
+@keyframes cc-slide-down-out {
+	from {
+		opacity: 1;
+		transform: translateY(0);
+	}
+	to {
+		opacity: 0;
+		transform: translateY(18px);
+	}
+}
+
+@keyframes cc-tab-fade-in {
+	from {
+		opacity: 0;
+		transform: translateY(4px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+@keyframes cc-conv-fade-in {
+	from {
+		opacity: 0.35;
+		transform: translateY(3px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+.cc-exit-ghost-layer {
+	position: fixed;
+	inset: 0;
+	z-index: 90;
+	pointer-events: none;
+	overflow: hidden;
+}
+
+.cc-ghost-txt::before {
+	content: attr(data-t);
+}
+
+.cc-exit-ghost-layer.has-backdrop {
+	background: rgba(15, 23, 42, 0.24);
+	backdrop-filter: blur(5px);
+	animation: cc-backdrop-out 175ms ease forwards;
+}
+
+:root[data-theme="dark"] .cc-exit-ghost-layer.has-backdrop,
+:root[data-theme="grail"] .cc-exit-ghost-layer.has-backdrop {
+	background: rgba(0, 0, 0, 0.48);
+}
+
+.cc-exit-ghost-modal {
+	animation: cc-modal-out 170ms var(--ease-out-expo) forwards !important;
+	will-change: transform, opacity;
+}
+
+.cc-exit-ghost-side {
+	z-index: 35;
+	animation: cc-slide-left-out 185ms var(--ease-out-expo) forwards !important;
+	will-change: transform, opacity;
+}
+
+.cc-exit-ghost-inspector {
+	z-index: 35;
+	animation: cc-slide-right-out 190ms var(--ease-out-expo) forwards !important;
+	will-change: transform, opacity;
+}
+
+.cc-exit-ghost-terminal {
+	z-index: 35;
+	animation: cc-slide-down-out 180ms var(--ease-out-expo) forwards !important;
+	will-change: transform, opacity;
+}
+
+/* Conversation switch gentle cross-fade */
+.cl-transcript {
+	animation: cc-conv-fade-in 170ms var(--ease-out-expo) both;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   7. Measured Sliding Segmented Tabs (.cc-sliding-tabs & .cc-seg-glider)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.cc-sliding-tabs {
+	position: relative;
+	isolation: isolate;
+}
+
+.cc-seg-glider {
+	position: absolute;
+	top: 0;
+	left: 0;
+	z-index: 0;
+	pointer-events: none;
+	border-radius: 7px;
+	background: var(--cl-surface);
+	border: 1px solid var(--cl-line-soft);
+	box-shadow: var(--elev-1);
+}
+
+:root[data-theme="dark"] .cc-seg-glider {
+	background: var(--cl-active);
+	border-color: rgba(255, 255, 255, 0.07);
+}
+
+:root[data-theme="grail"] .cc-seg-glider {
+	background: color-mix(in srgb, var(--cl-clay) 22%, var(--cl-surface));
+	border-color: rgba(242, 201, 107, 0.25);
+}
+
+.cc-seg-glider.is-animated {
+	transition:
+		transform 230ms var(--ease-spring),
+		width 230ms var(--ease-spring),
+		height 200ms var(--ease-spring);
+}
+
+.cc-sliding-tabs > button {
+	position: relative;
+	z-index: 1;
+	transition: color 150ms ease;
+}
+
+.cc-sliding-tabs > button[aria-selected="true"],
+.cc-sliding-tabs > button[aria-pressed="true"],
+.cc-sliding-tabs > button.active {
+	background: transparent !important;
+	border-color: transparent !important;
+	box-shadow: none !important;
+	color: var(--cl-1) !important;
+	font-weight: 600;
+}
+
+.cc-sliding-tabs > button:hover:not([aria-selected="true"]):not([aria-pressed="true"]):not(.active) {
+	background: transparent !important;
+	color: var(--cl-1);
+}
+
+.cc-modal-tabs.cc-sliding-tabs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 3px;
+	padding: 4px;
+	margin-bottom: 14px;
+	border-radius: 10px;
+	background: var(--cl-soft);
+	border: 1px solid var(--cl-line-soft);
+}
+
+.cc-modal-tabs.cc-sliding-tabs > button {
+	height: 30px;
+	padding: 0 11px;
+	border-radius: 7px;
+	font-size: 12.5px;
+	font-weight: 500;
+	color: var(--cl-2);
+}
+
+.cc-sliding-tabs-compact,
+.cc-sliding-tabs-pill {
+	display: inline-flex;
+	align-items: center;
+	gap: 2px;
+	padding: 3px;
+	border-radius: 8px;
+	background: var(--cl-soft);
+	border: 1px solid var(--cl-line-soft);
+}
+
+.cc-sliding-tabs-compact > button,
+.cc-sliding-tabs-pill > button {
+	height: 25px;
+	padding: 0 10px;
+	border-radius: 6px;
+	border: 1px solid transparent;
+	font-size: 12px;
+	font-weight: 500;
+	color: var(--cl-2);
+	background: transparent;
+}
+
+.cc-tab-panel,
+.cc-settings-pane {
+	animation: cc-tab-fade-in 180ms var(--ease-out-expo) both;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   8. Hero Empty State, Bento Starter Cards & Sidebar Navigation Polish
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.cl-empty {
+	gap: 22px;
+	padding: 52px 24px 36px;
+}
+
+.cc-empty-hero {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 12px;
+}
+
+.cl-empty-emblem {
+	width: 56px;
+	height: 56px;
+	border-radius: 16px;
+	background: linear-gradient(145deg, var(--cl-surface) 0%, var(--cl-clay-soft) 100%);
+	border: 1px solid color-mix(in srgb, var(--cl-clay) 20%, var(--cl-line));
+	box-shadow:
+		0 8px 24px -8px color-mix(in srgb, var(--cl-clay) 24%, transparent),
+		var(--elev-1);
+	color: var(--cl-clay);
+}
+
+.cl-empty h1 {
+	font-family: var(--font-ui);
+	font-size: 23px;
+	font-weight: 650;
+	letter-spacing: -0.024em;
+	line-height: 1.28;
+	margin: 0;
+}
+
+.cc-empty-context-pill {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	height: 26px;
+	padding: 0 11px;
+	border-radius: var(--r-pill);
+	background: var(--cl-soft);
+	border: 1px solid var(--cl-line-soft);
+	color: var(--cl-2);
+	font-size: 12px;
+	font-weight: 500;
+}
+
+.cc-empty-context-pill svg {
+	color: var(--cl-clay);
+	flex-shrink: 0;
+}
+
+.cc-empty-context-pill code {
+	font-family: var(--mono);
+	font-size: 11.5px;
+	color: var(--cl-2);
+}
+
+.cc-empty-dot {
+	width: 3px;
+	height: 3px;
+	border-radius: 50%;
+	background: var(--cl-3);
+	opacity: 0.55;
+}
+
+.cc-starter-grid {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	gap: 10px;
+	width: min(670px, 100%);
+	animation: cc-fade-up 240ms var(--ease-out-expo) both;
+}
+
+.cc-starter-card {
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 10px;
+	padding: 13px 14px;
+	border-radius: 13px;
+	background: var(--cl-surface);
+	border: 1px solid var(--cl-line);
+	box-shadow: var(--elev-1);
+	text-align: left;
+}
+
+.cc-starter-card:hover {
+	border-color: color-mix(in srgb, var(--cl-clay) 38%, var(--cl-line));
+	transform: translateY(-2px);
+	box-shadow: var(--elev-2);
+}
+
+.cc-starter-icon {
+	width: 30px;
+	height: 30px;
+	border-radius: 8px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.cc-starter-icon.tone-blue {
+	background: var(--cl-clay-soft);
+	color: var(--cl-clay);
+}
+
+.cc-starter-icon.tone-emerald {
+	background: var(--cl-green-soft);
+	color: var(--cl-green);
+}
+
+.cc-starter-icon.tone-amber {
+	background: var(--cl-amber-soft);
+	color: var(--cl-amber);
+}
+
+.cc-starter-copy {
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	min-width: 0;
+}
+
+.cc-starter-copy strong {
+	font-size: 13px;
+	font-weight: 600;
+	color: var(--cl-1);
+}
+
+.cc-starter-copy small {
+	font-size: 11.5px;
+	line-height: 1.45;
+	color: var(--cl-3);
+}
+
+.cc-starter-arrow {
+	position: absolute;
+	top: 12px;
+	right: 12px;
+	color: var(--cl-3);
+	opacity: 0.45;
+	transition: transform 180ms var(--ease-spring), opacity 180ms ease, color 180ms ease;
+}
+
+.cc-starter-card:hover .cc-starter-arrow {
+	opacity: 1;
+	color: var(--cl-clay);
+	transform: translate(2px, -2px);
+}
+
+@container conversation (max-width: 580px) {
+	.cc-starter-grid {
+		grid-template-columns: 1fr;
+		max-width: 420px;
+	}
+	.cc-starter-card {
+		flex-direction: row;
+		align-items: center;
+		padding-right: 34px;
+	}
+	.cc-starter-arrow {
+		top: 50%;
+		transform: translateY(-50%);
+	}
+	.cc-starter-card:hover .cc-starter-arrow {
+		transform: translate(2px, calc(-50% - 1px));
+	}
+}
+
+.cc-empty-hints {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: center;
+	gap: 8px 14px;
+	margin-top: 2px;
+	font-size: 12px;
+	color: var(--cl-3);
+}
+
+.cc-empty-hints span {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+}
+
+.cc-empty-hints kbd {
+	font-family: var(--mono);
+	font-size: 11px;
+	padding: 2px 6px;
+	border-radius: 5px;
+	background: var(--cl-soft);
+	border: 1px solid var(--cl-line);
+	box-shadow: 0 1px 0 var(--cl-line);
+	color: var(--cl-2);
+}
+
+/* Sidebar active left accent bar & collapsible polish */
+.cl-conv {
+	position: relative;
+}
+
+.cl-conv.selected::before {
+	content: "";
+	position: absolute;
+	left: 3px;
+	top: 8px;
+	bottom: 8px;
+	width: 3px;
+	border-radius: 99px;
+	background: var(--cl-clay);
+}
+
+.cl-conv-fold-icon {
+	transition: transform 180ms var(--ease-spring);
+}
+
+.cl-conv-fold-icon.open {
+	transform: rotate(90deg);
+}
+
+.cl-archived-toggle {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	width: 100%;
+	padding: 5px 8px;
+	border-radius: 6px;
+	text-align: left;
+	cursor: pointer;
+	transition: background var(--dur-fast) ease, color var(--dur-fast) ease;
+}
+
+.cl-archived-toggle:hover {
+	background: var(--cl-hover);
+	color: var(--cl-1);
+}
+
+.cl-archived-list {
+	padding-top: 2px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   9. Unified Dynamic Composer Dock & Elevated Approval Cards
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.cc-composer-dock-stack {
+	display: flex;
+	flex-direction: column;
+	width: 100%;
+	flex-shrink: 0;
+}
+
+/* Fuse ambient status strips (Todos, Subagents, Conversation Status) into a seamless top tray */
+.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status) {
+	width: var(--chat-width);
+	margin-inline: auto;
+	margin-bottom: 0;
+	border-radius: 0;
+	background: var(--cl-soft);
+	border: 1px solid var(--cl-line);
+	border-bottom: 0;
+	box-shadow: none;
+}
+
+.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status):first-child,
+.cc-composer-dock-stack > :not(:is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status)) + :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status) {
+	border-top-left-radius: 14px;
+	border-top-right-radius: 14px;
+}
+
+.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status) + :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status) {
+	border-top: 1px solid var(--cl-line-soft);
+}
+
+/* Pull the bottom-most tray strip flush behind the top curve of .cl-composer-box */
+.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status):has(+ .cl-composer) {
+	margin-bottom: -12px;
+	padding-bottom: 13px;
+}
+
+.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status):has(+ .cl-composer) + .cl-composer {
+	padding-top: 0;
+	position: relative;
+	z-index: 2;
+}
+
+/* Inline Approval & AskUserQuestion polish */
+.cc-inline-approval {
+	padding: 14px 16px;
+	border-radius: 14px;
+	border: 1px solid color-mix(in srgb, var(--cl-clay) 24%, var(--cl-line));
+	background: var(--cl-surface);
+	box-shadow: var(--elev-2);
+}
+
+.cc-inline-approval-head {
+	display: flex;
+	align-items: center;
+	gap: 9px;
+	margin-bottom: 10px;
+}
+
+.cc-inline-approval-head > h3 {
+	margin: 0;
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--cl-1);
+}
+
+.cc-inline-approval-icon {
+	width: 26px;
+	height: 26px;
+	border-radius: 7px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	background: var(--cl-clay-soft);
+	color: var(--cl-clay);
+	flex-shrink: 0;
+}
+
+.cc-ask-opt {
+	display: flex !important;
+	flex-direction: row !important;
+	align-items: flex-start !important;
+	gap: 10px !important;
+	padding: 10px 12px !important;
+	border-radius: 10px !important;
+	border: 1px solid var(--cl-line) !important;
+	background: var(--cl-surface) !important;
+	transition:
+		border-color 150ms ease,
+		background 150ms ease,
+		box-shadow 150ms ease !important;
+}
+
+.cc-ask-opt:hover:not(:disabled) {
+	border-color: color-mix(in srgb, var(--cl-clay) 40%, var(--cl-line)) !important;
+	background: var(--cl-soft) !important;
+}
+
+.cc-ask-opt.active {
+	border-color: var(--cl-clay) !important;
+	background: var(--cl-clay-soft) !important;
+	box-shadow: 0 0 0 1px color-mix(in srgb, var(--cl-clay) 22%, transparent);
+}
+
+.cc-ask-check {
+	width: 17px;
+	height: 17px;
+	margin-top: 1px;
+	border-radius: 50%;
+	border: 1.5px solid var(--cl-3);
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+	color: var(--cl-on-accent);
+	transition: background 150ms ease, border-color 150ms ease, transform 160ms var(--ease-pop);
+}
+
+.cc-ask-check.multi {
+	border-radius: 5px;
+}
+
+.cc-ask-check.checked {
+	background: var(--cl-clay);
+	border-color: var(--cl-clay);
+	transform: scale(1.04);
+}
+
+.cc-ask-copy {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+	text-align: left;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   10. Workspace Inspector (Diff / Files) & Integrated Terminal Polish
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.workspace-review {
+	background: var(--cl-bg);
+	border-left: 1px solid var(--cl-line);
+}
+
+.workspace-review > .inspector-header {
+	height: 48px;
+	padding: 0 10px 0 12px;
+	background: color-mix(in srgb, var(--cl-bg) 90%, transparent);
+	backdrop-filter: blur(10px);
+	border-bottom: 1px solid var(--cl-line-soft);
+}
+
+/* Replace raw browser details triangles inside workspace git & modal accordions */
+.workspace-review-git > summary,
+.live-settings-section > summary {
+	list-style: none;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.workspace-review-git > summary::-webkit-details-marker,
+.live-settings-section > summary::-webkit-details-marker {
+	display: none;
+}
+
+.workspace-review-git > summary::before,
+.live-settings-section > summary::before {
+	content: "›";
+	font-size: 14px;
+	line-height: 1;
+	color: var(--cl-3);
+	transition: transform 180ms var(--ease-spring);
+}
+
+.workspace-review-git[open] > summary::before,
+.live-settings-section[open] > summary::before {
+	transform: rotate(90deg);
+}
+
+.cc-file-dir {
+	font-style: normal;
+	color: var(--cl-3);
+	font-weight: 400;
+}
+
+.cc-file-base {
+	font-weight: 560;
+	color: var(--cl-1);
+}
+
+.cc-status-tag {
+	font-size: 11px;
+	font-weight: 550;
+	padding: 1px 6px;
+	border-radius: var(--r-pill);
+	flex-shrink: 0;
+	line-height: 1.45;
+}
+
+.cc-status-tag.status-added {
+	background: var(--cl-green-soft);
+	color: var(--cl-green);
+}
+
+.cc-status-tag.status-modified {
+	background: var(--cl-clay-soft);
+	color: var(--cl-clay);
+}
+
+.cc-status-tag.status-deleted {
+	background: var(--cl-remove);
+	color: var(--cl-red);
+}
+
+.cc-status-tag.status-untracked {
+	background: var(--cl-soft);
+	color: var(--cl-3);
+}
+
+.workspace-review-files .cc-change-row {
+	border-radius: 7px;
+	transition: background 120ms ease;
+}
+
+.workspace-review-files .cc-change-open {
+	border-radius: 7px;
+	padding-inline: 8px;
+}
+
+.workspace-review-files .cc-change-open[aria-current="true"] {
+	background: var(--cl-clay-soft);
+	box-shadow: inset 2.5px 0 0 var(--cl-clay);
+}
+
+.cc-preview-dot {
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: var(--cl-3);
+}
+
+.cc-preview-dot.ok {
+	background: var(--cl-green);
+}
+
+.cc-preview-dot.err {
+	background: var(--cl-red);
+}
+
+.cc-preview-dot.pending {
+	background: var(--cl-clay);
+	animation: cc-orb-breathe 1.5s ease-in-out infinite;
+}
+
+/* Integrated Terminal Panel */
+.terminal-panel {
+	border-top: 1px solid var(--cl-line);
+	background: var(--cl-bg);
+}
+
+.terminal-panel > .cc-term-header {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	min-height: 40px;
+	padding: 4px 10px 4px 12px;
+	background: var(--cl-side);
+	border-bottom: 1px solid var(--cl-line-soft);
+}
+
+.cc-term-brand {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	color: var(--cl-2);
+	flex-shrink: 0;
+}
+
+.cc-term-actions {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	margin-left: auto;
+	flex-shrink: 0;
+}
+
+.cc-ssh-form {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+	padding: 8px 12px;
+	background: var(--cl-soft);
+	border-bottom: 1px solid var(--cl-line-soft);
+}
+
+.cc-ssh-toggle {
+	margin-bottom: 0 !important;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   11. Settings Center (2-Column macOS Layout), Switches & All Modals Polish
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.modal::backdrop {
+	background: rgba(15, 23, 42, 0.28);
+	backdrop-filter: blur(6px);
+}
+
+:root[data-theme="dark"] .modal::backdrop,
+:root[data-theme="grail"] .modal::backdrop {
+	background: rgba(0, 0, 0, 0.54);
+}
+
+.modal .modal-shell {
+	border-radius: 16px;
+	border: 1px solid var(--cl-line);
+	box-shadow: var(--elev-3);
+	background: var(--cl-surface);
+}
+
+.modal .modal-shell > header {
+	padding: 13px 16px 13px 20px;
+	border-bottom: 1px solid var(--cl-line-soft);
+	background: color-mix(in srgb, var(--cl-surface) 92%, var(--cl-side));
+}
+
+.modal .modal-shell > header h2 {
+	font-size: 14.5px;
+	font-weight: 620;
+	letter-spacing: -0.01em;
+}
+
+/* Field-sized SelectPopover for forms & dialogs */
+.cc-select-popover.is-field {
+	display: flex;
+	width: 100%;
+	margin-top: 6px;
+}
+
+.cc-select-popover.is-field .cc-select-trigger {
+	width: 100%;
+	max-width: none;
+	height: 36px;
+	padding: 0 11px;
+	border-radius: 9px;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-surface);
+	color: var(--cl-1);
+	font-size: 13px;
+	font-weight: 450;
+	justify-content: space-between;
+	box-shadow: var(--elev-1);
+}
+
+.cc-select-popover.is-field .cc-select-trigger:hover:not(:disabled),
+.cc-select-popover.is-field.is-open .cc-select-trigger {
+	border-color: color-mix(in srgb, var(--cl-clay) 45%, var(--cl-line));
+	background: var(--cl-surface);
+}
+
+.cc-select-popover.is-field .cc-select-label {
+	flex: 1;
+	text-align: left;
+}
+
+.cc-select-popover.is-field .cc-select-menu {
+	width: 100%;
+	max-width: none;
+}
+
+/* Crisp form inputs inside modals */
+.modal-shell input:not([type="checkbox"]):not([type="radio"]):not([type="file"]),
+.modal-shell textarea {
+	border-radius: 9px;
+	border: 1px solid var(--cl-line);
+	transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+
+.modal-shell .search-dialog-input input {
+	border: 0 !important;
+	box-shadow: none !important;
+}
+
+.modal-shell input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):focus,
+.modal-shell textarea:focus {
+	outline: none;
+	border-color: color-mix(in srgb, var(--cl-clay) 55%, var(--cl-line));
+	box-shadow: 0 0 0 3px color-mix(in srgb, var(--cl-clay) 12%, transparent);
+}
+
+/* Native-feeling macOS / iOS pill toggle switches on .live-setting-toggle */
+.live-setting-toggle:not(.cc-external-check) {
+	display: flex;
+	align-items: flex-start;
+	gap: 10px;
+	font-size: 12.5px;
+	line-height: 1.5;
+	color: var(--cl-1);
+	cursor: pointer;
+	padding: 4px 0;
+	margin-bottom: 12px;
+}
+
+.live-setting-toggle:not(.cc-external-check) > input[type="checkbox"] {
+	appearance: none;
+	-webkit-appearance: none;
+	width: 34px;
+	height: 20px;
+	margin: 1px 0 0;
+	border-radius: 999px;
+	border: 1px solid transparent;
+	background: color-mix(in srgb, var(--cl-3) 30%, var(--cl-line));
+	position: relative;
+	flex-shrink: 0;
+	cursor: pointer;
+	transition: background 180ms var(--ease-spring), opacity 150ms ease;
+}
+
+.live-setting-toggle:not(.cc-external-check) > input[type="checkbox"]::after {
+	content: "";
+	position: absolute;
+	top: 1px;
+	left: 1px;
+	width: 16px;
+	height: 16px;
+	border-radius: 50%;
+	background: #ffffff;
+	box-shadow: 0 1px 3px rgba(15, 23, 42, 0.24);
+	transition: transform 200ms var(--ease-spring);
+}
+
+.live-setting-toggle:not(.cc-external-check) > input[type="checkbox"]:checked {
+	background: var(--cl-clay);
+}
+
+.live-setting-toggle:not(.cc-external-check) > input[type="checkbox"]:checked::after {
+	transform: translateX(14px);
+}
+
+.live-setting-toggle:not(.cc-external-check) > input[type="checkbox"]:disabled {
+	opacity: 0.45;
+	cursor: not-allowed;
+}
+
+/* 2-Column macOS System Settings Center */
+.modal.cc-settings-modal .modal-shell {
+	width: min(860px, calc(100vw - 32px));
+	max-width: 860px;
+	height: min(650px, calc(100vh - 44px));
+	max-height: calc(100vh - 44px);
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+}
+
+.cc-settings-layout {
+	display: grid !important;
+	grid-template-columns: 196px minmax(0, 1fr);
+	padding: 0 !important;
+	flex: 1;
+	min-height: 0;
+	overflow: hidden !important;
+}
+
+.cc-settings-nav {
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	padding: 12px 10px;
+	background: var(--cl-side);
+	border-right: 1px solid var(--cl-line-soft);
+	overflow-y: auto;
+}
+
+.cc-settings-nav-btn {
+	display: flex;
+	align-items: center;
+	gap: 9px;
+	width: 100%;
+	height: 35px;
+	padding: 0 11px;
+	border-radius: 8px;
+	font-size: 13px;
+	font-weight: 500;
+	color: var(--cl-2);
+	text-align: left;
+	transition:
+		background 150ms ease,
+		color 150ms ease,
+		box-shadow 150ms ease;
+}
+
+.cc-settings-nav-btn svg {
+	color: var(--cl-3);
+	flex-shrink: 0;
+	transition: color 150ms ease;
+}
+
+.cc-settings-nav-btn:hover {
+	background: var(--cl-hover);
+	color: var(--cl-1);
+}
+
+.cc-settings-nav-btn.active {
+	background: var(--cl-surface);
+	color: var(--cl-1);
+	font-weight: 600;
+	box-shadow: var(--elev-1);
+}
+
+:root[data-theme="dark"] .cc-settings-nav-btn.active {
+	background: var(--cl-active);
+	box-shadow: none;
+}
+
+.cc-settings-nav-btn.active svg {
+	color: var(--cl-clay);
+}
+
+.cc-settings-main {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	min-height: 0;
+	overflow: hidden;
+	background: var(--cl-surface);
+}
+
+.cc-settings-pane {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	padding: 20px 24px 16px;
+}
+
+.cc-settings-grid-2 {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 12px;
+}
+
+.cc-settings-accordion-btn {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	width: 100%;
+	padding: 11px 0;
+	font-size: 13px;
+	font-weight: 550;
+	color: var(--cl-2);
+	text-align: left;
+}
+
+.cc-settings-accordion-btn:hover {
+	color: var(--cl-1);
+}
+
+.cc-settings-chevron {
+	font-size: 15px;
+	line-height: 1;
+	color: var(--cl-3);
+	transition: transform 180ms var(--ease-spring);
+}
+
+.cc-settings-chevron.open {
+	transform: rotate(90deg);
+}
+
+.cc-settings-callout {
+	padding: 9px 12px;
+	border-radius: 9px;
+	background: var(--cl-amber-soft);
+	border: 1px solid color-mix(in srgb, var(--cl-amber) 20%, transparent);
+	color: var(--cl-2);
+	margin: 2px 0 14px;
+}
+
+.cc-settings-footer {
+	flex-shrink: 0;
+	padding: 10px 24px 14px;
+	border-top: 1px solid var(--cl-line-soft);
+	background: color-mix(in srgb, var(--cl-surface) 92%, var(--cl-side));
+}
+
+.cc-settings-footer .live-settings-security {
+	margin: 0 0 8px;
+}
+
+.cc-settings-footer .live-settings-actions {
+	margin-top: 6px;
+}
+
+@media (max-width: 720px) {
+	.cc-settings-layout {
+		grid-template-columns: 1fr;
+	}
+	.cc-settings-nav {
+		flex-direction: row;
+		flex-wrap: nowrap;
+		overflow-x: auto;
+		border-right: 0;
+		border-bottom: 1px solid var(--cl-line-soft);
+		padding: 8px 12px;
+	}
+	.cc-settings-nav-btn {
+		width: auto;
+		white-space: nowrap;
+	}
+	.cc-settings-grid-2 {
+		grid-template-columns: 1fr;
+	}
+}
+
+/* Raycast-style Command Palette & Conversation Search */
+.search-dialog-input {
+	border-radius: 11px;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-soft);
+	padding: 0 12px;
+	height: 40px;
+	transition: border-color 150ms ease, background 150ms ease, box-shadow 150ms ease;
+}
+
+.search-dialog-input:focus-within {
+	background: var(--cl-surface);
+	border-color: color-mix(in srgb, var(--cl-clay) 50%, var(--cl-line));
+	box-shadow: 0 0 0 3px color-mix(in srgb, var(--cl-clay) 11%, transparent);
+}
+
+.search-results button {
+	border-radius: 9px;
+	padding: 8px 11px;
+	transition: background 110ms ease;
+}
+
+.search-results button.active {
+	background: var(--cl-clay-soft);
+}
+
+.search-results button kbd {
+	font-family: var(--mono);
+	font-size: 11px;
+	padding: 2px 6px;
+	border-radius: 5px;
+	background: var(--cl-surface);
+	border: 1px solid var(--cl-line);
+	color: var(--cl-2);
+}
+
 @media (prefers-reduced-motion: reduce) {
-	.cc-smooth-collapse {
+	.cc-smooth-collapse,
+	.cc-seg-glider.is-animated {
 		transition: none !important;
 	}
 	.cc-shimmer-text,
 	.cl-think.thinking-active summary .cc-think-label,
-	.cl-tool-group.running .cc-tool-group-summary {
+	.cl-tool-group.running .cc-tool-group-summary,
+	.cl-transcript,
+	.cc-tab-panel,
+	.cc-settings-pane {
 		animation: none !important;
+	}
+	.cc-shimmer-text,
+	.cl-think.thinking-active summary .cc-think-label,
+	.cl-tool-group.running .cc-tool-group-summary {
 		color: var(--cl-2) !important;
 		background: none !important;
 	}

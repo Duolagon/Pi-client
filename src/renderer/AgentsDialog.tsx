@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Bot, Plus, Save, Trash2 } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
 import { useConfirmation } from "./ConfirmationDialog.tsx";
+import { SelectPopover } from "./SelectPopover.tsx";
 import type {
 	AgentDefinition,
 	AgentMemoryScope,
@@ -317,47 +318,47 @@ export function AgentsDialog({
 								onChange={(event) => setModelText(event.target.value)}
 							/>
 						</label>
-						<label className="field-label">
+						<div className="field-label">
 							思考强度 / effort
-							<select
+							<SelectPopover
+								ariaLabel="思考强度 / effort"
+								field
+								direction="down"
 								value={thinkingLevel}
 								disabled={busy || builtin}
-								onChange={(event) => setThinkingLevel(event.target.value as ThinkingLevel | "")}
-							>
-								{thinkingOptions.map((option) => (
-									<option key={option.value} value={option.value}>
-										{option.label}
-									</option>
-								))}
-							</select>
-						</label>
+								options={thinkingOptions.map((option) => ({ value: option.value, label: option.label }))}
+								onChange={(val) => setThinkingLevel(val as ThinkingLevel | "")}
+							/>
+						</div>
 					</div>
 					<div className="cc-agent-row">
-						<label className="field-label">
+						<div className="field-label">
 							权限模式
-							<select
+							<SelectPopover
+								ariaLabel="Agent 权限模式"
+								field
+								direction="down"
 								value={permissionMode}
 								disabled={busy || builtin}
-								onChange={(event) => setPermissionMode(event.target.value as AgentPermissionMode | "")}
-							>
-								{permissionModeOptions.map((option) => (
-									<option key={option.value} value={option.value}>
-										{option.label}
-									</option>
-								))}
-							</select>
-						</label>
-						<label className="field-label">
+								options={permissionModeOptions.map((option) => ({ value: option.value, label: option.label }))}
+								onChange={(val) => setPermissionMode(val as AgentPermissionMode | "")}
+							/>
+						</div>
+						<div className="field-label">
 							保存位置
-							<select
+							<SelectPopover
+								ariaLabel="保存位置"
+								field
+								direction="down"
 								value={form.scope}
 								disabled={busy || builtin}
-								onChange={(event) => setForm((value) => ({ ...value, scope: event.target.value as AgentSaveInput["scope"] }))}
-							>
-								<option value="project">项目 .pi/agents</option>
-								<option value="user">用户 ~/.pi/agent/agents</option>
-							</select>
-						</label>
+								options={[
+									{ value: "project", label: "项目 .pi/agents" },
+									{ value: "user", label: "用户 ~/.pi/agent/agents" },
+								]}
+								onChange={(val) => setForm((value) => ({ ...value, scope: val as AgentSaveInput["scope"] }))}
+							/>
+						</div>
 					</div>
 					{!builtin && (
 						<details className="live-settings-section">
@@ -387,22 +388,34 @@ export function AgentsDialog({
 									</label>
 								</div>
 								<div className="cc-agent-row">
-									<label className="field-label">
+									<div className="field-label">
 										持久化记忆 memory
-										<select value={memory} disabled={busy} onChange={(event) => setMemory(event.target.value as AgentMemoryScope | "")}>
-											{memoryOptions.map((opt) => (
-												<option key={opt.value} value={opt.value}>{opt.label}</option>
-											))}
-										</select>
-									</label>
-									<label className="field-label">
+										<SelectPopover
+											ariaLabel="持久化记忆 memory"
+											field
+											direction="down"
+											value={memory}
+											disabled={busy}
+											options={memoryOptions.map((opt) => ({ value: opt.value, label: opt.label }))}
+											onChange={(val) => setMemory(val as AgentMemoryScope | "")}
+										/>
+									</div>
+									<div className="field-label">
 										隔离方式 isolation
-										<select value={isolation} disabled={busy} onChange={(event) => setIsolation(event.target.value as "" | "worktree" | "shared")}>
-											<option value="">自动（只读共享 / 可写 Worktree）</option>
-											<option value="worktree">worktree</option>
-											<option value="shared">shared（仅只读可用）</option>
-										</select>
-									</label>
+										<SelectPopover
+											ariaLabel="隔离方式 isolation"
+											field
+											direction="down"
+											value={isolation}
+											disabled={busy}
+											options={[
+												{ value: "", label: "自动（只读共享 / 可写 Worktree）" },
+												{ value: "worktree", label: "worktree" },
+												{ value: "shared", label: "shared（仅只读可用）" },
+											]}
+											onChange={(val) => setIsolation(val as "" | "worktree" | "shared")}
+										/>
+									</div>
 								</div>
 								<div className="cc-agent-row">
 									<label className="field-label">
@@ -426,11 +439,11 @@ export function AgentsDialog({
 								</div>
 								<label className="live-setting-toggle">
 									<input type="checkbox" checked={background} disabled={busy} onChange={(event) => setBackground(event.target.checked)} />
-									默认后台运行（background: true）
+									<span>默认后台运行（background: true）</span>
 								</label>
 								<label className="live-setting-toggle">
 									<input type="checkbox" checked={omitClaudeMd} disabled={busy} onChange={(event) => setOmitClaudeMd(event.target.checked)} />
-									不注入 CLAUDE.md / AGENTS.md 上下文（omitClaudeMd）
+									<span>不注入 CLAUDE.md / AGENTS.md 上下文（omitClaudeMd）</span>
 								</label>
 							</div>
 						</details>

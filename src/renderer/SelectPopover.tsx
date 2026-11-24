@@ -25,6 +25,7 @@ export function SelectPopover({
 	disabled = false,
 	align = "left",
 	direction = "up",
+	field = false,
 	className = "",
 	pillClassName = "",
 	title,
@@ -39,6 +40,7 @@ export function SelectPopover({
 	disabled?: boolean;
 	align?: "left" | "right";
 	direction?: "up" | "down";
+	field?: boolean;
 	className?: string;
 	pillClassName?: string;
 	title?: string;
@@ -97,7 +99,7 @@ export function SelectPopover({
 	};
 
 	return (
-		<div ref={rootRef} className={`cc-select-popover ${open ? "is-open" : ""} ${className}`.trim()}>
+		<div ref={rootRef} className={`cc-select-popover ${field ? "is-field" : ""} ${open ? "is-open" : ""} ${className}`.trim()}>
 			<select
 				aria-label={ariaLabel}
 				value={value}

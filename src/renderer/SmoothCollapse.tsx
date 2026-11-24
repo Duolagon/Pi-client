@@ -21,9 +21,12 @@ export function SmoothCollapse({
 	const [mounted, setMounted] = useState(open);
 	const [expanded, setExpanded] = useState(open);
 
+	if (open && !mounted) {
+		setMounted(true);
+	}
+
 	useEffect(() => {
 		if (open) {
-			setMounted(true);
 			let frame2 = 0;
 			const frame1 = requestAnimationFrame(() => {
 				frame2 = requestAnimationFrame(() => setExpanded(true));
@@ -38,7 +41,7 @@ export function SmoothCollapse({
 		return () => clearTimeout(timer);
 	}, [open, durationMs]);
 
-	if (!mounted) return null;
+	if (!open && !mounted) return null;
 
 	return (
 		<div
