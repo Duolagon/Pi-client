@@ -42,7 +42,12 @@ export function TaskAttention({ items, openAll, showFinished, toggleFinished }: 
 				if (!group.length) return null;
 				return (
 					<div key={state} className="cc-attention-group" data-state={state}>
-						<h3><Icon size={12} aria-hidden="true" />{label}<span className="cc-attention-count">{group.length}</span></h3>
+						<h3>
+							<span className={`cc-attn-beacon is-${state}`} aria-hidden="true" />
+							<Icon size={12} aria-hidden="true" />
+							{label}
+							<span className="cc-attention-count">{group.length}</span>
+						</h3>
 						<AttentionRows items={group} />
 					</div>
 				);

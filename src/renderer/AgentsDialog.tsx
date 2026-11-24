@@ -3,6 +3,7 @@ import { Bot, Plus, Save, Trash2 } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
 import { useConfirmation } from "./ConfirmationDialog.tsx";
 import { SelectPopover } from "./SelectPopover.tsx";
+import { AnimatedDetails } from "./SmoothCollapse.tsx";
 import type {
 	AgentDefinition,
 	AgentMemoryScope,
@@ -255,7 +256,7 @@ export function AgentsDialog({
 						</button>
 					))}
 				</div>
-				<form className="cc-agent-editor" onSubmit={(event) => void save(event)}>
+				<form key={selected?.name ?? "__new__"} className="cc-agent-editor cc-tab-panel" onSubmit={(event) => void save(event)}>
 					<div className="cc-agent-editor-head">
 						<div>
 							<strong>{builtin ? "内置 Agent（只读）" : selected ? "编辑 Agent" : "新建 Agent"}</strong>
@@ -361,8 +362,10 @@ export function AgentsDialog({
 						</div>
 					</div>
 					{!builtin && (
-						<details className="live-settings-section">
-							<summary>Claude Code 高级兼容配置（Skills / Memory / 轮次 / 隔离）</summary>
+						<AnimatedDetails
+							className="live-settings-section"
+							summary="Claude Code 高级兼容配置（Skills / Memory / 轮次 / 隔离）"
+						>
 							<div className="live-settings-section-content">
 								<div className="cc-agent-row">
 									<label className="field-label">
@@ -446,7 +449,7 @@ export function AgentsDialog({
 									<span>不注入 CLAUDE.md / AGENTS.md 上下文（omitClaudeMd）</span>
 								</label>
 							</div>
-						</details>
+						</AnimatedDetails>
 					)}
 					{selected?.definitionError && (
 						<p className="cc-agent-error" role="alert">配置冲突：{selected.definitionError}</p>

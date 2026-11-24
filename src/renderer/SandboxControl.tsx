@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ShieldAlert, ShieldCheck, WifiOff } from "lucide-react";
+import { SurfacePresence } from "./Presence.tsx";
 import type { SandboxStatus } from "../shared.ts";
 
 export function SandboxControl({
@@ -96,8 +97,9 @@ export function SandboxControl({
 				)}
 				<span>{pillText}</span>
 			</button>
-			{open && (
-				<div className="cc-sandbox-popover" role="region" aria-label="命令沙箱控制">
+			<SurfacePresence show={open} direction="up">
+				{(popRef) => (
+				<div ref={popRef} className="cc-sandbox-popover" role="region" aria-label="命令沙箱控制">
 					<div className="cc-sandbox-head">
 						<div>
 							<strong>macOS Seatbelt 命令沙箱</strong>
@@ -152,7 +154,8 @@ export function SandboxControl({
 						<p>内置文件工具也会保护 .env 文件。交互终端、MCP 与 Hooks 使用各自的权限。</p>
 					</div>
 				</div>
-			)}
+				)}
+			</SurfacePresence>
 		</div>
 	);
 }

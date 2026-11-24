@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { prefersReducedMotion } from "./Presence.tsx";
 
 const SPOTLIGHT_SELECTOR =
-	".cc-starter-card, .cl-composer-box, .cc-completion-card, .cc-inline-approval, .cc-status-card, .cc-tool-ctrl-row";
+	".cc-starter-card, .cl-composer-box, .cc-completion-card, .cc-inline-approval, .cc-status-card, .cc-tool-ctrl-row, .cc-agent-item, .cc-rewind-item, .cc-doctor-row, .cc-subagent-row, .cc-pr-card";
 
 /**
  * Zero-rerender pointer-tracking spotlight & window-resize choreography controller.

@@ -5,7 +5,9 @@ import type { Change, CodeIntelligence, CodePosition, FileEntry, GitCheckpoint, 
 import { CodeLines, UnifiedDiffView, type DiffReviewAnchor } from "./DiffView.tsx";
 import { diffHunkCount } from "./diff-lines.ts";
 import { PullRequestPanel } from "./PullRequestPanel.tsx";
+import { SurfacePresence, prefersReducedMotion } from "./Presence.tsx";
 import { SlidingTabList } from "./SegmentedTabs.tsx";
+import { AnimatedDetails, SmoothCollapse } from "./SmoothCollapse.tsx";
 import { formatReviewNotes, readReviewView, reviewLocation, reviewRevision, saveReviewView, type ReviewPosition, type ReviewView } from "./workspace-review-state.ts";
 import "./workspace-review.css";
 
@@ -244,7 +246,13 @@ export function WorkspacePanel({
 	const jumpToHunk = (index: number) => {
 		if (!content || index < 0 || index >= hunkCount) return;
 		const hunk = scroller.current?.querySelector<HTMLElement>(`[data-diff-hunk="${index}"]`);
-		hunk?.scrollIntoView({ block: "start" });
+		if (hunk) {
+			hunk.scrollIntoView({ behavior: prefersReducedMotion() ? "instant" : "smooth", block: "start" });
+			hunk.dataset.hunkFlash = "true";
+			window.setTimeout(() => {
+				if (hunk.dataset.hunkFlash === "true") delete hunk.dataset.hunkFlash;
+			}, 950);
+		}
 		setPosition({ ...position, hunk: index, top: scroller.current?.scrollTop ?? position.top });
 	};
 
@@ -464,31 +472,39 @@ export function WorkspacePanel({
 						</div>
 					)}
 					{!turnReview && workspace?.isGit && (
-						<details className="workspace-review-git">
-							<summary>Git 操作 <span>{workspace.branch}</span></summary>
-							<PullRequestPanel conversationId={conversationId} branch={workspace.branch} readOnly={readOnly} />
-							{!readOnly && workspace.changes.length > 0 && (
+						<AnimatedDetails
+							className="workspace-review-git"
+							summary={
 								<>
-									<div className="cc-git-bulk">
-										<button type="button" className="cc-mini-btn" disabled={mutating} onClick={() => void runGit(() => window.pi.gitStage())}>
-											<Plus size={12} /> 全部暂存
-										</button>
-										{stagedChanges.length > 0 && (
-											<button type="button" className="cc-mini-btn" disabled={mutating} onClick={() => void runGit(() => window.pi.gitUnstage())}>
-												<Minus size={12} /> 全部取消暂存
-											</button>
-										)}
-									</div>
-									<form className="cc-commit-box" onSubmit={commit}>
-										<input aria-label="Git 提交说明" placeholder={stagedChanges.length ? `提交 ${stagedChanges.length} 个已暂存文件…` : "先暂存修改…"}
-											value={commitMessage} onChange={(event) => setCommitMessage(event.target.value)} disabled={mutating || !stagedChanges.length} />
-										<button type="submit" className="primary-button" disabled={mutating || !stagedChanges.length || !commitMessage.trim()}>
-											<Check size={13} /> 提交
-										</button>
-									</form>
+									Git 操作 <span>{workspace.branch}</span>
 								</>
-							)}
-						</details>
+							}
+						>
+							<div className="cc-workspace-git-body">
+								<PullRequestPanel conversationId={conversationId} branch={workspace.branch} readOnly={readOnly} />
+								{!readOnly && workspace.changes.length > 0 && (
+									<>
+										<div className="cc-git-bulk">
+											<button type="button" className="cc-mini-btn" disabled={mutating} onClick={() => void runGit(() => window.pi.gitStage())}>
+												<Plus size={12} /> 全部暂存
+											</button>
+											{stagedChanges.length > 0 && (
+												<button type="button" className="cc-mini-btn" disabled={mutating} onClick={() => void runGit(() => window.pi.gitUnstage())}>
+													<Minus size={12} /> 全部取消暂存
+												</button>
+											)}
+										</div>
+										<form className="cc-commit-box" onSubmit={commit}>
+											<input aria-label="Git 提交说明" placeholder={stagedChanges.length ? `提交 ${stagedChanges.length} 个已暂存文件…` : "先暂存修改…"}
+												value={commitMessage} onChange={(event) => setCommitMessage(event.target.value)} disabled={mutating || !stagedChanges.length} />
+											<button type="submit" className="primary-button" disabled={mutating || !stagedChanges.length || !commitMessage.trim()}>
+												<Check size={13} /> 提交
+											</button>
+										</form>
+									</>
+								)}
+							</div>
+						</AnimatedDetails>
 					)}
 					{turnReview && !checkpointId && <p className="subtle-note workspace-review-hint">当前轮次没有可关联的检查点。可查看整个工作区的未提交改动。</p>}
 					{turnReview && checkpointId && !activeCheckpoint && !listError && <p className="subtle-note workspace-review-hint" role="status">正在读取本轮检查点…</p>}
@@ -573,21 +589,24 @@ export function WorkspacePanel({
 							</div>
 						)}
 					</div>
-					{(view.draft || view.notes.length > 0) && (
-						<div className="workspace-review-notes" aria-label="评审意见">
-							{view.draft && (
-								<form className="workspace-review-note-editor" onSubmit={saveNote}>
-									<label>{reviewLocation(view.draft)}
-										<textarea aria-label="逐行评审反馈" ref={noteEditor} maxLength={maxNoteLength} value={view.draft.note}
-											onChange={(event) => updateView((current) => current.draft
-												? { ...current, draft: { ...current.draft, note: event.target.value } } : current)} />
-									</label>
-									<div>
-										<button type="submit" className="cc-mini-btn" disabled={!view.draft.note.trim() || sending}>保存评审意见</button>
-										<button type="button" className="cc-mini-btn" onClick={() => updateView((current) => ({ ...current, draft: undefined }))}>取消</button>
-									</div>
-								</form>
-							)}
+					<SurfacePresence show={Boolean(view.draft || view.notes.length > 0)} direction="up" group="review-notes">
+						{(notesRef) => (
+						<div ref={notesRef} className="workspace-review-notes" aria-label="评审意见">
+							<SmoothCollapse open={Boolean(view.draft)}>
+								{view.draft && (
+									<form className="workspace-review-note-editor" onSubmit={saveNote}>
+										<label>{reviewLocation(view.draft)}
+											<textarea aria-label="逐行评审反馈" ref={noteEditor} maxLength={maxNoteLength} value={view.draft.note}
+												onChange={(event) => updateView((current) => current.draft
+													? { ...current, draft: { ...current.draft, note: event.target.value } } : current)} />
+										</label>
+										<div>
+											<button type="submit" className="cc-mini-btn" disabled={!view.draft.note.trim() || sending}>保存评审意见</button>
+											<button type="button" className="cc-mini-btn" onClick={() => updateView((current) => ({ ...current, draft: undefined }))}>取消</button>
+										</div>
+									</form>
+								)}
+							</SmoothCollapse>
 							{view.notes.length > 0 && (
 								<>
 									<ul>
@@ -609,11 +628,12 @@ export function WorkspacePanel({
 								</>
 							)}
 						</div>
-					)}
+						)}
+					</SurfacePresence>
 				</>
 			)}
 			{pane === "files" && (
-				<>
+				<div key={selectedPath ? `file:${selectedPath}` : `dir:${view.files.directory}`} className="cc-files-stage cc-tab-panel">
 					{selectedPath ? (
 						<>
 							<div className="file-preview-heading">
@@ -633,20 +653,21 @@ export function WorkspacePanel({
 										<button type="submit" className="cc-mini-btn" disabled={analyzing}>查找定义</button>
 									</form>
 									{intelligence.definitions.map((item, index) => <button type="button" key={index} onClick={() => open(item.path, item.line)}>{item.path}:{item.line}:{item.column}</button>)}
-									<details open={intelligence.diagnostics.length > 0}>
-										<summary>{intelligence.diagnosticsComplete === false ? "语言服务器尚未报告诊断" : `诊断 ${intelligence.diagnostics.length}`}</summary>
+									<AnimatedDetails
+										defaultOpen={intelligence.diagnostics.length > 0}
+										summary={intelligence.diagnosticsComplete === false ? "语言服务器尚未报告诊断" : `诊断 ${intelligence.diagnostics.length}`}
+									>
 										{intelligence.diagnostics.map((item, index) => <button type="button" key={index} onClick={() => updateView((current) => ({ ...current, files: { ...current.files, line: item.line } }))}>{item.line}:{item.column} {item.message}</button>)}
-									</details>
-									<details>
-										<summary>符号 {intelligence.symbols.length}</summary>
+									</AnimatedDetails>
+									<AnimatedDetails summary={`符号 ${intelligence.symbols.length}`}>
 										{intelligence.symbols.map((item, index) => <button type="button" key={index} onClick={() => updateView((current) => ({ ...current, files: { ...current.files, line: item.line } }))}>{item.name} · {item.line}</button>)}
-									</details>
+									</AnimatedDetails>
 								</section>
 							)}
 							<div className="live-file-content" ref={scroller} onScroll={saveScroll}>
 								{content ? (content.text ? <CodeLines content={content.text} activeLine={view.files.line} /> : <p className="subtle-note">空文件</p>)
 									: contentError?.requestId === requestId ? <p className="subtle-note" role="alert">{contentError.message}</p>
-										: <p className="subtle-note" role="status">正在读取文件…</p>}
+										: <p className="subtle-note cc-shimmer-text" role="status">正在读取文件…</p>}
 							</div>
 						</>
 					) : (
@@ -667,12 +688,12 @@ export function WorkspacePanel({
 										<span>{entry.name}</span>
 									</button>
 								))}
-								{directoryLoading ? <p className="subtle-note" role="status">正在读取目录…</p>
+								{directoryLoading ? <p className="subtle-note cc-shimmer-text" role="status">正在读取目录…</p>
 									: !entries.length && !listError && <p className="subtle-note">目录为空。</p>}
 							</div>
 						</>
 					)}
-				</>
+				</div>
 			)}
 			{discard && (
 				<Modal title={discard.status === "??" ? "将未跟踪文件移到废纸篓" : "还原未暂存修改"} close={() => { if (!mutating) setDiscard(undefined); }}>

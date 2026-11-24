@@ -46,6 +46,7 @@ export function MemoryStatusDialog({
 	const [saving, setSaving] = useState(false);
 	const [compactInstructions, setCompactInstructions] = useState("");
 	const [tools, setTools] = useState<DesktopToolInfo[]>([]);
+	const [hoveredSeg, setHoveredSeg] = useState<"inst" | "tools" | "conv" | null>(null);
 
 	const refreshReport = async () => {
 		if (!snapshot.active) return;
@@ -191,11 +192,12 @@ export function MemoryStatusDialog({
 				{tab === "memory" && (
 					<div className="cc-controls-body">
 						<div className="cc-rewind-head">
-							<div className="cc-memory-switch">
+							<SlidingTabList variant="pill" className="cc-memory-switch">
 								{sources.map((entry) => (
 									<button
 										type="button"
 										key={entry.id}
+										aria-pressed={activePath === entry.relativePath}
 										className={`cc-mini-btn ${activePath === entry.relativePath ? "active" : ""}`}
 										onClick={() => switchSource(entry.relativePath)}
 										disabled={saving}
@@ -204,7 +206,7 @@ export function MemoryStatusDialog({
 										{entry.relativePath} {entry.exists ? `(${entry.estimatedTokens}t)` : "(新建)"}
 									</button>
 								))}
-							</div>
+							</SlidingTabList>
 							<button
 								type="button"
 								className="secondary-button"
@@ -294,15 +296,51 @@ export function MemoryStatusDialog({
 								</strong>
 								<span>可用余量 {(report?.remainingTokens ?? 0).toLocaleString()} tokens</span>
 							</div>
-							<div className="cc-context-bar" aria-label="上下文分段占用条">
-								<div className="cc-ctx-seg inst" style={{ width: `${Math.max(1, pctInstructions)}%` }} title="指令与记忆文件" />
-								<div className="cc-ctx-seg tools" style={{ width: `${Math.max(1, pctTools)}%` }} title="激活工具与 MCP Schema" />
-								<div className="cc-ctx-seg conv" style={{ width: `${Math.max(0, pctConv)}%` }} title="对话与工具输出" />
+							<div className={`cc-context-bar ${hoveredSeg ? `has-hover hover-${hoveredSeg}` : ""}`.trim()} aria-label="上下文分段占用条">
+								<div
+									className="cc-ctx-seg inst"
+									style={{ width: `${Math.max(1, pctInstructions)}%` }}
+									title="指令与记忆文件"
+									onMouseEnter={() => setHoveredSeg("inst")}
+									onMouseLeave={() => setHoveredSeg(null)}
+								/>
+								<div
+									className="cc-ctx-seg tools"
+									style={{ width: `${Math.max(1, pctTools)}%` }}
+									title="激活工具与 MCP Schema"
+									onMouseEnter={() => setHoveredSeg("tools")}
+									onMouseLeave={() => setHoveredSeg(null)}
+								/>
+								<div
+									className="cc-ctx-seg conv"
+									style={{ width: `${Math.max(0, pctConv)}%` }}
+									title="对话与工具输出"
+									onMouseEnter={() => setHoveredSeg("conv")}
+									onMouseLeave={() => setHoveredSeg(null)}
+								/>
 							</div>
 							<div className="cc-context-legend">
-								<span><i className="inst" /> 指令与规则 (~{report?.estimatedInstructionsTokens ?? 0} tok)</span>
-								<span><i className="tools" /> 工具与 MCP (~{report?.estimatedToolsTokens ?? 0} tok · {report?.activeToolsCount ?? activeToolsCount} 工具)</span>
-								<span><i className="conv" /> 对话消息 ({report?.conversationTokens ?? 0} tok)</span>
+								<span
+									className={hoveredSeg === "inst" ? "is-active" : undefined}
+									onMouseEnter={() => setHoveredSeg("inst")}
+									onMouseLeave={() => setHoveredSeg(null)}
+								>
+									<i className="inst" /> 指令与规则 (~{report?.estimatedInstructionsTokens ?? 0} tok)
+								</span>
+								<span
+									className={hoveredSeg === "tools" ? "is-active" : undefined}
+									onMouseEnter={() => setHoveredSeg("tools")}
+									onMouseLeave={() => setHoveredSeg(null)}
+								>
+									<i className="tools" /> 工具与 MCP (~{report?.estimatedToolsTokens ?? 0} tok · {report?.activeToolsCount ?? activeToolsCount} 工具)
+								</span>
+								<span
+									className={hoveredSeg === "conv" ? "is-active" : undefined}
+									onMouseEnter={() => setHoveredSeg("conv")}
+									onMouseLeave={() => setHoveredSeg(null)}
+								>
+									<i className="conv" /> 对话消息 ({report?.conversationTokens ?? 0} tok)
+								</span>
 								<span>缓存命中率：{report?.cacheHitPercent ?? 0}%</span>
 							</div>
 						</div>

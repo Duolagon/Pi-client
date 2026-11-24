@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { History, RotateCcw } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
 import { UnifiedDiffView } from "./DiffView.tsx";
+import { SurfacePresence } from "./Presence.tsx";
 import type { GitCheckpoint, GitCheckpointDiff } from "../shared.ts";
 import "./checkpoints-dialog.css";
 
@@ -140,7 +141,14 @@ export function CheckpointsDialog({
 			<div className="simple-dialog">
 				<div className="cc-rewind-layout">
 					<div className="cc-rewind-list" aria-label="检查点列表">
-						{!checkpoints && !listError && <p className="subtle-note" role="status">正在读取检查点…</p>}
+						{!checkpoints && !listError && (
+							<div className="cc-skeleton-stack" role="status">
+								<p className="subtle-note cc-shimmer-text">正在读取检查点…</p>
+								<span className="cc-skeleton-card" aria-hidden="true" />
+								<span className="cc-skeleton-card" aria-hidden="true" />
+								<span className="cc-skeleton-card" aria-hidden="true" />
+							</div>
+						)}
 						{listError && <p role="alert">{listError} <button type="button" className="cc-mini-btn" onClick={() => setListRetry((value) => value + 1)}>重试</button></p>}
 						{checkpoints?.map((cp) => (
 							<button
@@ -163,7 +171,7 @@ export function CheckpointsDialog({
 							</button>
 						))}
 					</div>
-					<div className="cc-rewind-detail">
+					<div key={activeCp?.id ?? "empty"} className="cc-rewind-detail cc-tab-panel">
 						{checkpoints && !activeCp && (
 							<div className="cc-empty-state">
 								<History size={22} aria-hidden="true" />
@@ -188,24 +196,32 @@ export function CheckpointsDialog({
 						{activeCp?.status === "pending" && <p className="subtle-note">检查点仍在记录，任务结束后可查看。</p>}
 						{readOnly && activeCp && <p className="subtle-note">在可写模式下可以恢复工作区文件。</p>}
 						{activeCp && activeCp.status !== "pending" && (!currentPreview || currentPreview.status === "loading") && (
-							<p className="subtle-note" role="status">正在读取所选检查点的文件差异…</p>
+							<div className="cc-skeleton-stack" role="status">
+								<p className="subtle-note cc-shimmer-text">正在读取所选检查点的文件差异…</p>
+								<span className="cc-skeleton-card tall" aria-hidden="true" />
+								<span className="cc-skeleton-card tall" aria-hidden="true" />
+							</div>
 						)}
 						{currentPreview?.status === "error" && (
 							<p role="alert">{currentPreview.message} <button type="button" className="cc-mini-btn" onClick={() => setPreviewRetry((value) => value + 1)}>重试预览</button></p>
 						)}
-						{confirm && confirm.checkpointId === diff?.checkpointId && (
-							<section className="cc-rewind-confirm" aria-label="确认恢复范围">
-								<strong>恢复到 {activeCp?.label} · {activeCp && formatTime(activeCp.createdAt)}</strong>
-								<p>此操作会恢复以下 {confirm.paths.length} 个文件的工作区内容，保留 Git 暂存区和会话历史。检查点之后新增的文件会被移除。</p>
-								<ul>{confirm.paths.map((path) => <li key={path}><code>{path}</code></li>)}</ul>
-								<div className="cc-rewind-confirm-actions">
-									<button type="button" className="cc-mini-btn" disabled={restoring} onClick={() => setConfirm(undefined)}>取消</button>
-									<button type="button" className="primary-button" disabled={!canRestore} onClick={() => void restore()}>
-										{restoring ? "正在恢复…" : `确认恢复 ${confirm.paths.length} 个文件`}
-									</button>
-								</div>
-							</section>
-						)}
+						<SurfacePresence show={Boolean(confirm && confirm.checkpointId === diff?.checkpointId)} direction="banner" group="rewind-confirm">
+							{(confirmRef) =>
+								confirm ? (
+									<section ref={confirmRef} className="cc-rewind-confirm" aria-label="确认恢复范围">
+										<strong>恢复到 {activeCp?.label} · {activeCp && formatTime(activeCp.createdAt)}</strong>
+										<p>此操作会恢复以下 {confirm.paths.length} 个文件的工作区内容，保留 Git 暂存区和会话历史。检查点之后新增的文件会被移除。</p>
+										<ul>{confirm.paths.map((path) => <li key={path}><code>{path}</code></li>)}</ul>
+										<div className="cc-rewind-confirm-actions">
+											<button type="button" className="cc-mini-btn" disabled={restoring} onClick={() => setConfirm(undefined)}>取消</button>
+											<button type="button" className="primary-button" disabled={!canRestore} onClick={() => void restore()}>
+												{restoring ? "正在恢复…" : `确认恢复 ${confirm.paths.length} 个文件`}
+											</button>
+										</div>
+									</section>
+								) : null
+							}
+						</SurfacePresence>
 						{restoreError && <p className="live-error" role="alert" style={{ whiteSpace: "pre-line" }}>{restoreError}</p>}
 						<div className="cc-rewind-files">
 							{diff?.files.map((file) => (

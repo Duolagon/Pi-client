@@ -198,7 +198,7 @@ export function McpDialog({
 					))}
 					{!loading && !servers.length && <p className="subtle-note">尚无 MCP 服务器。添加一个 stdio 或 HTTP 服务器后，Pi 会在下次会话启动时连接。</p>}
 				</div>
-				<form className="cc-agent-editor" onSubmit={(event) => void save(event)}>
+				<form key={selected ? `${selected.scope}:${selected.name}` : "__new__"} className="cc-agent-editor cc-tab-panel" onSubmit={(event) => void save(event)}>
 					<div className="cc-agent-editor-head">
 						<div>
 							<strong>{selected ? "编辑 MCP 服务器" : "新建 MCP 服务器"}</strong>

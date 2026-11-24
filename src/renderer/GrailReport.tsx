@@ -1,6 +1,8 @@
+import type { CSSProperties } from "react";
 import { Modal } from "../prototype/ui.tsx";
 import { GRAIL_CRITERIA, type GrailVerdict } from "../shared.ts";
 import { betterApproach, citationText, comparisonText, formatCost, gradeTone, type GrailWording } from "./grail-view.ts";
+import { AnimatedDetails } from "./SmoothCollapse.tsx";
 
 const CHECK_LABEL = { test: "测试", check: "类型检查", lint: "Lint" } as const;
 
@@ -69,7 +71,7 @@ export function GrailReportDialog({
 						<h4>逐条结论</h4>
 						<ul className="cc-grail-findings">
 							{comparison.findings.map((finding, index) => (
-								<li key={index} className={finding.pass ? "pass" : "fail"}>
+								<li key={index} className={finding.pass ? "pass" : "fail"} style={{ "--row-i": index } as CSSProperties}>
 									<strong>
 										{finding.pass ? "通过" : "未通过"} · {GRAIL_CRITERIA[finding.criterion] ?? finding.criterion}
 									</strong>
@@ -145,8 +147,7 @@ export function GrailReportDialog({
 					</section>
 				)}
 				{verdict.files.length > 0 && (
-					<details>
-						<summary>涉及 {verdict.files.length} 个文件</summary>
+					<AnimatedDetails summary={`涉及 ${verdict.files.length} 个文件`}>
 						<ul className="cc-grail-files">
 							{verdict.files.map((file) => (
 								<li key={file.path}>
@@ -154,7 +155,7 @@ export function GrailReportDialog({
 								</li>
 							))}
 						</ul>
-					</details>
+					</AnimatedDetails>
 				)}
 				<div className="dialog-actions">
 					<button type="button" className="secondary-button" disabled={busy || !canRejudge} onClick={onRejudge}>

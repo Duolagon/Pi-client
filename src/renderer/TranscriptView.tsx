@@ -2,8 +2,9 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { copyText } from "./clipboard.ts";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ArrowDownToLine, Bot, Check, Circle, CircleAlert, ChevronRight, Copy, ExternalLink, Eye, FilePen, FileText, GitFork, Globe, ListChecks, LoaderCircle, RotateCcw, Search, Sparkles, Square, Terminal as TerminalIcon } from "lucide-react";
-import { SmoothCollapse } from "./SmoothCollapse.tsx";
+import { ArrowDownToLine, Bot, Check, Circle, CircleAlert, ChevronRight, Copy, ExternalLink, Eye, FilePen, FileText, GitFork, Globe, ListChecks, LoaderCircle, RotateCcw, Search, Sparkles, Square, Terminal as TerminalIcon, X, ZoomIn } from "lucide-react";
+import { AnimatedDetails, SmoothCollapse } from "./SmoothCollapse.tsx";
+import { SurfacePresence } from "./Presence.tsx";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
 import { formatRunningToolTimer } from "../task-eta.ts";
 import type { DesktopTask, ExternalTask, Message, MonitorRecord, TaskProgress } from "../shared.ts";
@@ -209,6 +210,71 @@ const checkStatusLabel: Record<VerificationCheck["status"], string> = {
 	timed_out: "已超时",
 };
 
+function CopyUserButton({ text }: { text: string }) {
+	const [copied, setCopied] = useState(false);
+	if (!text.trim()) return null;
+	return (
+		<button
+			type="button"
+			className={copied ? "is-copied" : undefined}
+			aria-label="复制提示词"
+			title={copied ? "已复制" : "复制提示词"}
+			onClick={() => {
+				void copyText(text).then((ok) => {
+					if (!ok) return;
+					setCopied(true);
+					setTimeout(() => setCopied(false), 1400);
+				});
+			}}
+		>
+			{copied ? <Check size={12} /> : <Copy size={12} />}
+		</button>
+	);
+}
+
+function ThinkingBlock({ thinking, active }: { thinking: string; active: boolean }) {
+	const [elapsedSec, setElapsedSec] = useState(0);
+	useEffect(() => {
+		if (!active) return;
+		const start = Date.now();
+		setElapsedSec(0);
+		const timer = window.setInterval(() => {
+			setElapsedSec(Math.max(1, Math.floor((Date.now() - start) / 1000)));
+		}, 1000);
+		return () => window.clearInterval(timer);
+	}, [active]);
+
+	const lineCount = countLines(thinking);
+	const latestPreview = useMemo(() => {
+		if (!active) return "";
+		const lines = thinking
+			.split("\n")
+			.map((line) => line.replace(/^[#>*`\-\s]+/, "").trim())
+			.filter(Boolean);
+		return (lines[lines.length - 1] ?? "").slice(0, 72);
+	}, [active, thinking]);
+
+	return (
+		<AnimatedDetails
+			className={`cl-think ${active ? "thinking-active" : ""}`}
+			summary={
+				<>
+					<span className={`cc-think-glyph ${active ? "pulse" : ""}`}>∴</span>
+					<span className="cc-think-label">
+						{active ? `正在思考${elapsedSec > 0 ? ` ${elapsedSec}s` : ""}…` : `思考过程 · ${lineCount} 行`}
+					</span>
+					{active && latestPreview && <span className="cc-think-preview">{latestPreview}</span>}
+					<ChevronRight size={12} className="cl-tool-chevron" />
+				</>
+			}
+		>
+			<div className="cl-markdown cc-think-body">
+				<ReactMarkdown>{thinking}</ReactMarkdown>
+			</div>
+		</AnimatedDetails>
+	);
+}
+
 /** Background sub-agent result delivered into this conversation; the report is untrusted Markdown. */
 function TaskNotificationCard({ details, onOpenTask }: { details: unknown; onOpenTask?: (taskId: string) => void }) {
 	const info = (details && typeof details === "object" ? details : {}) as Record<string, unknown>;
@@ -230,16 +296,20 @@ function TaskNotificationCard({ details, onOpenTask }: { details: unknown; onOpe
 		Array.isArray(info.flagged) && info.flagged.length ? "含疑似指令内容，已作为数据处理" : undefined,
 	].filter(Boolean);
 	return (
-		<details className="cl-tool done">
-			<summary>
-				<span className={`cc-dot ${status === "completed" ? "ok" : status === "failed" ? "err" : ""}`} />
-				<span className="cc-tool-head">
-					<span className="cc-tool-verb">子 Agent</span>
-					<span className="cl-tool-name cl-tool-name-free">{description}</span>
-					<span className={`cc-task-notice-status ${status}`}>{noticeStatusLabel[status] ?? status}</span>
-				</span>
-				<ChevronRight size={13} className="cl-tool-chevron" />
-			</summary>
+		<AnimatedDetails
+			className="cl-tool done"
+			summary={
+				<>
+					<span className={`cc-dot ${status === "completed" ? "ok" : status === "failed" ? "err" : ""}`} />
+					<span className="cc-tool-head">
+						<span className="cc-tool-verb">子 Agent</span>
+						<span className="cl-tool-name cl-tool-name-free">{description}</span>
+						<span className={`cc-task-notice-status ${status}`}>{noticeStatusLabel[status] ?? status}</span>
+					</span>
+					<ChevronRight size={13} className="cl-tool-chevron" />
+				</>
+			}
+		>
 			<div className="cl-tool-body">
 				<div className="cc-summary-pad">
 					{meta.length > 0 && <p className="cc-task-notice-meta">{meta.join(" · ")}</p>}
@@ -252,7 +322,7 @@ function TaskNotificationCard({ details, onOpenTask }: { details: unknown; onOpe
 					)}
 				</div>
 			</div>
-		</details>
+		</AnimatedDetails>
 	);
 }
 
@@ -292,6 +362,19 @@ export function TranscriptView({
 	/** Opens a tool's file path in the configured external editor. */
 	onOpenFile?: OpenFileHandler;
 }) {
+	const [lightbox, setLightbox] = useState<{ src: string; alt: string } | null>(null);
+	useEffect(() => {
+		if (!lightbox) return;
+		const onKey = (event: KeyboardEvent) => {
+			if (event.key === "Escape") {
+				event.preventDefault();
+				event.stopPropagation();
+				setLightbox(null);
+			}
+		};
+		window.addEventListener("keydown", onKey, true);
+		return () => window.removeEventListener("keydown", onKey, true);
+	}, [lightbox]);
 	const verificationEvidence = useMemo(() => collectVerificationEvidence(state.messages, backgroundMonitors), [state.messages, backgroundMonitors]);
 	const messageIndices = new Map(state.messages.map((message, index) => [message, index]));
 	const approvals = approvalTool ? Object.entries(state.tools)
@@ -324,25 +407,38 @@ export function TranscriptView({
 										.map((b) => b.text)
 										.join("\n");
 						return (
-							<details className="cl-tool done" key={`custom-${message.customType}-${message.timestamp}-${index}`}>
-								<summary>
-									<span className="cc-dot ok" />
-									<span className="cc-tool-head">
-										<span className="cc-tool-verb">{cardMeta.verb}</span>
-										<span className="cl-tool-name cl-tool-name-free">{cardMeta.label}</span>
-									</span>
-									<ChevronRight size={13} className="cl-tool-chevron" />
-								</summary>
+							<AnimatedDetails
+								className="cl-tool done"
+								key={`custom-${message.customType}-${message.timestamp}-${index}`}
+								summary={
+									<>
+										<span className="cc-dot ok" />
+										<span className="cc-tool-head">
+											<span className="cc-tool-verb">{cardMeta.verb}</span>
+											<span className="cl-tool-name cl-tool-name-free">{cardMeta.label}</span>
+										</span>
+										<ChevronRight size={13} className="cl-tool-chevron" />
+									</>
+								}
+							>
 								<div className="cl-tool-body">
 									<div className="cc-summary-pad">
 										<MarkdownContent text={text} />
 									</div>
 								</div>
-							</details>
+							</AnimatedDetails>
 						);
 					}
 					const entryId = entryIds?.[messageIndices.get(message) ?? -1];
 					const checkpointId = entryId ? checkpointIds?.[entryId] : undefined;
+					const plainUserText =
+						typeof message.content === "string"
+							? message.content
+							: message.content
+									.filter((block): block is Extract<typeof block, { type: "text" }> => block.type === "text")
+									.filter((block, part) => !(message.role === "user" && part > 0 && isDesktopWorkspaceContext(block.text)))
+									.map((block) => block.text)
+									.join("\n");
 					return (
 						<div className="cl-msg cl-msg-user" key={`user-${message.timestamp}-${index}`}>
 							<div className="cl-user-bubble">
@@ -357,25 +453,31 @@ export function TranscriptView({
 											block.type === "text" ? (
 												message.role === "user" && part > 0 && isDesktopWorkspaceContext(block.text) ? null : <p key={part}>{block.text}</p>
 											) : (
-												<img key={part} alt="用户附件" src={`data:${block.mimeType};base64,${block.data}`} />
+												<img
+													key={part}
+													className="cc-zoomable-img"
+													alt="用户附件"
+													title="点击放大预览"
+													src={`data:${block.mimeType};base64,${block.data}`}
+													onClick={() => setLightbox({ src: `data:${block.mimeType};base64,${block.data}`, alt: "用户附件预览" })}
+												/>
 											),
 										)
 									)}
 								</div>
-								{entryId && (onRewindPrompt || onForkPrompt) && (
-									<div className="cc-user-actions">
-										{onForkPrompt && (
-											<button type="button" title="从此处分叉对话" onClick={() => onForkPrompt(entryId)}>
-												<GitFork size={12} />
-											</button>
-										)}
-										{onRewindPrompt && checkpointId && (
-											<button type="button" title="回滚到此检查点" onClick={() => onRewindPrompt(checkpointId)}>
-												<RotateCcw size={12} />
-											</button>
-										)}
-									</div>
-								)}
+								<div className="cc-user-actions">
+									<CopyUserButton text={plainUserText} />
+									{entryId && onForkPrompt && (
+										<button type="button" title="从此处分叉对话" onClick={() => onForkPrompt(entryId)}>
+											<GitFork size={12} />
+										</button>
+									)}
+									{entryId && onRewindPrompt && checkpointId && (
+										<button type="button" title="回滚到此检查点" onClick={() => onRewindPrompt(checkpointId)}>
+											<RotateCcw size={12} />
+										</button>
+									)}
+								</div>
 							</div>
 						</div>
 					);
@@ -390,19 +492,24 @@ export function TranscriptView({
 				if (unit.kind === "summary") {
 					const message = unit.message;
 					return (
-						<details className="cl-tool done" key={`summary-${message.timestamp}-${index}`}>
-							<summary>
-								<span className="cc-dot ok" />
-								<span className="cc-tool-verb">Compact</span>
-								<span className="cl-tool-name cl-tool-name-free">上下文已压缩摘要</span>
-								<ChevronRight size={13} className="cl-tool-chevron" />
-							</summary>
+						<AnimatedDetails
+							className="cl-tool done"
+							key={`summary-${message.timestamp}-${index}`}
+							summary={
+								<>
+									<span className="cc-dot ok" />
+									<span className="cc-tool-verb">Compact</span>
+									<span className="cl-tool-name cl-tool-name-free">上下文已压缩摘要</span>
+									<ChevronRight size={13} className="cl-tool-chevron" />
+								</>
+							}
+						>
 							<div className="cl-tool-body">
 								<div className="cc-summary-pad">
 									<MarkdownContent text={message.summary} />
 								</div>
 							</div>
-						</details>
+						</AnimatedDetails>
 					);
 				}
 				const last = unit.messages[unit.messages.length - 1];
@@ -442,6 +549,7 @@ export function TranscriptView({
 									onStopTask,
 									onOpenPreview,
 									onOpenFile,
+									onZoomImage: setLightbox,
 								}),
 							),
 							state,
@@ -453,18 +561,27 @@ export function TranscriptView({
 							</div>
 						)}
 						{aborted && <p className="cl-stopped">本次回复已停止。</p>}
-						{Boolean(verdict?.checks.length) && <details className="cc-turn-checks">
-							<summary>{verdict!.checks.length} 项检查</summary>
-							<ul>
-								{verdict!.checks.map((check) => (
-									<li key={check.id}>
-										<code>{check.command}</code>
-										<span>{check.shellId && check.status === "pending" ? "等待后台退出结果" : checkStatusLabel[check.status]}{check.exitCode !== undefined ? ` · 退出码 ${check.exitCode}` : ""}</span>
-										{onRerunCheck && <button type="button" className="cc-mini-btn" onClick={() => onRerunCheck(check.command)}>在终端重跑</button>}
-									</li>
-								))}
-							</ul>
-						</details>}
+						{Boolean(verdict?.checks.length) && (
+							<AnimatedDetails
+								className="cc-turn-checks"
+								summary={
+									<>
+										<span>{verdict!.checks.length} 项检查</span>
+										<ChevronRight size={12} className="cl-tool-chevron" />
+									</>
+								}
+							>
+								<ul>
+									{verdict!.checks.map((check) => (
+										<li key={check.id}>
+											<code>{check.command}</code>
+											<span>{check.shellId && check.status === "pending" ? "等待后台退出结果" : checkStatusLabel[check.status]}{check.exitCode !== undefined ? ` · 退出码 ${check.exitCode}` : ""}</span>
+											{onRerunCheck && <button type="button" className="cc-mini-btn" onClick={() => onRerunCheck(check.command)}>在终端重跑</button>}
+										</li>
+									))}
+								</ul>
+							</AnimatedDetails>
+						)}
 						{!isStreaming && last.model && (
 							<footer className="cl-ai-meta">
 								<span>{last.model}</span>
@@ -487,6 +604,32 @@ export function TranscriptView({
 					</article>
 				);
 			})}
+			<SurfacePresence show={Boolean(lightbox)} direction="pill" group="lightbox">
+				{(boxRef) =>
+					lightbox ? (
+						<div
+							ref={boxRef}
+							className="cc-lightbox-backdrop"
+							role="dialog"
+							aria-modal="true"
+							aria-label={lightbox.alt}
+							onClick={() => setLightbox(null)}
+						>
+							<div className="cc-lightbox-stage" onClick={(e) => e.stopPropagation()}>
+								<img src={lightbox.src} alt={lightbox.alt} />
+								<div className="cc-lightbox-bar">
+									<span>
+										<ZoomIn size={13} /> {lightbox.alt}
+									</span>
+									<button type="button" className="cc-lightbox-close" aria-label="关闭图片预览" onClick={() => setLightbox(null)}>
+										<X size={15} />
+									</button>
+								</div>
+							</div>
+						</div>
+					) : null
+				}
+			</SurfacePresence>
 		</div>
 	);
 }
@@ -508,6 +651,7 @@ function turnItems({
 	onStopTask,
 	onOpenPreview,
 	onOpenFile,
+	onZoomImage,
 }: {
 	message: Assistant;
 	state: Transcript;
@@ -521,17 +665,19 @@ function turnItems({
 	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
 	onOpenPreview?: (url: string) => void;
 	onOpenFile?: OpenFileHandler;
+	onZoomImage?: (img: { src: string; alt: string }) => void;
 }): TurnItem[] {
 	const items: TurnItem[] = [];
 	message.content.forEach((block, part) => {
 		const key = `${message.timestamp}-${part}`;
 		if (block.type === "text") {
 			if (!block.text.trim()) return;
+			const activeStreamText = isStreaming && part === message.content.length - 1;
 			items.push({
 				key,
 				block,
 				node: (
-					<div className="cc-ai-text" key={key}>
+					<div className={`cc-ai-text ${activeStreamText ? "is-streaming" : ""}`.trim()} key={key}>
 						<span className="cc-ai-bullet" aria-hidden="true" />
 						<div className="cc-ai-text-inner">
 							<MarkdownContent text={block.text} onOpenPreview={onOpenPreview} />
@@ -548,18 +694,7 @@ function turnItems({
 				key,
 				block,
 				live: activeThink,
-				node: (
-					<details className={`cl-think ${activeThink ? "thinking-active" : ""}`} key={key}>
-						<summary>
-							<span className={`cc-think-glyph ${activeThink ? "pulse" : ""}`}>∴</span>
-							<span className="cc-think-label">{activeThink ? "正在思考…" : "思考过程"}</span>
-							<ChevronRight size={12} className="cl-tool-chevron" />
-						</summary>
-						<div className="cl-markdown">
-							<ReactMarkdown>{block.thinking}</ReactMarkdown>
-						</div>
-					</details>
-				),
+				node: <ThinkingBlock key={key} thinking={block.thinking} active={activeThink} />,
 			});
 			return;
 		}
@@ -588,6 +723,7 @@ function turnItems({
 					onBackgroundTask={onBackgroundTask}
 					onStopTask={onStopTask}
 					onOpenFile={onOpenFile}
+					onZoomImage={onZoomImage}
 				/>
 			),
 		});
@@ -1163,6 +1299,7 @@ function ToolCard({
 	onBackgroundTask,
 	onStopTask,
 	onOpenFile,
+	onZoomImage,
 }: {
 	name: string;
 	args: unknown;
@@ -1175,6 +1312,7 @@ function ToolCard({
 	onBackgroundTask?: (taskId: string) => void;
 	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
 	onOpenFile?: OpenFileHandler;
+	onZoomImage?: (img: { src: string; alt: string }) => void;
 }) {
 	const output = result
 		? result.content
@@ -1204,7 +1342,8 @@ function ToolCard({
 		: status;
 	const dotClass = effectiveStatus === "error" ? "err" : effectiveStatus === "done" ? "ok" : "run";
 	const [open, setOpen] = useState<boolean>();
-	const isOpen = open ?? (status === "running" && !waitingForApproval);
+	const hasInlineBody = Boolean((info.editPairs && info.editPairs.length > 0) || (info.todos && info.todos.length > 0));
+	const isOpen = open ?? ((status === "running" && !waitingForApproval) || (!waitingForApproval && hasInlineBody));
 	const showLiveTimer = effectiveStatus === "running" && !waitingForApproval && !matchedTask && typeof progress?.startedAt === "number";
 	const [tickNow, setTickNow] = useState(() => Date.now());
 	useEffect(() => {
@@ -1287,9 +1426,9 @@ function ToolCard({
 					)}
 				</div>
 			)}
-			{info.todos && info.todos.length > 0 && (
+			<SmoothCollapse open={Boolean(isOpen && info.todos && info.todos.length > 0)}>
 				<div className="cl-tool-body cc-inline-edit-body cc-todo-card">
-					{info.todos.map((item) => (
+					{(info.todos ?? []).map((item) => (
 						<div key={item.id} className={`cc-todo-row ${item.status}`}>
 							{item.status === "completed" ? (
 								<Check size={12} className="ok" />
@@ -1302,21 +1441,31 @@ function ToolCard({
 						</div>
 					))}
 				</div>
-			)}
-			{(!waitingForApproval || open) && info.editPairs && info.editPairs.length > 0 && (
+			</SmoothCollapse>
+			<SmoothCollapse open={Boolean(isOpen && (!waitingForApproval || open) && info.editPairs && info.editPairs.length > 0)}>
 				<div className="cl-tool-body cc-inline-edit-body">
-					{info.editPairs.map((pair, idx) => (
+					{(info.editPairs ?? []).map((pair, idx) => (
 						<div key={idx} className={idx > 0 ? "cc-edit-hunk-sep" : undefined}>
 							<InlineEditDiff oldText={pair.oldText} newText={pair.newText} />
 						</div>
 					))}
 				</div>
-			)}
+			</SmoothCollapse>
 			<SmoothCollapse open={isOpen && (!info.editPairs || info.editPairs.length === 0) && !info.todos}>
 				<div className="cl-tool-body">
-					{images.map((img, idx) => (
-						<img key={idx} className="cc-tool-image" alt="工具返回图片" src={`data:${img.mimeType};base64,${img.data}`} />
-					))}
+					{images.map((img, idx) => {
+						const src = `data:${img.mimeType};base64,${img.data}`;
+						return (
+							<img
+								key={idx}
+								className="cc-tool-image cc-zoomable-img"
+								alt="工具返回图片"
+								title="点击放大预览"
+								src={src}
+								onClick={() => onZoomImage?.({ src, alt: `${info.verb} ${info.target || "图片"}` })}
+							/>
+						);
+					})}
 					{info.lineContent ? (
 						<CodeLines content={info.lineContent.content} startLine={info.lineContent.startLine} />
 					) : output ? (
@@ -1325,10 +1474,9 @@ function ToolCard({
 						<pre className="cl-tool-args">{JSON.stringify(args, null, 2)}</pre>
 					) : null}
 					{output && args != null && (
-						<details className="cc-tool-args-details">
-							<summary>参数</summary>
+						<AnimatedDetails className="cc-tool-args-details" summary="参数">
 							<pre className="cl-tool-args">{JSON.stringify(args, null, 2)}</pre>
-						</details>
+						</AnimatedDetails>
 					)}
 				</div>
 			</SmoothCollapse>

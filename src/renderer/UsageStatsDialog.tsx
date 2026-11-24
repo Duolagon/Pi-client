@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { RefreshCw } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
 import type { UsageBucket, UsageStatsReport } from "../shared.ts";
@@ -30,8 +30,8 @@ function UsageTable({ rows, label, bar }: { rows: UsageBucket[]; label: string; 
 				</tr>
 			</thead>
 			<tbody>
-				{rows.map((row) => (
-					<tr key={row.key}>
+				{rows.map((row, idx) => (
+					<tr key={row.key} style={{ "--row-i": idx } as CSSProperties}>
 						<th scope="row" className="cc-usage-key" title={`${row.key} · ${row.messages} 条回复`}>
 							{row.key}
 						</th>
@@ -78,7 +78,7 @@ export function UsageStatsDialog({ close }: { close: () => void }) {
 				<p className="subtle-note">
 					统计本机全部会话（含子 Agent 会话）近 30 天的 Token 用量，只读取本地会话记录。费用取决于服务商定价，服务商未报价时记为 $0。
 				</p>
-				{loading && !report && <p className="subtle-note">正在统计…</p>}
+				{loading && !report && <p className="subtle-note cc-shimmer-text">正在统计…</p>}
 				{error && (
 					<div className="live-error" role="alert">
 						{error}
@@ -120,14 +120,14 @@ export function UsageStatsDialog({ close }: { close: () => void }) {
 								<h3 className="cc-usage-heading">按日（自 {report.since} 起）</h3>
 								<UsageTable rows={report.days} label="日期" bar />
 								<h3 className="cc-usage-heading">按模型</h3>
-								<UsageTable rows={report.models} label="模型" />
+								<UsageTable rows={report.models} label="模型" bar />
 							</>
 						)}
 					</>
 				)}
 				<div className="dialog-actions">
 					<button type="button" className="secondary-button" disabled={loading} onClick={run}>
-						<RefreshCw size={14} aria-hidden="true" /> {loading ? "正在统计…" : "刷新"}
+						<RefreshCw size={14} className={loading ? "cc-spin" : undefined} aria-hidden="true" /> {loading ? "正在统计…" : "刷新"}
 					</button>
 					<span />
 					<button type="button" className="primary-button" onClick={close}>

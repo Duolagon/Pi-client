@@ -13,7 +13,7 @@ export function SlidingTabList({
 }: {
 	children: ReactNode;
 	className?: string;
-	variant?: "modal" | "compact" | "pill";
+	variant?: "modal" | "compact" | "pill" | "nav" | "list";
 } & HTMLAttributes<HTMLDivElement>) {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const [glider, setGlider] = useState<{ x: number; y: number; w: number; h: number; ready: boolean }>({

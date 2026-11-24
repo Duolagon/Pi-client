@@ -2,6 +2,7 @@ import type { PreviewCheck } from "../shared.ts";
 import { useEffect, useState } from "react";
 import { ExternalLink, Globe, Monitor, RefreshCw, Smartphone, X } from "lucide-react";
 import { IconButton } from "../prototype/ui.tsx";
+import { SurfacePresence } from "./Presence.tsx";
 import { DEFAULT_LOCAL_PREVIEW_URL } from "../preview-check-types.ts";
 
 function normalizeLocalUrl(raw: string): string | null {
@@ -97,7 +98,7 @@ export function PreviewPanel({
 					<IconButton icon={X} label="关闭预览面板" onClick={close} />
 				</div>
 			</header>
-			<form className="cc-preview-bar" onSubmit={navigate}>
+			<form className={`cc-preview-bar ${checking ? "is-checking" : ""}`.trim()} onSubmit={navigate}>
 				<input
 					aria-label="预览地址"
 					value={inputUrl}
@@ -107,17 +108,25 @@ export function PreviewPanel({
 				<button type="submit" className="cc-mini-btn" disabled={checking}>
 					访问
 				</button>
-				<button type="button" className="cc-mini-btn" disabled={checking} onClick={() => void verify()}>{checking ? "验证中…" : "验证页面"}</button>
+				<button type="button" className="cc-mini-btn" disabled={checking} onClick={() => void verify()}>
+					<span className={checking ? "cc-shimmer-text" : undefined}>{checking ? "验证中…" : "验证页面"}</span>
+				</button>
 			</form>
-			{result && <section className="cc-preview-result">
-				<strong>HTTP {result.status || "未知"} · {result.elapsedMs} ms</strong>
-				{result.title && <p>{result.title}</p>}
-				<p>{result.errors.length ? `${result.errors.length} 条浏览器错误` : "未捕获浏览器错误"}</p>
-				{result.errors.length > 0 && <ul>{result.errors.map((error, index) => <li key={index}>{error}</li>)}</ul>}
-				{onReport && <button type="button" className="cc-mini-btn" onClick={() => onReport(`浏览器验证 ${result.url} · HTTP ${result.status} · ${result.elapsedMs} ms\n${result.errors.join("\n")}`)}>加入会话草稿</button>}
-			</section>}
+			<SurfacePresence show={Boolean(result)} direction="banner" group="preview-result">
+				{(resRef) =>
+					result ? (
+						<section ref={resRef} className="cc-preview-result">
+							<strong>HTTP {result.status || "未知"} · {result.elapsedMs} ms</strong>
+							{result.title && <p>{result.title}</p>}
+							<p>{result.errors.length ? `${result.errors.length} 条浏览器错误` : "未捕获浏览器错误"}</p>
+							{result.errors.length > 0 && <ul>{result.errors.map((errItem, index) => <li key={index}>{errItem}</li>)}</ul>}
+							{onReport && <button type="button" className="cc-mini-btn" onClick={() => onReport(`浏览器验证 ${result.url} · HTTP ${result.status} · ${result.elapsedMs} ms\n${result.errors.join("\n")}`)}>加入会话草稿</button>}
+						</section>
+					) : null
+				}
+			</SurfacePresence>
 			{error && <div className="live-error" role="alert">{error}</div>}
-			<div className="cc-preview-stage">
+			<div className={`cc-preview-stage ${mobile ? "is-mobile" : "is-desktop"}`}>
 				{reachable === false && (
 					<div className="cc-empty-state cc-preview-empty" role="status">
 						<Globe size={22} aria-hidden="true" />

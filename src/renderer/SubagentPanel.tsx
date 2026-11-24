@@ -2,6 +2,7 @@ import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState }
 import { ArrowDownToLine, Bot, Eye, Square } from "lucide-react";
 import { formatCompactDuration, formatCompactTokens } from "../delegation-format.ts";
 import type { DesktopTask, ExternalTask, TaskProgress } from "../shared.ts";
+import { useSurfaceExit } from "./Presence.tsx";
 import { buildSubagentPanelState, isActiveTaskStatus, type SubagentPanelRow } from "./subagent-panel-state.ts";
 
 export interface SubagentPanelHandle {
@@ -98,6 +99,44 @@ export const SubagentPanel = forwardRef<
 
 	if (!state.rows.length && state.completedHintCount === 0) return null;
 
+	return (
+		<SubagentPanelSurface
+			state={state}
+			selectedIndex={selectedIndex}
+			setSelectedIndex={setSelectedIndex}
+			listRef={listRef}
+			onOpenTask={onOpenTask}
+			onStopTask={onStopTask}
+			onBackgroundTask={onBackgroundTask}
+			onOpenTasksDrawer={onOpenTasksDrawer}
+			onReturnToComposer={onReturnToComposer}
+		/>
+	);
+});
+
+function SubagentPanelSurface({
+	state,
+	selectedIndex,
+	setSelectedIndex,
+	listRef,
+	onOpenTask,
+	onStopTask,
+	onBackgroundTask,
+	onOpenTasksDrawer,
+	onReturnToComposer,
+}: {
+	state: ReturnType<typeof buildSubagentPanelState>;
+	selectedIndex: number;
+	setSelectedIndex: React.Dispatch<React.SetStateAction<number>>;
+	listRef: React.RefObject<HTMLDivElement | null>;
+	onOpenTask: (row: SubagentPanelRow) => void;
+	onStopTask: (row: SubagentPanelRow) => void;
+	onBackgroundTask: (taskId: string) => void;
+	onOpenTasksDrawer: () => void;
+	onReturnToComposer: () => void;
+}) {
+	const panelRef = useSurfaceExit<HTMLDivElement>("up", "subagent-panel");
+
 	const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
 		if (!state.rows.length) return;
 		if (event.key === "ArrowUp") {
@@ -127,7 +166,7 @@ export const SubagentPanel = forwardRef<
 	};
 
 	return (
-		<div className="cc-subagent-panel" role="region" aria-label="子 Agent 面板">
+		<div ref={panelRef} className="cc-subagent-panel" role="region" aria-label="子 Agent 面板">
 			{state.rows.length > 0 && (
 				<div
 					ref={listRef}
@@ -155,6 +194,7 @@ export const SubagentPanel = forwardRef<
 								aria-selected={selected}
 								className={`cc-subagent-row ${selected ? "selected" : ""} ${active ? "active" : "ended"}`}
 								style={row.depth > 1 ? { paddingLeft: `${6 + (row.depth - 1) * 16}px` } : undefined}
+								onMouseEnter={() => setSelectedIndex(index)}
 								onClick={() => {
 									setSelectedIndex(index);
 									onOpenTask(row);
@@ -169,7 +209,7 @@ export const SubagentPanel = forwardRef<
 								<span className="cc-source-tag">{row.subagentType}</span>
 								{row.model && <span className="cc-subagent-meta">{row.model}</span>}
 								{row.toolUses !== undefined && row.toolUses > 0 && (
-									<span className="cc-subagent-meta">
+									<span key={`${row.toolUses}-${row.lastToolName ?? ""}`} className="cc-subagent-meta cc-subagent-tool-pulse">
 										{row.toolUses} 次工具{row.lastToolName ? ` · ${row.lastToolName}` : ""}
 									</span>
 								)}
@@ -225,4 +265,4 @@ export const SubagentPanel = forwardRef<
 			)}
 		</div>
 	);
-});
+}

@@ -97,8 +97,9 @@ import { AgentsDialog } from "./AgentsDialog.tsx";
 import { McpDialog } from "./McpDialog.tsx";
 import { resolveEditorPath } from "../editor-path.ts";
 import { InteractiveEffects } from "./InteractiveEffects.tsx";
-import { SmoothCollapse } from "./SmoothCollapse.tsx";
-import { Presence, prefersReducedMotion } from "./Presence.tsx";
+import { AnimatedDetails, SmoothCollapse } from "./SmoothCollapse.tsx";
+import { Presence, SurfacePresence, prefersReducedMotion, showSurfaceExit } from "./Presence.tsx";
+import { SlidingTabList } from "./SegmentedTabs.tsx";
 import "./grail-theme.css";
 import "./task-flow.css";
 import "./motion-and-polish.css";
@@ -122,6 +123,36 @@ function projectName(snapshot: Snapshot, path: string): string {
 function savedInspectorWidth(key: string, fallback: number): number {
 	const stored = Number(localStorage.getItem(key));
 	return Number.isFinite(stored) && stored >= 320 ? stored : fallback;
+}
+
+function highlightMatch(text: string, needle: string): ReactNode {
+	const q = needle.trim();
+	if (!q) return text;
+	const lower = text.toLowerCase();
+	const idx = lower.indexOf(q.toLowerCase());
+	if (idx === -1) return text;
+	return (
+		<>
+			{text.slice(0, idx)}
+			<mark className="cc-search-mark">{text.slice(idx, idx + q.length)}</mark>
+			{text.slice(idx + q.length)}
+		</>
+	);
+}
+
+function JumpLatestButton({ running, onClick }: { running: boolean; onClick: () => void }) {
+	const btnRef = useRef<HTMLButtonElement>(null);
+	useLayoutEffect(() => {
+		return () => {
+			showSurfaceExit(btnRef.current, { direction: "pill", group: "jump-latest" });
+		};
+	}, []);
+	return (
+		<button ref={btnRef} type="button" className="cc-jump-latest" onClick={onClick}>
+			<ArrowDown size={14} aria-hidden="true" />
+			{running ? "有新输出 · 跳到最新" : "跳到最新"}
+		</button>
+	);
 }
 
 function SidebarConversationRow({
@@ -353,7 +384,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		position();
 		(menu.querySelector<HTMLElement>('[role="menuitem"]:not([disabled])') ?? menu).focus({ preventScroll: true });
 		window.addEventListener("resize", position);
-		return () => window.removeEventListener("resize", position);
+		return () => {
+			window.removeEventListener("resize", position);
+			showSurfaceExit(menu, { direction: "down", group: "conv-menu" });
+		};
 	}, [convMenu]);
 	const actOnQueue = async (action: "withdraw" | "send") => {
 		const id = snapshot?.active?.id;
@@ -382,8 +416,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		scroll.current?.scrollTo({ top: 0, behavior: "instant" });
 		setShowJump(false);
 	}, [hasTranscript]);
-	useEffect(() => {
-		if (hasTranscript && stickToEnd.current) scroll.current?.scrollTo({ top: scroll.current.scrollHeight });
+	useLayoutEffect(() => {
+		if (hasTranscript && stickToEnd.current && scroll.current) {
+			scroll.current.scrollTop = scroll.current.scrollHeight;
+		}
 	}, [hasTranscript, history, running]);
 	// User-initiated judgement of the current wish. Verdicts live outside the Pi session.
 	const [grail, setGrail] = useState<GrailState | null>(null);
@@ -1388,6 +1424,14 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		returningToLatest.current = element;
 		element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
 	};
+	const findHitTotal = (() => {
+		const term = findQuery.trim().toLowerCase();
+		if (!findOpen || !term || !scroll.current) return 0;
+		return Array.from(scroll.current.querySelectorAll<HTMLElement>(".cl-msg")).filter((el) =>
+			(el.textContent ?? "").toLowerCase().includes(term),
+		).length;
+	})();
+
 	const jumpFindMatch = (direction: -1 | 1) => {
 		const container = scroll.current;
 		const term = findQuery.trim().toLowerCase();
@@ -1401,7 +1445,13 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		cancelReturnToLatest(container);
 		stickToEnd.current = false;
 		setFindIndex(next);
-		hits[next].scrollIntoView({ behavior: prefersReducedMotion() ? "instant" : "smooth", block: "center" });
+		for (const el of nodes) delete el.dataset.findHit;
+		const target = hits[next];
+		target.dataset.findHit = "true";
+		window.setTimeout(() => {
+			if (target.dataset.findHit === "true") delete target.dataset.findHit;
+		}, 1100);
+		target.scrollIntoView({ behavior: prefersReducedMotion() ? "instant" : "smooth", block: "center" });
 	};
 	const closeFind = () => {
 		setFindOpen(false);
@@ -1849,12 +1899,14 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			</Presence>
 			<main className="cl-main">
 				<InteractiveEffects />
-				{flash && (
-					<div className="cc-flash" role="status" aria-live="polite">
-						<Check size={14} />
-						<span>{flash}</span>
-					</div>
-				)}
+				<SurfacePresence show={Boolean(flash)} direction="banner" group="flash">
+					{(flashRef) => (
+						<div ref={flashRef} className="cc-flash" role="status" aria-live="polite">
+							<Check size={14} />
+							<span>{flash}</span>
+						</div>
+					)}
+				</SurfacePresence>
 				{isGrail && <MagicCircleBackdrop />}
 				<header className={`cl-top ${sidebarVisible ? "" : "cl-top-collapsed"}`}>
 					<div className="cl-top-title">
@@ -1929,7 +1981,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							>
 								<GitCompareArrows size={14} />
 								<span>差异</span>
-								{gitSummary && gitSummary.count > 0 && <em className="cc-top-count">{gitSummary.count}</em>}
+								{gitSummary && gitSummary.count > 0 && <em key={gitSummary.count} className="cc-top-count">{gitSummary.count}</em>}
 							</button>
 							<button
 								type="button"
@@ -1961,7 +2013,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								<ListTodo size={14} />
 								<span>任务</span>
 								{(activeTaskCount > 0 || waitingTaskCount > 0) && (
-									<em className={`cc-top-count ${waitingTaskCount > 0 ? "warn" : ""}`}>
+									<em key={`${waitingTaskCount}-${activeTaskCount}`} className={`cc-top-count ${waitingTaskCount > 0 ? "warn" : ""}`}>
 										{waitingTaskCount > 0 ? `!${waitingTaskCount}` : activeTaskCount}
 									</em>
 								)}
@@ -1975,22 +2027,16 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							title="一键切换外观主题：浅色 / 深色 / 圣杯（二次元）"
 							onClick={() => void cycleTheme()}
 						>
-							{isGrail ? (
-								<>
+							<span key={snapshot.settings.theme} className="cc-theme-icon-spin">
+								{isGrail ? (
 									<HolyGrailIcon width={14} height={14} />
-									<span>圣杯</span>
-								</>
-							) : snapshot.settings.theme === "dark" ? (
-								<>
+								) : snapshot.settings.theme === "dark" ? (
 									<Moon size={13} />
-									<span>深色</span>
-								</>
-							) : (
-								<>
+								) : (
 									<Sun size={13} />
-									<span>浅色</span>
-								</>
-							)}
+								)}
+							</span>
+							<span>{isGrail ? "圣杯" : snapshot.settings.theme === "dark" ? "深色" : "浅色"}</span>
 						</button>
 						<div
 							className="cc-more-wrap"
@@ -2021,8 +2067,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							>
 								<MoreHorizontal size={15} />
 							</button>
-							{moreMenuOpen && (
-								<div className="cc-more-menu" role="menu" aria-label="更多工具菜单">
+							<SurfacePresence show={moreMenuOpen} direction="down">
+								{(moreMenuNodeRef) => (
+								<div ref={moreMenuNodeRef} className="cc-more-menu" role="menu" aria-label="更多工具菜单">
 									<div className="cc-more-group">
 										<div className="cc-more-label">工作区与会话</div>
 										<button
@@ -2188,66 +2235,79 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										)}
 									</div>
 								</div>
-							)}
+								)}
+							</SurfacePresence>
 						</div>
 					</div>
 				</header>
-				{(app.error || snapshot.engineError) && (
-					<div className="cl-banner cl-banner-error" role="alert">
-						<span>{app.error || snapshot.engineError}</span>
-						<button
-							onClick={() => {
-								app.setError("");
-								if (snapshot.engineError) void app.refresh();
-							}}
-							aria-label="关闭错误提示"
-						>
-							<X size={14} />
-						</button>
-					</div>
-				)}
-				{app.notice && (
-					<div className="cl-banner" role="status">
-						<span>{app.notice}</span>
-						<button aria-label="关闭状态提示" onClick={() => app.setNotice("")}>
-							<X size={14} />
-						</button>
-					</div>
-				)}
-				{snapshot.trust?.required && !snapshot.trust.decision && !trustLater[snapshot.trust.project] && (
-					<div className="cl-trust-banner" role="region" aria-label="项目配置">
-						<ShieldCheck size={15} />
-						<div className="cl-trust-text" title={`检测到 ${snapshot.trust.resources.join("、")}`}>
-							<strong>此项目带有自己的 MCP、Skills 与设置</strong>
-							<span>信任后才会加载</span>
+				<SurfacePresence show={Boolean(app.error || snapshot.engineError)} direction="banner" group="err-banner">
+					{(errRef) => (
+						<div ref={errRef} className="cl-banner cl-banner-error" role="alert">
+							<span>{app.error || snapshot.engineError}</span>
+							<button
+								onClick={() => {
+									app.setError("");
+									if (snapshot.engineError) void app.refresh();
+								}}
+								aria-label="关闭错误提示"
+							>
+								<X size={14} />
+							</button>
 						</div>
-						<button
-							type="button"
-							className="secondary-button"
-							disabled={trustBusy || blocked}
-							onClick={() => void decideTrust("trusted")}
-						>
-							信任并加载
-						</button>
-						<button
-							type="button"
-							className="cc-mini-btn"
-							disabled={trustBusy || blocked}
-							onClick={() => void decideTrust("untrusted")}
-						>
-							保持禁用
-						</button>
-						<button
-							type="button"
-							className="cl-trust-close"
-							aria-label="稍后决定"
-							title="稍后决定（可从顶栏盾牌图标再次打开）"
-							onClick={() => snapshot.trust && setTrustLater((prev) => ({ ...prev, [snapshot.trust!.project]: true }))}
-						>
-							<X size={14} />
-						</button>
-					</div>
-				)}
+					)}
+				</SurfacePresence>
+				<SurfacePresence show={Boolean(app.notice)} direction="banner" group="notice-banner">
+					{(noticeRef) => (
+						<div ref={noticeRef} className="cl-banner" role="status">
+							<span>{app.notice}</span>
+							<button aria-label="关闭状态提示" onClick={() => app.setNotice("")}>
+								<X size={14} />
+							</button>
+						</div>
+					)}
+				</SurfacePresence>
+				<SurfacePresence
+					show={Boolean(snapshot.trust?.required && !snapshot.trust.decision && !trustLater[snapshot.trust.project])}
+					direction="banner"
+					group="trust-banner"
+				>
+					{(trustRef) =>
+						snapshot.trust ? (
+							<div ref={trustRef} className="cl-trust-banner" role="region" aria-label="项目配置">
+								<ShieldCheck size={15} />
+								<div className="cl-trust-text" title={`检测到 ${snapshot.trust.resources.join("、")}`}>
+									<strong>此项目带有自己的 MCP、Skills 与设置</strong>
+									<span>信任后才会加载</span>
+								</div>
+								<button
+									type="button"
+									className="secondary-button"
+									disabled={trustBusy || blocked}
+									onClick={() => void decideTrust("trusted")}
+								>
+									信任并加载
+								</button>
+								<button
+									type="button"
+									className="cc-mini-btn"
+									disabled={trustBusy || blocked}
+									onClick={() => void decideTrust("untrusted")}
+								>
+									保持禁用
+								</button>
+								<button
+									type="button"
+									className="cl-trust-close"
+									aria-label="稍后决定"
+									title="稍后决定（可从顶栏盾牌图标再次打开）"
+									onClick={() => snapshot.trust && setTrustLater((prev) => ({ ...prev, [snapshot.trust!.project]: true }))}
+								>
+									<X size={14} />
+								</button>
+							</div>
+						) : null
+					}
+				</SurfacePresence>
 
 				{history.messages.length > 0 && !snapshot.models.length && (
 					<div className="cl-connect"><span>连接模型后即可继续此会话。</span>
@@ -2276,34 +2336,41 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							/>
 						) : (
 							<>
-								{findOpen && (
-									<div className="cc-find-bar" role="search" aria-label="会话内查找">
-										<Search size={14} />
-										<input
-											autoFocus data-autofocus
-											aria-label="查找会话内容"
-											placeholder="输入关键词按回车定位…"
-											value={findQuery}
-											onChange={(e) => {
-												setFindQuery(e.target.value);
-												setFindIndex(null);
-											}}
-											onKeyDown={(e) => {
-												if (e.key === "Enter") {
-													e.preventDefault();
-													jumpFindMatch(e.shiftKey ? -1 : 1);
-												} else if (e.key === "Escape") {
-													e.preventDefault();
-													e.stopPropagation();
-													closeFind();
-												}
-											}}
-										/>
-										<button type="button" className="cc-mini-btn" onClick={() => jumpFindMatch(-1)}>上一个</button>
-										<button type="button" className="cc-mini-btn" onClick={() => jumpFindMatch(1)}>下一个</button>
-										<button type="button" className="cc-mini-btn" aria-label="关闭会话查找" onClick={closeFind}>关闭</button>
-									</div>
-								)}
+								<SurfacePresence show={findOpen} direction="banner" group="find-bar">
+									{(findBarRef) => (
+										<div ref={findBarRef} className="cc-find-bar" role="search" aria-label="会话内查找">
+											<Search size={14} />
+											<input
+												autoFocus data-autofocus
+												aria-label="查找会话内容"
+												placeholder="输入关键词按回车定位…"
+												value={findQuery}
+												onChange={(e) => {
+													setFindQuery(e.target.value);
+													setFindIndex(null);
+												}}
+												onKeyDown={(e) => {
+													if (e.key === "Enter") {
+														e.preventDefault();
+														jumpFindMatch(e.shiftKey ? -1 : 1);
+													} else if (e.key === "Escape") {
+														e.preventDefault();
+														e.stopPropagation();
+														closeFind();
+													}
+												}}
+											/>
+											{findQuery.trim() && (
+												<span className={`cc-find-count ${findHitTotal === 0 ? "empty" : ""}`}>
+													{findHitTotal > 0 ? `${findIndex !== null ? findIndex + 1 : 0} / ${findHitTotal}` : "无匹配"}
+												</span>
+											)}
+											<button type="button" className="cc-mini-btn" onClick={() => jumpFindMatch(-1)}>上一个</button>
+											<button type="button" className="cc-mini-btn" onClick={() => jumpFindMatch(1)}>下一个</button>
+											<button type="button" className="cc-mini-btn" aria-label="关闭会话查找" onClick={closeFind}>关闭</button>
+										</div>
+									)}
+								</SurfacePresence>
 								<div
 									className="cl-scroll"
 									data-empty={!hasTranscript}
@@ -2498,36 +2565,6 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											</span>
 										</div>
 									)}
-									{!!snapshot.state?.pendingMessageCount && (
-										<div className="cc-queue" role="region" aria-label="排队的指令">
-											<div className="cc-queue-head">
-												<span>
-													{running
-														? `${snapshot.state.pendingMessageCount} 条待发送指令`
-														: `已停止，${snapshot.state.pendingMessageCount} 条指令还在排队，会和下一条消息一起发送`}
-												</span>
-												<span className="cc-queue-actions">
-													<button type="button" className="cc-mini-btn" disabled={Boolean(queueActionId)} onClick={() => void actOnQueue("withdraw")}>
-														撤回到输入框
-													</button>
-													{running && (
-														<button type="button" className="cc-mini-btn primary" title="中止现在的任务并发送所有排队指令" disabled={Boolean(queueActionId)} onClick={() => void actOnQueue("send")}>
-															停止并发送队列
-														</button>
-													)}
-												</span>
-											</div>
-											{([
-											["下一工具步骤", snapshot.queuedPromptGroups?.steering ?? snapshot.queuedMessages ?? []],
-											["本轮结束后", snapshot.queuedPromptGroups?.followUp ?? []],
-										] as const).map(([label, messages]) => messages.length > 0 && (
-											<div className="cc-queue-group" key={label}>
-												<span>{label}</span>
-												{messages.map((value, index) => <p className="cc-queue-item" key={index}>{value}</p>)}
-											</div>
-										))}
-									</div>
-								)}
 									{!running && currentEntryId && lastCheckpoint && lastCheckpoint.changes.length > 0 && (
 										<section className="cc-completion-card" aria-label="本轮结果">
 											<div><strong>{activePhase === "failed" ? "任务失败，已有改动可检查" : activePhase === "stopped" ? "任务已停止，已有改动可检查" : "本轮改动可审查"}</strong>
@@ -2549,18 +2586,41 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											</div>
 										</section>
 									)}
-									{showJump && (
-										<button
-											type="button"
-											className="cc-jump-latest"
-											onClick={jumpToLatest}
-										>
-											<ArrowDown size={14} aria-hidden="true" />
-											{running ? "有新输出 · 跳到最新" : "跳到最新"}
-										</button>
-									)}
+									{showJump && <JumpLatestButton running={running} onClick={jumpToLatest} />}
 								</div>
 						<div className="cc-composer-dock-stack">
+						<SurfacePresence show={Boolean(snapshot.state?.pendingMessageCount)} direction="up" group="queue">
+							{(queueRef) => (
+								<div ref={queueRef} className="cc-queue" role="region" aria-label="排队的指令">
+									<div className="cc-queue-head">
+										<span>
+											{running
+												? `${snapshot.state?.pendingMessageCount ?? 0} 条待发送指令`
+												: `已停止，${snapshot.state?.pendingMessageCount ?? 0} 条指令还在排队，会和下一条消息一起发送`}
+										</span>
+										<span className="cc-queue-actions">
+											<button type="button" className="cc-mini-btn" disabled={Boolean(queueActionId)} onClick={() => void actOnQueue("withdraw")}>
+												撤回到输入框
+											</button>
+											{running && (
+												<button type="button" className="cc-mini-btn primary" title="中止现在的任务并发送所有排队指令" disabled={Boolean(queueActionId)} onClick={() => void actOnQueue("send")}>
+													停止并发送队列
+												</button>
+											)}
+										</span>
+									</div>
+									{([
+										["下一工具步骤", snapshot.queuedPromptGroups?.steering ?? snapshot.queuedMessages ?? []],
+										["本轮结束后", snapshot.queuedPromptGroups?.followUp ?? []],
+									] as const).map(([label, messages]) => messages.length > 0 && (
+										<div className="cc-queue-group" key={label}>
+											<span>{label}</span>
+											{messages.map((value, index) => <p className="cc-queue-item" key={index}>{value}</p>)}
+										</div>
+									))}
+								</div>
+							)}
+						</SurfacePresence>
 						{latestTodos.length > 0 && !latestTodos.every((t) => t.status === "completed") && (() => {
 							const doneCount = latestTodos.filter((t) => t.status === "completed").length;
 							const activeTodo = latestTodos.find((t) => t.status === "in_progress");
@@ -2629,8 +2689,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							</div>
 							);
 						})()}
-						{showPlanApproval && (
-							<section className="cc-plan-bar" role="region" aria-label="计划审批">
+						<SurfacePresence show={showPlanApproval} direction="up" group="plan-bar">
+							{(planBarRef) => (
+							<section ref={planBarRef} className="cc-plan-bar" role="region" aria-label="计划审批">
 								<div className="cc-plan-bar-top">
 									<strong>{planReady ? "计划待批准" : "计划草稿"}</strong>
 									<div className="cc-plan-bar-actions">
@@ -2649,9 +2710,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									</div>
 								</div>
 								{planState?.exists === false && !planEditorOpen && <p className="subtle-note">等待 Pi 提交计划。也可以手动编写计划正文。</p>}
-								{planEditorOpen && <textarea className="cc-plan-editor" rows={6} aria-label="编辑计划内容"
-									placeholder="审查或补充实施步骤" value={planDraft} disabled={planApplying || !planState}
-									onChange={(event) => { planDraftEdited.current = true; setPlanDraft(event.target.value); }} />}
+								<SmoothCollapse open={planEditorOpen}>
+									<textarea className="cc-plan-editor" rows={6} aria-label="编辑计划内容"
+										placeholder="审查或补充实施步骤" value={planDraft} disabled={planApplying || !planState}
+										onChange={(event) => { planDraftEdited.current = true; setPlanDraft(event.target.value); }} />
+								</SmoothCollapse>
 								{planError && <div role="alert" className="cc-plan-error">
 									{planError}
 									<button type="button" className="cc-mini-btn" onClick={async () => {
@@ -2672,9 +2735,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									}}>重新读取计划</button>
 								</div>}
 							</section>
-						)}
-						{heldCount > 0 && (
-							<div className="cc-plan-bar cc-held-results" role="region" aria-label="待交付的子 Agent 结果">
+							)}
+						</SurfacePresence>
+						<SurfacePresence show={heldCount > 0} direction="up" group="held-results">
+							{(heldRef) => (
+							<div ref={heldRef} className="cc-plan-bar cc-held-results" role="region" aria-label="待交付的子 Agent 结果">
 								<div className="cc-plan-bar-top">
 									<span>{heldCount} 条子 Agent 结果待交付：主会话未运行时完成的结果会随下一条消息一起交给 Pi。</span>
 									<div className="cc-plan-bar-actions">
@@ -2684,7 +2749,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									</div>
 								</div>
 							</div>
-						)}
+							)}
+						</SurfacePresence>
 						{workflows
 							.filter((wf) => wf.pendingApproval)
 							.map((wf) => {
@@ -2758,52 +2824,61 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							}}
 							onReturnToComposer={() => composerInputRef.current?.focus()}
 						/>
-						{secondaryStatus && <details className="cc-conversation-status" open={Boolean(btwState) || undefined}>
-							<summary>会话动态 <span>{secondaryStatus}</span></summary>
-							<div className="cc-conversation-status-body">
-								{btwState && (
-									<div className="cc-btw-card" role="region" aria-label="侧问结果">
-										<div className="cc-btw-head">
-											<strong>/btw {btwState.question}</strong>
-											<button type="button" className="cc-mini-btn" onClick={() => setBtwState(null)}>关闭</button>
-										</div>
-										{btwState.loading ? (
-											<p className="subtle-note">正在独立思考…</p>
-										) : btwState.error ? (
-											<p className="live-error">{btwState.error}</p>
-										) : (
-											<div className="cc-btw-body">
-												<p>{btwState.answer}</p>
-												{btwState.model && <small className="subtle-note">模型：{btwState.model} · 未写入主会话</small>}
+						{secondaryStatus && (
+							<AnimatedDetails
+								className="cc-conversation-status"
+								defaultOpen={Boolean(btwState)}
+								summary={
+									<>
+										会话动态 <span>{secondaryStatus}</span>
+									</>
+								}
+							>
+								<div className="cc-conversation-status-body">
+									{btwState && (
+										<div className="cc-btw-card" role="region" aria-label="侧问结果">
+											<div className="cc-btw-head">
+												<strong>/btw {btwState.question}</strong>
+												<button type="button" className="cc-mini-btn" onClick={() => setBtwState(null)}>关闭</button>
 											</div>
-										)}
-									</div>
-								)}
-						{snapshot.active?.goal?.active && (
-							<div className="cc-goal-banner" role="status">
-								<span>
-									<strong>目标模式</strong>（{snapshot.active.goal.turnsUsed}/{snapshot.active.goal.maxTurns} 轮
-									{snapshot.active.goal.maxCostUsd ? ` · 上限 $${snapshot.active.goal.maxCostUsd}` : ""}）：
-									{snapshot.active.goal.objective}
-								</span>
-								<button
-									type="button"
-									className="cc-mini-btn"
-									onClick={() => {
-										if (!snapshot.active) return;
-										void app.switchTo(async () => {
-											const next = await api.stopGoal(snapshot.active!.id);
-											app.setNotice("已停止目标模式。");
-											return next;
-										});
-									}}
-								>
-									停止目标
-								</button>
-							</div>
+											{btwState.loading ? (
+												<p className="subtle-note cc-shimmer-text">正在独立思考…</p>
+											) : btwState.error ? (
+												<p className="live-error">{btwState.error}</p>
+											) : (
+												<div className="cc-btw-body">
+													<p>{btwState.answer}</p>
+													{btwState.model && <small className="subtle-note">模型：{btwState.model} · 未写入主会话</small>}
+												</div>
+											)}
+										</div>
+									)}
+									{snapshot.active?.goal?.active && (
+										<div className="cc-goal-banner" role="status">
+											<span>
+												<strong>目标模式</strong>（{snapshot.active.goal.turnsUsed}/{snapshot.active.goal.maxTurns} 轮
+												{snapshot.active.goal.maxCostUsd ? ` · 上限 $${snapshot.active.goal.maxCostUsd}` : ""}）：
+												{snapshot.active.goal.objective}
+											</span>
+											<button
+												type="button"
+												className="cc-mini-btn"
+												onClick={() => {
+													if (!snapshot.active) return;
+													void app.switchTo(async () => {
+														const next = await api.stopGoal(snapshot.active!.id);
+														app.setNotice("已停止目标模式。");
+														return next;
+													});
+												}}
+											>
+												停止目标
+											</button>
+										</div>
+									)}
+								</div>
+							</AnimatedDetails>
 						)}
-							</div>
-							</details>}
 							{showGrailStatus && (
 							<div className="cc-grail-bar" role="region" aria-label={grailText.report}>
 								{grail?.running ? (
@@ -3067,7 +3142,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								placeholder="搜索标题或项目…"
 							/>
 						</div>
-						<div className="search-results" id="cc-search-results" role="listbox" aria-label="搜索结果">
+						<SlidingTabList variant="list" className="search-results" id="cc-search-results" role="listbox" aria-label="搜索结果">
 							{results.length === 0 && <p className="cc-search-empty">没有匹配的会话</p>}
 							{results.map((session, index) => (
 								<button
@@ -3082,13 +3157,21 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									onMouseEnter={() => setSearchIndex(index)}
 									onClick={() => open(session.id)}
 								>
-									<div>
-										<strong>{session.title}</strong>
-										<span title={session.project}>{projectName(snapshot, session.project)}</span>
+									<div className="cc-palette-row-main">
+										<MessageSquare size={14} className="cc-palette-icon" aria-hidden="true" />
+										<div>
+											<strong>{highlightMatch(session.title, needle)}</strong>
+											<span title={session.project}>{highlightMatch(projectName(snapshot, session.project), needle)}</span>
+										</div>
 									</div>
 									{session.id === snapshot.active?.id && <em className="cc-search-current">当前</em>}
 								</button>
 							))}
+						</SlidingTabList>
+						<div className="cc-palette-foot" aria-hidden="true">
+							<span><kbd>↑↓</kbd> 选择</span>
+							<span><kbd>↵</kbd> 切换会话</span>
+							<span><kbd>Esc</kbd> 关闭</span>
 						</div>
 					</Modal>
 				);

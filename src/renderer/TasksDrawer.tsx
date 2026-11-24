@@ -7,6 +7,7 @@ import { ExternalApprovalCard } from "./ExternalApprovalCard.tsx";
 import { CheckpointsDialog } from "./CheckpointsDialog.tsx";
 import { SlidingTabList } from "./SegmentedTabs.tsx";
 import { SelectPopover } from "./SelectPopover.tsx";
+import { SurfacePresence } from "./Presence.tsx";
 import { applyEvent, transcript, type Transcript } from "./messages.ts";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
 import { computeChecklistEta, computeMonitorTiming, computeTodoTiming } from "../task-eta.ts";
@@ -385,8 +386,9 @@ export function TasksDrawer({
 					</button>
 				</SlidingTabList>
 
+				<div key={tab} className="cc-tab-panel">
 				{tab === "tasks" && (
-					<div className="cc-controls-body cc-tab-panel">
+					<div className="cc-controls-body">
 						{backgroundCount > 0 && !detailTranscript && !extDetail && (
 							<div className="cc-task-stop-all">
 								<span>当前会话有 {backgroundCount} 项活跃后台任务。</span>
@@ -570,9 +572,9 @@ export function TasksDrawer({
 											disabled={busy}
 										/>
 										{detailTask.parentConversationId && !isActive(detailTask.status) && (
-											<label className="cc-task-notify" title="本轮完成后，把结果作为子 Agent 通知交付给发起它的会话">
+											<label className="live-setting-toggle cc-task-notify" title="本轮完成后，把结果作为子 Agent 通知交付给发起它的会话">
 												<input type="checkbox" checked={notifyParent} onChange={(e) => setNotifyParent(e.target.checked)} disabled={busy} />
-												完成后通知父会话
+												<span>完成后通知父会话</span>
 											</label>
 										)}
 										<button type="submit" className="primary-button" disabled={busy || !piFollowUp.trim()}>
@@ -969,21 +971,24 @@ export function TasksDrawer({
 										</button>
 									</div>
 								</div>
-								{confirmWorktreeCleanup === wt.id && (
-									<div className="cc-task-approval" role="group" aria-label="确认清理 Worktree">
-										<span>忽略文件会移到保留目录。请先提交或移出其他改动。</span>
-										<div>
-											<button type="button" className="secondary-button" disabled={busy} onClick={() => setConfirmWorktreeCleanup(undefined)}>取消</button>
-											<button type="button" className="primary-button" disabled={busy} onClick={() => void removeWorktree(wt.id)}>确认清理</button>
+								<SurfacePresence show={confirmWorktreeCleanup === wt.id} direction="banner" group={`wt-${wt.id}`}>
+									{(wtConfirmRef) => (
+										<div ref={wtConfirmRef} className="cc-task-approval" role="group" aria-label="确认清理 Worktree">
+											<span>忽略文件会移到保留目录。请先提交或移出其他改动。</span>
+											<div>
+												<button type="button" className="secondary-button" disabled={busy} onClick={() => setConfirmWorktreeCleanup(undefined)}>取消</button>
+												<button type="button" className="primary-button" disabled={busy} onClick={() => void removeWorktree(wt.id)}>确认清理</button>
+											</div>
 										</div>
-									</div>
-								)}
+									)}
+								</SurfacePresence>
 								</div>
 							))}
 							{!worktrees.length && <p className="subtle-note">当前项目没有受管 Worktree。</p>}
 						</div>
 					</div>
 				)}
+				</div>
 			</div>
 			{confirmation}
 		</Modal>

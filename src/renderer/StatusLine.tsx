@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
+import { BarChart3, Layers } from "lucide-react";
 import type { Provider, ProviderBalanceResult, Snapshot } from "../shared.ts";
+import { SurfacePresence } from "./Presence.tsx";
 import { desktopProvider } from "./status-line-state.ts";
 
 /** Balance lookups run at most once per this interval per provider. */
@@ -83,13 +85,69 @@ function useProviderBalance(provider: Provider | undefined, enabled: boolean, ru
 	return enabled ? result : undefined;
 }
 
-/** Compact status line: model, context usage, session cost, git branch and account balance. */
-export function StatusLine({ snapshot, running, gitBranch }: { snapshot: Snapshot; running: boolean; gitBranch?: string }) {
+function ContextRing({ pct }: { pct: number }) {
+	const clamped = Math.max(0, Math.min(100, pct));
+	const r = 4.6;
+	const c = 2 * Math.PI * r;
+	const offset = c - (clamped / 100) * c;
+	const tone = clamped >= 85 ? "danger" : clamped >= 65 ? "warn" : "ok";
+	return (
+		<svg className={`cc-ctx-ring ${tone}`} width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+			<circle className="cc-ctx-ring-track" cx="6" cy="6" r={r} fill="none" strokeWidth="1.6" />
+			<circle
+				className="cc-ctx-ring-fill"
+				cx="6"
+				cy="6"
+				r={r}
+				fill="none"
+				strokeWidth="1.7"
+				strokeDasharray={c}
+				strokeDashoffset={offset}
+				strokeLinecap="round"
+			/>
+		</svg>
+	);
+}
+
+/** Compact status line: model, context usage ring, session cost, git branch, account balance & interactive Telemetry HUD. */
+export function StatusLine({
+	snapshot,
+	running,
+	gitBranch,
+	onOpenContext,
+	onOpenStats,
+}: {
+	snapshot: Snapshot;
+	running: boolean;
+	gitBranch?: string;
+	onOpenContext?: () => void;
+	onOpenStats?: () => void;
+}) {
+	const [hudOpen, setHudOpen] = useState(false);
+	const rootRef = useRef<HTMLSpanElement>(null);
+
+	useEffect(() => {
+		if (!hudOpen) return;
+		const onDown = (event: MouseEvent) => {
+			if (rootRef.current && !rootRef.current.contains(event.target as Node)) setHudOpen(false);
+		};
+		const onKey = (event: KeyboardEvent) => {
+			if (event.key === "Escape") setHudOpen(false);
+		};
+		window.addEventListener("mousedown", onDown);
+		window.addEventListener("keydown", onKey);
+		return () => {
+			window.removeEventListener("mousedown", onDown);
+			window.removeEventListener("keydown", onKey);
+		};
+	}, [hudOpen]);
+
 	const stats = snapshot.stats;
-	const contextPct =
-		stats?.contextUsage && typeof stats.contextUsage === "object" && "percent" in stats.contextUsage
-			? (stats.contextUsage as { percent?: number | null }).percent ?? undefined
+	const contextUsageObj =
+		stats?.contextUsage && typeof stats.contextUsage === "object"
+			? (stats.contextUsage as { percent?: number | null; tokens?: number; contextWindow?: number })
 			: undefined;
+	const contextPct = contextUsageObj?.percent ?? undefined;
 	const model = snapshot.state?.model;
 	const provider = desktopProvider(model?.provider);
 	const balanceEnabled =
@@ -99,38 +157,129 @@ export function StatusLine({ snapshot, running, gitBranch }: { snapshot: Snapsho
 	const tokens = stats?.tokens;
 	const showUsage = Boolean(stats && (stats.tokens.total > 0 || contextPct !== undefined));
 	if (!modelName && !showUsage && !gitBranch && !balance) return null;
+
+	const interactive = Boolean(onOpenContext || onOpenStats || tokens || balance);
+
 	return (
-		<span className="cc-stats-pill cc-status-line" role="status" aria-label="状态栏">
-			{modelName && (
-				<span className="cc-status-model" title={`当前模型：${model?.provider}/${model?.id}`}>
-					{modelName}
-				</span>
-			)}
-			{showUsage && contextPct !== undefined && (
-				<span className="cc-status-item" title={`上下文已用 ${contextPct.toFixed(1)}%${tokens ? `\n输入 ${tokens.input} · 输出 ${tokens.output}` : ""}`}>
-					Ctx {Math.round(contextPct)}%
-				</span>
-			)}
-			{showUsage && contextPct === undefined && tokens && (
-				<span className="cc-status-item" title={`输入 ${tokens.input} · 输出 ${tokens.output}`}>
-					{Math.round(tokens.total / 1000)}k tok
-				</span>
-			)}
-			{stats && stats.cost > 0 && (
-				<span className="cc-status-item" title="本会话费用（按服务商价格计算）">
-					${stats.cost.toFixed(3)}
-				</span>
-			)}
-			{gitBranch && (
-				<span className="cc-status-item cc-status-branch" title={`Git 分支：${gitBranch}`}>
-					⎇ {gitBranch}
-				</span>
-			)}
-			{balance && (
-				<span className="cc-status-item cc-status-balance" title={balance.title}>
-					{balance.text}
-				</span>
-			)}
+		<span ref={rootRef} className={`cc-stats-pill cc-status-line ${hudOpen ? "is-open" : ""}`.trim()} role="status" aria-label="状态栏">
+			<button
+				type="button"
+				className="cc-status-hud-trigger"
+				aria-expanded={interactive ? hudOpen : undefined}
+				title="点击查看上下文与费用明细"
+				onClick={() => {
+					if (interactive) setHudOpen((v) => !v);
+				}}
+			>
+				{modelName && (
+					<span className="cc-status-model">
+						{modelName}
+					</span>
+				)}
+				{showUsage && contextPct !== undefined && (
+					<span className="cc-status-item cc-status-ctx">
+						<ContextRing pct={contextPct} />
+						<span>Ctx {Math.round(contextPct)}%</span>
+					</span>
+				)}
+				{showUsage && contextPct === undefined && tokens && (
+					<span className="cc-status-item">
+						{Math.round(tokens.total / 1000)}k tok
+					</span>
+				)}
+				{stats && stats.cost > 0 && (
+					<span className="cc-status-item">
+						${stats.cost.toFixed(3)}
+					</span>
+				)}
+				{gitBranch && (
+					<span className="cc-status-item cc-status-branch">
+						⎇ {gitBranch}
+					</span>
+				)}
+				{balance && (
+					<span className="cc-status-item cc-status-balance">
+						{balance.text}
+					</span>
+				)}
+			</button>
+
+			<SurfacePresence show={hudOpen} direction="up">
+				{(hudRef) => (
+					<div ref={hudRef} className="cc-telemetry-hud" role="region" aria-label="会话遥测明细">
+						<div className="cc-telemetry-head">
+							<strong>会话用量与遥测</strong>
+							{modelName && <span className="cc-source-tag">{modelName}</span>}
+						</div>
+						{contextPct !== undefined && (
+							<div className="cc-telemetry-meter">
+								<div className="cc-telemetry-meter-row">
+									<span>上下文窗口</span>
+									<strong>
+										{contextPct.toFixed(1)}%
+										{contextUsageObj?.contextWindow ? ` · ${Math.round(contextUsageObj.contextWindow / 1000)}k` : ""}
+									</strong>
+								</div>
+								<div className="cc-telemetry-bar">
+									<div
+										className={`cc-telemetry-bar-fill ${contextPct >= 85 ? "danger" : contextPct >= 65 ? "warn" : ""}`}
+										style={{ width: `${Math.max(2, Math.min(100, contextPct))}%` }}
+									/>
+								</div>
+							</div>
+						)}
+						{tokens && (
+							<div className="cc-telemetry-grid">
+								<div>
+									<span>输入 Token</span>
+									<strong>{tokens.input.toLocaleString()}</strong>
+								</div>
+								<div>
+									<span>输出 Token</span>
+									<strong>{tokens.output.toLocaleString()}</strong>
+								</div>
+								<div>
+									<span>缓存读取</span>
+									<strong>{(tokens.cacheRead ?? 0).toLocaleString()}</strong>
+								</div>
+								<div>
+									<span>本会话费用</span>
+									<strong>${(stats?.cost ?? 0).toFixed(4)}</strong>
+								</div>
+							</div>
+						)}
+						{balance && <p className="cc-telemetry-balance">{balance.title.replace(/^账户余额（[^）]+）\n?/, "")}</p>}
+						{(onOpenContext || onOpenStats) && (
+							<div className="cc-telemetry-actions">
+								{onOpenContext && (
+									<button
+										type="button"
+										className="cc-mini-btn"
+										onClick={() => {
+											setHudOpen(false);
+											onOpenContext();
+										}}
+									>
+										<Layers size={12} /> 上下文分析
+									</button>
+								)}
+								{onOpenStats && (
+									<button
+										type="button"
+										className="cc-mini-btn"
+										onClick={() => {
+											setHudOpen(false);
+											onOpenStats();
+										}}
+									>
+										<BarChart3 size={12} /> 30 天统计
+									</button>
+								)}
+							</div>
+						)}
+					</div>
+				)}
+			</SurfacePresence>
 		</span>
 	);
 }

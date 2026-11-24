@@ -18,6 +18,7 @@ import type {
 } from "../shared.ts";
 import { Modal } from "../prototype/ui.tsx";
 import { useConfirmation } from "./ConfirmationDialog.tsx";
+import { SlidingTabList } from "./SegmentedTabs.tsx";
 import { SelectPopover } from "./SelectPopover.tsx";
 import { SmoothCollapse } from "./SmoothCollapse.tsx";
 import { parseForegroundMinutes } from "./settings-input.ts";
@@ -525,22 +526,24 @@ export function SettingsDialog({
 			>
 				{!connectionOnly && (
 					<nav className="cc-settings-nav" aria-label="设置分类">
-						{navItems.map((item) => {
-							const Icon = item.icon;
-							const active = activeSection === item.id;
-							return (
-								<button
-									key={item.id}
-									type="button"
-									className={`cc-settings-nav-btn ${active ? "active" : ""}`}
-									aria-current={active ? "page" : undefined}
-									onClick={() => setSection(item.id)}
-								>
-									<Icon size={15} aria-hidden="true" />
-									<span>{item.label}</span>
-								</button>
-							);
-						})}
+						<SlidingTabList variant="nav" className="cc-settings-nav-track">
+							{navItems.map((item) => {
+								const Icon = item.icon;
+								const active = activeSection === item.id;
+								return (
+									<button
+										key={item.id}
+										type="button"
+										className={`cc-settings-nav-btn ${active ? "active" : ""}`}
+										aria-current={active ? "page" : undefined}
+										onClick={() => setSection(item.id)}
+									>
+										<Icon size={15} aria-hidden="true" />
+										<span>{item.label}</span>
+									</button>
+								);
+							})}
+						</SlidingTabList>
 					</nav>
 				)}
 				<div className="cc-settings-main">

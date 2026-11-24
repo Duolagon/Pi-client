@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { Check, ChevronDown } from "lucide-react";
+import { SurfacePresence } from "./Presence.tsx";
 
 export interface SelectPopoverOption {
 	value: string;
@@ -145,41 +146,44 @@ export function SelectPopover({
 				<ChevronDown size={12} className="cc-select-chevron" aria-hidden="true" />
 			</button>
 
-			{open && (
-				<div
-					id={listboxId}
-					role="listbox"
-					aria-label={`${ariaLabel} 选项`}
-					className={`cc-select-menu align-${align} dir-${direction}`}
-				>
-					{options.map((opt, idx) => {
-						const isSelected = opt.value === value;
-						const isActive = idx === activeIndex;
-						return (
-							<button
-								key={opt.value}
-								id={`${listboxId}-${idx}`}
-								type="button"
-								value={opt.value}
-								role="option"
-								tabIndex={-1}
-								disabled={opt.disabled}
-								aria-selected={isSelected}
-								className={`cc-select-option ${isSelected ? "selected" : ""} ${isActive ? "active" : ""}`.trim()}
-								onMouseDown={(event) => event.preventDefault()}
-								onClick={() => choose(opt.value)}
-							>
-								<span className="cc-select-option-main">
-									{opt.dotClass && <span className={`cc-perm-dot ${opt.dotClass}`} aria-hidden="true" />}
-									<span className="cc-select-option-title">{opt.label}</span>
-									{opt.hint && <span className="cc-select-option-hint">{opt.hint}</span>}
-								</span>
-								<Check size={13} className={`cc-select-check ${isSelected ? "visible" : ""}`} aria-hidden="true" />
-							</button>
-						);
-					})}
-				</div>
-			)}
+			<SurfacePresence show={open} direction={direction}>
+				{(menuRef) => (
+					<div
+						ref={menuRef}
+						id={listboxId}
+						role="listbox"
+						aria-label={`${ariaLabel} 选项`}
+						className={`cc-select-menu align-${align} dir-${direction}`}
+					>
+						{options.map((opt, idx) => {
+							const isSelected = opt.value === value;
+							const isActive = idx === activeIndex;
+							return (
+								<button
+									key={opt.value}
+									id={`${listboxId}-${idx}`}
+									type="button"
+									value={opt.value}
+									role="option"
+									tabIndex={-1}
+									disabled={opt.disabled}
+									aria-selected={isSelected}
+									className={`cc-select-option ${isSelected ? "selected" : ""} ${isActive ? "active" : ""}`.trim()}
+									onMouseDown={(event) => event.preventDefault()}
+									onClick={() => choose(opt.value)}
+								>
+									<span className="cc-select-option-main">
+										{opt.dotClass && <span className={`cc-perm-dot ${opt.dotClass}`} aria-hidden="true" />}
+										<span className="cc-select-option-title">{opt.label}</span>
+										{opt.hint && <span className="cc-select-option-hint">{opt.hint}</span>}
+									</span>
+									<Check size={13} className={`cc-select-check ${isSelected ? "visible" : ""}`} aria-hidden="true" />
+								</button>
+							);
+						})}
+					</div>
+				)}
+			</SurfacePresence>
 		</div>
 	);
 }

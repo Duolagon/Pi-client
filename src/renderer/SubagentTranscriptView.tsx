@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useConfirmation } from "./ConfirmationDialog.tsx";
-import { ArrowDownToLine, ArrowLeft, Bot, Send, Square } from "lucide-react";
+import { ArrowDownToLine, ArrowLeft, ArrowUp, Bot, Square } from "lucide-react";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
 import type { DesktopAPI, DesktopTask, RpcExtensionUIRequest, TaskProgress } from "../shared.ts";
 import { applyEvent, transcript, type Transcript } from "./messages.ts";
+import { useSurfaceExit } from "./Presence.tsx";
 import { TranscriptView } from "./TranscriptView.tsx";
 import { PermissionDialog } from "./PermissionDialog.tsx";
 import { classifySubagentViewSlash, isActiveTaskStatus } from "./subagent-panel-state.ts";
@@ -143,13 +144,16 @@ export function SubagentTranscriptView({
 		return parts.join(" · ");
 	})();
 
+	const viewRef = useSurfaceExit<HTMLDivElement>("down", "subagent-drill");
+
 	return (
-		<div className="cc-subagent-view">
+		<div ref={viewRef} className="cc-subagent-view">
 			<div className="cc-subagent-view-head">
-				<button type="button" className="secondary-button" onClick={onBack}>
+				<button type="button" className="secondary-button cc-subagent-back-btn" onClick={onBack}>
 					<ArrowLeft size={13} /> 返回主会话
 				</button>
 				<div className="cc-subagent-view-title">
+					<span className={`cc-dot ${active ? "run" : task.status === "completed" ? "ok" : "err"}`} aria-hidden="true" />
 					<Bot size={14} />
 					<strong>{task.name || task.title || task.subagentType || "子 Agent"}</strong>
 					{task.subagentType && <span className="cc-source-tag">{task.subagentType}</span>}
@@ -212,7 +216,7 @@ export function SubagentTranscriptView({
 			>
 				{loading ? (
 					<div className="cl-working" role="status">
-						<span className="cl-spinner" /> 正在加载子 Agent 记录…
+						<span className="cl-spinner" /> <span className="cc-shimmer-text">正在加载子 Agent 记录…</span>
 					</div>
 				) : history.messages.length ? (
 					<TranscriptView transcript={history} />
@@ -221,30 +225,34 @@ export function SubagentTranscriptView({
 				)}
 				{active && (
 					<div className="cl-working" role="status">
-						<span className="cl-spinner" /> {progress ? formatTaskProgressSummary(progress) : "子 Agent 正在运行…"}
+						<span className="cl-spinner" />
+						<span className="cc-shimmer-text">{progress ? formatTaskProgressSummary(progress) : "子 Agent 正在运行…"}</span>
 					</div>
 				)}
 			</div>
 
 			{!task.quarantined && task.status !== "queued" && (
-				<form className="cc-subagent-view-composer" onSubmit={(e) => void handleSubmit(e)}>
-					<input
-						aria-label="向子 Agent 发送消息"
-						placeholder={active ? "向运行中的子 Agent 补充说明（下一轮生效）…" : "向子 Agent 继续对话（保留上下文）…"}
-						value={input}
-						onChange={(e) => setInput(e.target.value)}
-						disabled={sending}
-					/>
-					{task.parentConversationId && !active && (
-						<label className="cc-task-notify" title="本轮完成后，把结果作为子 Agent 通知交付给主会话">
-							<input type="checkbox" checked={notifyParent} onChange={(e) => setNotifyParent(e.target.checked)} disabled={sending} />
-							完成后通知主会话
-						</label>
-					)}
-					<button type="submit" className="primary-button" disabled={sending || !input.trim()}>
-						<Send size={13} /> {active ? "发送" : "继续对话"}
-					</button>
-				</form>
+				<div className="cc-subagent-composer-wrap">
+					<form className="cc-subagent-view-composer cc-subagent-capsule" onSubmit={(e) => void handleSubmit(e)}>
+						<input
+							aria-label="向子 Agent 发送消息"
+							placeholder={active ? "向运行中的子 Agent 补充说明（下一轮生效）…" : "向子 Agent 继续对话（保留上下文）…"}
+							value={input}
+							onChange={(e) => setInput(e.target.value)}
+							disabled={sending}
+						/>
+						{task.parentConversationId && !active && (
+							<label className="live-setting-toggle cc-task-notify" title="本轮完成后，把结果作为子 Agent 通知交付给主会话">
+								<input type="checkbox" checked={notifyParent} onChange={(e) => setNotifyParent(e.target.checked)} disabled={sending} />
+								<span>通知主会话</span>
+							</label>
+						)}
+						<button type="submit" className="cl-send" disabled={sending || !input.trim()}>
+							<ArrowUp size={14} />
+							<span>{active ? "发送" : "继续对话"}</span>
+						</button>
+					</form>
+				</div>
 			)}
 			{confirmation}
 		</div>

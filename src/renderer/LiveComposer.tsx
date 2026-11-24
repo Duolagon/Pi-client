@@ -3,6 +3,7 @@ import { ArrowUp, Brain, File, Folder, Paperclip, ShieldCheck, Square, X } from 
 import type { Command, FileEntry, FileReferenceAvailability, Message, PermissionMode, Project, SandboxStatus, Snapshot, ThinkingLevel } from "../shared.ts";
 import { SandboxControl } from "./SandboxControl.tsx";
 import { SelectPopover } from "./SelectPopover.tsx";
+import { SurfacePresence } from "./Presence.tsx";
 import { CommandSealIcon } from "./GrailIcons.tsx";
 import { StatusLine } from "./StatusLine.tsx";
 import { fileReferences, insertFileReference, isDesktopWorkspaceContext, referenceQuery, removeFileReference, visiblePromptText } from "../file-references.ts";
@@ -206,6 +207,8 @@ export function LiveComposer({
 }) {
 	const [sending, setSending] = useState(false);
 	const [launching, setLaunching] = useState(false);
+	const [draggingFiles, setDraggingFiles] = useState(false);
+	const dragDepth = useRef(0);
 	const [runElapsedSec, setRunElapsedSec] = useState(0);
 	useEffect(() => {
 		if (!running) {
@@ -593,65 +596,100 @@ export function LiveComposer({
 
 	return (
 		<div className={`cl-composer${running ? " is-running" : ""}`}>
-			{slashOptions.length > 0 && (
-				<div className="cc-slash-menu" role="listbox" aria-label="斜杠命令">
-					{slashOptions.map((item, idx) => (
-						<button
-							type="button"
-							key={`${item.source}-${item.name}`}
-							role="option"
-							aria-selected={idx === activeSlashIndex}
-							id={`cc-slash-${idx}`}
-							className={`cc-slash-item ${idx === activeSlashIndex ? "active" : ""}`}
-							onMouseEnter={() => setSlashIndex(idx)}
-							onMouseDown={(event) => {
-								event.preventDefault();
-								selectSlash(item.name);
-							}}
-						>
-							<span className="cc-slash-name">/{item.name}</span>
-							{item.description && <span className="cc-slash-desc">{item.description}</span>}
-						</button>
-					))}
-				</div>
-			)}
-			{atMatch && (
-				<div className="cc-slash-menu" id="cc-at-files" role="listbox" aria-label="引用项目文件" aria-busy={filesLoading}>
-					{!atOptions.length && <div className="cc-reference-empty" role="status">
-						{filesLoading ? "正在查找项目文件…" : fileResults?.error ? "无法查找项目文件" : "没有匹配的项目文件"}
-					</div>}
-					{atOptions.map((file, idx) => (
-						<button
-							type="button"
-							key={file.path}
-							role="option"
-							aria-selected={idx === activeAtIndex}
-							id={`cc-at-${idx}`}
-							className={`cc-slash-item ${idx === activeAtIndex ? "active" : ""}`}
-							onMouseEnter={() => setAtIndex(idx)}
-							onMouseDown={(event) => {
-								event.preventDefault();
-								selectAtFile(file);
-							}}
-						>
-							{file.directory ? <Folder size={13} /> : <File size={13} />}
-							<span className="cc-slash-name">@{file.path}{file.directory ? "/" : ""}</span>
-						</button>
-					))}
-				</div>
-			)}
+			<SurfacePresence show={slashOptions.length > 0} direction="up">
+				{(slashRef) => (
+					<div ref={slashRef} className="cc-slash-menu" role="listbox" aria-label="斜杠命令">
+						{slashOptions.map((item, idx) => (
+							<button
+								type="button"
+								key={`${item.source}-${item.name}`}
+								role="option"
+								aria-selected={idx === activeSlashIndex}
+								id={`cc-slash-${idx}`}
+								className={`cc-slash-item ${idx === activeSlashIndex ? "active" : ""}`}
+								onMouseEnter={() => setSlashIndex(idx)}
+								onMouseDown={(event) => {
+									event.preventDefault();
+									selectSlash(item.name);
+								}}
+							>
+								<span className="cc-slash-name">/{item.name}</span>
+								{item.description && <span className="cc-slash-desc">{item.description}</span>}
+							</button>
+						))}
+					</div>
+				)}
+			</SurfacePresence>
+			<SurfacePresence show={Boolean(atMatch)} direction="up">
+				{(atRef) => (
+					<div ref={atRef} className="cc-slash-menu" id="cc-at-files" role="listbox" aria-label="引用项目文件" aria-busy={filesLoading}>
+						{!atOptions.length && <div className="cc-reference-empty" role="status">
+							{filesLoading ? "正在查找项目文件…" : fileResults?.error ? "无法查找项目文件" : "没有匹配的项目文件"}
+						</div>}
+						{atOptions.map((file, idx) => (
+							<button
+								type="button"
+								key={file.path}
+								role="option"
+								aria-selected={idx === activeAtIndex}
+								id={`cc-at-${idx}`}
+								className={`cc-slash-item ${idx === activeAtIndex ? "active" : ""}`}
+								onMouseEnter={() => setAtIndex(idx)}
+								onMouseDown={(event) => {
+									event.preventDefault();
+									selectAtFile(file);
+								}}
+							>
+								{file.directory ? <Folder size={13} /> : <File size={13} />}
+								<span className="cc-slash-name">@{file.path}{file.directory ? "/" : ""}</span>
+							</button>
+						))}
+					</div>
+				)}
+			</SurfacePresence>
 			<form
-				className="cl-composer-box"
+				className={`cl-composer-box ${draggingFiles ? "is-dragging" : ""}`.trim()}
 				onSubmit={(event) => {
 					event.preventDefault();
 					void submit();
 				}}
-				onDragOver={(event) => event.preventDefault()}
+				onDragEnter={(event) => {
+					if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+					event.preventDefault();
+					dragDepth.current += 1;
+					setDraggingFiles(true);
+				}}
+				onDragOver={(event) => {
+					event.preventDefault();
+					if (Array.from(event.dataTransfer.types).includes("Files") && !draggingFiles) {
+						setDraggingFiles(true);
+					}
+				}}
+				onDragLeave={(event) => {
+					if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+					dragDepth.current = Math.max(0, dragDepth.current - 1);
+					if (dragDepth.current === 0 || !event.currentTarget.contains(event.relatedTarget as Node | null)) {
+						dragDepth.current = 0;
+						setDraggingFiles(false);
+					}
+				}}
 				onDrop={(event) => {
 					event.preventDefault();
+					dragDepth.current = 0;
+					setDraggingFiles(false);
 					void attach(Array.from(event.dataTransfer.files));
 				}}
 			>
+				<SurfacePresence show={draggingFiles} direction="pill" group="composer-drop">
+					{(dropRef) => (
+						<div ref={dropRef} className="cc-composer-dropzone" aria-hidden="true">
+							<span className="cc-composer-dropzone-badge">
+								<Paperclip size={15} />
+								<span>松手添加图片或代码附件</span>
+							</span>
+						</div>
+					)}
+				</SurfacePresence>
 				{snapshot.active && (dockStatus || snapshot.stats || snapshot.state?.model) && (
 					<div className={`cc-dock-header ${dockStatus?.active ? "is-live" : ""}`}>
 						<div className="cc-dock-header-left">
@@ -668,46 +706,65 @@ export function LiveComposer({
 							)}
 						</div>
 						<div className="cc-dock-header-right">
-							<StatusLine snapshot={snapshot} running={running} />
+							<StatusLine
+								snapshot={snapshot}
+								running={running}
+								onOpenContext={() => onBuiltinSlash("context")}
+								onOpenStats={() => onBuiltinSlash("stats")}
+							/>
 						</div>
 					</div>
 				)}
-				{attachments.length > 0 && (
-					<div className="cl-attachments">
-						{attachments.map((item, index) => (
-							<span key={`${item.name}-${index}`} title={item.name}>
-								<span className="cl-attachment-name">{item.name}</span>
-								<button
-									type="button"
-									aria-label={`移除附件 ${item.name}`}
-									onClick={() => {
-										updateAttachments((items) => items.filter((_, at) => at !== index));
-										textarea.current?.focus();
-									}}
-								>
-									<X size={13} />
-								</button>
-							</span>
-						))}
-					</div>
-				)}
-				{references.some((ref) => ref.from !== atMatch?.from) && (
-					<div className="cl-attachments cc-reference-chips" role="list" aria-label="草稿的文件引用">
-						{references.map((ref, index) => {
-							if (ref.from === atMatch?.from) return null;
-							const status = index >= 24 ? "超过单次引用上限" : referenceStatus?.key === referenceKey
-								? REFERENCE_STATUS_LABEL[referenceStatus.statuses[index] ?? "unavailable"] : "检查中";
-							return (
-								<span key={ref.from} role="listitem" title={`${ref.path} · ${status}`}>
-									<File size={12} aria-hidden="true" />
-									<span className="cl-attachment-name">{ref.path}</span>
-									<span className="cc-reference-status">{status}</span>
-									<button type="button" aria-label={`移除引用 ${ref.path}`} onClick={() => removeReference(ref)}><X size={13} /></button>
+				<SurfacePresence show={attachments.length > 0} direction="banner" group="attachments">
+					{(attRef) => (
+						<div ref={attRef} className="cl-attachments">
+							{attachments.map((item, index) => (
+								<span key={`${item.name}-${index}`} className="cc-attachment-chip" title={item.name}>
+									{item.image ? (
+										<img
+											className="cc-attach-thumb"
+											src={`data:${item.image.mimeType};base64,${item.image.data}`}
+											alt=""
+											aria-hidden="true"
+										/>
+									) : (
+										<File size={12} aria-hidden="true" />
+									)}
+									<span className="cl-attachment-name">{item.name}</span>
+									<button
+										type="button"
+										aria-label={`移除附件 ${item.name}`}
+										onClick={() => {
+											updateAttachments((items) => items.filter((_, at) => at !== index));
+											textarea.current?.focus();
+										}}
+									>
+										<X size={13} />
+									</button>
 								</span>
-							);
-						})}
-					</div>
-				)}
+							))}
+						</div>
+					)}
+				</SurfacePresence>
+				<SurfacePresence show={references.some((ref) => ref.from !== atMatch?.from)} direction="banner" group="references">
+					{(refWrap) => (
+						<div ref={refWrap} className="cl-attachments cc-reference-chips" role="list" aria-label="草稿的文件引用">
+							{references.map((ref, index) => {
+								if (ref.from === atMatch?.from) return null;
+								const status = index >= 24 ? "超过单次引用上限" : referenceStatus?.key === referenceKey
+									? REFERENCE_STATUS_LABEL[referenceStatus.statuses[index] ?? "unavailable"] : "检查中";
+								return (
+									<span key={ref.from} className="cc-attachment-chip" role="listitem" title={`${ref.path} · ${status}`}>
+										<File size={12} aria-hidden="true" />
+										<span className="cl-attachment-name">{ref.path}</span>
+										<span className="cc-reference-status">{status}</span>
+										<button type="button" aria-label={`移除引用 ${ref.path}`} onClick={() => removeReference(ref)}><X size={13} /></button>
+									</span>
+								);
+							})}
+						</div>
+					)}
+				</SurfacePresence>
 				<textarea
 					ref={(el) => {
 						textarea.current = el;
@@ -927,8 +984,9 @@ export function LiveComposer({
 								>
 									Skills · {snapshot.commands.length}
 								</button>
-								{skillsOpen && (
-									<div className="cl-skills-list" role="region" aria-label="Skills 列表">
+								<SurfacePresence show={skillsOpen} direction="up">
+									{(skillsMenuRef) => (
+									<div ref={skillsMenuRef} className="cl-skills-list" role="region" aria-label="Skills 列表">
 										<input
 											className="cc-skills-filter"
 											placeholder="搜索技能或命令…"
@@ -972,7 +1030,8 @@ export function LiveComposer({
 											))}
 										</div>
 									</div>
-								)}
+									)}
+								</SurfacePresence>
 							</div>
 						)}
 						{!snapshot.commands.length && (

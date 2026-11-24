@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Folder, FolderPlus, GitBranch } from "lucide-react";
 import { menuKeyNav } from "../prototype/ui.tsx";
+import { SurfacePresence } from "./Presence.tsx";
 import type { Project } from "../shared.ts";
 
 function shortenPath(path: string): string {
@@ -71,8 +72,10 @@ export function WorkspacePicker({
 				)}
 				<ChevronDown size={12} className="cc-ws-caret" />
 			</button>
-			{open && (
+			<SurfacePresence show={open} direction={variant === "composer" ? "up" : "down"}>
+				{(menuRef) => (
 				<div
+					ref={menuRef}
 					className={`cc-ws-menu ${variant === "composer" ? "up" : "down"}`}
 					role="menu"
 					aria-label="工作目录列表"
@@ -129,7 +132,8 @@ export function WorkspacePicker({
 						</button>
 					</div>
 				</div>
-			)}
+				)}
+			</SurfacePresence>
 		</div>
 	);
 }

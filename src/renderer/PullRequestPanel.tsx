@@ -1,5 +1,8 @@
 import { useEffect, useState } from "react";
+import { ChevronRight, ExternalLink, GitPullRequest, MessageSquareCode, Plus, RefreshCw, Send } from "lucide-react";
 import { formatPullRequestCommentsPrompt, type PullRequestComment, type PullRequestMergeMethod, type PullRequestStatus } from "../shared.ts";
+import { SelectPopover } from "./SelectPopover.tsx";
+import { SmoothCollapse } from "./SmoothCollapse.tsx";
 
 export function PullRequestPanel({ conversationId, branch, readOnly }: { conversationId?: string; branch: string; readOnly: boolean }) {
 	const [open, setOpen] = useState(false);
@@ -113,76 +116,138 @@ export function PullRequestPanel({ conversationId, branch, readOnly }: { convers
 	}, [conversationId, open, selected, revision, watch]);
 
 	return (
-		<section className="cc-pr-panel" aria-label="PR 与 CI">
-			<button type="button" className="cc-mini-btn" aria-expanded={open} onClick={() => setOpen(!open)}>PR 与 CI</button>
-			{open && <>
-				<form onSubmit={(event) => {
-					event.preventDefault();
-					setPr(undefined);
-					setComments(null);
-					setStatusNote("");
-					setSelected(number ? Number(number) : undefined);
-					setRevision((value) => value + 1);
-				}}>
-					<input aria-label="PR 编号" type="number" min="1" step="1" value={number} placeholder="当前分支的 PR" onChange={(event) => setNumber(event.target.value)} />
-					<button className="cc-mini-btn" type="submit">刷新</button>
-					<label><input type="checkbox" checked={watch} onChange={(event) => setWatch(event.target.checked)} /> 跟踪 CI</label>
-				</form>
-				{created && <a href={created} target="_blank" rel="noreferrer">已创建草稿 PR</a>}
-				{!readOnly && branch && branch !== "HEAD" && pr === null && !showDraft && <button type="button" className="cc-mini-btn" onClick={() => setShowDraft(true)}>填写草稿 PR</button>}
-				{showDraft && <form className="cc-pr-draft" onSubmit={(event) => void create(event)}>
-					<p>从已推送的 {branch} 分支创建 GitHub 草稿 PR。</p>
-					<input aria-label="草稿 PR 标题" required maxLength={256} placeholder="标题" value={draftTitle} onChange={(e) => setDraftTitle(e.target.value)} />
-					<input aria-label="草稿 PR 目标分支" placeholder="目标分支（默认仓库主分支）" value={base} onChange={(e) => setBase(e.target.value)} />
-					<textarea aria-label="草稿 PR 说明" placeholder="变更说明" value={draftBody} onChange={(e) => setDraftBody(e.target.value)} />
-					<button className="cc-mini-btn" type="submit" disabled={creating || readOnly || !draftTitle.trim()}>创建 GitHub 草稿 PR</button>
-					<button className="cc-mini-btn" type="button" disabled={creating} onClick={() => setShowDraft(false)}>取消</button>
-				</form>}
-				{error ? <p role="alert">{error}</p> : pr === undefined ? <p>正在读取…</p> : pr === null ? <p>当前分支还没有 PR。</p> : <>
-					<a href={pr.url} target="_blank" rel="noreferrer">#{pr.number} {pr.title}</a>
-					<p>
-						{pr.headRefName} → {pr.baseRefName} · {pr.isDraft ? "草稿" : pr.state}
-						{pr.reviewDecision ? ` · ${pr.reviewDecision}` : ""}
-						{pr.autoMerge?.enabled ? ` · 自动合并已开启${pr.autoMerge.mergeMethod ? ` (${pr.autoMerge.mergeMethod})` : ""}` : ""}
-					</p>
-					<div className="cc-pr-actions" style={{ display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center", margin: "6px 0" }}>
-						{!readOnly && pr.state === "OPEN" && <>
-							{!pr.autoMerge?.enabled && (
-								<select aria-label="自动合并方式" value={mergeMethod} onChange={(e) => setMergeMethod(e.target.value as PullRequestMergeMethod)} disabled={togglingAutoMerge}>
-									<option value="squash">Squash</option>
-									<option value="merge">Merge</option>
-									<option value="rebase">Rebase</option>
-								</select>
-							)}
-							<button type="button" className="cc-mini-btn" disabled={togglingAutoMerge} onClick={() => void toggleAutoMerge()}>
-								{togglingAutoMerge ? "处理中…" : pr.autoMerge?.enabled ? "关闭自动合并" : "开启自动合并"}
-							</button>
-						</>}
-						<button type="button" className="cc-mini-btn" disabled={loadingComments} onClick={() => void loadComments()}>
-							{loadingComments ? "拉取中…" : "拉取 PR 评论"}
-						</button>
-						{!readOnly && comments && comments.length > 0 && (
-							<button type="button" className="cc-mini-btn" disabled={sendingComments} onClick={() => void sendCommentsToAgent()}>
-								{sendingComments ? "发送中…" : `一键交给 Agent 处理 (${comments.length})`}
-							</button>
-						)}
-					</div>
-					{statusNote && <p className="subtle-note">{statusNote}</p>}
-					{pr.checks.length > 0 && <ul>{pr.checks.map((check, i) => <li key={i}>{check.name} · {check.status}</li>)}</ul>}
-					{comments && comments.length > 0 && (
-						<ul className="cc-pr-comments" aria-label="PR 评论列表">
-							{comments.map((comment) => (
-								<li key={comment.id}>
-									<strong>@{comment.author}</strong>
-									{comment.path ? ` · ${comment.path}${comment.line ? `:${comment.line}` : ""}` : ""}
-									{comment.kind === "review" && comment.state ? ` (${comment.state})` : ""}
-									<p style={{ margin: "2px 0 6px", whiteSpace: "pre-wrap" }}>{comment.body.slice(0, 300)}{comment.body.length > 300 ? "…" : ""}</p>
-								</li>
-							))}
-						</ul>
+		<section className={`cc-pr-panel ${open ? "is-open" : ""}`.trim()} aria-label="PR 与 CI">
+			<button type="button" className="cc-pr-toggle" aria-expanded={open} onClick={() => setOpen(!open)}>
+				<GitPullRequest size={13} />
+				<span>PR 与 CI</span>
+				<ChevronRight size={13} className={`cl-tool-chevron ${open ? "open" : ""}`} />
+			</button>
+			<SmoothCollapse open={open}>
+				<div className="cc-pr-body">
+					<form className="cc-pr-bar" onSubmit={(event) => {
+						event.preventDefault();
+						setPr(undefined);
+						setComments(null);
+						setStatusNote("");
+						setSelected(number ? Number(number) : undefined);
+						setRevision((value) => value + 1);
+					}}>
+						<input aria-label="PR 编号" type="number" min="1" step="1" value={number} placeholder="当前分支的 PR" onChange={(event) => setNumber(event.target.value)} />
+						<button className="cc-mini-btn" type="submit"><RefreshCw size={11} /> 刷新</button>
+						<label className="live-setting-toggle cc-pr-watch">
+							<input type="checkbox" checked={watch} onChange={(event) => setWatch(event.target.checked)} />
+							<span>跟踪 CI</span>
+						</label>
+					</form>
+					{created && (
+						<a className="cc-pr-link" href={created} target="_blank" rel="noreferrer">
+							<ExternalLink size={12} /> 已创建草稿 PR
+						</a>
 					)}
-				</>}
-			</>}
+					{!readOnly && branch && branch !== "HEAD" && pr === null && !showDraft && (
+						<button type="button" className="cc-mini-btn" onClick={() => setShowDraft(true)}>
+							<Plus size={12} /> 填写草稿 PR
+						</button>
+					)}
+					<SmoothCollapse open={showDraft}>
+						<form className="cc-pr-draft" onSubmit={(event) => void create(event)}>
+							<p className="subtle-note">从已推送的 <code>{branch}</code> 分支创建 GitHub 草稿 PR。</p>
+							<input aria-label="草稿 PR 标题" required maxLength={256} placeholder="标题" value={draftTitle} onChange={(e) => setDraftTitle(e.target.value)} />
+							<input aria-label="草稿 PR 目标分支" placeholder="目标分支（默认仓库主分支）" value={base} onChange={(e) => setBase(e.target.value)} />
+							<textarea aria-label="草稿 PR 说明" rows={3} placeholder="变更说明" value={draftBody} onChange={(e) => setDraftBody(e.target.value)} />
+							<div className="cc-pr-draft-actions">
+								<button className="primary-button" type="submit" disabled={creating || readOnly || !draftTitle.trim()}>
+									{creating ? "创建中…" : "创建 GitHub 草稿 PR"}
+								</button>
+								<button className="cc-mini-btn" type="button" disabled={creating} onClick={() => setShowDraft(false)}>取消</button>
+							</div>
+						</form>
+					</SmoothCollapse>
+					{error ? (
+						<p className="live-error" role="alert">{error}</p>
+					) : pr === undefined ? (
+						<p className="subtle-note cc-shimmer-text">正在读取 PR 与 CI 状态…</p>
+					) : pr === null ? (
+						<p className="subtle-note">当前分支还没有关联 PR。</p>
+					) : (
+						<div className="cc-pr-card">
+							<div className="cc-pr-card-head">
+								<a className="cc-pr-title" href={pr.url} target="_blank" rel="noreferrer">
+									<span>#{pr.number} {pr.title}</span>
+									<ExternalLink size={12} />
+								</a>
+								<span className="cc-source-tag">{pr.isDraft ? "草稿" : pr.state}</span>
+							</div>
+							<p className="cc-pr-meta">
+								<code>{pr.headRefName}</code> → <code>{pr.baseRefName}</code>
+								{pr.reviewDecision ? ` · ${pr.reviewDecision}` : ""}
+								{pr.autoMerge?.enabled ? ` · 自动合并已开启${pr.autoMerge.mergeMethod ? ` (${pr.autoMerge.mergeMethod})` : ""}` : ""}
+							</p>
+							<div className="cc-pr-actions">
+								{!readOnly && pr.state === "OPEN" && (
+									<>
+										{!pr.autoMerge?.enabled && (
+											<SelectPopover
+												ariaLabel="自动合并方式"
+												direction="down"
+												value={mergeMethod}
+												disabled={togglingAutoMerge}
+												options={[
+													{ value: "squash", label: "Squash" },
+													{ value: "merge", label: "Merge" },
+													{ value: "rebase", label: "Rebase" },
+												]}
+												onChange={(val) => setMergeMethod(val as PullRequestMergeMethod)}
+											/>
+										)}
+										<button type="button" className="cc-mini-btn" disabled={togglingAutoMerge} onClick={() => void toggleAutoMerge()}>
+											{togglingAutoMerge ? "处理中…" : pr.autoMerge?.enabled ? "关闭自动合并" : "开启自动合并"}
+										</button>
+									</>
+								)}
+								<button type="button" className="cc-mini-btn" disabled={loadingComments} onClick={() => void loadComments()}>
+									<MessageSquareCode size={12} /> {loadingComments ? "拉取中…" : "拉取 PR 评论"}
+								</button>
+								{!readOnly && comments && comments.length > 0 && (
+									<button type="button" className="cc-mini-btn primary" disabled={sendingComments} onClick={() => void sendCommentsToAgent()}>
+										<Send size={11} /> {sendingComments ? "发送中…" : `一键交给 Agent 处理 (${comments.length})`}
+									</button>
+								)}
+							</div>
+							{statusNote && <p className="subtle-note">{statusNote}</p>}
+							{pr.checks.length > 0 && (
+								<ul className="cc-pr-checks">
+									{pr.checks.map((check, i) => {
+										const ok = /pass|success/i.test(check.status);
+										const failCheck = /fail|error/i.test(check.status);
+										return (
+											<li key={i}>
+												<span className={`cc-dot ${ok ? "ok" : failCheck ? "err" : "run"}`} />
+												<span>{check.name}</span>
+												<small>{check.status}</small>
+											</li>
+										);
+									})}
+								</ul>
+							)}
+							{comments && comments.length > 0 && (
+								<ul className="cc-pr-comments" aria-label="PR 评论列表">
+									{comments.map((comment) => (
+										<li key={comment.id}>
+											<div className="cc-pr-comment-head">
+												<strong>@{comment.author}</strong>
+												{comment.path && <code>{comment.path}{comment.line ? `:${comment.line}` : ""}</code>}
+												{comment.kind === "review" && comment.state && <span className="cc-source-tag">{comment.state}</span>}
+											</div>
+											<p>{comment.body.slice(0, 300)}{comment.body.length > 300 ? "…" : ""}</p>
+										</li>
+									))}
+								</ul>
+							)}
+						</div>
+					)}
+				</div>
+			</SmoothCollapse>
 		</section>
 	);
 }

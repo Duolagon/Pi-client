@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { CircleAlert, CircleCheck, CircleX, Copy, RefreshCw } from "lucide-react";
+import { useEffect, useState, type CSSProperties } from "react";
+import { Check, CircleAlert, CircleCheck, CircleX, Copy, RefreshCw } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
 import type { DoctorCheck, DoctorReport, DoctorStatus } from "../shared.ts";
 import { copyText } from "./clipboard.ts";
@@ -23,10 +23,13 @@ export function DoctorDialog({ close, onNotice }: { close: () => void; onNotice:
 	const [report, setReport] = useState<DoctorReport | null>(null);
 	const [error, setError] = useState("");
 	const [loading, setLoading] = useState(true);
+	const [copied, setCopied] = useState(false);
+	const [runSeq, setRunSeq] = useState(0);
 
 	const run = () => {
 		setLoading(true);
 		setError("");
+		setRunSeq((n) => n + 1);
 		window.pi
 			.doctor()
 			.then(setReport)
@@ -44,7 +47,7 @@ export function DoctorDialog({ close, onNotice }: { close: () => void; onNotice:
 		<Modal title="环境诊断" close={close} wide>
 			<div className="simple-dialog cc-doctor">
 				<p className="subtle-note">只检查本机配置，不发送网络或模型请求。结果不含密钥内容。</p>
-				{loading && !report && <p className="subtle-note">正在检查…</p>}
+				{loading && !report && <p className="subtle-note cc-shimmer-text">正在检查…</p>}
 				{error && (
 					<div className="live-error" role="alert">
 						{error}
@@ -55,9 +58,9 @@ export function DoctorDialog({ close, onNotice }: { close: () => void; onNotice:
 						<p className="cc-doctor-summary" role="status">
 							正常 {counts.ok} · 注意 {counts.warn} · 异常 {counts.error}
 						</p>
-						<ul className="cc-doctor-list">
-							{report.checks.map((check) => (
-								<li key={check.id} className={`cc-doctor-row ${check.status}`}>
+						<ul key={runSeq} className="cc-doctor-list">
+							{report.checks.map((check, idx) => (
+								<li key={check.id} className={`cc-doctor-row ${check.status}`} style={{ "--row-i": idx } as CSSProperties}>
 									<span className="cc-doctor-status" title={STATUS_LABEL[check.status]}>
 										<StatusIcon status={check.status} />
 										<span>{STATUS_LABEL[check.status]}</span>
@@ -71,18 +74,24 @@ export function DoctorDialog({ close, onNotice }: { close: () => void; onNotice:
 				)}
 				<div className="dialog-actions">
 					<button type="button" className="secondary-button" disabled={loading} onClick={run}>
-						<RefreshCw size={14} aria-hidden="true" /> {loading ? "正在检查…" : "重新检查"}
+						<RefreshCw size={14} className={loading ? "cc-spin" : undefined} aria-hidden="true" /> {loading ? "正在检查…" : "重新检查"}
 					</button>
 					<button
 						type="button"
-						className="secondary-button"
+						className={`secondary-button ${copied ? "is-copied" : ""}`.trim()}
 						disabled={!report}
 						onClick={() =>
 							report &&
-							void copyText(doctorReportText(report)).then((ok) => onNotice(ok ? "已复制诊断报告到剪贴板。" : "复制失败，请手动选择文字复制。"))
+							void copyText(doctorReportText(report)).then((ok) => {
+								if (ok) {
+									setCopied(true);
+									setTimeout(() => setCopied(false), 1400);
+								}
+								onNotice(ok ? "已复制诊断报告到剪贴板。" : "复制失败，请手动选择文字复制。");
+							})
 						}
 					>
-						<Copy size={14} aria-hidden="true" /> 复制报告
+						{copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />} {copied ? "已复制" : "复制报告"}
 					</button>
 					<span />
 					<button type="button" className="primary-button" onClick={close}>
