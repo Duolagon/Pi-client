@@ -607,7 +607,7 @@ function recordUsage(ctx: unknown, usage: NotificationUsage, key: string): void 
 	} catch {}
 }
 
-const BACKGROUND_BASH_NOTE = " Set run_in_background: true for long-running commands (dev servers, watchers, long builds) instead of appending '&': the call returns a shell_id at once, BashOutput reads new output, KillShell stops it, and you get one notice when it ends. timeout does not apply to background commands.";
+const BACKGROUND_BASH_NOTE = " Set run_in_background: true for long-running commands (dev servers, watchers, long builds) instead of appending '&': the call returns a shell_id at once, BashOutput reads new output, KillShell stops it, and you get one notice when it ends. The timeout is in seconds and defaults to 24 hours for background commands.";
 
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
@@ -674,6 +674,7 @@ function registerBackgroundBash(pi: ExtensionAPI, host: { url: string; token: st
 			const params = validateDesktopToolInput("BashBackground", {
 				command: shell.commandPrefix ? `${shell.commandPrefix}\n${command}` : command,
 				...(typeof description === "string" && description.trim() ? { description: description.trim().slice(0, 160) } : {}),
+				...(args.timeout === undefined ? {} : { timeout: args.timeout }),
 			});
 			const response = await postLoopbackJson(host.url, "/invoke", host.token, { tool: "BashBackground", toolCallId, input: params }, signal);
 			const record = response.body as { ok?: boolean; data?: { shell_id?: unknown }; error?: string } | undefined;
@@ -683,7 +684,7 @@ function registerBackgroundBash(pi: ExtensionAPI, host: { url: string; token: st
 			return {
 				content: [{ type: "text", text: `Command running in background with ID: ${id}. Use BashOutput with bash_id "${id}" to read its output and KillShell to stop it.` }],
 				details: { ...record.data, background: true },
-				structuredContent: { output: "", truncated: false, exit_code: 0, wall_time_seconds: 0 },
+				structuredContent: { shell_id: id, status: "running", background: true },
 			};
 		},
 	} as ToolDefinition);

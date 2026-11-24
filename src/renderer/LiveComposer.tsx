@@ -130,6 +130,7 @@ export function LiveComposer({
 	onTogglePlanMode,
 	send,
 	stop,
+	stopping,
 	command,
 	setPermission,
 	onSelectProject,
@@ -160,6 +161,7 @@ export function LiveComposer({
 	onTogglePlanMode?: () => void;
 	send: (prompt: Prompt, input?: ComposerDraft, delivery?: Prompt["streamingBehavior"]) => Promise<unknown>;
 	stop: () => void;
+	stopping?: boolean;
 	command: (value: Command) => Promise<void>;
 	setPermission: (value: PermissionMode) => void;
 	onSelectProject: (path: string) => void;
@@ -850,7 +852,7 @@ export function LiveComposer({
 										<option value="steer">下一工具步骤</option>
 									</select>
 								</label>
-								<button type="button" className="cl-send stop" aria-label="停止任务" title="停止当前任务（Esc）" onClick={stop}>
+								<button type="button" className="cl-send stop" aria-label="停止任务" title="停止本轮回复和本机后台命令（Esc）" onClick={stop} disabled={stopping}>
 									<Square size={12} fill="currentColor" />
 								</button>
 							</>

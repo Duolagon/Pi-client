@@ -13,6 +13,7 @@ import { connectionDefaults, connectionMode } from "./model-connections.ts";
 import { providerModels } from "./provider-presets.ts";
 import { BALANCE_PROVIDER_NAMES, balanceFor, fetchBalance, formatBalance, validBalanceTarget } from "./provider-balance.ts";
 import { evaluatePermission, loadRuntimePermissionPolicy, redactSearchOutput } from "./permission-policy.ts";
+import { isStatusOnlyRequest } from "./remote-operation.ts";
 import { formatWebSearchResults, injectDeepSeekBuiltinSearch, isDeepSeekModel, searchWithDeepSeekApi } from "./web-search.ts";
 
 function shellQuote(value: string): string {
@@ -1038,6 +1039,15 @@ export default function permissions(pi: ExtensionAPI) {
 			const policy = await loadRuntimePermissionPolicy();
 			let decision = await evaluatePermission(policy, event);
 			if (decision.action === "deny") return { block: true, reason: decision.reason };
+			const statusOnlyTurn = () => {
+				const lastUser = ctx.sessionManager?.getBranch?.().findLast((entry) => entry.type === "message" && entry.message.role === "user");
+				if (lastUser?.type !== "message" || lastUser.message.role !== "user") return false;
+				const content = lastUser.message.content;
+				if (typeof content === "string") return isStatusOnlyRequest(content);
+				return content.every((item) => item.type === "text") && isStatusOnlyRequest(content.map((item) => item.text).join("\n"));
+			};
+			const statusBlockReason = "本轮仅查询状态，不能执行远端写操作。";
+			if (decision.remoteMutation && statusOnlyTurn()) return { block: true, reason: statusBlockReason };
 			let effectiveAction = decision.action;
 			let confirmReason = decision.reason;
 			if (!testingConnection) {
@@ -1054,10 +1064,11 @@ export default function permissions(pi: ExtensionAPI) {
 					applyUpdatedInput(event.input as Record<string, unknown>, hook.updatedInput as Record<string, unknown>);
 					decision = await evaluatePermission(policy, event);
 					if (decision.action === "deny") return { block: true, reason: decision.reason };
+					if (decision.remoteMutation && statusOnlyTurn()) return { block: true, reason: statusBlockReason };
 					effectiveAction = decision.action;
 					confirmReason = decision.reason;
 				}
-				if (hook?.permissionDecision === "allow" && effectiveAction === "ask" && !decision.ruleId) {
+				if (hook?.permissionDecision === "allow" && effectiveAction === "ask" && !decision.ruleId && !decision.remoteMutation) {
 					effectiveAction = "allow";
 				} else if (hook?.permissionDecision === "ask" && effectiveAction === "allow") {
 					effectiveAction = "ask";
@@ -1079,11 +1090,17 @@ export default function permissions(pi: ExtensionAPI) {
 						applyUpdatedInput(event.input as Record<string, unknown>, permHook.updatedInput as Record<string, unknown>);
 						decision = await evaluatePermission(await loadRuntimePermissionPolicy(), event);
 						if (decision.action === "deny") return { block: true, reason: decision.reason };
+						if (decision.remoteMutation && statusOnlyTurn()) return { block: true, reason: statusBlockReason };
+						if (decision.remoteMutation) confirmReason = decision.reason;
 					}
-					if (permHook?.permissionDecision === "allow") {
+					if (permHook?.permissionDecision === "allow" && !decision.remoteMutation) {
 						const recheck = await evaluatePermission(await loadRuntimePermissionPolicy(), event);
 						if (recheck.action === "deny") return { block: true, reason: recheck.reason };
-						effectiveAction = "allow";
+						if (recheck.remoteMutation) {
+							if (statusOnlyTurn()) return { block: true, reason: statusBlockReason };
+							decision = recheck;
+							confirmReason = recheck.reason;
+						} else effectiveAction = "allow";
 					}
 				}
 			}
@@ -1092,13 +1109,14 @@ export default function permissions(pi: ExtensionAPI) {
 				return { block: true, reason: `dontAsk 模式自动拒绝未预授权的操作：${confirmReason}` };
 			if (effectiveAction === "ask") {
 				const allowed = await ctx.ui.confirm(
-					`允许执行 ${event.toolName}？`,
+					`允许执行 ${event.toolName}${decision.remoteMutation ? "（远端写入，仅本次）" : ""}？`,
 					`${confirmReason}\n\n${JSON.stringify(event.input, null, 2)}`,
 				);
 				if (!allowed) return { block: true, reason: "用户未批准此操作。" };
 				// An approval dialog can stay open while the host revokes this tool or adds a deny rule.
 				const latest = await evaluatePermission(await loadRuntimePermissionPolicy(), event);
 				if (latest.action === "deny") return { block: true, reason: latest.reason };
+				if (latest.remoteMutation && statusOnlyTurn()) return { block: true, reason: statusBlockReason };
 			}
 			const sandboxProfile = process.env.PI_DESKTOP_SANDBOX_PROFILE;
 			if (sandboxProfile && event.toolName === "bash" && typeof (event.input as { command?: unknown })?.command === "string") {

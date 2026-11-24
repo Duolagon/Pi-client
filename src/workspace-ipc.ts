@@ -93,6 +93,7 @@ export function installWorkspaceHandlers(
 	handle("pi:task:background", (taskId) => service.backgroundTask(id(taskId)));
 	// Both act only on the named conversation's own children; the host checks it exists.
 	handle("pi:task:stopAll", (conversationId) => service.stopAllTasks(id(conversationId)));
+	handle("pi:task:stopCurrentTurn", (conversationId, runId) => service.stopCurrentTurn(id(conversationId), id(runId)));
 	handle("pi:task:deliverNow", (conversationId) => service.deliverTaskNotifications(id(conversationId)));
 	// The user's "继续对话": a message for an existing task (resume a finished one, steer a running one).
 	handle("pi:task:send", (value) => {

@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_AGENT_MCP_SERVERS } from "./delegation-limits.ts";
+import { knownRemoteOperation } from "./remote-operation.ts";
 import type {
 	PermissionAction,
 	PermissionCommandSelector,
@@ -391,6 +392,46 @@ function parseShell(command: string): ShellCommand {
 	return { commands, compound, opaque };
 }
 
+const commandAssignments = /^[a-zA-Z_][a-zA-Z0-9_]*=/;
+const inlineShells = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
+const argvWrappers = new Set(["env", "command", "exec", "sudo", "doas", "xargs"]);
+const wrapperValueOptions = new Set(["-u", "--unset", "-C", "--chdir", "-g", "-I", "-L", "-n", "-P"]);
+
+/** Inspect literal invocations even in a command chain or a shell wrapper. Unknown scripts remain ordinary Bash. */
+function remoteShellOperation(commands: string[][], depth = 0): string | undefined {
+	if (depth >= 5) return;
+	for (const command of commands) {
+		let argv = command;
+		for (let wrapper = 0; wrapper < 8 && argv.length; wrapper++) {
+			if (commandAssignments.test(argv[0]) || ["if", "then", "else", "do", "!", "{"].includes(argv[0])) {
+				argv = argv.slice(1);
+				continue;
+			}
+			argv = stripProcessWrappers(argv);
+			if (!argv.length) break;
+			const executable = executableName(argv[0]);
+			if (argvWrappers.has(executable)) {
+				let index = 1;
+				while (argv[index]?.startsWith("-") && argv[index] !== "--") index += wrapperValueOptions.has(argv[index]) ? 2 : 1;
+				if (argv[index] === "--") index++;
+				argv = argv.slice(index);
+				continue;
+			}
+			if (inlineShells.has(executable) || executable === "eval") {
+				const selector = argv.findIndex((word, index) => index > 0 && /^-[a-z]*c[a-z]*$/.test(word));
+				const body = executable === "eval" ? argv.slice(1).join(" ") : selector > 0 ? argv[selector + 1] : undefined;
+				const operation = body && remoteShellOperation(parseShell(body).commands, depth + 1);
+				if (operation) return operation;
+				break;
+			}
+			if (/^python(?:[23](?:\.\d+)?)?$/.test(executable) && argv[1] === "-m" && argv[2] === "kaggle") argv = argv.slice(2);
+			const operation = knownRemoteOperation(argv);
+			if (operation) return operation;
+			break;
+		}
+	}
+}
+
 function commandMatches(selector: PermissionCommandSelector, rawArgv: string[], action: PermissionAction): boolean {
 	const expected = selector.type === "prefix" ? selector.argv : parseShell(selector.value).commands[0];
 	const argv = stripProcessWrappers(rawArgv);
@@ -523,14 +564,14 @@ export async function evaluatePermission(
 	// The bash tool's run_in_background path; it must never be weaker than a foreground bash call.
 	if (call.toolName === "BashBackground") {
 		if (typeof input.command !== "string" || !input.command.trim()) return { action: "deny", reason: "后台命令缺少 command。" };
-		return evaluatePermission(policy, { toolName: "bash", input: { command: input.command } });
+		return evaluatePermission(policy, { toolName: "bash", input: { command: input.command, run_in_background: true } });
 	}
 	if (call.toolName === "Monitor") {
 		if (typeof input.command === "string" && input.command.trim()) {
 			if (policy.disabledTools.includes("bash")) {
 				return { action: "deny", reason: "Bash 工具已停用，无法启动命令监听。" };
 			}
-			return evaluatePermission(policy, { toolName: "bash", input: { command: input.command } });
+			return evaluatePermission(policy, { toolName: "bash", input: { command: input.command, run_in_background: true } });
 		}
 		if (typeof input.url === "string" && input.url.trim()) {
 			let parsed: URL;
@@ -547,6 +588,8 @@ export async function evaluatePermission(
 		}
 	}
 	const shell = call.toolName === "bash" && typeof input.command === "string" ? parseShell(input.command) : undefined;
+	const remoteOperation = shell && remoteShellOperation(shell.commands);
+	const autoForeground = policy.mode === "auto" && !policy.dontAsk && input.run_in_background !== true;
 	const agentType = call.toolName === "Agent"
 		? input.fork === true
 			? "fork"
@@ -583,7 +626,7 @@ export async function evaluatePermission(
 	}
 	for (const action of ["deny", "ask", "allow"] as const) {
 		const match = matches.find((candidate) => candidate.rule.action === action);
-		if (match) {
+		if (match && (!remoteOperation || action === "deny" || autoForeground)) {
 			if (action === "ask" && policy.dontAsk) {
 				return {
 					action: "deny",
@@ -597,6 +640,7 @@ export async function evaluatePermission(
 				ruleId: match.rule.id,
 				reason: match.conservative ? `复杂 Shell 语法无法安全排除规则 ${match.rule.id}，按规则保守处理。` : `匹配权限规则 ${match.rule.id}。`,
 				...(targets.length ? { targets } : {}),
+				...(remoteOperation ? { remoteMutation: true as const } : {}),
 			};
 		}
 	}
@@ -605,6 +649,14 @@ export async function evaluatePermission(
 			return { action: "deny", reason: `dontAsk 模式自动拒绝未预授权的操作：${reason}`, ...(targets.length ? { targets } : {}) };
 		return { action, reason, ...(targets.length ? { targets } : {}) };
 	};
+	if (remoteOperation) {
+		if (input.run_in_background === true)
+			return { ...result("deny", `${remoteOperation} 会修改远端状态，请在前台执行。`), remoteMutation: true };
+		const decision = autoForeground
+			? result("allow", "全部放行模式。")
+			: result("ask", `${remoteOperation} 会修改远端状态，需要你单次确认。`);
+		return { ...decision, remoteMutation: true };
+	}
 	if (policy.mode === "read" && call.toolName === "Agent" && (input.subagent_type === "Explore" || input.subagent_type === "Plan"))
 		return result("allow", "只读模式：允许只读探索/规划子 Agent。");
 	if (policy.mode === "plan") {

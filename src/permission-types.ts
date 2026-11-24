@@ -54,4 +54,6 @@ export interface PermissionDecision {
 	reason: string;
 	ruleId?: string;
 	targets?: string[];
+	/** Known remote mutation, even when the current mode allows it without a prompt. */
+	remoteMutation?: true;
 }

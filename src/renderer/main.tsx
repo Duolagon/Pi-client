@@ -96,6 +96,7 @@ import { runLabels } from "./run-status.ts";
 import { TaskAttention, type AttentionItem } from "./TaskAttention.tsx";
 import { fileReferences, formatFileReference } from "../file-references.ts";
 import { useSessionWorkspace } from "./session-workspace.ts";
+import { useBackgroundShells } from "./useBackgroundShells.ts";
 import type { GitCheckpoint } from "../git-types.ts";
 import type { SessionEntriesResult } from "../session-types.ts";
 
@@ -115,6 +116,13 @@ function savedInspectorWidth(key: string, fallback: number): number {
 function Desktop({ api }: { api: DesktopAPI }) {
 	const app = useDesktop(api);
 	const { snapshot, history, running, changing, bashBusy } = app;
+	const shellRecords = useBackgroundShells(api);
+	const activeShellRecords = useMemo(() => Object.values(shellRecords)
+		.filter((shell) => shell.conversationId === snapshot?.active?.id), [shellRecords, snapshot?.active?.id]);
+	const turn = snapshot?.turn;
+	const liveTurnShells = activeShellRecords.filter((shell) => shell.ownerRunId === turn?.id && shell.status === "running");
+	const stopInProgress = useRef<string | undefined>(undefined);
+	const [stoppingRunId, setStoppingRunId] = useState<string>();
 	const [sidebar, setSidebar] = useState(true);
 	const [settings, setSettings] = useState(false);
 	const [connecting, setConnecting] = useState(false);
@@ -524,9 +532,34 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		if (!snapshot?.active) return;
 		try {
 			const { stopped } = await api.tasks.stopAll(snapshot.active.id);
-			app.setNotice(stopped ? `已停止 ${stopped} 个后台子 Agent。` : "当前会话没有运行中的后台子 Agent。");
+			app.setNotice(stopped ? `已停止 ${stopped} 项后台任务。` : "当前会话没有运行中的后台任务。");
 		} catch (error) {
 			app.fail(error);
+		}
+	};
+	const stopTurn = async () => {
+		const conversationId = snapshot?.active?.id;
+		if (!conversationId || stopInProgress.current) return;
+		if (!turn || (running && !turn.active)) {
+			if (running) await app.command({ type: "abort" });
+			return;
+		}
+		stopInProgress.current = turn.id;
+		setStoppingRunId(turn.id);
+		try {
+			const result = await api.tasks.stopCurrentTurn(conversationId, turn.id);
+			await app.refresh();
+			if (activeConversationRef.current !== conversationId) return;
+			if (result.stoppedShells.length) {
+				app.setNotice(`已停止${result.foregroundStopped ? "本轮回复和 " : "本轮 "}${result.stoppedShells.length} 条本地后台命令。`);
+			} else {
+				app.setNotice(result.foregroundStopped ? "已停止本轮回复。" : "本轮本地命令已结束。");
+			}
+		} catch (error) {
+			if (activeConversationRef.current === conversationId) app.fail(error);
+		} finally {
+			stopInProgress.current = undefined;
+			setStoppingRunId(undefined);
 		}
 	};
 	const backgroundSubagent = async (taskId: string) => {
@@ -979,7 +1012,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					void stopAllBackground();
 				} else {
 					stopChord.current.armed = Date.now();
-					app.setNotice("再按一次 Ctrl+X Ctrl+K 停止当前会话的全部后台子 Agent。");
+					app.setNotice("再按一次 Ctrl+X Ctrl+K 停止当前会话的全部后台任务。");
 				}
 				return;
 			}
@@ -1191,7 +1224,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const activeRequest = app.requests[0];
 	const approvalExpanded = Boolean(activeRequest && activeRequest.id !== deferredApproval);
 	const approvalTool = approvalExpanded && activeRequest?.method === "confirm"
-		? /^允许执行\s+([^\s？?]+)[？?]?$/.exec(activeRequest.title)?.[1] : undefined;
+		? /^允许执行\s+([^\s？?（]+)(?:（远端写入，仅本次）)?[？?]?$/.exec(activeRequest.title)?.[1] : undefined;
 	const openCheckpoint = (checkpointId?: string, path?: string) => {
 		setRewindTarget(checkpointId ? { checkpointId, path } : undefined);
 		setCheckpointsOpen(true);
@@ -1262,6 +1295,25 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			detail: task.status === "waiting_for_input" ? "子任务待确认" : task.status === "queued" ? "子任务排队中" : "子任务运行中",
 			state: task.status === "waiting_for_input" ? "approval" : "running",
 			open: () => openSubagent(task.id),
+		});
+	}
+	for (const shell of Object.values(shellRecords)) {
+		if (shell.status !== "running") continue;
+		const conversation = snapshot.conversations.find((entry) => entry.id === shell.rootConversationId);
+		if (!conversation) continue;
+		attention.push({
+			id: shell.id,
+			title: shell.description,
+			detail: `${projectName(snapshot, conversation.project)} · 本机后台命令`,
+			state: "running",
+			open: () => {
+				if (snapshot.active?.id === conversation.id) openTaskManager();
+				else switchTo(async () => {
+					const next = await api.selectConversation(conversation.id);
+					openTaskManager();
+					return next;
+				});
+			},
 		});
 	}
 	const isGrail = snapshot.settings.theme === "grail";
@@ -2039,6 +2091,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									{history.messages.length ? (
 										<TranscriptView
 											transcript={history}
+											backgroundMonitors={activeShellRecords}
 											tasks={Object.values(tasksMap)}
 											externalTasks={Object.values(externalTasksMap)}
 											taskProgressMap={taskProgressMap}
@@ -2202,6 +2255,17 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											<div className="cc-completion-actions">
 												<button type="button" className="secondary-button" onClick={() => openCheckpoint(lastCheckpoint.id)}>查看回滚选项</button>
 												<button type="button" className="primary-button" onClick={() => setPane("changes")}>审查本轮改动</button>
+											</div>
+										</section>
+									)}
+									{turn && liveTurnShells.length > 0 && (
+										<section className="cc-turn-jobs" aria-label="本轮本机后台命令">
+											<div><strong>{liveTurnShells.length} 条本机后台命令正在运行</strong>
+												<small>{liveTurnShells.map((shell) => shell.description).join(" · ")}</small></div>
+											<div className="cc-completion-actions">
+												<button type="button" className="secondary-button" onClick={openTaskManager}>查看后台任务</button>
+												{!running && <button type="button" className="secondary-button" disabled={stoppingRunId === turn.id}
+													onClick={() => void stopTurn()}>停止本轮后台命令</button>}
 											</div>
 										</section>
 									)}
@@ -2482,7 +2546,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							planMode={inPlanMode}
 							onTogglePlanMode={() => void togglePlanMode()}
 							send={app.send}
-							stop={() => void app.command({ type: "abort" })}
+							stop={() => void stopTurn()}
+							stopping={Boolean(stoppingRunId && stoppingRunId === turn?.id)}
 							command={app.command}
 							setPermission={(permission) => void savePermission(permission)}
 							onSelectProject={selectWorkspace}

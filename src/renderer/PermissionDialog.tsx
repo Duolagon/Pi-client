@@ -84,8 +84,9 @@ export function PermissionDialog({
 		}
 	}, [isAskQuestions, request]);
 	const title = isAskQuestions ? "请回答以下确认问题" : "title" in request ? request.title : "Pi 需要你的输入";
-	const toolMatch = /^允许执行\s+([^\s？?]+)[？?]?$/.exec(title);
+	const toolMatch = /^允许执行\s+([^\s？?（]+)(（远端写入，仅本次）)?[？?]?$/.exec(title);
 	const inferredTool = toolMatch?.[1];
+	const singleRemoteUse = Boolean(toolMatch?.[2]);
 
 	const parsedConfirm = useMemo(() => {
 		if (request.method !== "confirm") return null;
@@ -118,7 +119,7 @@ export function PermissionDialog({
 	// Narrow the remembered rule like Claude Code: a command prefix for bash and
 	// a host for WebFetch, never the whole tool when a narrower selector exists.
 	const allowSelector = useMemo((): { label: string; extra: Record<string, unknown> } | null | undefined => {
-		if (!inferredTool) return null;
+		if (!inferredTool || singleRemoteUse) return null;
 		const input = parsedConfirm?.input;
 		if (inferredTool === "bash") {
 			const command = typeof input?.command === "string" ? input.command.trim() : "";
@@ -143,7 +144,7 @@ export function PermissionDialog({
 			}
 		}
 		return { label: inferredTool, extra: {} };
-	}, [inferredTool, parsedConfirm]);
+	}, [inferredTool, parsedConfirm, singleRemoteUse]);
 
 	const alwaysAllow = async () => {
 		if (!inferredTool || !allowSelector) return;
@@ -266,7 +267,7 @@ export function PermissionDialog({
 								onClick={() => void answer({ type: "extension_ui_response", id: request.id, confirmed: true })}
 								className="primary-button"
 							>
-								允许执行
+								{singleRemoteUse ? "仅本次执行" : "允许执行"}
 							</button>
 						</div>
 					</>

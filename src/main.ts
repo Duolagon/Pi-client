@@ -499,6 +499,18 @@ void app.whenReady().then(() => {
 		initialProject: process.env.PI_DESKTOP_WORKSPACE,
 		trashItem: (filePath) => shell.trashItem(filePath),
 		inspectPreview: (input) => runPreviewCheck(input),
+		confirmRemoteCommand: async ({ command, reason }) => {
+			if (!window || window.isDestroyed()) return false;
+			const { response } = await dialog.showMessageBox(window, {
+				type: "warning",
+				message: "确认执行远端写操作？",
+				detail: `${reason}\n\n${command}`,
+				buttons: ["取消", "仅本次执行"],
+				defaultId: 0,
+				cancelId: 0,
+			});
+			return response === 1;
+		},
 		encrypt: (value) => {
 			if (!safeStorage.isEncryptionAvailable()) throw new Error("系统安全存储不可用。");
 			return safeStorage.encryptString(value).toString("base64");

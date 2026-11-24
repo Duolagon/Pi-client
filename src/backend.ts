@@ -256,6 +256,8 @@ interface GrailRecord {
 }
 interface SessionRuntime {
 	conversationId: string;
+	/** The latest native agent run, retained while its managed shells can still be stopped. */
+	workingTurn?: WorkingTurn;
 	liveTranscript: LiveTranscript;
 	eventSequence: number;
 	transcriptRevision: number;
@@ -316,6 +318,12 @@ interface SessionRuntime {
 		lastPersistAt: number;
 	};
 }
+interface WorkingTurn {
+	id: string;
+	active: boolean;
+	stopRequested?: boolean;
+	stopOperation?: Promise<{ stoppedShells: string[]; foregroundStopped: boolean }>;
+}
 /** One undelivered background result, rebuilt from the task record on every flush. */
 interface OutboxItem {
 	key: string;
@@ -373,6 +381,8 @@ export interface ServiceOptions {
 	logDir?: string;
 	/** Receives content-free engine failure records for the local diagnostic log. */
 	onDiagnostic?: (level: "warn" | "error", event: string, details: Record<string, string>) => void;
+	/** The desktop confirms known remote mutations explicitly submitted through its command runner. */
+	confirmRemoteCommand?: (input: { command: string; reason: string }) => Promise<boolean>;
 }
 
 /** Desktop session owner. Runtime injection keeps the real subprocess usable in isolated tests. */
@@ -2463,9 +2473,11 @@ export class DesktopService {
 			const command = buildLaunchShellCommand(config);
 			const task = this.store.tasks.find((item) => item.conversationId === conv.id);
 			const runtime = this.runtimes.get(conv.id);
+			const ownerRunId = this.shellRunOwner(runtime, context.signal);
 			const record = this.monitors.startShell({
 				conversationId: conv.id,
 				rootConversationId: rootId,
+				ownerRunId,
 				workingDirectory: config.cwd ?? task?.workingDirectory ?? conv.project,
 				env: runtime?.shellEnv ?? this.options.env,
 				sandboxProfileFile: runtime?.sandboxProfileFile,
@@ -2779,14 +2791,17 @@ export class DesktopService {
 			const conv = this.conversation(context.conversationId);
 			const task = this.store.tasks.find((item) => item.conversationId === conv.id);
 			const runtime = this.runtimes.get(conv.id);
+			const ownerRunId = this.shellRunOwner(runtime, context.signal);
 			const record = this.monitors.startShell({
 				conversationId: conv.id,
 				rootConversationId: this.rootConversationId(conv.id),
+				ownerRunId,
 				workingDirectory: task?.workingDirectory ?? conv.project,
 				env: runtime?.shellEnv ?? this.options.env,
 				sandboxProfileFile: runtime?.sandboxProfileFile,
 				command: String(input.command),
 				description: typeof input.description === "string" ? input.description : undefined,
+				timeout: input.timeout as number | undefined,
 			});
 			return { shell_id: record.id, status: "running", description: record.description };
 		}
@@ -2901,6 +2916,50 @@ export class DesktopService {
 		return this.monitors.stop(id, undefined, "user_stop");
 	}
 
+	private shellRunOwner(runtime: SessionRuntime | undefined, signal: AbortSignal): string | undefined {
+		signal.throwIfAborted();
+		const turn = runtime?.workingTurn;
+		if (turn?.stopRequested) throw new Error("本轮任务已停止，未启动新的后台命令。");
+		return turn?.active ? turn.id : undefined;
+	}
+
+	private turnSnapshot(runtime: SessionRuntime): NonNullable<Snapshot["turn"]> | undefined {
+		const turn = runtime.workingTurn;
+		if (!turn) return undefined;
+		return { id: turn.id, active: turn.active, runningShells: this.monitors.countRunningShellsForRun(runtime.conversationId, turn.id) };
+	}
+
+	/** Stop only the exact run shown to the user, including its still-running background shells. */
+	async stopCurrentTurn(conversationId: string, runId: string): Promise<{ stoppedShells: string[]; foregroundStopped: boolean }> {
+		await this.operation;
+		if (this.closed) throw new Error("桌面服务已关闭。");
+		const owner = this.conversation(conversationId).id;
+		const runtime = this.runtimes.get(owner);
+		const turn = runtime?.workingTurn;
+		if (!runtime || !turn || turn.id !== runId) throw new Error("任务已切换，请刷新后重新选择要停止的回合。");
+		if (turn.stopOperation) return turn.stopOperation;
+		turn.stopRequested = true;
+		const agent = runtime.agent;
+		const foreground = turn.active && agent ? this.abortForegroundRun(runtime, agent).then(() => true) : Promise.resolve(false);
+		const shells = this.monitors.stopShellsForRun(owner, runId);
+		const operation = Promise.allSettled([shells, foreground] as const).then(async ([shellResult, foregroundResult]) => {
+			await this.monitors.persistRunShellOutcomes(owner, runId);
+			if (shellResult.status === "rejected") throw shellResult.reason;
+			if (foregroundResult.status === "rejected") throw foregroundResult.reason;
+			return { stoppedShells: shellResult.value, foregroundStopped: foregroundResult.value };
+		});
+		turn.stopOperation = operation;
+		return operation.finally(() => { delete turn.stopOperation; });
+	}
+
+	private async abortForegroundRun(runtime: SessionRuntime, agent: AgentProcess): Promise<unknown> {
+		// Explicitly independent background agents keep running and report back.
+		await this.delegation.cancelChildren(runtime.conversationId, { foregroundOnly: true, reason: "parent_abort" });
+		await this.external.cancelChildren(runtime.conversationId, { foregroundOnly: true, reason: "parent_abort" });
+		await this.cancelDialogs(runtime);
+		return agent.request({ type: "abort" });
+	}
+
 	subscribeExternal(listener: (event: ExternalEvent) => void): () => void { return this.external.subscribe(listener); }
 	externalExecutors() { return this.external.executors(); }
 	configureExternal(input: ExternalExecutorInput) { return this.external.configure(input); }
@@ -2933,13 +2992,15 @@ export class DesktopService {
 		if (!runtime) return { drafts: [] };
 		const agent = this.requireAgent(runtime);
 		const queue = runtime.userQueue ??= new QueuedPrompts();
+		const runId = runtime.workingTurn?.id;
 		const drafts = await queue.take(() => agent.request<NativeQueue>({ type: "clear_queue" }));
 		if (action === "withdraw" || !drafts.length) return { drafts };
 		try {
 			const draft = mergeDrafts(drafts);
 			// Prepare the replacement before interrupting the current run.
 			const next = draftPrompt(draft);
-			await this.command({ type: "abort" }, conversationId);
+			if (runId) await this.stopCurrentTurn(conversationId, runId);
+			else await this.command({ type: "abort" }, conversationId);
 			await runtime.settling;
 			await this.command(next, conversationId, undefined, draft);
 			return { drafts: [] };
@@ -3032,8 +3093,17 @@ export class DesktopService {
 		if (!allowed.has(command.type) && command.type !== "bash") throw new Error("此命令请通过桌面会话操作执行。");
 		if (["set_model", "set_thinking_level", "compact"].includes(command.type)) this.assertRuntimeIdle(runtime);
 		if (command.type === "bash") {
-			const decision = await evaluatePermission(this.permissionPolicy(active.id), { toolName: "bash", input: { command: command.command } });
+			const request = { toolName: "bash", input: { command: command.command } };
+			const decision = await evaluatePermission(this.permissionPolicy(active.id), request);
 			if (decision.action === "deny") throw new Error(decision.reason);
+			if (decision.remoteMutation && decision.action === "ask") {
+				if (!(await this.options.confirmRemoteCommand?.({ command: command.command, reason: decision.reason })))
+					throw new Error("用户未确认远端写操作，命令未执行。");
+				if (this.closed || this.runtimes.get(active.id) !== runtime || runtime.agent !== agent)
+					throw new Error("确认时会话已关闭，命令未执行。");
+				const latest = await evaluatePermission(this.permissionPolicy(active.id), request);
+				if (latest.action === "deny") throw new Error(latest.reason);
+			}
 			this.assertRuntimeIdle(runtime);
 			this.assertPathAvailable(active.project, active.id);
 			runtime.bashBusy = true;
@@ -3060,20 +3130,17 @@ export class DesktopService {
 			return result;
 		}
 		if (command.type === "abort") {
-			// Esc stops only the children this run is waiting on. Background children keep
-			// running and report back; "停止全部后台子 Agent" (stopAllTasks) stops them.
-			await this.delegation.cancelChildren(active.id, { foregroundOnly: true, reason: "parent_abort" });
-			await this.external.cancelChildren(active.id, { foregroundOnly: true, reason: "parent_abort" });
-			await this.cancelDialogs(runtime);
-			const result = await agent.request(command);
-			return result;
+			return this.abortForegroundRun(runtime, agent);
 		}
 		if (command.type === "prompt") {
+			if (runtime.workingTurn?.stopOperation) await runtime.workingTurn.stopOperation.catch(() => {});
+			if (runtime.workingTurn?.active && runtime.workingTurn.stopRequested) throw new Error("本轮正在停止，请稍后重新发送。");
 			const alreadyRunning = runtime.busy || Boolean(runtime.state?.isStreaming);
 			if (!alreadyRunning) {
 				this.assertPathAvailable(active.project, active.id);
 				if (runtime.bashBusy) throw new Error("请先停止当前终端命令。");
 				runtime.busy = true;
+				runtime.workingTurn = { id: randomUUID(), active: true };
 				runtime.lastError = undefined;
 				if (runtime.state) runtime.state.isStreaming = true;
 			}
@@ -3104,10 +3171,12 @@ export class DesktopService {
 				await this.persist();
 				if (this.closed || (launch !== undefined && this.launches.get(active.id) !== launch))
 					throw new Error("任务已取消。");
+				if (runtime.workingTurn?.stopRequested) throw new Error("本轮任务已停止。");
 				const result = await this.requestQueuedInput(runtime, agent, promptToSend, draft);
 				if (result.disposition === "handled") {
 					if (!alreadyRunning) {
 						runtime.busy = false;
+						if (runtime.workingTurn) runtime.workingTurn.active = false;
 						runtime.settling = this.finishRuntime(runtime, false);
 						await runtime.settling;
 					}
@@ -3116,6 +3185,7 @@ export class DesktopService {
 			} catch (error) {
 				if (!alreadyRunning) {
 					runtime.busy = false;
+					if (runtime.workingTurn) runtime.workingTurn.active = false;
 					if (runtime.state) runtime.state.isStreaming = false;
 					runtime.settling = this.finishRuntime(runtime, false, error instanceof Error ? error.message : String(error));
 					await runtime.settling;
@@ -6653,10 +6723,12 @@ export class DesktopService {
 		}
 		if (event.type === "agent_start") {
 			runtime.busy = true;
+			if (!runtime.workingTurn?.active && !runtime.workingTurn?.stopOperation)
+				runtime.workingTurn = { id: randomUUID(), active: true };
 			runtime.stopHookRanThisTurn = false;
 			this.consumeQueuedNotifications(runtime);
 			if (runtime.state) runtime.state.isStreaming = true;
-			if (task && (task.status === "cancelled" || task.status === "interrupted")) {
+			if (runtime.workingTurn?.stopRequested || (task && (task.status === "cancelled" || task.status === "interrupted"))) {
 				void runtime.agent?.request({ type: "abort" }).catch(() => {});
 			} else if (task) {
 				// A new run starts without the previous run's stop reason or result; while it
@@ -6711,13 +6783,15 @@ export class DesktopService {
 		}
 		if (event.type === "agent_settled") {
 			runtime.busy = false;
+			if (runtime.workingTurn) runtime.workingTurn.active = false;
 			if (runtime.state) runtime.state.isStreaming = false;
 			runtime.pendingUI.clear();
 			this.syncTaskPendingApprovals(runtime, task);
 			runtime.settling = this.finishRuntime(runtime, event.aborted, runtime.lastError);
 			// Settlement is emitted after host cleanup; allocate its delivery sequence at that point.
+			const turn = this.turnSnapshot(runtime);
 			void runtime.settling.finally(() => {
-				this.emit({ conversationId, event });
+				this.emit({ conversationId, event, turn });
 				// A live parent receives results that could not be delivered during its run,
 				// including results whose automatic retries were exhausted.
 				void this.flushNotifications(conversationId, "settled");
@@ -6728,6 +6802,7 @@ export class DesktopService {
 		}
 		if (event.type === "desktop_error") {
 			runtime.busy = false;
+			if (runtime.workingTurn) runtime.workingTurn.active = false;
 			runtime.bashBusy = false;
 			runtime.engineStatus = "error";
 			runtime.engineError = event.message;
@@ -6745,6 +6820,9 @@ export class DesktopService {
 
 	private emit(event: DesktopEvent): void {
 		const runtime = this.runtimes.get(event.conversationId);
+		if (runtime && !event.turn && ["agent_start", "message_start", "desktop_error"].includes(event.event.type)) {
+			event = { ...event, turn: this.turnSnapshot(runtime) };
+		}
 		if (event.sequence === undefined && runtime) {
 			runtime.eventSequence = ++this.eventSequence;
 			event = { ...event, sequence: runtime.eventSequence };
@@ -6861,6 +6939,7 @@ export class DesktopService {
 					: item.busy || item.bashBusy || item.state?.isCompacting ? [[item.conversationId, "running" as const]] : [],
 			)),
 			bashBusy: runtime?.bashBusy ?? false,
+			turn: runtime ? this.turnSnapshot(runtime) : undefined,
 			liveTranscript,
 			queuedMessages: runtime?.userQueue?.preview(),
 			queuedPromptGroups: runtime?.userQueue?.groups(),

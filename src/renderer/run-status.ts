@@ -10,7 +10,7 @@ export const runLabels: Record<RunPhase, string> = {
 	approval: "待确认",
 	retrying: "正在重试",
 	compacting: "正在压缩上下文",
-	completed: "已结束",
+	completed: "回复已结束",
 	failed: "失败",
 	stopped: "已停止",
 };

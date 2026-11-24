@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -14,6 +14,7 @@ import type { RuntimePermissionPolicy } from "../src/permission-types.ts";
 import toolControl, { unwrapSandboxedCommand } from "../src/tool-control-extension.ts";
 import { validateDesktopToolInput, validateToolInvocation } from "../src/tool-control-types.ts";
 import { ToolHostServer } from "../src/tool-host-server.ts";
+import type { DesktopEvent } from "../src/shared.ts";
 import { createCoreFixture } from "./fixtures/core-fixture.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -27,10 +28,10 @@ async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs = 8000
 }
 
 function service() {
-	const delivered: { conversationId: string; customType: string; content: string; details: Record<string, unknown> }[] = [];
+	const delivered: { conversationId: string; customType: string; content: string; details: Record<string, unknown>; triggerTurn?: boolean }[] = [];
 	const monitors = new MonitorService({
 		deliver: async (conversationId, params) => {
-			delivered.push({ conversationId, customType: params.customType, content: params.content, details: params.details });
+			delivered.push({ conversationId, customType: params.customType, content: params.content, details: params.details, triggerTurn: params.triggerTurn });
 			return "sent";
 		},
 	});
@@ -89,9 +90,10 @@ test("background shell: failure status, kill, caps and truncation", async (t) =>
 	const stopped = await monitors.stop(long.id, undefined, "model_stop");
 	assert.equal(stopped.status, "stopped");
 	assert.equal(monitors.readShell(long.id).status, "killed");
-	// A model stop does not send a completion notice.
-	await delay(100);
-	assert.ok(!delivered.some((item) => item.details.shell_id === long.id));
+	// A manual stop preserves the cancellation result without asking the model to respond.
+	const stoppedReceipt = delivered.find((item) => item.details.shell_id === long.id);
+	assert.equal(stoppedReceipt?.triggerTurn, false);
+	assert.equal(stoppedReceipt?.details.status, "killed");
 
 	const sleepers = Array.from({ length: MAX_SHELLS_PER_ROOT }, () =>
 		monitors.startShell({ conversationId: "conv", rootConversationId: "conv", workingDirectory: cwd, command: "sleep 30" }));
@@ -115,6 +117,25 @@ test("background shell: failure status, kill, caps and truncation", async (t) =>
 	assert.ok(total <= 1024 * 1024 + 2048, String(total));
 	assert.ok(total > 900 * 1024, String(total));
 	assert.match(read.stdout, /1499$/);
+});
+
+test("background timeout terminates the timed shell group and leaves other runs alive", async (t) => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-bash-bg-timeout-"));
+	const { monitors, delivered } = service();
+	t.after(async () => { await monitors.close(); await rm(cwd, { recursive: true, force: true }); });
+	const defaults = { conversationId: "conversation", rootConversationId: "conversation", workingDirectory: cwd };
+	const previous = monitors.startShell({ ...defaults, ownerRunId: "old-run", command: "sleep 30" });
+	const timed = monitors.startShell({ ...defaults, ownerRunId: "current-run", command: "(sleep 1; touch escaped) & wait", timeout: 0.2 });
+	assert.equal(timed.timeoutMs, 200);
+	await waitFor(() => monitors.get(timed.id)?.stopReason === "timed_out");
+	assert.equal(monitors.get(timed.id)?.status, "timed_out");
+	assert.equal(monitors.get(previous.id)?.status, "running");
+	const result = delivered.find((event) => event.details.shell_id === timed.id);
+	assert.equal(result?.details.reason, "timed_out");
+	assert.equal(result?.details.started_at, timed.createdAt);
+	assert.ok(Number(result?.details.finished_at) >= timed.createdAt + 200);
+	await delay(900);
+	await assert.rejects(access(join(cwd, "escaped")), { code: "ENOENT" });
 });
 
 test("background Bash permission equals foreground bash; BashOutput and KillShell are harmless", async (t) => {
@@ -147,6 +168,9 @@ test("background Bash permission equals foreground bash; BashOutput and KillShel
 	assert.throws(() => validateDesktopToolInput("BashOutput", { bash_id: "x", extra: 1 }), /Unknown/);
 	assert.throws(() => validateDesktopToolInput("KillShell", { shell_id: "" }), /shell_id/);
 	assert.throws(() => validateDesktopToolInput("BashBackground", { command: "x\0" }), /command/);
+	for (const badTimeout of [0, -1, Infinity, 86401, "30"]) {
+		assert.throws(() => validateDesktopToolInput("BashBackground", { command: "ls", timeout: badTimeout }), /timeout/);
+	}
 	assert.equal(validateToolInvocation({ tool: "BashBackground", toolCallId: "c", input: { command: "ls" } }).tool, "BashBackground");
 	assert.throws(() => validateToolInvocation({ tool: "BashBackground", toolCallId: "c", input: { command: "ls" }, batch: { writers: 0 } }), /batch/);
 });
@@ -198,9 +222,10 @@ test("bash wrapper keeps foreground runs native and sends run_in_background to t
 	try {
 		// The permission extension already wrapped the approved command in sandbox-exec.
 		const wrapped = `/usr/bin/sandbox-exec -f '/tmp/profile '\\''x'\\''.sb' /bin/sh -c 'npm run dev -- --name '\\''a b'\\'''`;
-		const bg = await bash.execute("call-2", { command: wrapped, run_in_background: true, description: "dev server" }, undefined, undefined, ctx);
+		const bg = await bash.execute("call-2", { command: wrapped, run_in_background: true, description: "dev server", timeout: 17.5 }, undefined, undefined, ctx);
 		assert.match(JSON.stringify(bg.content), /shell_0123456789ab/);
-		assert.deepEqual(requests, [{ tool: "BashBackground", input: { command: "npm run dev -- --name 'a b'", description: "dev server" }, owner: "parent" }]);
+		assert.deepEqual(bg.structuredContent, { shell_id: "shell_0123456789ab", status: "running", background: true });
+		assert.deepEqual(requests, [{ tool: "BashBackground", input: { command: "npm run dev -- --name 'a b'", description: "dev server", timeout: 17.5 }, owner: "parent" }]);
 	} finally {
 		if (previousProfile === undefined) delete process.env.PI_DESKTOP_SANDBOX_PROFILE; else process.env.PI_DESKTOP_SANDBOX_PROFILE = previousProfile;
 	}
@@ -281,16 +306,57 @@ test("pwd of background shell is the project directory", { timeout: 60000 }, asy
 		};
 		const context = { conversationId, toolCallId: "c", signal: new AbortController().signal };
 		const id = (await internals.modelTool({ tool: "BashBackground", toolCallId: "c", input: { command: "pwd -P; cat seed.txt" } }, context)).shell_id as string;
-		let out = "";
+		const out: string[] = [];
 		await waitFor(async () => {
 			const read = await internals.modelTool({ tool: "BashOutput", toolCallId: "c", input: { bash_id: id } }, context);
-			out += read.stdout as string;
+			if (read.stdout) out.push(String(read.stdout));
 			return read.status === "completed";
 		});
-		const lines = out.split("\n");
+		const lines = out.join("\n").split("\n");
 		const { realpath } = await import("node:fs/promises");
 		assert.equal(lines[0], await realpath(fixture.project));
 		assert.equal(lines[1], "seed-content");
+	} finally {
+		await desktop.close();
+		await fixture.cleanup();
+	}
+});
+
+test("stopping an idle turn persists its shell receipt across reinitialization without restarting the model", { timeout: 60000 }, async () => {
+	const fixture = await createCoreFixture();
+	const options = {
+		dataDir: fixture.dataDir,
+		executable: process.execPath,
+		entry: fixture.entry,
+		permissionExtension: resolve(here, "../src/permission-extension.ts"),
+		toolControlExtension: resolve(here, "../src/tool-control-extension.ts"),
+		env: { ...fixture.env, HOME: fixture.root },
+		initialProject: fixture.project,
+	};
+	let desktop = new DesktopService(options);
+	const events: DesktopEvent[] = [];
+	desktop.subscribe((event) => events.push(event));
+	try {
+		const snapshot = await desktop.initialize();
+		const conversationId = snapshot.active!.id;
+		await desktop.saveSettings({ permission: "auto", theme: "light" });
+		await desktop.command({ type: "prompt", message: "launch-managed-shell-fixture" }, conversationId);
+		await waitFor(() => events.some((event) => event.conversationId === conversationId && event.event.type === "agent_settled"));
+		const after = await desktop.snapshot();
+		assert.equal(after.turn?.active, false);
+		assert.equal(after.turn?.runningShells, 1);
+		const shell = (await desktop.listMonitors(conversationId)).find((record) => record.ownerRunId === after.turn?.id);
+		assert.ok(shell);
+		await assert.rejects(desktop.stopCurrentTurn(conversationId, "older-run"), /任务已切换/);
+		assert.equal((await desktop.listMonitors(conversationId)).find((record) => record.id === shell.id)?.status, "running");
+		assert.deepEqual(await desktop.stopCurrentTurn(conversationId, after.turn!.id), { stoppedShells: [shell.id], foregroundStopped: false });
+		assert.equal(events.filter(({ event }) => event.type === "agent_start").length, 1);
+		await desktop.close();
+		desktop = new DesktopService(options);
+		const reopened = await desktop.initialize();
+		const receipt = reopened.messages.find((message) => message.role === "custom" && message.customType === SHELL_EVENT_TYPE && (message.details as { shell_id?: string })?.shell_id === shell.id);
+		assert.ok(receipt && receipt.role === "custom");
+		assert.equal((receipt.details as { reason?: string })?.reason, "turn_stop");
 	} finally {
 		await desktop.close();
 		await fixture.cleanup();

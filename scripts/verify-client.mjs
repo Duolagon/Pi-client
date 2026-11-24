@@ -1004,6 +1004,99 @@ try {
 	await rm(oversized);
 	checks.push("read-only prompts bypass snapshots and writable prompts skip oversized files");
 
+	// A real shell invokes this fixture only. It cannot reach a Kaggle account or the network.
+	await mkdir(join(project, ".venv/bin"), { recursive: true });
+	const kaggleLog = join(project, "fake-kaggle.log");
+	await writeFile(join(project, ".venv/bin/kaggle"), '#!/bin/sh\nprintf "%s\\n" "$2" >> fake-kaggle.log\nprintf "%s\\n" QUEUED\n', { mode: 0o755 });
+	const setPermissionMode = async (mode) => {
+		if (mode === "auto") page.once("dialog", (dialog) => dialog.accept());
+		await permissions.selectOption(mode);
+		await until(async () => (await snapshot()).settings.permission === mode && !(await permissions.isDisabled()), mode);
+	};
+	await setPermissionMode("auto");
+	await newChat();
+	await submit("为啥要排队，现在在跑什么");
+	await page.getByText("演示队列状态查询结束。", { exact: true }).waitFor();
+	await idle();
+	const queried = (await snapshot()).messages.filter((message) => message.role === "toolResult");
+	assert.deepEqual(queried.map((message) => message.isError), [false, true, true]);
+	assert.equal(await readFile(kaggleLog, "utf8"), "status\n");
+	const remoteApproval = page.getByRole("region", { name: /远端写入/ });
+	await submit("请删除演示云端作业");
+	await page.getByText("演示远端操作结束。", { exact: true }).waitFor();
+	await idle();
+	assert.equal(await remoteApproval.count(), 0);
+	assert.equal(await readFile(kaggleLog, "utf8"), "status\ndelete\n");
+
+	await setPermissionMode("ask");
+	await newChat();
+	await submit("请删除演示云端作业");
+	await remoteApproval.waitFor();
+	assert.equal(await remoteApproval.getByRole("button", { name: /始终允许/ }).count(), 0);
+	assert.equal(await readFile(kaggleLog, "utf8"), "status\ndelete\n");
+	await remoteApproval.getByRole("button", { name: "仅本次执行", exact: true }).click();
+	await page.getByText("演示远端操作结束。", { exact: true }).waitFor();
+	await idle();
+	assert.equal(await readFile(kaggleLog, "utf8"), "status\ndelete\ndelete\n");
+	checks.push("status-only requests cannot mutate the remote queue; explicit writes follow auto and manual approval modes");
+
+	await setPermissionMode("auto");
+	await newChat();
+	const listShells = () => page.evaluate(async () => window.pi.monitors.list((await window.pi.snapshot()).active.id));
+	const olderPidPath = join(project, "previous-shell.pid");
+	const latestPidPath = join(project, "current-shell.pid");
+	await submit("登记旧的本机后台命令");
+	await page.getByText("演示旧轮后台命令已登记。", { exact: true }).waitFor();
+	await idle();
+	const older = (await listShells()).find((shell) => shell.description === "演示旧轮后台命令");
+	assert.ok(older?.ownerRunId);
+	await submit("登记本轮本机后台命令");
+	await page.getByText("演示本轮后台命令已登记。", { exact: true }).waitFor();
+	await idle();
+	const latest = (await listShells()).find((shell) => shell.description === "演示本轮后台命令");
+	assert.ok(latest?.ownerRunId && latest.ownerRunId !== older.ownerRunId);
+	await assert.rejects(page.evaluate(async (runId) => window.pi.tasks.stopCurrentTurn((await window.pi.snapshot()).active.id, runId), older.ownerRunId));
+	await until(() => Promise.all([access(olderPidPath), access(latestPidPath)]).then(() => true, () => false), "both demo background processes started");
+	const olderPid = Number(await readFile(olderPidPath, "utf8"));
+	const latestPid = Number(await readFile(latestPidPath, "utf8"));
+	assert.ok(olderPid > 1 && latestPid > 1 && olderPid !== latestPid);
+	await page.reload();
+	await ready();
+	await page.getByRole("button", { name: "停止本轮后台命令", exact: true }).click();
+	await until(async () => (await listShells()).find((shell) => shell.id === latest.id)?.status === "stopped", "current background job stops");
+	await until(() => {
+		try { process.kill(latestPid, 0); return false; }
+		catch (error) { if (error.code === "ESRCH") return true; throw error; }
+	}, "current process exits");
+	assert.equal((await listShells()).find((shell) => shell.id === older.id)?.status, "running");
+	process.kill(olderPid, 0);
+	await page.getByRole("button", { name: "后台任务与 Worktree", exact: true }).click();
+	const drawer = page.getByRole("dialog", { name: "后台任务、子 Agent 与 Worktree (/tasks)", exact: true });
+	await drawer.getByRole("button", { name: "停止全部后台任务", exact: true }).waitFor();
+	await drawer.getByRole("button", { name: "关闭对话框", exact: true }).click();
+	await page.evaluate((id) => window.pi.monitors.stop(id), older.id);
+	checks.push("stop remains available after the reply and reload, rejects another run ID, and exits only the current process");
+
+	await newChat();
+	await writeFile(join(project, "test/background-check.test.mjs"), [
+		'import { access } from "node:fs/promises";',
+		'import { test } from "node:test";',
+		'import { setTimeout as wait } from "node:timers/promises";',
+		'test("waits for the test driver", async () => {',
+		'  while (!(await access("release-check.flag").then(() => true, () => false))) await wait(25);',
+		'});',
+	].join("\n"));
+	await submit("验证后台检查的退出结果");
+	await page.getByText("后台检查已登记，等待退出结果。", { exact: true }).waitFor();
+	const evidence = page.locator(".cc-turn-checks").filter({ hasText: "node --test test/background-check.test.mjs" });
+	await evidence.locator("summary").click();
+	await evidence.getByText("等待后台退出结果", { exact: true }).waitFor();
+	assert.equal(await evidence.getByText("通过 · 退出码 0", { exact: true }).count(), 0);
+	await writeFile(join(project, "release-check.flag"), "go\n");
+	await evidence.getByText("通过 · 退出码 0", { exact: true }).waitFor();
+	await idle();
+	checks.push("background verification stays pending until the same real shell exits successfully");
+
 	assert.deepEqual(pageErrors, []);
 	if (capture)
 		for (const name of ["client-light.png", "client-dark.png"])

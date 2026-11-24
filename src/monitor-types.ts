@@ -2,10 +2,14 @@
 export type MonitorKind = "command" | "websocket" | "shell";
 export type MonitorStatus = "running" | "stopped" | "exited" | "timed_out" | "error";
 
+export const MAX_BACKGROUND_SHELL_TIMEOUT_SECONDS = 24 * 60 * 60;
+
 export interface MonitorRecord {
 	id: string;
 	conversationId: string;
 	rootConversationId: string;
+	/** Desktop run that launched this managed shell. Independent monitors have no run owner. */
+	ownerRunId?: string;
 	kind: MonitorKind;
 	description: string;
 	target: string;

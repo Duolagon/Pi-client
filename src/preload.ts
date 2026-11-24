@@ -90,6 +90,7 @@ const api: DesktopAPI = {
 		cancel: (id) => ipcRenderer.invoke("pi:task:cancel", id),
 		background: (id) => ipcRenderer.invoke("pi:task:background", id),
 		stopAll: (conversationId) => ipcRenderer.invoke("pi:task:stopAll", conversationId),
+		stopCurrentTurn: (conversationId, runId) => ipcRenderer.invoke("pi:task:stopCurrentTurn", conversationId, runId),
 		deliverNow: (conversationId) => ipcRenderer.invoke("pi:task:deliverNow", conversationId),
 		send: (input) => ipcRenderer.invoke("pi:task:send", input),
 		viewing: (conversationId, viewing) => ipcRenderer.invoke("pi:conversation:viewing", conversationId, viewing),

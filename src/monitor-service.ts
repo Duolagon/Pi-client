@@ -7,7 +7,7 @@ import { Script, createContext } from "node:vm";
 import { escapeMarkup } from "./delegation-format.ts";
 import { HostResourceGuard, buildSafeComputeEnv, killProcessGroup, resolveNiceCommand } from "./host-guard.ts";
 import type { DeliverCustomType, NotificationDelivery, NotificationDisposition } from "./tool-control-types.ts";
-import type { MonitorEvent, MonitorRecord, MonitorStartInput, MonitorStatus } from "./monitor-types.ts";
+import { MAX_BACKGROUND_SHELL_TIMEOUT_SECONDS, type MonitorEvent, type MonitorRecord, type MonitorStartInput, type MonitorStatus } from "./monitor-types.ts";
 
 export const MONITOR_EVENT_TYPE: DeliverCustomType = "desktop_monitor_event";
 export const SHELL_EVENT_TYPE: DeliverCustomType = "desktop_shell_event";
@@ -17,7 +17,8 @@ export const MAX_SHELL_OUTPUT_CHARS = 1024 * 1024;
 const MAX_FINISHED_SHELLS_PER_ROOT = 16;
 const MAX_SHELL_LINE_CHARS = 16 * 1024;
 const MAX_SHELL_READ_CHARS = 256 * 1024;
-const SHELL_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const SHELL_TIMEOUT_MS = MAX_BACKGROUND_SHELL_TIMEOUT_SECONDS * 1000;
+const SHELL_STOP_TIMEOUT_MS = 2000;
 const FILTER_TIMEOUT_MS = 500;
 export type ShellStatus = "running" | "completed" | "killed" | "failed";
 
@@ -50,6 +51,25 @@ interface ShellBuffer {
 	cursor: number;
 	chars: number;
 	partial: { stdout: string; stderr: string };
+	terminalRead?: boolean;
+}
+
+/** Wait for the tracked group leader to exit after signalling the whole group. */
+function stopManagedShell(child: ChildProcessByStdio<null, Readable, Readable>): Promise<boolean> {
+	if (!child.pid) return Promise.resolve(true);
+	const pid = child.pid;
+	return new Promise((resolve) => {
+		const done = (exited: boolean) => {
+			clearTimeout(timer);
+			child.removeListener("exit", exitedListener);
+			resolve(exited);
+		};
+		const exitedListener = () => done(true);
+		const timer = setTimeout(() => done(false), SHELL_STOP_TIMEOUT_MS);
+		child.once("exit", exitedListener);
+		killProcessGroup(pid);
+		if (child.exitCode !== null || child.signalCode !== null) done(true);
+	});
 }
 const COALESCE_MS = 200;
 const RATE_WINDOW_MS = 1000;
@@ -180,7 +200,8 @@ interface LiveMonitor {
 	flushing: boolean;
 	terminated: boolean;
 	terminationNotified: boolean;
-	pendingTermination?: { key: string; content: string; details: Record<string, unknown> };
+	pendingTermination?: { key: string; content: string; details: Record<string, unknown>; triggerTurn?: boolean };
+	terminationDelivery?: Promise<void>;
 	deliverySeq: number;
 	child?: ChildProcessByStdio<null, Readable, Readable>;
 	ws?: WebSocket;
@@ -320,15 +341,20 @@ export class MonitorService {
 	startShell(params: {
 		conversationId: string;
 		rootConversationId: string;
+		ownerRunId?: string;
 		workingDirectory: string;
 		env?: NodeJS.ProcessEnv;
 		sandboxProfileFile?: string;
 		command: string;
 		description?: string;
+		timeout?: number;
 	}): MonitorRecord {
 		if (this.closing) throw new Error("Monitor service is shutting down");
 		const command = params.command.trim();
 		if (!command) throw new Error("Background Bash requires a command");
+		const timeoutMs = params.timeout === undefined ? SHELL_TIMEOUT_MS : Math.ceil(params.timeout * 1000);
+		if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > SHELL_TIMEOUT_MS)
+			throw new Error(`Background Bash timeout must be greater than 0 and at most ${MAX_BACKGROUND_SHELL_TIMEOUT_SECONDS} seconds`);
 		const running = [...this.monitors.values()].filter(
 			(item) => item.shell && item.record.rootConversationId === params.rootConversationId && item.record.status === "running",
 		).length;
@@ -349,12 +375,13 @@ export class MonitorService {
 			id,
 			conversationId: params.conversationId,
 			rootConversationId: params.rootConversationId,
+			...(params.ownerRunId && { ownerRunId: params.ownerRunId }),
 			kind: "shell",
 			description: (params.description?.trim() || command.slice(0, 80)).slice(0, 160),
 			target: command.slice(0, 300),
 			status: "running",
 			persistent: false,
-			timeoutMs: SHELL_TIMEOUT_MS,
+			timeoutMs,
 			createdAt: now,
 			updatedAt: now,
 			eventCount: 0,
@@ -374,8 +401,8 @@ export class MonitorService {
 		};
 		this.monitors.set(id, live);
 		live.timeoutTimer = setTimeout(() => {
-			void this.terminate(id, "timed_out", { reason: "timed_out", notify: true });
-		}, SHELL_TIMEOUT_MS);
+			void this.terminate(id, "timed_out", { reason: "timed_out", notify: true, confirmExit: true });
+		}, timeoutMs);
 		live.timeoutTimer.unref?.();
 		this.startCommand(live, command, params.workingDirectory, params.env, params.sandboxProfileFile);
 		this.emit({ type: "monitor_updated", monitor: structuredClone(record) });
@@ -419,6 +446,7 @@ export class MonitorService {
 		}
 		buffer.cursor = buffer.baseSeq + index;
 		const hasMore = index < buffer.entries.length;
+		if (live.record.status !== "running" && !hasMore) buffer.terminalRead = true;
 		let kept = selected;
 		if (pattern) {
 			const matches = matchLines(pattern, selected.map((entry) => entry.text));
@@ -444,6 +472,32 @@ export class MonitorService {
 		);
 		await Promise.all(matching.map((item) => this.terminate(item.record.id, "stopped", { reason, notify: false })));
 		return matching.length;
+	}
+
+	countRunningShellsForRun(conversationId: string, runId: string): number {
+		return this.runningShellsForRun(conversationId, runId).length;
+	}
+
+	async stopShellsForRun(conversationId: string, runId: string): Promise<string[]> {
+		const matching = this.runningShellsForRun(conversationId, runId);
+		await Promise.all(matching.map((item) => this.terminate(item.record.id, "stopped", {
+			reason: "turn_stop", notify: false, confirmExit: true, recordShellOutcome: true,
+		})));
+		const unconfirmed = matching.filter((item) => item.record.stopReason === "stop_unconfirmed");
+		if (unconfirmed.length) throw new Error(`有 ${unconfirmed.length} 个后台命令未能确认退出，请在任务面板查看。`);
+		return matching.filter((item) => item.record.stopReason === "turn_stop").map((item) => item.record.id);
+	}
+
+	async persistRunShellOutcomes(conversationId: string, runId: string): Promise<void> {
+		await Promise.all([...this.monitors.values()]
+			.filter(({ record, shell }) => shell && record.conversationId === conversationId && record.ownerRunId === runId)
+			.map((item) => this.redeliverTermination(item)));
+	}
+
+	private runningShellsForRun(conversationId: string, runId: string): LiveMonitor[] {
+		return [...this.monitors.values()].filter(({ record, shell }) =>
+			shell && record.status === "running" && record.conversationId === conversationId && record.ownerRunId === runId,
+		);
 	}
 
 	private pushShellLine(live: LiveMonitor, stream: "stdout" | "stderr", raw: string): void {
@@ -684,7 +738,9 @@ export class MonitorService {
 		}
 		await this.terminate(id, "stopped", {
 			reason,
-			notify: reason === "user_stop",
+			notify: !live.shell && reason === "user_stop",
+			confirmExit: Boolean(live.shell),
+			recordShellOutcome: Boolean(live.shell),
 		});
 		return structuredClone(live.record);
 	}
@@ -714,28 +770,34 @@ export class MonitorService {
 			if (!live.terminated && live.pendingLines.length > 0) {
 				this.scheduleFlush(live, 0);
 			}
-			if (live.terminated && live.pendingTermination && !this.closing) {
-				const pending = live.pendingTermination;
-				live.pendingTermination = undefined;
-				void this.deliver(live.record.conversationId, {
-					customType: live.shell ? SHELL_EVENT_TYPE : MONITOR_EVENT_TYPE,
-					key: pending.key,
-					content: pending.content,
-					details: pending.details,
-					deliverAs: "followUp",
-					triggerTurn: true,
-					display: true,
-				}).then((disp) => {
-					if (disp === "deferred" && !this.closing) live.pendingTermination = pending;
-				}).catch(() => {});
-			}
+			void this.redeliverTermination(live);
 		}
+	}
+
+	private redeliverTermination(live: LiveMonitor): Promise<void> {
+		if (live.terminationDelivery) return live.terminationDelivery;
+		if (!live.terminated || !live.pendingTermination || this.closing) return Promise.resolve();
+		const pending = live.pendingTermination;
+		live.pendingTermination = undefined;
+		const delivery = this.deliver(live.record.conversationId, {
+			customType: live.shell ? SHELL_EVENT_TYPE : MONITOR_EVENT_TYPE,
+			key: pending.key,
+			content: pending.content,
+			details: pending.details,
+			deliverAs: "followUp",
+			triggerTurn: pending.triggerTurn !== false && !live.shell?.terminalRead,
+			display: true,
+		}).then((disposition) => {
+			if (disposition === "deferred" && !this.closing) live.pendingTermination = pending;
+		}).catch(() => {}).finally(() => { delete live.terminationDelivery; });
+		live.terminationDelivery = delivery;
+		return delivery;
 	}
 
 	private async terminate(
 		id: string,
 		status: MonitorStatus,
-		opts: { exitCode?: number | null; error?: string; reason: string; notify: boolean },
+		opts: { exitCode?: number | null; error?: string; reason: string; notify: boolean; confirmExit?: boolean; recordShellOutcome?: boolean },
 	): Promise<void> {
 		const live = this.monitors.get(id);
 		if (!live || live.terminated) return;
@@ -757,7 +819,12 @@ export class MonitorService {
 			live.child = undefined;
 			if (child.pid) this.guard.unregister(child.pid);
 			try {
-				if (process.platform !== "win32" && child.pid) {
+				if (opts.confirmExit) {
+					if (!(await stopManagedShell(child))) {
+						status = "error";
+						opts = { ...opts, reason: "stop_unconfirmed", error: "已发出停止信号，但未能确认后台命令退出。" };
+					}
+				} else if (process.platform !== "win32" && child.pid) {
 					const pgid = child.pid;
 					try {
 						process.kill(-pgid, "SIGTERM");
@@ -788,14 +855,14 @@ export class MonitorService {
 		if (opts.error) live.record.error = opts.error;
 		this.emit({ type: "monitor_updated", monitor: structuredClone(live.record) });
 
-		if (live.shell && opts.notify && !live.terminationNotified && !this.closing) {
+		if (live.shell && (opts.notify || opts.recordShellOutcome) && !live.terminationNotified && !this.closing) {
 			live.terminationNotified = true;
 			const status = shellStatus(live.record);
 			const summary = status === "completed"
 				? "后台命令已完成（exitCode=0）"
 				: status === "failed"
 					? `后台命令失败（${opts.error ? escapeMarkup(opts.error) : `exitCode=${opts.exitCode ?? "null"}${opts.reason.startsWith("signal:") ? `，${opts.reason}` : ""}`}）`
-					: opts.reason === "timed_out" ? "后台命令运行超过 24 小时，已终止" : "后台命令已被停止";
+					: opts.reason === "timed_out" ? `后台命令达到 ${live.record.timeoutMs / 1000} 秒时限，已终止` : "后台命令已被停止";
 			const content = `[SYSTEM NOTIFICATION - NOT USER INPUT] ${summary}（${escapeMarkup(live.record.description)}，shell_id=${id}）。如需查看剩余输出，请调用 BashOutput。`;
 			const details: Record<string, unknown> = {
 				shell_id: id,
@@ -804,18 +871,21 @@ export class MonitorService {
 				exit_code: opts.exitCode ?? null,
 				reason: opts.reason,
 				terminal: true,
+				started_at: live.record.createdAt,
+				finished_at: live.record.updatedAt,
 			};
 			const key = `${id}:1`;
+			const triggerTurn = opts.notify && !live.shell.terminalRead;
 			const disp = await this.deliver(live.record.conversationId, {
 				customType: SHELL_EVENT_TYPE,
 				key,
 				content,
 				details,
 				deliverAs: "followUp",
-				triggerTurn: true,
+				triggerTurn,
 				display: true,
 			}).catch(() => "unavailable" as const);
-			if (disp === "deferred" && !this.closing) live.pendingTermination = { key, content, details };
+			if (disp === "deferred" && !this.closing) live.pendingTermination = { key, content, details, triggerTurn };
 			return;
 		}
 		if (opts.notify && !live.terminationNotified && !this.closing) {

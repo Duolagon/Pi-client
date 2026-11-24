@@ -20,7 +20,7 @@
 | `pi.externalAgents` | `executors / configure / start / list / snapshot / send / result / cancel / respond / replay / onEvent` | 本机 Codex／Claude／Kimi／Antigravity 协作与独立审批流 |
 | `pi.git` | `begin / finish / list / diff / restore` | 工作树检查点与安全恢复 |
 | `pi.terminals` | `create / list / write / resize / close / replay / onEvent / ssh / mcpOAuth / packages` | PTY 与输出回放、SSH、MCP OAuth 和 Pi CLI 扩展管理 |
-| `pi.tasks` | `start / list / snapshot / result / cancel / stopAll / deliverNow / command / respond / files / readFile / workspace / diff / onEvent` | 后台任务、模型委派结果与指定会话操作；`stopAll` 停止会话的全部后台子 Agent，`deliverNow` 立即交付待交付的子 Agent 结果 |
+| `pi.tasks` | `start / list / snapshot / result / cancel / stopAll / stopCurrentTurn / deliverNow / command / respond / files / readFile / workspace / diff / onEvent` | 后台任务、模型委派结果与指定会话操作；`stopAll` 停止会话的全部后台任务，`stopCurrentTurn` 只停止指定回合的前台和本机后台 Bash |
 | `pi.worktrees` | `create / list / remove / merge` | 托管 Worktree 生命周期 |
 | `pi.sessions` | `fork / clone / entries / tree / forkMessages / navigate / history / importHistory` | 会话分支、树导航和 CLI 历史导入 |
 | `pi.setProjectTrust` | `setProjectTrust({ project, decision })` | 保存项目信任决定、重启相关会话并返回新快照 |
@@ -167,6 +167,12 @@ const snapshot = await window.pi.tasks.snapshot(task.id);
 `task.id` 与 `task.conversationId` 相同。`project` 是原项目，`workingDirectory` 是实际执行目录，`worktreeId` 标识隔离目录。源项目为子目录时，执行目录保持它在 Git 仓库内的相对位置。
 
 `start()` 返回已登记的任务，不等待模型生成完成。状态为 `queued / running / waiting_for_input / completed / failed / cancelled / interrupted`；`revision` 单调递增。默认最多同时运行四个后台任务，超出后排队。`waiting_for_input` 占用并发名额。
+
+`Snapshot.turn` 和回合事件携带 `id / active / runningShells`。后台 Bash 的 `MonitorRecord.ownerRunId` 标记启动它的回合。前台回复结束后，仍可用 `pi.tasks.stopCurrentTurn(conversationId, runId)` 停止同一轮的本机后台命令。回合 ID 已变时请求会失败，旧轮命令仍可在任务抽屉单独停止。
+
+后台 Bash 接受 `timeout`（秒）。省略时使用 24 小时上限。启动回执提供作业 ID 和运行状态，验收等到同一作业的最终退出结果。手动停止的结果写入会话记录，无需额外调用模型。界面使用 `pi.monitors.list` 和 `pi.monitors.onEvent` 刷新本机后台命令和检查状态。
+
+「全部放行」模式下，客户端可识别的前台 Kaggle 写操作遵循显式权限规则，无匹配的确认或拒绝规则时直接执行。默认询问模式下，这类写操作需要单次确认，内置命令栏使用原生确认窗口。纯状态查询和受控后台 Bash 或命令监听中会拒绝这类写操作。识别覆盖支持的命令形态，任意脚本仍由原有工具规则和沙箱约束。
 
 同一工作目录或相互包含的目录不会并发执行写任务。`isolation: "shared"` 直接使用原目录，同目录后台任务按顺序运行；前台在该目录有写任务时，新提示会被拒绝。普通非 Git 项目可显式使用 `shared`。
 

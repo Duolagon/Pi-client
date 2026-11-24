@@ -73,6 +73,10 @@ export default function desktopTestProvider(pi) {
 								"TOOLS_COMPLETE: " +
 									results.map((message) => `${message.toolName}:${message.isError ? "error" : "ok"}`).join(","),
 							);
+			} else if (text.includes("launch-managed-shell-fixture")) {
+				response = results.length === 0
+					? fauxAssistantMessage(fauxToolCall("bash", { command: "sleep 30", run_in_background: true }), { stopReason: "toolUse" })
+					: fauxAssistantMessage("MANAGED_SHELL_LAUNCHED");
 			} else if (text.includes("deny-write")) {
 				response =
 					results.length === 0

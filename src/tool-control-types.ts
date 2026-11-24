@@ -1,6 +1,7 @@
 import type { ToolExposure } from "@earendil-works/pi-coding-agent";
 import { AGENT_CALL_NAME_PATTERN, MAX_AGENT_PROMPT, MAX_SEND_MESSAGE, MAX_SEND_SUMMARY, MAX_SEND_TARGET, exceedsLength } from "./delegation-limits.ts";
 import type { ModelToolResult, ToolUsage } from "./delegation-types.ts";
+import { MAX_BACKGROUND_SHELL_TIMEOUT_SECONDS } from "./monitor-types.ts";
 import { todoStatuses } from "./todo-types.ts";
 import { teamMessageTypes } from "./team-types.ts";
 
@@ -249,7 +250,7 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 		Monitor: ["description", "command", "url", "timeout_ms", "persistent"],
 		BashOutput: ["bash_id", "filter"],
 		KillShell: ["shell_id"],
-		BashBackground: ["command", "description"],
+		BashBackground: ["command", "description", "timeout"],
 		ScheduleWakeup: ["delay_seconds", "reason", "prompt"],
 		CronCreate: ["prompt", "cron", "interval_seconds", "recurring", "durable"],
 		CronList: [],
@@ -355,6 +356,9 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 	} else if (tool === "BashBackground") {
 		text(input.command, "command", 64 * 1024);
 		if (input.description !== undefined) text(input.description, "description", 160);
+		if (input.timeout !== undefined && (typeof input.timeout !== "number" || !Number.isFinite(input.timeout) || input.timeout <= 0 || input.timeout > MAX_BACKGROUND_SHELL_TIMEOUT_SECONDS)) {
+			throw new Error(`Background Bash timeout must be greater than 0 and at most ${MAX_BACKGROUND_SHELL_TIMEOUT_SECONDS} seconds`);
+		}
 	} else if (tool === "ScheduleWakeup") {
 		if (typeof input.delay_seconds !== "number" || !Number.isSafeInteger(input.delay_seconds) || input.delay_seconds < 1 || input.delay_seconds > 604800) {
 			throw new Error("Invalid delay_seconds (expected 1–604800)");

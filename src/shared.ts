@@ -106,8 +106,10 @@ export interface DesktopTaskAPI {
 	cancel(id: string): Promise<DesktopTask>;
 	/** Move an active foreground sub-agent to the background (Ctrl+B); result arrives via outbox. */
 	background(id: string): Promise<DesktopTask>;
-	/** Stop every background sub-agent (Pi and external) that this conversation delegated. */
+	/** Stop a conversation's background agents, local commands and monitors. */
 	stopAll(conversationId: string): Promise<{ stopped: number }>;
+	/** Stop the matching run and its own local background Bash commands. */
+	stopCurrentTurn(conversationId: string, runId: string): Promise<{ stoppedShells: string[]; foregroundStopped: boolean }>;
 	/** Deliver held background results to this conversation now and start a run for them. */
 	deliverNow(conversationId: string): Promise<{ pending: number }>;
 	/**
@@ -605,10 +607,17 @@ export function formatPullRequestCommentsPrompt(pr: PullRequestStatus, comments:
 	return lines.join("\n").trim();
 }
 
+export interface TurnWorkState {
+	id: string;
+	active: boolean;
+	runningShells: number;
+}
+
 export interface Snapshot {
 	activity?: Record<string, SessionActivity>;
 	activitySequence?: number;
 	bashBusy?: boolean;
+	turn?: TurnWorkState;
 	/** Sequence of the last host event included in this snapshot. */
 	eventSequence?: number;
 	/** Current output omitted from Pi's finalized get_messages transcript. */
@@ -642,6 +651,7 @@ export type DesktopEvent = {
 	/** Monotonic within this desktop host; used to replay events crossing a snapshot. */
 	sequence?: number;
 	queuedPromptGroups?: QueuedPromptGroups;
+	turn?: TurnWorkState;
 	event:
 		| JsonAgentSessionEvent
 		| RpcExtensionUIRequest

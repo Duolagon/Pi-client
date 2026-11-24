@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { scoreTurn } from "../src/renderer/quality-verdict.ts";
-import type { Message } from "../src/shared.ts";
+import { collectVerificationEvidence, scoreTurn } from "../src/renderer/quality-verdict.ts";
+import type { Message, MonitorRecord } from "../src/shared.ts";
 
 let clock = 1000;
 function at(): number {
@@ -22,13 +22,14 @@ function assistant(content: Message extends { role: "assistant" } ? never : unkn
 	} as unknown as Message;
 }
 
-function toolResult(toolCallId: string, isError: boolean): Message {
+function toolResult(toolCallId: string, isError: boolean, details: Record<string, unknown> = { exitCode: isError ? 1 : 0 }): Message {
 	return {
 		role: "toolResult",
 		toolCallId,
 		toolName: "x",
 		content: [{ type: "text", text: isError ? "boom" : "ok" }],
 		isError,
+		details,
 		timestamp: at(),
 	} as unknown as Message;
 }
@@ -57,6 +58,81 @@ test("edit + passing verify (agent Bash) = verified", () => {
 	const v = scoreTurn(msgs);
 	assert.equal(v.omen, "verified");
 	assert.equal(v.signals.verifyPassed, true);
+});
+
+test("a successful tool response without a recorded exit code cannot certify the check", () => {
+	const msgs = [assistant(null, { tools: [edit(), bash("b1", "npm test")] }), toolResult("b1", false, {})];
+	const verdict = scoreTurn(msgs);
+	assert.equal(verdict.omen, "unverified");
+	assert.equal(verdict.checks[0].status, "pending");
+});
+
+const checkShellId = "shell_0123456789ab";
+
+function backgroundTestLaunch(): Message[] {
+	return [
+		assistant(null, { tools: [edit(), { id: "bg-test", name: "bash", arguments: { command: "npm test", run_in_background: true } }] }),
+		// Previous clients populated exitCode on the launch acknowledgement. Existing sessions must stay accurate.
+		toolResult("bg-test", false, { background: true, shell_id: checkShellId, status: "running", exitCode: 0 }),
+	];
+}
+
+function shellEvent(details: Record<string, unknown>): Message {
+	return {
+		role: "custom",
+		customType: "desktop_shell_event",
+		content: "后台命令状态",
+		display: true,
+		details: { terminal: true, shell_id: checkShellId, ...details },
+		timestamp: at(),
+	} as Message;
+}
+
+test("a background check passes only after its own terminal exit with code zero", () => {
+	const turn = backgroundTestLaunch();
+	for (const later of [
+		[],
+		[shellEvent({ status: "completed", exit_code: 0, shell_id: "shell_other" })],
+		[shellEvent({ status: "completed", exit_code: 0, terminal: false })],
+		[shellEvent({ status: "completed", exit_code: null })],
+	]) {
+		const verdict = scoreTurn(turn, collectVerificationEvidence([...turn, ...later]));
+		assert.equal(verdict.omen, "unverified");
+		assert.equal(verdict.checks[0].status, "pending");
+		assert.equal(verdict.checks[0].exitCode, undefined);
+	}
+	const evidence = collectVerificationEvidence([...turn, shellEvent({ status: "completed", exit_code: 0 })]);
+	assert.equal(scoreTurn(turn, evidence).omen, "verified");
+});
+
+test("failed, stopped, and timed out background checks keep distinct outcomes", () => {
+	const turn = backgroundTestLaunch();
+	for (const [details, status] of [
+		[{ status: "failed", exit_code: 1 }, "failed"],
+		[{ status: "killed", reason: "user_stop" }, "stopped"],
+		[{ status: "killed", reason: "timed_out" }, "timed_out"],
+	] as const) {
+		const verdict = scoreTurn(turn, collectVerificationEvidence([...turn, shellEvent(details)]));
+		assert.equal(verdict.omen, "problem");
+		assert.equal(verdict.checks[0].status, status);
+	}
+});
+
+test("a live shell record shows a silent stop immediately", () => {
+	const turn = backgroundTestLaunch();
+	const monitor = {
+		id: checkShellId, kind: "shell", status: "stopped", createdAt: turn[1].timestamp, updatedAt: at(),
+	} as MonitorRecord;
+	assert.equal(scoreTurn(turn, collectVerificationEvidence(turn, [monitor])).checks[0].status, "stopped");
+});
+
+test("edits in a later turn while a background check is running invalidate its result", () => {
+	const turn = backgroundTestLaunch();
+	const laterEdit = assistant(null, { tools: [edit("e2")] });
+	const completion = shellEvent({ status: "completed", exit_code: 0, started_at: turn[1].timestamp });
+	const afterCompletion = assistant(null, { tools: [edit("e3")] });
+	assert.equal(scoreTurn(turn, collectVerificationEvidence([...turn, laterEdit, completion])).checks[0].status, "stale");
+	assert.equal(scoreTurn(turn, collectVerificationEvidence([...turn, completion, afterCompletion])).checks[0].status, "passed");
 });
 
 test("edit + passing verify via ! bashExecution exit 0 = verified", () => {

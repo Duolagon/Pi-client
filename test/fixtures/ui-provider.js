@@ -54,6 +54,33 @@ export default function uiProvider(pi) {
 			} else if (prompt === "提交本地演示计划") {
 				response = results.length ? fauxAssistantMessage("本地演示计划已提交。")
 					: fauxAssistantMessage(fauxToolCall("ExitPlanMode", { title: "E2E Plan", plan: "1. Review the implementation." }), { stopReason: "toolUse" });
+			} else if (prompt === "为啥要排队，现在在跑什么") {
+				const commands = [
+					".venv/bin/kaggle kernels status research/demo",
+					"KAGGLE_FIXTURE=1; .venv/bin/kaggle kernels delete -k research/demo; .venv/bin/kaggle kernels delete -k research/demo-other",
+					"test -d . && .venv/bin/kaggle kernels push -p notebook",
+				];
+				response = results.length < commands.length
+					? fauxAssistantMessage(fauxToolCall("bash", { command: commands[results.length] }), { stopReason: "toolUse" })
+					: fauxAssistantMessage("演示队列状态查询结束。");
+			} else if (prompt === "请删除演示云端作业") {
+				response = results.length ? fauxAssistantMessage("演示远端操作结束。")
+					: fauxAssistantMessage(fauxToolCall("bash", { command: ".venv/bin/kaggle kernels delete -k research/demo" }), { stopReason: "toolUse" });
+			} else if (prompt === "登记旧的本机后台命令" || prompt === "登记本轮本机后台命令") {
+				const previous = prompt === "登记旧的本机后台命令";
+				const description = previous ? "演示旧轮后台命令" : "演示本轮后台命令";
+				const path = previous ? "previous-shell.pid" : "current-shell.pid";
+				response = results.length ? fauxAssistantMessage(`${description}已登记。`)
+					: fauxAssistantMessage(fauxToolCall("bash", {
+							command: `printf '%s\\n' $$ > ${path}; exec /bin/sleep 120`, description, run_in_background: true, timeout: 120,
+						}), { stopReason: "toolUse" });
+			} else if (prompt === "验证后台检查的退出结果") {
+				const steps = [
+					fauxToolCall("write", { path: "background-checked.txt", content: "example change\n" }),
+					fauxToolCall("bash", { command: "node --test test/background-check.test.mjs", run_in_background: true, timeout: 30 }),
+				];
+				response = results.length < steps.length ? fauxAssistantMessage(steps[results.length], { stopReason: "toolUse" })
+					: fauxAssistantMessage("后台检查已登记，等待退出结果。");
 			} else if (prompt.includes("审批拒绝验证")) {
 				response = results.length ? fauxAssistantMessage(results[0].isError ? "写入已按你的选择取消。" : "写入已执行。")
 					: fauxAssistantMessage(fauxToolCall("write", { path: "denied.txt", content: "should be denied\n" }), { stopReason: "toolUse" });

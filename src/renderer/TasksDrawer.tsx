@@ -17,7 +17,7 @@ export function TasksDrawer({
 	fail,
 }: {
 	project?: string;
-	/** Active conversation; "停止全部后台子 Agent" acts only on its own children. */
+	/** Active conversation; the stop-all action is scoped to its background work. */
 	conversationId?: string;
 	agentTeams?: boolean;
 	initialTaskId?: string;
@@ -322,13 +322,16 @@ export function TasksDrawer({
 		? tasks.filter((task) => task.parentConversationId === conversationId && task.runInBackground && isActive(task.status)).length +
 			externalTasks.filter((task) => task.parentConversationId === conversationId && isActive(task.status)).length
 		: 0;
+	const backgroundMonitors = conversationId ? monitors.filter((monitor) => monitor.status === "running" &&
+		(monitor.conversationId === conversationId || monitor.rootConversationId === conversationId)).length : 0;
+	const backgroundCount = backgroundChildren + backgroundMonitors;
 	const stopAllBackground = async () => {
-		if (!conversationId || !backgroundChildren) return;
-		if (!window.confirm(`停止当前会话的全部 ${backgroundChildren} 个后台子 Agent？已完成的修改会保留，主会话会收到“已停止”的结果。`)) return;
+		if (!conversationId || !backgroundCount) return;
+		if (!window.confirm(`停止当前会话的全部 ${backgroundCount} 项后台任务？这会停止所有回合中的子 Agent、后台命令和监听，已完成的修改会保留。`)) return;
 		setBusy(true);
 		try {
 			const { stopped } = await window.pi.tasks.stopAll(conversationId);
-			onNotice(stopped ? `已停止 ${stopped} 个后台子 Agent。` : "当前会话没有运行中的后台子 Agent。");
+			onNotice(stopped ? `已停止 ${stopped} 项后台任务。` : "当前会话没有运行中的后台任务。");
 			await refresh();
 		} catch (error) {
 			fail(error);
@@ -365,17 +368,17 @@ export function TasksDrawer({
 
 				{tab === "tasks" && (
 					<div className="cc-controls-body">
-						{backgroundChildren > 0 && !detailTranscript && !extDetail && (
+						{backgroundCount > 0 && !detailTranscript && !extDetail && (
 							<div className="cc-task-stop-all">
-								<span>当前会话有 {backgroundChildren} 个运行中的子 Agent。按 Esc 只会中断前台调用，后台子 Agent 会继续运行。</span>
+								<span>当前会话有 {backgroundCount} 项活跃后台任务。</span>
 								<button
 									type="button"
 									className="cc-mini-btn danger"
-									title="停止全部后台子 Agent（Ctrl+X Ctrl+K）"
+									title="停止当前会话的全部后台任务（Ctrl+X Ctrl+K）"
 									disabled={busy}
 									onClick={() => void stopAllBackground()}
 								>
-									<Square size={12} /> 停止全部后台子 Agent
+									<Square size={12} /> 停止全部后台任务
 								</button>
 							</div>
 						)}

@@ -1,14 +1,14 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { copyText } from "./clipboard.ts";
 import ReactMarkdown from "react-markdown";
 import { ArrowDownToLine, Check, Circle, CircleAlert, ChevronRight, Copy, ExternalLink, Eye, GitFork, LoaderCircle, RotateCcw, Square } from "lucide-react";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
 import { formatRunningToolTimer } from "../task-eta.ts";
-import type { DesktopTask, ExternalTask, Message, TaskProgress } from "../shared.ts";
+import type { DesktopTask, ExternalTask, Message, MonitorRecord, TaskProgress } from "../shared.ts";
 import type { Transcript, ToolProgress } from "./messages.ts";
 import { CodeLines, InlineEditDiff, computeLineDiff } from "./DiffView.tsx";
 import { highlightCode } from "./highlight.tsx";
-import { scoreTurn, type QualityVerdict } from "./quality-verdict.ts";
+import { collectVerificationEvidence, scoreTurn, type QualityVerdict, type VerificationCheck } from "./quality-verdict.ts";
 import { OmenGlyph } from "./GrailIcons.tsx";
 
 export interface TodoItem {
@@ -181,6 +181,14 @@ function CopyTurnButton({ text }: { text: string }) {
 
 const noticeStatusLabel: Record<string, string> = { completed: "已完成", failed: "失败", stopped: "已停止" };
 const noticeStopLabel: Record<string, string> = { user_stop: "用户停止", restart: "应用重启" };
+const checkStatusLabel: Record<VerificationCheck["status"], string> = {
+	passed: "通过",
+	failed: "未通过",
+	pending: "未记录退出结果",
+	stale: "早于后续改动",
+	stopped: "已停止",
+	timed_out: "已超时",
+};
 
 /** Background sub-agent result delivered into this conversation; the report is untrusted Markdown. */
 function TaskNotificationCard({ details, onOpenTask }: { details: unknown; onOpenTask?: (taskId: string) => void }) {
@@ -241,6 +249,7 @@ export function TranscriptView({
 	onForkPrompt,
 	entryIds,
 	checkpointIds,
+	backgroundMonitors,
 	approvalTool,
 	onRerunCheck,
 	onOpenPreview,
@@ -257,12 +266,14 @@ export function TranscriptView({
 	onForkPrompt?: (entryId: string) => void;
 	entryIds?: Record<number, string>;
 	checkpointIds?: Record<string, string>;
+	backgroundMonitors?: readonly MonitorRecord[];
 	approvalTool?: string;
 	onRerunCheck?: (command: string) => void;
 	onOpenPreview?: (url: string) => void;
 	/** Opens a tool's file path in the configured external editor. */
 	onOpenFile?: OpenFileHandler;
 }) {
+	const verificationEvidence = useMemo(() => collectVerificationEvidence(state.messages, backgroundMonitors), [state.messages, backgroundMonitors]);
 	const messageIndices = new Map(state.messages.map((message, index) => [message, index]));
 	const approvals = approvalTool ? Object.entries(state.tools)
 		.filter(([, tool]) => tool.name === approvalTool && tool.status === "running") : [];
@@ -389,7 +400,7 @@ export function TranscriptView({
 						message.role === "compactionSummary" || (message.role === "custom" && message.display)) break;
 				}
 				const verdict: QualityVerdict | null = isStreaming || firstIndex < 0 || last.stopReason === "toolUse"
-					? null : scoreTurn(state.messages.slice(firstIndex, end));
+					? null : scoreTurn(state.messages.slice(firstIndex, end), verificationEvidence);
 				const turnText = unit.messages
 					.flatMap((m) => m.content)
 					.filter((b): b is Extract<typeof b, { type: "text" }> => b.type === "text")
@@ -429,7 +440,7 @@ export function TranscriptView({
 								{verdict!.checks.map((check) => (
 									<li key={check.id}>
 										<code>{check.command}</code>
-										<span>{check.status === "passed" ? "通过" : check.status === "failed" ? "未通过" : check.status === "stale" ? "早于后续改动" : "无完成结果"}{check.exitCode !== undefined ? ` · 退出码 ${check.exitCode}` : ""}</span>
+										<span>{check.shellId && check.status === "pending" ? "等待后台退出结果" : checkStatusLabel[check.status]}{check.exitCode !== undefined ? ` · 退出码 ${check.exitCode}` : ""}</span>
 										{onRerunCheck && <button type="button" className="cc-mini-btn" onClick={() => onRerunCheck(check.command)}>在终端重跑</button>}
 									</li>
 								))}
@@ -808,7 +819,7 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 		return {
 			verb: "Bash",
 			target: cmd,
-			badge: status === "error" ? "error" : status === "done" ? "done" : undefined,
+			badge: status === "error" ? "error" : status === "done" ? (a.run_in_background === true ? "已在后台启动" : "done") : undefined,
 			treeSummary: firstLine,
 		};
 	}

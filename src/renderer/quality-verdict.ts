@@ -1,4 +1,4 @@
-import type { Message } from "../shared.ts";
+import type { Message, MonitorRecord } from "../shared.ts";
 
 /** Summarize recorded checks without promoting older results to the current code state. */
 export type QualityOmen =
@@ -15,7 +15,8 @@ export interface VerificationCheck {
 	id: string;
 	command: string;
 	exitCode?: number;
-	status: "passed" | "failed" | "pending" | "stale";
+	shellId?: string;
+	status: "passed" | "failed" | "pending" | "stale" | "stopped" | "timed_out";
 }
 
 export interface QualityVerdict {
@@ -86,7 +87,74 @@ function bashCommandOf(call: Extract<Assistant["content"][number], { type: "tool
 	return typeof args.command === "string" ? args.command : null;
 }
 
-export function scoreTurn(turnMessages: Message[]): QualityVerdict {
+interface BackgroundCheckExit {
+	status: "exited" | "error" | "stopped" | "timed_out";
+	exitCode?: number;
+	startedAt?: number;
+	finishedAt: number;
+}
+
+interface VerificationEvidence {
+	shellExits: ReadonlyMap<string, BackgroundCheckExit>;
+	writeTimes: readonly number[];
+}
+
+/** Background checks may finish in a later turn, so index terminal events across the conversation. */
+export function collectVerificationEvidence(messages: readonly Message[], monitors: readonly MonitorRecord[] = []): VerificationEvidence {
+	const shellExits = new Map<string, BackgroundCheckExit>();
+	const writeTimes: number[] = [];
+	for (const message of messages) {
+		if (message.role === "custom" && message.customType === "desktop_shell_event") {
+			const details = message.details as {
+				terminal?: unknown; shell_id?: unknown; status?: unknown; exit_code?: unknown; reason?: unknown;
+				started_at?: unknown; finished_at?: unknown;
+			} | undefined;
+			if (details?.terminal !== true || typeof details.shell_id !== "string") continue;
+			const status = details.reason === "timed_out" ? "timed_out"
+				: details.status === "killed" ? "stopped"
+				: details.status === "failed" ? "error"
+				: details.status === "completed" ? "exited" : undefined;
+			if (status) shellExits.set(details.shell_id, {
+				status,
+				exitCode: exitCodeOf(details.exit_code),
+				startedAt: typeof details.started_at === "number" ? details.started_at : undefined,
+				finishedAt: typeof details.finished_at === "number" ? details.finished_at : message.timestamp,
+			});
+		} else if (
+			(message.role === "assistant" && message.content.some((call) => {
+				if (call.type !== "toolCall") return false;
+				const command = bashCommandOf(call);
+				return EDIT_TOOLS.has(toolName(call)) || (command !== null && !isVerifyCommand(command) && mayEditWithShell(command));
+			})) || (message.role === "bashExecution" && !isVerifyCommand(message.command) && mayEditWithShell(message.command))
+		) {
+			writeTimes.push(message.timestamp);
+		}
+	}
+	for (const monitor of monitors) {
+		if (monitor.kind !== "shell" || monitor.status === "running") continue;
+		shellExits.set(monitor.id, {
+			status: monitor.status,
+			exitCode: exitCodeOf(monitor.exitCode),
+			startedAt: monitor.createdAt,
+			finishedAt: monitor.updatedAt,
+		});
+	}
+	return { shellExits, writeTimes };
+}
+
+function exitCodeOf(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isInteger(value) ? value : undefined;
+}
+
+function exitStatus(exitCode: number | undefined, failed: boolean): VerificationCheck["status"] {
+	if (failed) return "failed";
+	return exitCode === undefined ? "pending" : exitCode === 0 ? "passed" : "failed";
+}
+
+export function scoreTurn(
+	turnMessages: readonly Message[],
+	evidence: VerificationEvidence = collectVerificationEvidence(turnMessages),
+): QualityVerdict {
 	let editVersion = 0;
 	let toolErrors = 0;
 	let modelError = false;
@@ -94,7 +162,7 @@ export function scoreTurn(turnMessages: Message[]): QualityVerdict {
 	let edited = false;
 	let latestWriteEnd = -Infinity;
 	const writes = new Set<string>();
-	const runningChecks = new Map<string, { check: VerificationCheck; version: number; startedAt?: number }>();
+	const runningChecks = new Map<string, { check: VerificationCheck; version: number; background?: boolean; startedAt?: number }>();
 	for (const message of turnMessages) {
 		switch (message.role) {
 			case "assistant":
@@ -104,7 +172,11 @@ export function scoreTurn(turnMessages: Message[]): QualityVerdict {
 					if (call.type !== "toolCall") continue;
 					const command = bashCommandOf(call);
 					if (command && isVerifyCommand(command)) {
-						runningChecks.set(call.id, { check: { id: call.id, command, status: "pending" }, version: editVersion });
+						runningChecks.set(call.id, {
+							check: { id: call.id, command, status: "pending" },
+							version: editVersion,
+							background: (call.arguments as { run_in_background?: unknown }).run_in_background === true,
+						});
 					} else if (EDIT_TOOLS.has(toolName(call)) || (command && mayEditWithShell(command))) {
 						editVersion++;
 						writes.add(call.id);
@@ -118,10 +190,14 @@ export function scoreTurn(turnMessages: Message[]): QualityVerdict {
 				const entry = runningChecks.get(message.toolCallId);
 				if (entry) {
 					entry.startedAt = message.timestamp - (message.durationMs ?? 0);
-					const details = message.details as { exitCode?: unknown } | undefined;
-					const exitCode = typeof details?.exitCode === "number" ? details.exitCode : undefined;
-					entry.check.exitCode = exitCode;
-					entry.check.status = message.isError || (exitCode !== undefined && exitCode !== 0) ? "failed" : "passed";
+					const details = message.details as { exitCode?: unknown; background?: unknown; shell_id?: unknown } | undefined;
+					if (entry.background || details?.background === true) {
+						if (message.isError) entry.check.status = "failed";
+						else if (typeof details?.shell_id === "string") entry.check.shellId = details.shell_id;
+					} else {
+						entry.check.exitCode = exitCodeOf(details?.exitCode);
+						entry.check.status = exitStatus(entry.check.exitCode, message.isError);
+					}
 				}
 				break;
 			}
@@ -131,28 +207,41 @@ export function scoreTurn(turnMessages: Message[]): QualityVerdict {
 					break;
 				}
 				const id = `shell-${message.timestamp}-${runningChecks.size}`;
-				const status = message.cancelled || (message.exitCode !== undefined && message.exitCode !== 0)
-					? "failed" : message.exitCode === 0 ? "passed" : "pending";
-				runningChecks.set(id, { check: { id, command: message.command, exitCode: message.exitCode ?? undefined, status }, version: editVersion });
+				const exitCode = exitCodeOf(message.exitCode);
+				const status = message.cancelled ? "stopped" : exitStatus(exitCode, false);
+				runningChecks.set(id, { check: { id, command: message.command, exitCode, status }, version: editVersion });
 				break;
 			}
 		}
 	}
-	const checks = [...runningChecks.values()].map(({ check, version, startedAt }) =>
-		check.status === "passed" && (version !== editVersion || (startedAt !== undefined && latestWriteEnd > startedAt))
-			? { ...check, status: "stale" as const } : check,
-	);
+	const checks = [...runningChecks.values()].map(({ check, version, startedAt }) => {
+		const shell = check.shellId ? evidence.shellExits.get(check.shellId) : undefined;
+		const started = shell?.startedAt ?? startedAt;
+		if (shell) {
+			check.exitCode = shell.exitCode;
+			check.status = shell.status === "timed_out" || shell.status === "stopped" ? shell.status
+				: exitStatus(shell.exitCode, shell.status === "error");
+		}
+		if (check.status !== "passed") return check;
+		const wroteDuringShell = shell && started !== undefined && evidence.writeTimes.some((time) => time > started && time <= shell.finishedAt);
+		if (version !== editVersion || (started !== undefined && latestWriteEnd > started) || wroteDuringShell) {
+			check.status = "stale";
+		}
+		return check;
+	});
 	const verifyPassed = checks.some((check) => check.status === "passed");
 	const signals = { edited, verifyRan: checks.length > 0, verifyPassed, toolErrors, modelError, aborted };
 	const result = (omen: QualityOmen, label: string, reason: string): QualityVerdict => ({ omen, label, reason, signals, checks });
 	if (aborted) return result("none", "", "本次回复已停止");
 	if (modelError) return result("problem", "有报错", "模型返回错误");
-	if (toolErrors || checks.some((check) => check.status === "failed"))
+	if (toolErrors || checks.some((check) => ["failed", "stopped", "timed_out"].includes(check.status)))
 		return result("problem", "有检查未通过", "展开查看失败命令和工具记录");
 	if (!signals.edited) return result("none", "", "本轮无代码改动");
 	if (verifyPassed && !checks.some((check) => check.status === "pending"))
 		return result("verified", "检查通过", "这些检查在本轮最后一次编辑后完成");
 	if (checks.some((check) => check.status === "stale"))
 		return result("unverified", "改动后待验证", "最近的成功检查早于本轮最后一次编辑");
+	if (checks.some((check) => check.shellId && check.status === "pending"))
+		return result("unverified", "等待检查结果", "后台检查尚无最终退出记录");
 	return result("unverified", "未验证", "本轮改动尚无完成的检查");
 }

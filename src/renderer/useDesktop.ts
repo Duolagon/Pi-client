@@ -133,7 +133,7 @@ export function useDesktop(api: DesktopAPI) {
 	}, [api, apply, fail]);
 	refreshLatest.current = refresh;
 	listener.current = (packet, replay = false) => {
-		const { conversationId, event, sequence, queuedPromptGroups } = packet;
+		const { conversationId, event, sequence, queuedPromptGroups, turn } = packet;
 		if (!replay && sequence !== undefined) {
 			const bytes = JSON.stringify(packet).length * 2;
 			buffered.current.push({ packet, bytes });
@@ -172,6 +172,7 @@ export function useDesktop(api: DesktopAPI) {
 			if (sequence <= appliedSequence.current) return;
 			appliedSequence.current = sequence;
 		}
+		if (turn) setSnapshot((previous) => previous?.active?.id === conversationId ? { ...previous, turn } : previous);
 		if (event.type === "desktop_error") {
 			fail(event.message);
 			setRunning(false);
