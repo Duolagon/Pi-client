@@ -25,8 +25,10 @@ import { loadLocalLangfuseConfig, saveLocalLangfuseConfig } from "./langfuse-loc
 
 app.setName("Pi Desktop");
 if (process.env.PI_DESKTOP_DATA_DIR) app.setPath("userData", process.env.PI_DESKTOP_DATA_DIR);
+const tracingContent = process.argv.includes("--enable-langfuse-content") ? true :
+	process.argv.includes("--disable-langfuse-content") ? false : undefined;
 const tracingCommand = process.argv.includes("--configure-langfuse") ? "configure" :
-	process.argv.includes("--check-langfuse") ? "check" : undefined;
+	process.argv.includes("--check-langfuse") ? "check" : tracingContent !== undefined ? "content" : undefined;
 // Electron keys the lock on the userData directory, so a second launch with the
 // same data focuses the open window while separate data directories still coexist.
 const primaryInstance = app.requestSingleInstanceLock();
@@ -90,6 +92,14 @@ async function checkLocalTracing(dataDir: string): Promise<string> {
 	await tracing.close();
 	if (!traceId) throw new Error("无法生成 Langfuse 验证追踪。");
 	return traceId;
+}
+
+async function configureTracingContent(dataDir: string, captureContent: boolean): Promise<void> {
+	const saved = await loadLocalLangfuseConfig(dataDir, decryptLocal);
+	if (!saved) throw new Error("请先保存本机 Langfuse 配置。");
+	await saveLocalLangfuseConfig(dataDir, {
+		baseUrl: saved.LANGFUSE_BASE_URL, publicKey: saved.LANGFUSE_PUBLIC_KEY, secretKey: saved.LANGFUSE_SECRET_KEY, captureContent,
+	}, encryptLocal);
 }
 
 function createWindow() {
@@ -530,6 +540,9 @@ void app.whenReady().then(async () => {
 			if (tracingCommand === "configure") {
 				await configureLocalTracing(dataDir);
 				process.stdout.write("Langfuse 配置已加密保存。\n", () => app.exit(0));
+			} else if (tracingCommand === "content") {
+				await configureTracingContent(dataDir, tracingContent === true);
+				process.stdout.write(tracingContent ? "Langfuse 正文采集已开启。\n" : "Langfuse 正文采集已关闭。\n", () => app.exit(0));
 			} else {
 				const traceId = await checkLocalTracing(dataDir);
 				process.stdout.write(`${traceId}\n`, () => app.exit(0));
@@ -555,8 +568,10 @@ void app.whenReady().then(async () => {
 		return undefined;
 	});
 	const tracing = createPiTracing({ ...tracingEnvironment, ...localTracing,
+		LANGFUSE_CAPTURE_CONTENT: tracingEnvironment.LANGFUSE_CAPTURE_CONTENT ?? localTracing?.LANGFUSE_CAPTURE_CONTENT,
 		LANGFUSE_RELEASE: tracingEnvironment.LANGFUSE_RELEASE || app.getVersion() }, () => log.warn("tracing_configuration_invalid", {}));
-	if (tracing) log.info("tracing_enabled", { source: localTracing ? "local" : "environment" });
+	if (tracing) log.info("tracing_enabled", { source: localTracing ? "local" : "environment",
+		content: (tracingEnvironment.LANGFUSE_CAPTURE_CONTENT ?? localTracing?.LANGFUSE_CAPTURE_CONTENT) === "1" });
 	service = new DesktopService({
 		dataDir,
 		tracing,

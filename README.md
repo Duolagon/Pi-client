@@ -154,7 +154,9 @@ unset LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY LANGFUSE_BASE_URL
 
 在 Langfuse 的 Traces 中筛选环境 `pi-desktop`。每轮 Pi Agent、`/btw` 和 `/grail` 模型评审各自记录一条运行 Trace，下面显示模型 Generation 和工具耗时。相同会话通过匿名 ID 分组。Generation 记录模型、结束状态、用量、缓存读写和 Pi 报告的美元费用。可设置 `LANGFUSE_RELEASE` 为提交号，用于区分版本。
 
-追踪只发送元数据。提示词、回答、文件内容、工具参数、命令、错误原文和凭据保留在本机。外部 Agent 适配器内部的独立模型调用目前由其各自的运行时管理。启用时请使用可访问且可信的实例，跨机器传输时使用 HTTPS。 [Langfuse OpenTelemetry 文档](https://langfuse.com/integrations/native/opentelemetry)
+默认只发送元数据。需要查看正文时，先退出客户端，再运行 `'/Applications/Pi Desktop.app/Contents/MacOS/Pi Desktop' --enable-langfuse-content`。用 `--disable-langfuse-content` 恢复仅元数据。一次性环境配置可以通过 `LANGFUSE_CAPTURE_CONTENT=1` 启用。
+
+开启后，Trace 记录当轮用户可见文本和助手回复，Generation 记录当轮已观测的消息、可见输出和工具名称，工具步骤记录完成状态。正文会去除常见凭据及内网 IP 并限制长度。附件、引用文件正文、隐藏推理、原始工具参数与结果保留在本机。外部 Agent 适配器内部的独立模型调用目前由各自的运行时管理。跨机器传输时使用 HTTPS。 [Langfuse OpenTelemetry 文档](https://langfuse.com/integrations/native/opentelemetry)
 
 ## 旧界面原型
 

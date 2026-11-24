@@ -7,13 +7,19 @@ const filename = "langfuse.json";
 const maxConfigBytes = 32_768;
 const invalidConfig = "Langfuse 配置无效。请检查地址和两把密钥。";
 
-export type LocalLangfuseConfig = { baseUrl: string; publicKey: string; secretKey: string };
+export type LocalLangfuseConfig = { baseUrl: string; publicKey: string; secretKey: string; captureContent?: boolean };
 
 export function validateLocalLangfuseConfig(raw: unknown): LocalLangfuseConfig {
-	if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.keys(raw).length !== 3 ||
-		!["baseUrl", "publicKey", "secretKey"].every((key) => Object.hasOwn(raw, key))) throw new Error(invalidConfig);
-	const { baseUrl, publicKey, secretKey } = raw as Record<string, unknown>;
-	if (typeof baseUrl !== "string" || typeof publicKey !== "string" || typeof secretKey !== "string")
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(invalidConfig);
+	const keys = Object.keys(raw);
+	const hasCaptureContent = keys.includes("captureContent");
+	if (keys.length !== (hasCaptureContent ? 4 : 3) ||
+		!["baseUrl", "publicKey", "secretKey"].every((key) => keys.includes(key))) throw new Error(invalidConfig);
+	const config = raw as Record<string, unknown>;
+	const { baseUrl, publicKey, secretKey } = config;
+	const captureContent = hasCaptureContent ? config.captureContent : undefined;
+	if (typeof baseUrl !== "string" || typeof publicKey !== "string" || typeof secretKey !== "string" ||
+		(hasCaptureContent && typeof captureContent !== "boolean"))
 		throw new Error(invalidConfig);
 	const urlValue = baseUrl.trim().replace("\\:", ":");
 	const publicValue = publicKey.trim(), secretValue = secretKey.trim();
@@ -22,7 +28,12 @@ export function validateLocalLangfuseConfig(raw: unknown): LocalLangfuseConfig {
 		!publicValue || !secretValue || publicValue.length > 4096 || secretValue.length > 4096 ||
 		/[\s\u0000-\u001f\u007f:]/u.test(publicValue) || /[\s\u0000-\u001f\u007f]/u.test(secretValue) ||
 		/[\n\r\t]/u.test(urlValue)) throw new Error(invalidConfig);
-	return { baseUrl: url.href.replace(/\/+$/, ""), publicKey: publicValue, secretKey: secretValue };
+	return {
+		baseUrl: url.href.replace(/\/+$/, ""),
+		publicKey: publicValue,
+		secretKey: secretValue,
+		...(typeof captureContent === "boolean" ? { captureContent } : {}),
+	};
 }
 
 export async function saveLocalLangfuseConfig(
@@ -62,7 +73,12 @@ export async function loadLocalLangfuseConfig(
 			const stored = JSON.parse(await file.readFile("utf8")) as { version?: unknown; encrypted?: unknown };
 			if (stored.version !== 1 || typeof stored.encrypted !== "string" || !stored.encrypted) throw new Error();
 			const config = validateLocalLangfuseConfig(JSON.parse(decrypt(stored.encrypted)));
-			return { LANGFUSE_BASE_URL: config.baseUrl, LANGFUSE_PUBLIC_KEY: config.publicKey, LANGFUSE_SECRET_KEY: config.secretKey };
+			return {
+				LANGFUSE_BASE_URL: config.baseUrl,
+				LANGFUSE_PUBLIC_KEY: config.publicKey,
+				LANGFUSE_SECRET_KEY: config.secretKey,
+				...(config.captureContent ? { LANGFUSE_CAPTURE_CONTENT: "1" } : {}),
+			};
 		} finally {
 			await file.close();
 		}

@@ -54,8 +54,23 @@ test("local tracing rejects invalid addresses and malformed credential objects",
 		[sample], {}, { ...sample, extra: true }, { ...sample, publicKey: "two:parts" }, { ...sample, secretKey: "" },
 		{ ...sample, secretKey: "with\nnewline" }, { ...sample, baseUrl: "file:///tmp/local.json" },
 		{ ...sample, baseUrl: "https://fixture:password@localhost/" }, { ...sample, baseUrl: "https://localhost/?private=true" },
-		{ ...sample, baseUrl: "https://localhost/#anchor" },
+		{ ...sample, baseUrl: "https://localhost/#anchor" }, { ...sample, captureContent: "true" },
+		{ ...sample, captureContent: 1 }, { ...sample, captureContent: undefined },
+		{ ...sample, captureContent: true, extra: true },
 	]) assert.throws(() => validateLocalLangfuseConfig(raw), { message: "Langfuse 配置无效。请检查地址和两把密钥。" });
+});
+
+test("local tracing content capture requires an explicit encrypted opt-in", async (t) => {
+	const dataDir = await mkdtemp(join(tmpdir(), "pi-langfuse-config-"));
+	t.after(() => rm(dataDir, { recursive: true, force: true }));
+	const file = join(dataDir, "observability", "langfuse.json");
+
+	await saveLocalLangfuseConfig(dataDir, { ...sample, captureContent: true }, encrypt);
+	assert.doesNotMatch(await readFile(file, "utf8"), /"captureContent"/);
+	assert.equal((await loadLocalLangfuseConfig(dataDir, decrypt))?.LANGFUSE_CAPTURE_CONTENT, "1");
+
+	await saveLocalLangfuseConfig(dataDir, { ...sample, captureContent: false }, encrypt);
+	assert.equal((await loadLocalLangfuseConfig(dataDir, decrypt))?.LANGFUSE_CAPTURE_CONTENT, undefined);
 });
 
 test("local tracing refuses to follow symlinked configuration files", { skip: process.platform === "win32" }, async (t) => {
