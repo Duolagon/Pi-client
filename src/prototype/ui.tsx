@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { X, type LucideIcon } from "lucide-react";
-import { clearExitGhosts, spawnExitGhost } from "../renderer/Presence.tsx";
+import { clearModalExit, showModalExit } from "../renderer/Presence.tsx";
 
 export function IconButton({
 	icon: Icon,
@@ -57,7 +57,7 @@ export function Modal({
 	useEffect(() => {
 		const node = dialog.current;
 		if (!node) return;
-		clearExitGhosts("modal");
+		clearModalExit();
 		// Children marked with autoFocus cannot take focus while the dialog is still closed, and showModal()
 		// would otherwise focus the header close button. Pick the intended target explicitly after opening.
 		node.showModal();
@@ -84,11 +84,7 @@ export function Modal({
 		const node = dialog.current;
 		return () => {
 			const shell = node?.querySelector<HTMLElement>(".modal-shell") ?? null;
-			spawnExitGhost(shell, "modal", {
-				durationMs: 180,
-				withBackdrop: true,
-				extraClass: `${wide ? "wide" : ""} ${className}`.trim(),
-			});
+			if (node) showModalExit(shell, node.className);
 		};
 	}, []);
 	return (

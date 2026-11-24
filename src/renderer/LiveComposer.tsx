@@ -813,6 +813,7 @@ export function LiveComposer({
 						</button>
 						<SelectPopover
 							ariaLabel="选择模型"
+							className="cc-dock-model"
 							value={selected ? `${selected.provider}\0${selected.id}` : ""}
 							placeholder="未连接模型"
 							disabled={changing || running || !snapshot.models.length}
@@ -940,6 +941,7 @@ export function LiveComposer({
 							<>
 								<SelectPopover
 									ariaLabel="补充指令发送时机"
+									className="cc-dock-delivery"
 									align="right"
 									value={delivery}
 									disabled={disabled}

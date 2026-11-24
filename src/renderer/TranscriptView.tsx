@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { copyText } from "./clipboard.ts";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { ArrowDownToLine, Bot, Check, Circle, CircleAlert, ChevronRight, Copy, ExternalLink, Eye, FilePen, FileText, GitFork, Globe, ListChecks, LoaderCircle, RotateCcw, Search, Sparkles, Square, Terminal as TerminalIcon } from "lucide-react";
 import { SmoothCollapse } from "./SmoothCollapse.tsx";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
@@ -115,9 +116,13 @@ function MarkdownContent({ text, onOpenPreview }: { text: string; onOpenPreview?
 	return (
 		<div className="cl-markdown">
 			<ReactMarkdown
+				remarkPlugins={[remarkGfm]}
 				components={{
 					pre({ children }) {
 						return <>{children}</>;
+					},
+					table({ node: _node, ...props }) {
+						return <div className="cl-table-scroll"><table {...props} /></div>;
 					},
 					a({ href, children, ...props }) {
 						const isLocal = typeof href === "string" && /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?/i.test(href);
@@ -1080,8 +1085,8 @@ function ToolCard({
 				: "running"
 		: status;
 	const dotClass = effectiveStatus === "error" ? "err" : effectiveStatus === "done" ? "ok" : "run";
-	const [open, setOpen] = useState(false);
-	const isOpen = open || (status === "running" && !waitingForApproval);
+	const [open, setOpen] = useState<boolean>();
+	const isOpen = open ?? (status === "running" && !waitingForApproval);
 	const showLiveTimer = effectiveStatus === "running" && !waitingForApproval && !matchedTask && typeof progress?.startedAt === "number";
 	const [tickNow, setTickNow] = useState(() => Date.now());
 	useEffect(() => {
@@ -1104,7 +1109,7 @@ function ToolCard({
 
 	return (
 		<div className={`cl-tool ${effectiveStatus} ${isOpen ? "is-open" : ""} ${fileTarget && onOpenFile ? "has-open-editor" : ""}`}>
-			<button type="button" className="cc-tool-row" onClick={() => setOpen((v) => !v)} aria-expanded={isOpen}>
+			<button type="button" className="cc-tool-row" onClick={() => setOpen(!isOpen)} aria-expanded={isOpen}>
 				{effectiveStatus === "running" ? (
 					<span className={`cc-dot ${dotClass}`} />
 				) : (

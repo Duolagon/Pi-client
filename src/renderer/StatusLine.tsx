@@ -127,7 +127,7 @@ export function StatusLine({ snapshot, running, gitBranch }: { snapshot: Snapsho
 				</span>
 			)}
 			{balance && (
-				<span className="cc-status-item" title={balance.title}>
+				<span className="cc-status-item cc-status-balance" title={balance.title}>
 					{balance.text}
 				</span>
 			)}

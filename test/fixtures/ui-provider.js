@@ -59,6 +59,19 @@ export default function uiProvider(pi) {
 			} else if (prompt === "提交本地演示计划") {
 				response = results.length ? fauxAssistantMessage("本地演示计划已提交。")
 					: fauxAssistantMessage(fauxToolCall("ExitPlanMode", { title: "E2E Plan", plan: "1. Review the implementation." }), { stopReason: "toolUse" });
+			} else if (prompt === "验证运行中工具折叠和 Markdown 表格") {
+				const columns = ["任务", ...Array.from({ length: 27 }, (_, i) => `检查 ${i + 1}`)];
+				const table = [
+					columns,
+					columns.map(() => "---"),
+					["本地命令", ...columns.slice(1).map(() => "已通过")],
+				].map((row) => `| ${row.join(" | ")} |`).join("\n");
+				response = results.length ? fauxAssistantMessage(table)
+					: fauxAssistantMessage(fauxToolCall("bash", {
+						command: "while ! test -f release-tool-card.flag; do /bin/sleep 0.05; done",
+						description: "等待工具折叠验证",
+						timeout: 20,
+					}), { stopReason: "toolUse" });
 			} else if (prompt === "为啥要排队，现在在跑什么") {
 				const commands = [
 					".venv/bin/kaggle kernels status research/demo",

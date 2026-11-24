@@ -1,4 +1,5 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useLayoutEffect, useState, type ReactNode } from "react";
+import { prefersReducedMotion } from "./Presence.tsx";
 
 /**
  * Smooth height + opacity accordion primitive built on CSS Grid `0fr -> 1fr`.
@@ -9,24 +10,26 @@ export function SmoothCollapse({
 	open,
 	className = "",
 	innerClassName = "",
-	durationMs = 240,
 	children,
 }: {
 	open: boolean;
 	className?: string;
 	innerClassName?: string;
-	durationMs?: number;
 	children: ReactNode;
 }) {
 	const [mounted, setMounted] = useState(open);
 	const [expanded, setExpanded] = useState(open);
 
-	if (open && !mounted) {
-		setMounted(true);
-	}
+	const reducedMotion = prefersReducedMotion();
 
-	useEffect(() => {
+	useLayoutEffect(() => {
+		if (reducedMotion) {
+			setExpanded(open);
+			setMounted(open);
+			return;
+		}
 		if (open) {
+			setMounted(true);
 			let frame2 = 0;
 			const frame1 = requestAnimationFrame(() => {
 				frame2 = requestAnimationFrame(() => setExpanded(true));
@@ -37,17 +40,19 @@ export function SmoothCollapse({
 			};
 		}
 		setExpanded(false);
-		const timer = setTimeout(() => setMounted(false), durationMs + 30);
+		const timer = setTimeout(() => setMounted(false), 270);
 		return () => clearTimeout(timer);
-	}, [open, durationMs]);
+	}, [open, reducedMotion]);
 
-	if (!open && !mounted) return null;
+	if (!open && (!mounted || reducedMotion)) return null;
 
 	return (
 		<div
-			className={`cc-smooth-collapse ${expanded ? "is-expanded" : ""} ${className}`.trim()}
+			className={`cc-smooth-collapse ${(reducedMotion ? open : expanded) ? "is-expanded" : ""} ${className}`.trim()}
+			inert={!open}
+			aria-hidden={!open || undefined}
 			onTransitionEnd={(event) => {
-				if (event.target === event.currentTarget && !open) {
+				if (event.target === event.currentTarget && event.propertyName === "grid-template-rows" && !open) {
 					setMounted(false);
 				}
 			}}

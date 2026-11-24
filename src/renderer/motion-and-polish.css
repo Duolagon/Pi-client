@@ -100,39 +100,6 @@
 	}
 }
 
-@keyframes cc-slide-right-in {
-	from {
-		opacity: 0.4;
-		transform: translateX(18px);
-	}
-	to {
-		opacity: 1;
-		transform: translateX(0);
-	}
-}
-
-@keyframes cc-slide-left-in {
-	from {
-		opacity: 0.4;
-		transform: translateX(-14px);
-	}
-	to {
-		opacity: 1;
-		transform: translateX(0);
-	}
-}
-
-@keyframes cc-slide-up-panel {
-	from {
-		opacity: 0.4;
-		transform: translateY(14px);
-	}
-	to {
-		opacity: 1;
-		transform: translateY(0);
-	}
-}
-
 @keyframes cc-shimmer-sweep {
 	0% {
 		background-position: 200% 0;
@@ -195,7 +162,6 @@
 
 .cl-side {
 	border-right: 1px solid var(--cl-line);
-	animation: cc-slide-left-in 200ms var(--ease-out-expo) both;
 }
 
 .cl-main {
@@ -203,13 +169,31 @@
 	box-shadow: -8px 0 24px -16px rgba(15, 23, 42, 0.07);
 }
 
-.workspace-review,
-.cc-preview-panel {
-	animation: cc-slide-right-in 220ms var(--ease-out-expo) both;
+.live-app {
+	transition: grid-template-columns 200ms ease;
 }
-
-.cl-body > .terminal-panel {
-	animation: cc-slide-up-panel 210ms var(--ease-out-expo) both;
+.live-app.is-full-review,
+body.cc-resizing .live-app {
+	transition: none;
+}
+.cc-terminal-track {
+	--terminal-height: clamp(180px, 34vh, 360px);
+	flex: none;
+	block-size: 0;
+	min-width: 0;
+	overflow: clip;
+	transition: block-size 200ms ease;
+}
+.cc-terminal-track[data-open="true"] {
+	block-size: var(--terminal-height);
+}
+.cc-terminal-track > .terminal-panel {
+	height: var(--terminal-height);
+}
+@starting-style {
+	.cc-terminal-track[data-open="true"] {
+		block-size: 0;
+	}
 }
 
 /* De-cluttered, borderless airy Topbar */
@@ -588,6 +572,8 @@ button:not(:disabled):active {
 }
 
 .cl-composer-box {
+	container: composer / inline-size;
+	position: relative;
 	border-radius: 15px;
 	border: 1px solid var(--cl-line);
 	background: var(--cl-surface);
@@ -629,7 +615,7 @@ button:not(:disabled):active {
 	animation: cc-fade-up 210ms var(--ease-out-expo) both;
 }
 
-/* Unified single toolbar row inside .cl-composer-box */
+/* Use the same row structure before and during a reply. */
 .cc-dock-toolbar {
 	display: flex;
 	align-items: center;
@@ -648,11 +634,25 @@ button:not(:disabled):active {
 	flex: 1 1 auto;
 }
 
+.cc-dock-left > :not(.cc-dock-model),
+.cc-dock-right > :not(.cc-status-line) {
+	flex-shrink: 0;
+}
+
+.cc-dock-model {
+	min-width: min(82px, 34%);
+}
+
+.cc-dock-model > .cc-select-trigger {
+	max-width: 100%;
+}
+
 .cc-dock-right {
 	display: flex;
 	align-items: center;
+	justify-content: flex-end;
 	gap: 6px;
-	flex-shrink: 0;
+	min-width: 0;
 }
 
 .cc-dock-divider {
@@ -671,12 +671,19 @@ button:not(:disabled):active {
 	font-size: 11px;
 	color: var(--cl-3);
 	opacity: 0.85;
+	flex-shrink: 0;
 }
 
 /* Hide redundant model & gitBranch inside composer status line since Model & Topbar already display them */
 .cl-composer-box .cc-status-model,
 .cl-composer-box .cc-status-model + .cc-status-item::before {
 	display: none;
+}
+
+.cl-composer-box .cc-status-balance {
+	max-width: 80px;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 .cl-composer-box .cc-skills-trigger {
@@ -703,17 +710,6 @@ button:not(:disabled):active {
 	align-items: center;
 	min-width: 0;
 	max-width: 100%;
-}
-
-.cc-select-native-proxy {
-	position: absolute;
-	inset: 0;
-	width: 100%;
-	height: 100%;
-	opacity: 0;
-	pointer-events: none;
-	margin: 0;
-	border: 0;
 }
 
 .cc-select-trigger {
@@ -906,40 +902,57 @@ button:not(:disabled):active {
 	box-shadow: 0 3px 10px -2px color-mix(in srgb, var(--cl-red) 40%, transparent);
 }
 
-@container conversation (max-width: 680px) {
-	.cl-composer.is-running .cc-dock-toolbar {
-		flex-wrap: wrap;
+@container composer (max-width: 695px) {
+	.cc-dock-toolbar {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		gap: 4px;
 	}
-	.cl-composer.is-running .cc-dock-left {
-		flex-basis: 100%;
-		flex-wrap: wrap;
+	.cc-dock-left,
+	.cc-dock-right {
+		min-height: 30px;
 	}
-	.cl-composer.is-running .cc-dock-right {
-		margin-inline-start: auto;
+	.cl-composer-box .cc-status-line {
+		margin-inline-end: auto;
 	}
-	.cl-composer.is-running .cc-status-line {
-		display: none;
+	.cl-composer-box .cl-skills {
+		position: static;
+	}
+	.cl-composer-box .cl-skills-list {
+		width: min(440px, 100%);
 	}
 }
 
-@container conversation (max-width: 520px) {
-	.cc-dock-toolbar {
-		flex-wrap: wrap;
+@container composer (max-width: 470px) or (width > 695px) {
+	.cl-composer-box .cc-sandbox-pill {
+		padding-inline: 6px;
 	}
-	.cc-dock-left {
-		flex-wrap: wrap;
-	}
-	.cl-composer.is-running .cc-dock-left {
-		flex-basis: 100%;
-	}
-	.cc-dock-right {
-		margin-inline-start: auto;
-	}
-	.cl-composer-box .cc-status-line {
+	.cl-composer-box .cc-sandbox-pill > span {
 		display: none;
 	}
-	.cc-select-trigger {
-		max-width: 150px;
+	.cl-composer-box .cc-sandbox-wrap {
+		position: static;
+	}
+	.cl-composer-box .cc-sandbox-popover {
+		left: auto;
+		right: 0;
+		width: min(360px, 100%);
+	}
+}
+
+@container composer (max-width: 400px) {
+	.cc-dock-right {
+		gap: 4px;
+	}
+	.cl-composer-box .cc-skills-trigger,
+	.cc-dock-delivery > .cc-select-trigger {
+		padding-inline: 4px;
+	}
+	.cl-composer-box .cc-status-line {
+		padding-inline: 0;
+	}
+	.cl-composer-box .cc-status-balance {
+		display: none;
 	}
 }
 
@@ -1034,7 +1047,7 @@ button:not(:disabled):active {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   6. Bidirectional Exit Ghost Engine (Modals, Sidebar, Inspector, Terminal)
+   6. Modal exit and content transitions
    ═══════════════════════════════════════════════════════════════════════════ */
 
 @keyframes cc-backdrop-out {
@@ -1050,39 +1063,6 @@ button:not(:disabled):active {
 	to {
 		opacity: 0;
 		transform: translateY(8px) scale(0.972);
-	}
-}
-
-@keyframes cc-slide-left-out {
-	from {
-		opacity: 1;
-		transform: translateX(0);
-	}
-	to {
-		opacity: 0;
-		transform: translateX(-20px);
-	}
-}
-
-@keyframes cc-slide-right-out {
-	from {
-		opacity: 1;
-		transform: translateX(0);
-	}
-	to {
-		opacity: 0;
-		transform: translateX(24px);
-	}
-}
-
-@keyframes cc-slide-down-out {
-	from {
-		opacity: 1;
-		transform: translateY(0);
-	}
-	to {
-		opacity: 0;
-		transform: translateY(18px);
 	}
 }
 
@@ -1114,43 +1094,22 @@ button:not(:disabled):active {
 	z-index: 90;
 	pointer-events: none;
 	overflow: hidden;
+	background: rgba(15, 23, 42, 0.24);
+	backdrop-filter: blur(5px);
+	animation: cc-backdrop-out 175ms ease forwards;
 }
 
 .cc-ghost-txt::before {
 	content: attr(data-t);
 }
 
-.cc-exit-ghost-layer.has-backdrop {
-	background: rgba(15, 23, 42, 0.24);
-	backdrop-filter: blur(5px);
-	animation: cc-backdrop-out 175ms ease forwards;
-}
-
-:root[data-theme="dark"] .cc-exit-ghost-layer.has-backdrop,
-:root[data-theme="grail"] .cc-exit-ghost-layer.has-backdrop {
+:root[data-theme="dark"] .cc-exit-ghost-layer,
+:root[data-theme="grail"] .cc-exit-ghost-layer {
 	background: rgba(0, 0, 0, 0.48);
 }
 
 .cc-exit-ghost-modal {
 	animation: cc-modal-out 170ms var(--ease-out-expo) forwards !important;
-	will-change: transform, opacity;
-}
-
-.cc-exit-ghost-side {
-	z-index: 35;
-	animation: cc-slide-left-out 185ms var(--ease-out-expo) forwards !important;
-	will-change: transform, opacity;
-}
-
-.cc-exit-ghost-inspector {
-	z-index: 35;
-	animation: cc-slide-right-out 190ms var(--ease-out-expo) forwards !important;
-	will-change: transform, opacity;
-}
-
-.cc-exit-ghost-terminal {
-	z-index: 35;
-	animation: cc-slide-down-out 180ms var(--ease-out-expo) forwards !important;
 	will-change: transform, opacity;
 }
 
@@ -1466,6 +1425,24 @@ button:not(:disabled):active {
 	border: 1px solid var(--cl-line);
 	box-shadow: 0 1px 0 var(--cl-line);
 	color: var(--cl-2);
+}
+
+@media (max-height: 700px) {
+	.cl-empty {
+		gap: 12px;
+		padding: 16px 20px;
+	}
+	.cc-empty-hero {
+		gap: 8px;
+	}
+	.cl-empty-emblem {
+		width: 42px;
+		height: 42px;
+		border-radius: 12px;
+	}
+	.cc-starter-card {
+		padding-block: 8px;
+	}
 }
 
 /* Sidebar active left accent bar & collapsible polish */
@@ -2168,6 +2145,8 @@ button:not(:disabled):active {
 }
 
 @media (prefers-reduced-motion: reduce) {
+	.live-app,
+	.cc-terminal-track,
 	.cc-smooth-collapse,
 	.cc-seg-glider.is-animated {
 		transition: none !important;

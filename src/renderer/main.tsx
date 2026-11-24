@@ -95,7 +95,7 @@ import { AgentsDialog } from "./AgentsDialog.tsx";
 import { McpDialog } from "./McpDialog.tsx";
 import { resolveEditorPath } from "../editor-path.ts";
 import { SmoothCollapse } from "./SmoothCollapse.tsx";
-import { useExitGhost } from "./Presence.tsx";
+import { Presence, prefersReducedMotion } from "./Presence.tsx";
 import "./grail-theme.css";
 import "./task-flow.css";
 import "./motion-and-polish.css";
@@ -121,20 +121,11 @@ function savedInspectorWidth(key: string, fallback: number): number {
 	return Number.isFinite(stored) && stored >= 320 ? stored : fallback;
 }
 
-function SidebarAside({ children }: { children: React.ReactNode }) {
-	const ref = useRef<HTMLElement>(null);
-	useExitGhost(ref, "side", { skipOnResize: true, durationMs: 190 });
-	return (
-		<aside ref={ref} className="cl-side" aria-label="项目与会话">
-			{children}
-		</aside>
-	);
-}
-
 function Desktop({ api }: { api: DesktopAPI }) {
 	const { confirm, confirmation } = useConfirmation();
 	const app = useDesktop(api);
 	const { snapshot, history, running, changing, bashBusy } = app;
+	const hasTranscript = history.messages.length > 0;
 	const shellRecords = useBackgroundShells(api);
 	const activeShellRecords = useMemo(() => Object.values(shellRecords)
 		.filter((shell) => shell.conversationId === snapshot?.active?.id), [shellRecords, snapshot?.active?.id]);
@@ -180,7 +171,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [btwState, setBtwState] = useState<{ loading: boolean; question: string; answer?: string; error?: string; model?: string } | null>(null);
 	const [findOpen, setFindOpen] = useState(false);
 	const [findQuery, setFindQuery] = useState("");
-	const [findIndex, setFindIndex] = useState(0);
+	const [findIndex, setFindIndex] = useState<number | null>(null);
 	const [trustOpen, setTrustOpen] = useState(false);
 	// Projects whose trust prompt the user postponed in this session; the topbar shield keeps a dot.
 	const [trustLater, setTrustLater] = useState<Record<string, true>>({});
@@ -216,6 +207,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [groupEdit, setGroupEdit] = useState<{ id: string; value: string } | null>(null);
 	const [archivedOpen, setArchivedOpen] = useState(false);
 	const [convMenu, setConvMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+	const conversationMenuRef = useRef<HTMLDivElement>(null);
 	const [queueActionId, setQueueActionId] = useState<string>();
 	const queueAction = useRef<string | undefined>(undefined);
 	const [showJump, setShowJump] = useState(false);
@@ -225,9 +217,26 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [usageOpen, setUsageOpen] = useState(false);
 	const [moreMenuOpen, setMoreMenuOpen] = useState(false);
 	const moreMenuRef = useRef<HTMLDivElement>(null);
+	const moreMenuTrigger = useRef<HTMLButtonElement>(null);
 	const scroll = useRef<HTMLDivElement>(null);
 	const stickToEnd = useRef(true);
+	const returningToLatest = useRef<HTMLDivElement | null>(null);
 	const savedScroll = useRef(new Map<string, { top: number; stick: boolean }>());
+	const bindScroll = useCallback((element: HTMLDivElement | null) => {
+		scroll.current = element;
+		if (!element) return;
+		const observer = new ResizeObserver(() => {
+			if (element.dataset.empty !== "true" && stickToEnd.current && !returningToLatest.current) {
+				element.scrollTop = element.scrollHeight;
+			}
+		});
+		observer.observe(element);
+		return () => {
+			observer.disconnect();
+			scroll.current = null;
+			if (returningToLatest.current === element) returningToLatest.current = null;
+		};
+	}, []);
 	useEffect(() => {
 		let mounted = true;
 		void api.sandboxStatus().then((status) => {
@@ -242,22 +251,17 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		const onMouseDown = (event: MouseEvent) => {
 			if (moreMenuRef.current && !moreMenuRef.current.contains(event.target as Node)) setMoreMenuOpen(false);
 		};
-		const onKeyDown = (event: KeyboardEvent) => {
-			if (event.key === "Escape") setMoreMenuOpen(false);
-		};
 		window.addEventListener("mousedown", onMouseDown);
-		window.addEventListener("keydown", onKeyDown);
-		return () => {
-			window.removeEventListener("mousedown", onMouseDown);
-			window.removeEventListener("keydown", onKeyDown);
-		};
+		return () => window.removeEventListener("mousedown", onMouseDown);
 	}, [moreMenuOpen]);
 	useLayoutEffect(() => {
 		const id = snapshot?.active?.id;
 		const position = id ? savedScroll.current.get(id) : undefined;
+		returningToLatest.current = null;
 		stickToEnd.current = position?.stick ?? true;
-		if (position && scroll.current) scroll.current.scrollTop = position.top;
+		scroll.current?.scrollTo({ top: position?.top ?? 0, behavior: "instant" });
 		setShowJump(Boolean(position && !position.stick));
+		setFindIndex(null);
 		setDeferredApproval(undefined);
 		setFocusedSubagentTaskId(null);
 		setPlanEditorOpen(false);
@@ -281,9 +285,21 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	useEffect(() => {
 		setTrustOpen(false);
 	}, [snapshot?.active?.project]);
-	const focusFirstMenuItem = useCallback((node: HTMLDivElement | null) => {
-		node?.querySelector<HTMLElement>('[role="menuitem"]:not([disabled])')?.focus();
-	}, []);
+	useLayoutEffect(() => {
+		const menu = conversationMenuRef.current;
+		if (!convMenu || !menu) return;
+		const position = () => {
+			const margin = 8;
+			const { offsetWidth, offsetHeight } = menu;
+			const top = convMenu.y + offsetHeight + margin > window.innerHeight ? convMenu.y - offsetHeight : convMenu.y;
+			menu.style.left = `${Math.max(margin, Math.min(convMenu.x, window.innerWidth - offsetWidth - margin))}px`;
+			menu.style.top = `${Math.max(margin, Math.min(top, window.innerHeight - offsetHeight - margin))}px`;
+		};
+		position();
+		(menu.querySelector<HTMLElement>('[role="menuitem"]:not([disabled])') ?? menu).focus({ preventScroll: true });
+		window.addEventListener("resize", position);
+		return () => window.removeEventListener("resize", position);
+	}, [convMenu]);
 	const actOnQueue = async (action: "withdraw" | "send") => {
 		const id = snapshot?.active?.id;
 		if (!id || queueAction.current) return;
@@ -306,9 +322,14 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		}
 	};
 
+	useLayoutEffect(() => {
+		if (hasTranscript) return;
+		scroll.current?.scrollTo({ top: 0, behavior: "instant" });
+		setShowJump(false);
+	}, [hasTranscript]);
 	useEffect(() => {
-		if (stickToEnd.current) scroll.current?.scrollTo({ top: scroll.current.scrollHeight });
-	}, [history, running]);
+		if (hasTranscript && stickToEnd.current) scroll.current?.scrollTo({ top: scroll.current.scrollHeight });
+	}, [hasTranscript, history, running]);
 	// User-initiated judgement of the current wish. Verdicts live outside the Pi session.
 	const [grail, setGrail] = useState<GrailState | null>(null);
 	const [grailReportId, setGrailReportId] = useState<string | null>(null);
@@ -1082,7 +1103,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			}
 			if (lower === "f" && snapshot?.active) {
 				event.preventDefault();
-				setFindOpen((open) => !open);
+				if (findOpen) closeFind();
+				else setFindOpen(true);
 			}
 			if (lower === "n" && snapshot?.active && !changing) {
 				event.preventDefault();
@@ -1276,16 +1298,54 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		setCheckpointsOpen(true);
 	};
 
-	const jumpFindMatch = (nextIdx: number) => {
+	const cancelReturnToLatest = (element: HTMLDivElement) => {
+		if (returningToLatest.current !== element) return;
+		returningToLatest.current = null;
+		element.scrollTo({ top: element.scrollTop, behavior: "instant" });
+		const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+		stickToEnd.current = distance < 80;
+		setShowJump(distance > 240);
+	};
+	const finishReturnToLatest = (element: HTMLDivElement) => {
+		returningToLatest.current = null;
+		stickToEnd.current = true;
+		element.scrollTo({ top: element.scrollHeight, behavior: "instant" });
+		setShowJump(false);
+	};
+	const jumpToLatest = () => {
+		const element = scroll.current;
+		if (!element || returningToLatest.current === element) return;
+		if (prefersReducedMotion()) {
+			finishReturnToLatest(element);
+			return;
+		}
+		if (element.scrollHeight - element.scrollTop <= element.clientHeight + 1) {
+			finishReturnToLatest(element);
+			return;
+		}
+		stickToEnd.current = false;
+		returningToLatest.current = element;
+		element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+	};
+	const jumpFindMatch = (direction: -1 | 1) => {
 		const container = scroll.current;
 		const term = findQuery.trim().toLowerCase();
 		if (!container || !term) return;
-		const nodes = Array.from(container.querySelectorAll(".cl-msg")) as HTMLElement[];
+		const nodes = Array.from(container.querySelectorAll<HTMLElement>(".cl-msg"));
 		const hits = nodes.filter((el) => (el.textContent ?? "").toLowerCase().includes(term));
 		if (!hits.length) return;
-		const clamped = ((nextIdx % hits.length) + hits.length) % hits.length;
-		setFindIndex(clamped);
-		hits[clamped].scrollIntoView({ behavior: "smooth", block: "center" });
+		const next = findIndex === null
+			? (direction === 1 ? 0 : hits.length - 1)
+			: ((findIndex + direction) % hits.length + hits.length) % hits.length;
+		cancelReturnToLatest(container);
+		stickToEnd.current = false;
+		setFindIndex(next);
+		hits[next].scrollIntoView({ behavior: prefersReducedMotion() ? "instant" : "smooth", block: "center" });
+	};
+	const closeFind = () => {
+		setFindOpen(false);
+		setFindIndex(null);
+		composerInputRef.current?.focus({ preventScroll: true });
 	};
 	const paletteActions: PaletteAction[] = [
 		{ id: "new", label: "新建会话", shortcut: "⌘N", keywords: "new session clear", disabled: changing || !snapshot.active, run: () => startNewConversation() },
@@ -1377,11 +1437,16 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const inspectorOpen = Boolean(pane || previewUrl);
 	const reviewing = pane === "changes";
 	const fullReview = reviewing && (focusReview || viewportWidth <= 860);
-	const compactInspector = inspectorOpen && !fullReview && viewportWidth <= (reviewing ? 1179 : 1000);
+	const minInspectorWidth = 320;
+	const minConversationWidth = 430;
+	const preferredSidebarWidth = viewportWidth <= 1000 ? 204 : viewportWidth <= 1180 ? 224 : 256;
+	const preferredInspectorWidth = reviewing ? 500 : minInspectorWidth;
+	const compactInspector = inspectorOpen && !fullReview &&
+		viewportWidth < preferredInspectorWidth + minConversationWidth + preferredSidebarWidth;
 	const sidebarVisible = sidebar && !compactInspector && !fullReview;
-	const sidebarWidth = sidebarVisible ? (viewportWidth <= 1180 ? 224 : 256) : 0;
-	const maxInspectorWidth = Math.max(320, Math.min(1000, viewportWidth - sidebarWidth - 430));
-	const clampInspector = (width: number) => Math.round(Math.min(maxInspectorWidth, Math.max(320, width)));
+	const sidebarWidth = sidebarVisible ? preferredSidebarWidth : 0;
+	const maxInspectorWidth = Math.max(minInspectorWidth, Math.min(1000, viewportWidth - sidebarWidth - minConversationWidth));
+	const clampInspector = (width: number) => Math.round(Math.min(maxInspectorWidth, Math.max(minInspectorWidth, width)));
 	const dockedWidth = clampInspector(reviewing ? reviewWidth : inspectorWidth);
 	const changeInspectorWidth = reviewing ? setReviewWidth : setInspectorWidth;
 	const inspectorWidthKey = reviewing ? "pi.reviewInspectorWidth" : "pi.inspectorWidth";
@@ -1397,7 +1462,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					role="separator"
 					aria-orientation="vertical"
 					aria-label="调整右侧面板宽度"
-					aria-valuemin={320}
+					aria-valuemin={minInspectorWidth}
 					aria-valuemax={maxInspectorWidth}
 					aria-valuenow={dockedWidth}
 					tabIndex={0}
@@ -1438,8 +1503,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					title="拖动调整宽度，双击恢复默认"
 				/>
 			)}
-			{sidebarVisible && (
-				<SidebarAside>
+			<Presence show={sidebarVisible} className="cc-sidebar-track">
+				<aside className="cl-side" aria-label="项目与会话">
 					<div className="cl-side-head">
 						<span className="cl-side-brand">
 							{isGrail ? <HolyGrailIcon width={18} height={18} /> : <PiMark />}
@@ -1694,8 +1759,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							<span>设置</span>
 						</button>
 					</div>
-				</SidebarAside>
-			)}
+				</aside>
+			</Presence>
 			<main className="cl-main">
 				{flash && (
 					<div className="cc-flash" role="status" aria-live="polite">
@@ -1840,9 +1905,26 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								</>
 							)}
 						</button>
-						<div className="cc-more-wrap" ref={moreMenuRef} onKeyDown={menuKeyNav}>
+						<div
+							className="cc-more-wrap"
+							ref={moreMenuRef}
+							onBlur={(event) => {
+								if (moreMenuOpen && !event.currentTarget.contains(event.relatedTarget)) setMoreMenuOpen(false);
+							}}
+							onKeyDown={(event) => {
+								if (event.key === "Escape" && moreMenuOpen) {
+									event.preventDefault();
+									event.stopPropagation();
+									moreMenuTrigger.current?.focus();
+									setMoreMenuOpen(false);
+									return;
+								}
+								menuKeyNav(event);
+							}}
+						>
 							<button
 								type="button"
+								ref={moreMenuTrigger}
 								className={`cc-top-btn cc-more-btn ${moreMenuOpen ? "active" : ""}`}
 								aria-label="更多工具"
 								aria-haspopup="menu"
@@ -2117,27 +2199,44 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											value={findQuery}
 											onChange={(e) => {
 												setFindQuery(e.target.value);
-												setFindIndex(0);
+												setFindIndex(null);
 											}}
 											onKeyDown={(e) => {
 												if (e.key === "Enter") {
 													e.preventDefault();
-													jumpFindMatch(findIndex + (e.shiftKey ? -1 : 1));
+													jumpFindMatch(e.shiftKey ? -1 : 1);
 												} else if (e.key === "Escape") {
-													setFindOpen(false);
+													e.preventDefault();
+													e.stopPropagation();
+													closeFind();
 												}
 											}}
 										/>
-										<button type="button" className="cc-mini-btn" onClick={() => jumpFindMatch(findIndex - 1)}>上一个</button>
-										<button type="button" className="cc-mini-btn" onClick={() => jumpFindMatch(findIndex + 1)}>下一个</button>
-										<button type="button" className="cc-mini-btn" aria-label="关闭会话查找" onClick={() => setFindOpen(false)}>关闭</button>
+										<button type="button" className="cc-mini-btn" onClick={() => jumpFindMatch(-1)}>上一个</button>
+										<button type="button" className="cc-mini-btn" onClick={() => jumpFindMatch(1)}>下一个</button>
+										<button type="button" className="cc-mini-btn" aria-label="关闭会话查找" onClick={closeFind}>关闭</button>
 									</div>
 								)}
 								<div
 									className="cl-scroll"
-									ref={scroll}
+									data-empty={!hasTranscript}
+									ref={bindScroll}
+									onWheelCapture={(event) => cancelReturnToLatest(event.currentTarget)}
+									onTouchStartCapture={(event) => cancelReturnToLatest(event.currentTarget)}
+									onPointerDown={(event) => {
+										if (event.target === event.currentTarget) cancelReturnToLatest(event.currentTarget);
+									}}
+									onKeyDownCapture={(event) => {
+										if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(event.key)) {
+											cancelReturnToLatest(event.currentTarget);
+										}
+									}}
+									onScrollEnd={(event) => {
+										if (returningToLatest.current === event.currentTarget) finishReturnToLatest(event.currentTarget);
+									}}
 									onScroll={(event) => {
 										const element = event.currentTarget;
+										if (!hasTranscript || returningToLatest.current === element) return;
 										stickToEnd.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
 										const far = element.scrollHeight - element.scrollTop - element.clientHeight > 240;
 										if (far !== showJump) setShowJump(far);
@@ -2367,11 +2466,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										<button
 											type="button"
 											className="cc-jump-latest"
-											onClick={() => {
-												stickToEnd.current = true;
-												setShowJump(false);
-												scroll.current?.scrollTo({ top: scroll.current.scrollHeight, behavior: "smooth" });
-											}}
+											onClick={jumpToLatest}
 										>
 											<ArrowDown size={14} aria-hidden="true" />
 											{running ? "有新输出 · 跳到最新" : "跳到最新"}
@@ -2691,7 +2786,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							</>
 						)}
 					</div>
-					{terminalOpen && (
+					<Presence show={terminalOpen} className="cc-terminal-track">
 						<TerminalPanel
 							key={snapshot.active?.id}
 							focusId={focusedTerminal?.conversationId === snapshot.active?.id ? focusedTerminal?.terminalId : undefined}
@@ -2708,57 +2803,58 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							onClose={() => { setRerun(undefined); setTerminalOpen(false); }}
 							fail={app.fail}
 						/>
-					)}
+					</Presence>
 				</div>
 			</main>
-			{pane && (
-				<WorkspacePanel
-					key={snapshot.active?.id}
-					pane={pane}
-					conversationId={snapshot.active?.id}
-					checkpointId={lastCheckpoint?.id}
-					focusReview={focusReview}
-					onToggleReviewFocus={toggleReviewFocus}
-					onOpenCheckpoint={openCheckpoint}
-					onSendReview={async (message) => {
-						const id = snapshot.active?.id;
-						if (!id) throw new Error("请先打开会话。");
-						await api.command({ type: "prompt", message, ...(running ? { streamingBehavior: "followUp" as const } : {}) }, id);
-						await app.refresh();
-					}}
-					setPane={setPane}
-					close={() => setPane(null)}
-					revision={app.revision}
-					project={snapshot.active?.project}
-					readOnly={activePermMode === "read" || activePermMode === "plan"}
-					onOpenInEditor={openInEditor}
-					onReferenceFile={(filePath) => {
-						const ref = formatFileReference(filePath);
-						const already = fileReferences(app.draft).some((reference) => reference.path === filePath);
-						if (!already) {
-							const prefix = app.draft && !app.draft.endsWith(" ") && !app.draft.endsWith("\n") ? `${app.draft} ` : app.draft;
-							app.setDraft(`${prefix}${ref} `);
-						}
-						requestAnimationFrame(() => {
-							const input = composerInputRef.current;
-							if (!input) return;
-							input.focus();
-							input.setSelectionRange(input.value.length, input.value.length);
-						});
-					}}
-					onWorkspaceMutated={() => void app.refresh()}
-					onNotice={(msg) => app.setNotice(msg)}
-				/>
-			)}
-			{!pane && previewUrl && (
-				<PreviewPanel
-					key={snapshot.active?.id}
-					url={previewUrl}
-					onNavigate={setPreviewUrl}
-					onReport={(report) => app.setDraft([app.draft, report].filter(Boolean).join("\n\n"))}
-					close={() => setPreviewUrl(null)}
-				/>
-			)}
+			<Presence show={inspectorOpen} className="cc-inspector-track">
+				{pane ? (
+					<WorkspacePanel
+						key={snapshot.active?.id}
+						pane={pane}
+						conversationId={snapshot.active?.id}
+						checkpointId={lastCheckpoint?.id}
+						focusReview={focusReview}
+						onToggleReviewFocus={toggleReviewFocus}
+						onOpenCheckpoint={openCheckpoint}
+						onSendReview={async (message) => {
+							const id = snapshot.active?.id;
+							if (!id) throw new Error("请先打开会话。");
+							await api.command({ type: "prompt", message, ...(running ? { streamingBehavior: "followUp" as const } : {}) }, id);
+							await app.refresh();
+						}}
+						setPane={setPane}
+						close={() => setPane(null)}
+						revision={app.revision}
+						project={snapshot.active?.project}
+						readOnly={activePermMode === "read" || activePermMode === "plan"}
+						onOpenInEditor={openInEditor}
+						onReferenceFile={(filePath) => {
+							const ref = formatFileReference(filePath);
+							const already = fileReferences(app.draft).some((reference) => reference.path === filePath);
+							if (!already) {
+								const prefix = app.draft && !app.draft.endsWith(" ") && !app.draft.endsWith("\n") ? `${app.draft} ` : app.draft;
+								app.setDraft(`${prefix}${ref} `);
+							}
+							requestAnimationFrame(() => {
+								const input = composerInputRef.current;
+								if (!input) return;
+								input.focus();
+								input.setSelectionRange(input.value.length, input.value.length);
+							});
+						}}
+						onWorkspaceMutated={() => void app.refresh()}
+						onNotice={(msg) => app.setNotice(msg)}
+					/>
+				) : previewUrl ? (
+					<PreviewPanel
+						key={snapshot.active?.id}
+						url={previewUrl}
+						onNavigate={setPreviewUrl}
+						onReport={(report) => app.setDraft([app.draft, report].filter(Boolean).join("\n\n"))}
+						close={() => setPreviewUrl(null)}
+					/>
+				) : null}
+			</Presence>
 			{trustOpen && snapshot.trust && (
 				<ProjectTrustDialog
 					trust={snapshot.trust}
@@ -2895,16 +2991,17 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							className="cc-conv-menu"
 							role="menu"
 							aria-label={`会话「${target.title}」操作`}
-							style={{ left: Math.min(convMenu.x, window.innerWidth - 188), top: Math.min(convMenu.y, window.innerHeight - 96) }}
+							tabIndex={-1}
 							onKeyDown={(event) => {
 								if (event.key === "Escape") {
 									event.preventDefault();
+									event.stopPropagation();
 									closeMenu();
 									return;
 								}
 								menuKeyNav(event);
 							}}
-							ref={focusFirstMenuItem}
+							ref={conversationMenuRef}
 						>
 							<button
 								type="button"

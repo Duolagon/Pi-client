@@ -125,6 +125,18 @@ try {
 		await page.getByRole("button", { name: "更多工具", exact: true }).click();
 		await page.getByRole("menuitem", { name, exact: true }).click();
 	};
+	const selectListbox = async (control) => {
+		await control.click();
+		const id = await control.getAttribute("aria-controls");
+		assert.ok(id, "Combobox exposes its active listbox");
+		return page.getByRole("listbox").and(page.locator(`[id=${JSON.stringify(id)}]`));
+	};
+	const selectValue = async (control, value) => {
+		const list = await selectListbox(control);
+		await list.getByRole("option").and(page.locator(`[value=${JSON.stringify(value)}]`)).click();
+		await list.waitFor({ state: "hidden" });
+	};
+	const selectControl = (name) => page.getByRole("combobox", { name, exact: true });
 	const assertChatEdges = async (card) => {
 		const boxes = await Promise.all([".cl-transcript", ".cl-composer-box", card].map((selector) => page.locator(selector).boundingBox()));
 		assert.ok(boxes.every(Boolean), `Visible transcript, composer and ${card}`);
@@ -136,23 +148,43 @@ try {
 	};
 	await ready();
 	assert.ok((await snapshot()).models.length >= 2);
-	await page.getByRole("combobox", { name: "选择模型", exact: true }).selectOption({ label: "本地演示模型 · 备用" });
+	const modelControl = selectControl("选择模型");
+	assert.equal(await modelControl.count(), 1);
+	await modelControl.focus();
+	await modelControl.press("Enter");
+	const modelOptions = page.getByRole("listbox", { name: "选择模型 选项", exact: true });
+	await modelOptions.waitFor();
+	await modelControl.press("ArrowDown");
+	const alternateModel = modelOptions.getByRole("option", { name: "本地演示模型 · 备用", exact: true });
+	assert.equal(await modelControl.getAttribute("aria-activedescendant"), await alternateModel.getAttribute("id"));
+	await modelControl.press("Escape");
+	await modelOptions.waitFor({ state: "hidden" });
+	assert.equal((await snapshot()).state?.model?.id, "desktop-demo-1");
+	assert.equal(await modelControl.evaluate((node) => node === document.activeElement), true);
+	await modelControl.press("Enter");
+	await modelOptions.waitFor();
+	await modelControl.press("Tab");
+	await modelOptions.waitFor({ state: "hidden" });
+	assert.equal(await selectControl("思考强度").evaluate((node) => node === document.activeElement), true);
+	await modelControl.press("Enter");
+	await modelControl.press("ArrowDown");
+	await modelControl.press("Enter");
 	await until(
 		async () =>
 			(await snapshot()).state?.model?.id === "desktop-demo-2" &&
-			(await page.getByRole("combobox", { name: "选择模型", exact: true }).inputValue()).endsWith("desktop-demo-2"),
+			(await modelControl.textContent()).trim() === "本地演示模型 · 备用",
 		"the selected alternate model",
 	);
-	await page.getByRole("combobox", { name: "选择模型", exact: true }).selectOption({ label: "本地演示模型" });
+	await (await selectListbox(modelControl)).getByRole("option", { name: "本地演示模型", exact: true }).click();
 	await until(
 		async () =>
 			(await snapshot()).state?.model?.id === "desktop-demo-1" &&
-			(await page.getByRole("combobox", { name: "选择模型", exact: true }).inputValue()).endsWith("desktop-demo-1"),
+			(await modelControl.textContent()).trim() === "本地演示模型",
 		"the selected demo model",
 	);
-	await page.getByRole("combobox", { name: "思考强度", exact: true }).selectOption("low");
+	await selectValue(selectControl("思考强度"), "low");
 	await until(async () => (await snapshot()).state?.thinkingLevel === "low", "the selected thinking level");
-	checks.push("model and thinking controls");
+	checks.push("keyboard and pointer combobox selection, Escape cancellation, and Tab focus");
 
 	const input = page.getByRole("textbox", { name: "输入任务", exact: true });
 	await input.fill("需要检查的草稿\n".repeat(30));
@@ -344,7 +376,7 @@ try {
 		await page.screenshot({ path: join(screenshots, "client-light.png"), scale: "css" });
 		await page.getByRole("button", { name: "设置", exact: true }).click();
 		await page.getByText("权限与外观", { exact: true }).click();
-		await page.getByRole("combobox", { name: /^外观/ }).selectOption("dark");
+		await selectValue(selectControl("外观"), "dark");
 		await page.getByRole("button", { name: "保存设置", exact: true }).click();
 		await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
 		await page.getByRole("button", { name: "代码修改", exact: true }).click();
@@ -377,15 +409,19 @@ try {
 	await page.getByRole("button", { name: "关闭终端", exact: true }).click();
 	checks.push("legacy shell command panel");
 	await page.getByRole("button", { name: "设置", exact: true }).click();
-	const providerSelection = page.getByRole("combobox", { name: "模型服务商", exact: true });
-	await providerSelection.selectOption("deepseek");
-	assert.ok((await page.getByRole("combobox", { name: "默认模型", exact: true }).locator("option").count()) >= 2);
+	const providerSelection = selectControl("模型服务商");
+	await selectValue(providerSelection, "deepseek");
+	const defaultModelControl = selectControl("默认模型");
+	const defaultModelOptions = await selectListbox(defaultModelControl);
+	assert.ok((await defaultModelOptions.getByRole("option").count()) >= 2);
+	await defaultModelControl.press("Escape");
+	await defaultModelOptions.waitFor({ state: "hidden" });
 	const providerKey = page.getByLabel("API Key", { exact: true });
 	assert.equal(await providerKey.inputValue(), "");
 	await providerKey.fill("demo-provider-draft");
-	await providerSelection.selectOption("openai");
+	await selectValue(providerSelection, "openai");
 	assert.equal(await providerKey.inputValue(), "");
-	await providerSelection.selectOption("deepseek");
+	await selectValue(providerSelection, "deepseek");
 	assert.equal(await providerKey.inputValue(), "demo-provider-draft");
 	await providerKey.fill("");
 	await page.getByText("Agent 与自动化", { exact: true }).click();
@@ -513,7 +549,7 @@ try {
 	assert.equal(await input.evaluate((node) => node === document.activeElement), true);
 	const submitExternalAnswers = externalQuestion.getByRole("button", { name: "提交回答", exact: true });
 	assert.equal(await submitExternalAnswers.isDisabled(), true);
-	await externalQuestion.getByRole("combobox", { name: "q0", exact: true }).selectOption("blue");
+	await selectValue(externalQuestion.getByRole("combobox", { name: "q0", exact: true }), "blue");
 	await externalQuestion.getByRole("checkbox", { name: "test", exact: true }).check();
 	await submitExternalAnswers.click();
 	await externalQuestion.waitFor({ state: "hidden" });
@@ -659,9 +695,10 @@ try {
 	await page.locator(".search-results button").filter({ hasText: "/memory" }).waitFor();
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
-	await page.getByRole("combobox", { name: "权限模式", exact: true }).selectOption("plan");
+	const permissionControl = selectControl("权限模式");
+	await selectValue(permissionControl, "plan");
 	await until(
-		async () => (await page.getByRole("combobox", { name: "权限模式", exact: true }).inputValue()) === "plan",
+		async () => permissionOf(await snapshot()) === "plan",
 		"Plan mode switch",
 	);
 	const planFile = (await page.evaluate(() => window.pi.readPlan())).relativePath;
@@ -715,11 +752,11 @@ try {
 	await page.getByRole("textbox", { name: "Hook 命令", exact: true }).fill("echo HOOK_UI_OK");
 	await page.getByRole("button", { name: "添加 Hook", exact: true }).click();
 	await page.getByText("echo HOOK_UI_OK", { exact: true }).waitFor();
-	await page.getByRole("combobox", { name: "Hook 类型", exact: true }).selectOption("http");
+	await selectValue(selectControl("Hook 类型"), "http");
 	await page.getByRole("textbox", { name: "Hook URL", exact: true }).fill(new URL("/hook-test", previewUrl).href);
 	await page.getByRole("button", { name: "添加 Hook", exact: true }).click();
 	await page.getByText(new URL("/hook-test", previewUrl).href, { exact: true }).waitFor();
-	await page.getByRole("combobox", { name: "Hook 类型", exact: true }).selectOption("command");
+	await selectValue(selectControl("Hook 类型"), "command");
 	await page.getByRole("button", { name: "测试触发", exact: true }).click();
 	await page.getByText(/执行 .* 个 Hook/).waitFor();
 	await page.getByRole("tab", { name: /^Skills/ }).click();
@@ -748,22 +785,85 @@ try {
 	await page.locator('[aria-label="上下文分段占用条"]').waitFor();
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
+	const keyboardMenu = page.getByRole("button", { name: "更多工具", exact: true });
+	await keyboardMenu.click();
+	await keyboardMenu.press("ArrowDown");
+	await page.waitForFunction(() => document.activeElement?.getAttribute("role") === "menuitem");
+	await page.keyboard.press("Escape");
+	await page.getByRole("menu", { name: "更多工具菜单" }).waitFor({ state: "hidden" });
+	assert.equal(await keyboardMenu.evaluate((element) => document.activeElement === element), true);
+
 	await openMore("命令面板");
 	await page.getByRole("dialog", { name: "命令面板 (⌘P)", exact: true }).waitFor();
 	await page.locator(".search-results button").filter({ hasText: "会话内关键词搜索" }).click();
 	await page.getByRole("search", { name: "会话内查找", exact: true }).waitFor();
-	await page.getByRole("textbox", { name: "查找会话内容", exact: true }).fill("问候函数");
-	await page.getByRole("button", { name: "关闭会话查找", exact: true }).click();
+	await page.emulateMedia({ reducedMotion: "reduce" });
+	const find = page.getByRole("textbox", { name: "查找会话内容", exact: true });
+	const matchTrace = await page.evaluateHandle(() => {
+		const matches = [...document.querySelectorAll(".cl-scroll .cl-msg")].filter((node) => node.textContent.includes("问候函数"));
+		const previous = Element.prototype.scrollIntoView;
+		const calls = [];
+		Element.prototype.scrollIntoView = function (options) {
+			const index = matches.indexOf(this);
+			if (index >= 0) calls.push({ index, behavior: options?.behavior });
+			previous.call(this, options);
+		};
+		return { count: matches.length, calls, restore: () => { Element.prototype.scrollIntoView = previous; } };
+	});
+	assert.ok(await matchTrace.evaluate((trace) => trace.count) >= 2);
+	await find.fill("问候函数");
+	await find.press("Enter");
+	await find.press("Enter");
+	await find.press("Shift+Enter");
+	assert.deepEqual(await matchTrace.evaluate((trace) => trace.calls), [
+		{ index: 0, behavior: "instant" },
+		{ index: 1, behavior: "instant" },
+		{ index: 0, behavior: "instant" },
+	]);
+	await matchTrace.evaluate((trace) => trace.restore());
+	await matchTrace.dispose();
+	await find.press("Escape");
+	assert.equal(await input.evaluate((element) => document.activeElement === element), true);
 	checks.push("Hooks UI, Skills manager, rules hierarchy, /context breakdown and transcript search");
 
-	await page.getByRole("combobox", { name: "权限模式", exact: true }).selectOption("acceptEdits");
+	const transcriptScroll = page.locator(".cl-scroll");
+	const jumpLatest = page.locator(".cc-jump-latest");
+	for (const reducedMotion of ["reduce", "no-preference"]) {
+		await page.emulateMedia({ reducedMotion });
+		await transcriptScroll.evaluate((element) => { element.scrollTop = 0; });
+		await jumpLatest.waitFor();
+		const updates = await transcriptScroll.evaluateHandle((element) => {
+			const changes = [];
+			const observer = new MutationObserver((records) => {
+				for (const record of records) {
+					for (const [action, nodes] of [["add", record.addedNodes], ["remove", record.removedNodes]]) {
+						for (const node of nodes) if (node instanceof HTMLElement && node.matches(".cc-jump-latest")) changes.push(action);
+					}
+				}
+			});
+			observer.observe(element, { childList: true });
+			return { changes, stop: () => observer.disconnect() };
+		});
+		await jumpLatest.click();
+		await jumpLatest.waitFor({ state: "detached" });
+		await page.waitForFunction(() => {
+			const element = document.querySelector(".cl-scroll");
+			return element.scrollHeight - element.clientHeight - element.scrollTop < 2;
+		});
+		assert.deepEqual(await updates.evaluate((watch) => watch.changes), ["remove"]);
+		await updates.evaluate((watch) => watch.stop());
+		await updates.dispose();
+	}
+	checks.push("jump to latest reaches the bottom without flashing in either motion mode");
+
+	await selectValue(permissionControl, "acceptEdits");
 	await until(
-		async () => (await page.getByRole("combobox", { name: "权限模式", exact: true }).inputValue()) === "acceptEdits",
+		async () => permissionOf(await snapshot()) === "acceptEdits",
 		"acceptEdits permission mode",
 	);
-	await page.getByRole("combobox", { name: "权限模式", exact: true }).selectOption("ask");
+	await selectValue(permissionControl, "ask");
 	await until(
-		async () => (await page.getByRole("combobox", { name: "权限模式", exact: true }).inputValue()) === "ask",
+		async () => permissionOf(await snapshot()) === "ask",
 		"restore ask mode",
 	);
 
@@ -775,7 +875,7 @@ try {
 	await page.getByRole("textbox", { name: "描述（模型据此决定何时委派）", exact: true }).fill("E2E reviewer");
 	await page.getByRole("textbox", { name: "禁用工具 disallowedTools", exact: true }).fill("Write, Edit, Bash");
 	await page.getByRole("textbox", { name: "系统提示词", exact: true }).fill("Review only. Do not edit files.");
-	await page.getByRole("combobox", { name: "保存位置", exact: true }).selectOption("user");
+	await selectValue(selectControl("保存位置"), "user");
 	await page.getByText("Claude Code 高级兼容配置（Skills / Memory / 轮次 / 隔离）", { exact: true }).click();
 	await page.getByRole("textbox", { name: "MCP 服务器名称 mcpServers（逗号分隔）", exact: true }).fill("github");
 	await page.getByRole("textbox", { name: "主题色 color（名称或 #RRGGBB）", exact: true }).fill("#3b82f6");
@@ -794,8 +894,8 @@ try {
 	await page.getByRole("dialog", { name: "MCP 服务器", exact: true }).waitFor();
 	await page.getByRole("button", { name: "新建", exact: true }).click();
 	await page.getByRole("textbox", { name: "名称", exact: true }).fill("e2e-mcp");
-	await page.getByRole("combobox", { name: "作用域", exact: true }).selectOption("user");
-	await page.getByRole("combobox", { name: "传输方式", exact: true }).selectOption("http");
+	await selectValue(selectControl("作用域"), "user");
+	await selectValue(selectControl("传输方式"), "http");
 	await page.getByRole("textbox", { name: "URL", exact: true }).fill(new URL("/mcp", previewUrl).href);
 	await page.getByRole("button", { name: "保存并重载", exact: true }).click();
 	await page.getByText("e2e-mcp", { exact: true }).waitFor();
@@ -996,9 +1096,20 @@ try {
 		await newChat();
 		await startStream();
 		const text = withImage ? "带图的立即发送回归检查" : "纯文本立即发送回归检查";
-		const timing = page.getByRole("combobox", { name: "补充指令发送时机", exact: true });
-		assert.equal(await timing.inputValue(), "followUp");
-		if (withImage) await timing.selectOption("steer");
+		const timing = selectControl("补充指令发送时机");
+		assert.equal((await timing.textContent()).trim(), "本轮结束后");
+		if (withImage) {
+			await timing.press("Enter");
+			await timing.press("ArrowDown");
+			const activeId = await timing.getAttribute("aria-activedescendant");
+			const steeringOption = page.getByRole("option", { name: /下一工具步骤/ });
+			assert.equal(activeId, await steeringOption.getAttribute("id"));
+			const response = page.locator(".cl-transcript").getByText(/^流式恢复验证：/).first();
+			const length = (await response.textContent()).length;
+			await until(async () => (await response.textContent()).length > length + 5, "new streaming output");
+			assert.equal(await timing.getAttribute("aria-activedescendant"), activeId);
+			await timing.press("Space");
+		}
 		await input.fill(text);
 		if (withImage) await attachPicture();
 		await input.press("Enter");
@@ -1072,9 +1183,9 @@ try {
 	const oversized = join(project, "checkpoint-oversized.bin");
 	await writeFile(oversized, "");
 	await truncate(oversized, 65 * 1024 * 1024);
-	const permissions = page.getByRole("combobox", { name: "权限模式", exact: true });
+	const permissions = selectControl("权限模式");
 	for (const [mode, text] of [["read", "有大文件时的只读提问"], ["ask", "有大文件时的普通提问"]]) {
-		await permissions.selectOption(mode);
+		await selectValue(permissions, mode);
 		await until(async () => permissionOf(await snapshot()) === mode && !(await permissions.isDisabled()), mode);
 		await submit(text);
 		await until(async () => Boolean(queuedUserMessage((await snapshot()).messages, text)), text);
@@ -1092,7 +1203,7 @@ try {
 	await writeFile(join(project, ".venv/bin/kaggle"), '#!/bin/sh\nprintf "%s\\n" "$2" >> fake-kaggle.log\nprintf "%s\\n" QUEUED\n', { mode: 0o755 });
 	const setPermissionMode = async (mode) => {
 		const requiresConfirmation = mode === "auto" && permissionOf(await snapshot()) !== "auto";
-		await permissions.selectOption(mode);
+		await selectValue(permissions, mode);
 		if (requiresConfirmation)
 			await page.getByRole("dialog", { name: "为当前会话启用「全部放行」？" }).getByRole("button", { name: "启用全部放行" }).click();
 		await until(async () => permissionOf(await snapshot()) === mode && !(await permissions.isDisabled()), mode);
@@ -1183,6 +1294,43 @@ try {
 	await evidence.getByText("通过 · 退出码 0", { exact: true }).waitFor();
 	await idle();
 	checks.push("background verification stays pending until the same real shell exits successfully");
+
+	await newChat();
+	await setPermissionMode("auto");
+	await submit("验证运行中工具折叠和 Markdown 表格");
+	const liveTool = page.locator(".cl-tool.running > .cc-tool-row").filter({ hasText: /等待工具折叠验证|release-tool-card/ });
+	await liveTool.waitFor();
+	assert.equal(await liveTool.getAttribute("aria-expanded"), "true");
+	await liveTool.click();
+	assert.equal(await liveTool.getAttribute("aria-expanded"), "false");
+	await liveTool.click();
+	assert.equal(await liveTool.getAttribute("aria-expanded"), "true");
+	await liveTool.click();
+	await writeFile(join(project, "release-tool-card.flag"), "go\n");
+	await idle();
+	const wideTable = page.getByRole("table").filter({ hasText: "本地命令" });
+	await wideTable.waitFor();
+	assert.equal(await wideTable.getByRole("columnheader").count(), 28);
+	const tableGeometry = await wideTable.evaluate(async (table) => {
+		await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+		const scroller = table.parentElement;
+		const transcript = table.closest(".cl-scroll");
+		const previous = scroller.scrollLeft;
+		scroller.scrollLeft = 32;
+		const metrics = {
+			tableOffset: scroller.scrollLeft,
+			tableContentWidth: scroller.scrollWidth,
+			tableViewportWidth: scroller.clientWidth,
+			transcriptContentWidth: transcript.scrollWidth,
+			transcriptViewportWidth: transcript.clientWidth,
+		};
+		scroller.scrollLeft = previous;
+		return metrics;
+	});
+	assert.ok(tableGeometry.tableOffset > 0 &&
+		tableGeometry.transcriptContentWidth <= tableGeometry.transcriptViewportWidth + 1,
+		`Wide tables should scroll without spreading the conversation. ${JSON.stringify(tableGeometry)}`);
+	checks.push("running command cards collapse and wide GFM tables scroll independently");
 
 	assert.deepEqual(pageErrors, []);
 	if (capture)

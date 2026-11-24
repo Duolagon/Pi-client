@@ -5,7 +5,6 @@ import type { Change, CodeIntelligence, CodePosition, FileEntry, GitCheckpoint, 
 import { CodeLines, UnifiedDiffView, type DiffReviewAnchor } from "./DiffView.tsx";
 import { diffHunkCount } from "./diff-lines.ts";
 import { PullRequestPanel } from "./PullRequestPanel.tsx";
-import { useExitGhost } from "./Presence.tsx";
 import { SlidingTabList } from "./SegmentedTabs.tsx";
 import { formatReviewNotes, readReviewView, reviewLocation, reviewRevision, saveReviewView, type ReviewPosition, type ReviewView } from "./workspace-review-state.ts";
 import "./workspace-review.css";
@@ -90,8 +89,6 @@ export function WorkspacePanel({
 	const [discardVersion, setDiscardVersion] = useState<string>();
 	const [undo, setUndo] = useState<{ checkpoint: GitCheckpoint; path: string }>();
 	const scroller = useRef<HTMLDivElement>(null);
-	const asideRef = useRef<HTMLElement>(null);
-	useExitGhost(asideRef, "inspector", { skipOnResize: true, durationMs: 195 });
 	const noteEditor = useRef<HTMLTextAreaElement>(null);
 	const focusNoteOnMount = useRef<Element | null>(null);
 	const focusNoteEditor = () => {
@@ -427,7 +424,7 @@ export function WorkspacePanel({
 	};
 
 	return (
-		<aside ref={asideRef} className={`inspector workspace-review ${pane === "changes" ? "workspace-review-changes" : ""}`} aria-label="真实项目工作区">
+		<aside className={`inspector workspace-review ${pane === "changes" ? "workspace-review-changes" : ""}`} aria-label="真实项目工作区">
 			<header className="inspector-header workspace-review-header">
 				{pane === "changes" && (
 					<button type="button" className="cc-mini-btn workspace-review-back" onClick={close}>

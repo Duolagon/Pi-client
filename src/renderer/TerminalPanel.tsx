@@ -1,9 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type UIEvent } from "react";
 import { Package, Plus, Server, Square, Terminal as TerminalIcon, X } from "lucide-react";
 import { InteractiveTerminal } from "./InteractiveTerminal.tsx";
 import { IconButton } from "../prototype/ui.tsx";
 import { useConfirmation } from "./ConfirmationDialog.tsx";
-import { useExitGhost } from "./Presence.tsx";
 import { SlidingTabList } from "./SegmentedTabs.tsx";
 import { SelectPopover } from "./SelectPopover.tsx";
 import { SmoothCollapse } from "./SmoothCollapse.tsx";
@@ -57,10 +56,15 @@ export function TerminalPanel({
 	const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
 	const [activeId, setActiveId] = useState<string | null>(null);
 	const [ptyOutputs, setPtyOutputs] = useState<Record<string, string>>({});
-	const panelRef = useRef<HTMLElement>(null);
-	useExitGhost(panelRef, "terminal", { durationMs: 185 });
 	const shellRef = useRef<HTMLDivElement>(null);
+	const followOutput = useRef(true);
 	const commandInput = useRef<HTMLInputElement>(null);
+	const shellOutput = mode === "bash" ? bashOutput : activeId ? ptyOutputs[activeId] : undefined;
+	const terminalView = mode === "bash" ? "bash" : activeId;
+	const updateFollowOutput = (event: UIEvent<HTMLDivElement>) => {
+		const element = event.currentTarget;
+		followOutput.current = element.scrollHeight - element.clientHeight - element.scrollTop < 32;
+	};
 	useEffect(() => {
 		if (!prefill) return;
 		setMode("bash");
@@ -68,9 +72,15 @@ export function TerminalPanel({
 		requestAnimationFrame(() => commandInput.current?.focus());
 	}, [prefill]);
 
-	useEffect(() => {
-		shellRef.current?.scrollTo({ top: shellRef.current.scrollHeight });
-	}, [bashOutput, ptyOutputs, activeId, mode]);
+	useLayoutEffect(() => {
+		followOutput.current = true;
+		const element = shellRef.current;
+		if (element) element.scrollTop = element.scrollHeight;
+	}, [conversationId, terminalView]);
+	useLayoutEffect(() => {
+		const element = shellRef.current;
+		if (element && followOutput.current) element.scrollTop = element.scrollHeight;
+	}, [shellOutput]);
 
 	useEffect(() => {
 		if (!conversationId) return;
@@ -149,7 +159,7 @@ export function TerminalPanel({
 	const activePty = terminals.find((t) => t.id === activeId);
 
 	return (
-		<section ref={panelRef} className="terminal-panel" aria-label="集成终端">
+		<section className="terminal-panel" aria-label="集成终端">
 			<header className="cc-term-header">
 				<span className="cc-term-brand">
 					<TerminalIcon size={14} aria-hidden="true" />
@@ -245,7 +255,7 @@ export function TerminalPanel({
 			</SmoothCollapse>
 
 			{mode === "bash" ? (
-				<div className="terminal-output" ref={shellRef}>
+				<div className="terminal-output" ref={shellRef} onScroll={updateFollowOutput}>
 					<pre>{bashOutput || "直接输入命令在当前项目运行，输出会加入会话上下文。"}</pre>
 					<form
 						onSubmit={(event) => {
@@ -287,7 +297,7 @@ export function TerminalPanel({
 			) : activePty?.label ? (
 				<InteractiveTerminal key={activePty.id} id={activePty.id} readOnly={readOnly || activePty.status === "exited"} fail={fail} />
 			) : (
-				<div className="terminal-output" ref={shellRef}>
+				<div className="terminal-output" ref={shellRef} onScroll={updateFollowOutput}>
 					<pre>{activeId ? ptyOutputs[activeId] || "PTY 已就绪，输入命令并回车…" : "点击上方 + 创建交互式终端"}</pre>
 					{activeId && (
 						<form

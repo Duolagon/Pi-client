@@ -10,11 +10,7 @@ export interface SelectPopoverOption {
 	disabled?: boolean;
 }
 
-/**
- * Custom tactile floating popover selector that replaces raw OS `<select>` menus
- * while preserving an underlying synchronized `<select>` for accessibility tools
- * and programmatic combobox automation.
- */
+/** Select-only combobox. Focus stays on the trigger as users navigate the options. */
 export function SelectPopover({
 	ariaLabel,
 	value,
@@ -47,117 +43,105 @@ export function SelectPopover({
 	onChange: (value: string) => void;
 }) {
 	const [open, setOpen] = useState(false);
-	const [activeIndex, setActiveIndex] = useState(0);
+	const [activeValue, setActiveValue] = useState<string>();
 	const rootRef = useRef<HTMLDivElement>(null);
 	const triggerRef = useRef<HTMLButtonElement>(null);
 	const listboxId = useId();
+	const displayId = `${listboxId}-value`;
 
 	const selectedOption = options.find((opt) => opt.value === value);
 	const displayLabel = selectedOption ? (selectedOption.shortLabel ?? selectedOption.label) : placeholder;
+	const enabledOptions = options.filter((opt) => !opt.disabled);
+	const activeOption = enabledOptions.find((opt) => opt.value === activeValue)
+		?? enabledOptions.find((opt) => opt.value === value)
+		?? enabledOptions[0];
+	const activeIndex = activeOption ? options.indexOf(activeOption) : -1;
+	const activeId = activeIndex >= 0 ? `${listboxId}-${activeIndex}` : undefined;
+	const unavailable = disabled || !enabledOptions.length;
 
 	useEffect(() => {
-		if (disabled && open) setOpen(false);
-	}, [disabled, open]);
+		if (unavailable && open) setOpen(false);
+	}, [unavailable, open]);
+
+	useEffect(() => {
+		if (open && activeId) document.getElementById(activeId)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+	}, [open, activeId]);
 
 	useEffect(() => {
 		if (!open) return;
-		const currentIdx = Math.max(
-			0,
-			options.findIndex((opt) => opt.value === value && !opt.disabled),
-		);
-		setActiveIndex(currentIdx);
-
-		const onPointerDown = (event: MouseEvent) => {
+		const onPointerDown = (event: PointerEvent) => {
 			if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
 				setOpen(false);
 			}
 		};
-		const onKeyDown = (event: KeyboardEvent) => {
-			if (event.key === "Escape") {
-				event.preventDefault();
-				event.stopPropagation();
-				setOpen(false);
-				triggerRef.current?.focus();
-			}
-		};
-		window.addEventListener("mousedown", onPointerDown);
-		window.addEventListener("keydown", onKeyDown, true);
-		return () => {
-			window.removeEventListener("mousedown", onPointerDown);
-			window.removeEventListener("keydown", onKeyDown, true);
-		};
-	}, [open, options, value]);
+		window.addEventListener("pointerdown", onPointerDown);
+		return () => window.removeEventListener("pointerdown", onPointerDown);
+	}, [open]);
 
-	const enabledIndices = options
-		.map((opt, idx) => (opt.disabled ? -1 : idx))
-		.filter((idx) => idx >= 0);
+	const reveal = () => {
+		setActiveValue(undefined);
+		setOpen(true);
+	};
 
 	const choose = (nextValue: string) => {
+		triggerRef.current?.focus({ preventScroll: true });
 		setOpen(false);
 		if (nextValue !== value) onChange(nextValue);
-		requestAnimationFrame(() => triggerRef.current?.focus());
 	};
 
 	return (
-		<div ref={rootRef} className={`cc-select-popover ${field ? "is-field" : ""} ${open ? "is-open" : ""} ${className}`.trim()}>
-			<select
-				aria-label={ariaLabel}
-				value={value}
-				disabled={disabled}
-				tabIndex={-1}
-				className="cc-select-native-proxy"
-				onChange={(event) => onChange(event.target.value)}
-			>
-				{!selectedOption && (
-					<option value="" disabled>
-						{placeholder}
-					</option>
-				)}
-				{options.map((opt) => (
-					<option key={opt.value} value={opt.value} disabled={opt.disabled}>
-						{opt.label}
-					</option>
-				))}
-			</select>
-
+		<div
+			ref={rootRef}
+			className={`cc-select-popover ${field ? "is-field" : ""} ${open ? "is-open" : ""} ${className}`.trim()}
+			onBlur={(event) => {
+				if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false);
+			}}
+		>
 			<button
 				ref={triggerRef}
 				type="button"
-				disabled={disabled}
+				role="combobox"
+				disabled={unavailable}
 				title={title ?? ariaLabel}
+				aria-label={ariaLabel}
+				aria-describedby={displayId}
 				aria-haspopup="listbox"
 				aria-expanded={open}
 				aria-controls={open ? listboxId : undefined}
+				aria-activedescendant={open ? activeId : undefined}
 				className={`cc-select-trigger ${pillClassName}`.trim()}
 				onClick={() => {
-					if (!disabled && enabledIndices.length > 0) setOpen((prev) => !prev);
+					if (open) setOpen(false);
+					else reveal();
 				}}
 				onKeyDown={(event) => {
-					if (disabled || !enabledIndices.length) return;
-					if (!open && (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Enter" || event.key === " ")) {
-						event.preventDefault();
-						setOpen(true);
-						return;
-					}
-					if (!open) return;
+					if (unavailable) return;
 					if (event.key === "ArrowDown" || event.key === "ArrowUp") {
 						event.preventDefault();
-						const pos = enabledIndices.indexOf(activeIndex);
+						if (!open) {
+							reveal();
+							return;
+						}
+						const pos = activeOption ? enabledOptions.indexOf(activeOption) : 0;
 						const delta = event.key === "ArrowDown" ? 1 : -1;
-						const nextPos = pos === -1 ? 0 : (pos + delta + enabledIndices.length) % enabledIndices.length;
-						const nextIdx = enabledIndices[nextPos];
-						setActiveIndex(nextIdx);
-						document.getElementById(`${listboxId}-${nextIdx}`)?.scrollIntoView({ block: "nearest" });
-					} else if (event.key === "Enter" || event.key === " ") {
+						const nextPos = (pos + delta + enabledOptions.length) % enabledOptions.length;
+						setActiveValue(enabledOptions[nextPos].value);
+					} else if (open && (event.key === "Home" || event.key === "End")) {
 						event.preventDefault();
-						const target = options[activeIndex];
-						if (target && !target.disabled) choose(target.value);
+						setActiveValue(enabledOptions[event.key === "Home" ? 0 : enabledOptions.length - 1].value);
+					} else if (open && (event.key === "Enter" || event.key === " ")) {
+						event.preventDefault();
+						if (activeOption) choose(activeOption.value);
+					} else if (open && event.key === "Escape") {
+						event.preventDefault();
+						event.stopPropagation();
+						setOpen(false);
 					}
 				}}
 			>
 				{dotClass && <span className={`cc-perm-dot ${dotClass}`} aria-hidden="true" />}
 				{icon && <span className="cc-select-icon" aria-hidden="true">{icon}</span>}
-				<span className="cc-select-label">{displayLabel}</span>
+				<span className="cc-select-label" id={displayId}>{displayLabel}</span>
 				<ChevronDown size={12} className="cc-select-chevron" aria-hidden="true" />
 			</button>
 
@@ -176,17 +160,14 @@ export function SelectPopover({
 								key={opt.value}
 								id={`${listboxId}-${idx}`}
 								type="button"
+								value={opt.value}
 								role="option"
+								tabIndex={-1}
 								disabled={opt.disabled}
 								aria-selected={isSelected}
 								className={`cc-select-option ${isSelected ? "selected" : ""} ${isActive ? "active" : ""}`.trim()}
-								onMouseEnter={() => {
-									if (!opt.disabled) setActiveIndex(idx);
-								}}
-								onMouseDown={(event) => {
-									event.preventDefault();
-									if (!opt.disabled) choose(opt.value);
-								}}
+								onMouseDown={(event) => event.preventDefault()}
+								onClick={() => choose(opt.value)}
 							>
 								<span className="cc-select-option-main">
 									{opt.dotClass && <span className={`cc-perm-dot ${opt.dotClass}`} aria-hidden="true" />}

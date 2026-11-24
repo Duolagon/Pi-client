@@ -1,55 +1,30 @@
-import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type RefObject, type ReactNode } from "react";
-
-let lastWindowResizeAt = 0;
-if (typeof window !== "undefined") {
-	window.addEventListener(
-		"resize",
-		() => {
-			lastWindowResizeAt = Date.now();
-			clearExitGhosts();
-		},
-		{ passive: true },
-	);
-}
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 
 export function prefersReducedMotion(): boolean {
 	return typeof window !== "undefined" && Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
 }
 
-export type ExitGhostVariant = "modal" | "side" | "inspector" | "terminal" | "bar";
-
-export function clearExitGhosts(variant?: ExitGhostVariant): void {
-	if (typeof document === "undefined") return;
-	const selector = variant ? `.cc-exit-ghost-layer.cc-exit-${variant}` : ".cc-exit-ghost-layer";
-	for (const el of document.querySelectorAll(selector)) el.remove();
+export function clearModalExit(): void {
+	for (const el of document.querySelectorAll(".cc-exit-ghost-layer")) el.remove();
 }
 
-/**
- * Spawns a non-interactive, ARIA-inert fixed visual clone at the node's last live
- * bounding box so panels, drawers, and modals play silky GPU-composited exit transitions
- * without delaying layout updates, breaking `>` CSS combinators, or blocking clicks.
- */
-export function spawnExitGhost(
-	node: HTMLElement | null,
-	variant: ExitGhostVariant,
-	options?: { skipOnResize?: boolean; durationMs?: number; extraClass?: string; withBackdrop?: boolean },
-): void {
-	if (!node || typeof document === "undefined" || prefersReducedMotion()) return;
-	if (options?.skipOnResize && Date.now() - lastWindowResizeAt < 260) return;
+/** Copies the visible dialog during its brief exit after the native top layer releases focus. */
+export function showModalExit(node: HTMLElement | null, dialogClassName: string): void {
+	if (!node || prefersReducedMotion()) return;
 	const rect = node.getBoundingClientRect();
 	if (rect.width < 4 || rect.height < 4) return;
-	// Full-window review mode occupies the entire viewport (left ~ 0); let chat cross-fade cleanly instead of sliding full screen.
-	if (variant === "inspector" && rect.left <= 8) return;
 
-	clearExitGhosts(variant);
-	const durationMs = options?.durationMs ?? 185;
+	clearModalExit();
 	const layer = document.createElement("div");
-	layer.className = `cc-exit-ghost-layer cc-exit-${variant} ${options?.withBackdrop ? "has-backdrop" : ""} ${options?.extraClass ?? ""}`.trim();
+	layer.className = "cc-exit-ghost-layer";
 	layer.setAttribute("aria-hidden", "true");
-	(layer as HTMLElement & { inert?: boolean }).inert = true;
+	layer.inert = true;
+	const context = document.createElement("div");
+	context.className = dialogClassName;
+	context.style.display = "contents";
 
 	const clone = node.cloneNode(true) as HTMLElement;
-	clone.classList.add("cc-exit-ghost-node", `cc-exit-ghost-${variant}`);
+	clone.classList.add("cc-exit-ghost-modal");
 	clone.style.position = "fixed";
 	clone.style.left = `${rect.left}px`;
 	clone.style.top = `${rect.top}px`;
@@ -58,7 +33,10 @@ export function spawnExitGhost(
 	clone.style.margin = "0";
 	clone.style.pointerEvents = "none";
 
-	for (const el of [clone, ...Array.from(clone.querySelectorAll<HTMLElement>("*"))]) {
+	const originalElements = [node, ...node.querySelectorAll<HTMLElement>("*")];
+	const clonedElements = [clone, ...clone.querySelectorAll<HTMLElement>("*")];
+	const scrollOffsets = originalElements.map(({ scrollTop, scrollLeft }) => ({ scrollTop, scrollLeft }));
+	for (const el of clonedElements) {
 		el.removeAttribute("id");
 		el.removeAttribute("role");
 		el.removeAttribute("aria-label");
@@ -97,90 +75,45 @@ export function spawnExitGhost(
 		textNode.replaceWith(span);
 	}
 
-	layer.appendChild(clone);
+	context.appendChild(clone);
+	layer.appendChild(context);
 	document.body.appendChild(layer);
-	window.setTimeout(() => layer.remove(), durationMs);
-}
-
-/**
- * Attaches an automatic unmount exit transition to a panel/bar ref.
- */
-export function useExitGhost(
-	ref: RefObject<HTMLElement | null>,
-	variant: ExitGhostVariant,
-	options?: { skipOnResize?: boolean; durationMs?: number },
-): void {
-	const optsRef = useRef(options);
-	optsRef.current = options;
-	useLayoutEffect(() => {
-		const node = ref.current;
-		return () => {
-			spawnExitGhost(node, variant, optsRef.current);
-		};
-	}, [ref, variant]);
-}
-
-export function Presence({
-	show,
-	exitMs = 190,
-	instantExit = false,
-	className = "",
-	style,
-	children,
-}: {
-	show: boolean;
-	exitMs?: number;
-	instantExit?: boolean;
-	className?: string;
-	style?: CSSProperties;
-	children: ReactNode;
-}) {
-	const [mounted, setMounted] = useState(show);
-	const cachedRef = useRef<ReactNode>(show ? children : null);
-	const hostRef = useRef<HTMLDivElement>(null);
-
-	if (show) {
-		cachedRef.current = children;
+	for (const [index, { scrollTop, scrollLeft }] of scrollOffsets.entries()) {
+		const element = clonedElements[index];
+		if (scrollTop) element.scrollTop = scrollTop;
+		if (scrollLeft) element.scrollLeft = scrollLeft;
 	}
+	window.setTimeout(() => layer.remove(), 180);
+}
 
+/** Retains the actual panel through exit so its layout can reverse from the current frame. */
+export function Presence({ show, className, children }: { show: boolean; className: string; children: ReactNode }) {
+	const [mounted, setMounted] = useState(show);
+	const lastChildren = useRef<ReactNode>(null);
+	useLayoutEffect(() => {
+		if (show) lastChildren.current = children;
+	}, [show, children]);
 	useLayoutEffect(() => {
 		if (show) {
 			setMounted(true);
 			return;
 		}
-		if (instantExit || prefersReducedMotion()) {
+		if (!mounted) return;
+		const finish = () => {
+			lastChildren.current = null;
 			setMounted(false);
+		};
+		if (prefersReducedMotion()) {
+			finish();
 			return;
 		}
-		const timer = window.setTimeout(() => setMounted(false), exitMs);
+		const timer = window.setTimeout(finish, 220);
 		return () => window.clearTimeout(timer);
-	}, [show, exitMs, instantExit]);
-
-	const exiting = !show && mounted && !instantExit;
-
-	useLayoutEffect(() => {
-		const node = hostRef.current as (HTMLDivElement & { inert?: boolean }) | null;
-		if (!node) return;
-		node.inert = exiting;
-	}, [exiting, mounted]);
-
-	useEffect(() => {
-		if (!mounted && !show) {
-			cachedRef.current = null;
-		}
-	}, [mounted, show]);
-
-	if (!show && (!mounted || instantExit)) return null;
-
+	}, [show, mounted]);
+	if (!show && !mounted) return null;
 	return (
-		<div
-			ref={hostRef}
-			className={`cc-presence ${exiting ? "is-exiting" : "is-present"} ${className}`.trim()}
-			data-state={exiting ? "exiting" : "present"}
-			aria-hidden={exiting ? "true" : undefined}
-			style={style}
-		>
-			{show ? children : cachedRef.current}
+		<div className={className} data-open={show} inert={!show} aria-hidden={!show || undefined}>
+			{show ? children : lastChildren.current}
 		</div>
 	);
 }
