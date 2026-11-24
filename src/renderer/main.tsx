@@ -1,3 +1,5 @@
+import "../prototype/style.css";
+import "./style.css";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { createRoot } from "react-dom/client";
 import { copyText } from "./clipboard.ts";
@@ -90,10 +92,10 @@ import { ProjectTrustDialog } from "./ProjectTrustDialog.tsx";
 import { AgentsDialog } from "./AgentsDialog.tsx";
 import { McpDialog } from "./McpDialog.tsx";
 import { resolveEditorPath } from "../editor-path.ts";
-import "../prototype/style.css";
-import "./style.css";
+import { SmoothCollapse } from "./SmoothCollapse.tsx";
 import "./grail-theme.css";
 import "./task-flow.css";
+import "./motion-and-polish.css";
 import { checkpointByEntry, matchUserEntries, submittedPlan } from "./turn-state.ts";
 import { runLabels } from "./run-status.ts";
 import { TaskAttention, type AttentionItem } from "./TaskAttention.tsx";
@@ -2254,7 +2256,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								{running && !approvalExpanded && (
 										<div className="cl-working" role="status">
 											{waitingForInput ? <ShieldCheck size={15} /> : isGrail ? <MagicCircleLoader size={16} /> : <span className="cl-spinner" />}
-											{waitingForInput ? "等待你处理审批" : activePhase && activePhase !== "completed" ? runLabels[activePhase] : "正在处理任务"}
+											<span className={waitingForInput ? "cl-working-text" : "cl-working-text cc-shimmer-text"}>
+												{waitingForInput ? "等待你处理审批" : activePhase && activePhase !== "completed" ? runLabels[activePhase] : "正在处理任务"}
+											</span>
 										</div>
 									)}
 									{!!snapshot.state?.pendingMessageCount && (
@@ -2364,7 +2368,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										</button>
 									)}
 								</div>
-								{todoExpanded && (
+								<SmoothCollapse open={todoExpanded}>
 									<div className="cc-pinned-todos-list">
 										{latestTodos.map((item) => {
 											const timing = computeTodoTiming(item, todoClock, running);
@@ -2387,7 +2391,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											);
 										})}
 									</div>
-								)}
+								</SmoothCollapse>
 							</div>
 							);
 						})()}

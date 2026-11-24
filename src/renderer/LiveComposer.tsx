@@ -1,8 +1,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, Brain, File, Folder, Paperclip, ShieldCheck, Square, X } from "lucide-react";
 import type { Command, FileEntry, FileReferenceAvailability, Message, PermissionMode, Project, SandboxStatus, Snapshot, ThinkingLevel } from "../shared.ts";
-import { WorkspacePicker } from "./WorkspacePicker.tsx";
 import { SandboxControl } from "./SandboxControl.tsx";
+import { SelectPopover } from "./SelectPopover.tsx";
 import { CommandSealIcon } from "./GrailIcons.tsx";
 import { StatusLine } from "./StatusLine.tsx";
 import { fileReferences, insertFileReference, isDesktopWorkspaceContext, referenceQuery, removeFileReference, visiblePromptText } from "../file-references.ts";
@@ -24,6 +24,22 @@ const PERMISSION_LABEL: Record<PermissionMode, string> = {
 	auto: "全部放行",
 	dontAsk: "不询问（未放行即拒绝）",
 	read: "只读模式",
+};
+const PERMISSION_SHORT_LABEL: Record<PermissionMode, string> = {
+	ask: "手动确认",
+	acceptEdits: "接受编辑",
+	plan: "计划模式",
+	auto: "全部放行",
+	dontAsk: "不询问",
+	read: "只读",
+};
+const THINKING_HINT: Record<string, string> = {
+	off: "关闭",
+	minimal: "极简",
+	low: "低",
+	medium: "中",
+	high: "高",
+	xhigh: "极高",
 };
 export type BuiltinSlashAction =
 	| "compact"
@@ -132,8 +148,8 @@ export function LiveComposer({
 	stopping,
 	command,
 	setPermission,
-	onSelectProject,
-	onOpenProject,
+	onSelectProject: _onSelectProject,
+	onOpenProject: _onOpenProject,
 	sandboxStatus,
 	sandboxOpen,
 	setSandboxOpen,
@@ -790,168 +806,111 @@ export function LiveComposer({
 						}
 					}}
 				/>
-				<div className="cl-composer-row">
-					<div className="cl-composer-row-left">
+				<div className="cc-dock-toolbar">
+					<div className="cc-dock-left">
 						<button className="cl-icon-btn" type="button" aria-label="添加附件" title="添加图片或代码附件" onClick={() => fileInput.current?.click()}>
-							<Paperclip size={16} />
+							<Paperclip size={15} />
 						</button>
-						<WorkspacePicker
-							variant="composer"
-							projects={snapshot.projects}
-							activeProject={activeProject}
-							disabled={changing}
-							onSelectProject={onSelectProject}
-							onOpenProject={onOpenProject}
+						<SelectPopover
+							ariaLabel="选择模型"
+							value={selected ? `${selected.provider}\0${selected.id}` : ""}
+							placeholder="未连接模型"
+							disabled={changing || running || !snapshot.models.length}
+							options={snapshot.models.map((model) => ({
+								value: `${model.provider}\0${model.id}`,
+								label: model.name || model.id,
+							}))}
+							onChange={(val) => {
+								const [provider, modelId] = val.split("\0");
+								if (provider && modelId) void command({ type: "set_model", provider, modelId });
+							}}
 						/>
-						<label className="cl-pill cl-pill-inline">
-							<span className="cl-pill-select">
-								<select
-									aria-label="选择模型"
-									value={selected ? `${selected.provider}\0${selected.id}` : ""}
-									disabled={changing || running || !snapshot.models.length}
-									onChange={(event) => {
-										const [provider, modelId] = event.target.value.split("\0");
-										void command({ type: "set_model", provider, modelId });
+						{snapshot.thinkingLevels.length > 0 && (
+							<SelectPopover
+								ariaLabel="思考强度"
+								icon={<Brain size={12.5} />}
+								value={snapshot.state?.thinkingLevel ?? "off"}
+								disabled={changing || running || !snapshot.thinkingLevels.length}
+								options={snapshot.thinkingLevels.map((level) => ({
+									value: level,
+									label: level,
+									shortLabel: THINKING_HINT[level] ?? level,
+									hint: THINKING_HINT[level],
+								}))}
+								onChange={(val) => void command({ type: "set_thinking_level", level: val as ThinkingLevel })}
+							/>
+						)}
+						<span className="cc-dock-divider" aria-hidden="true" />
+						<SelectPopover
+							ariaLabel="权限模式"
+							dotClass={permissionMode}
+							pillClassName="ghost"
+							title="切换权限模式（快捷键 Shift+Tab）"
+							value={permissionMode}
+							disabled={changing || !snapshot.active}
+							options={(Object.keys(PERMISSION_LABEL) as PermissionMode[]).map((mode) => ({
+								value: mode,
+								label: PERMISSION_LABEL[mode],
+								shortLabel: PERMISSION_SHORT_LABEL[mode],
+								dotClass: mode,
+							}))}
+							onChange={(val) => setPermission(val as PermissionMode)}
+						/>
+						<SandboxControl
+							enabled={Boolean(snapshot.settings.sandbox)}
+							offline={Boolean(snapshot.settings.sandbox && snapshot.settings.sandboxOffline)}
+							status={sandboxStatus}
+							projectPath={activeProject?.path}
+							disabled={changing || running}
+							open={sandboxOpen}
+							onOpenChange={setSandboxOpen}
+							onChange={onUpdateSandbox}
+						/>
+					</div>
+					<div className="cc-dock-right">
+						<StatusLine snapshot={snapshot} running={running} />
+						{snapshot.commands.length > 0 && (
+							<div className="cl-skills" ref={skillsRef}>
+								<button
+									type="button"
+									className={`cc-skills-trigger ${skillsOpen ? "open" : ""}`}
+									aria-expanded={skillsOpen}
+									onClick={() => {
+										setSkillsFilter("");
+										setSkillsIndex(0);
+										setSkillsOpen((open) => !open);
 									}}
 								>
-									<option value="" disabled>
-										未连接模型
-									</option>
-									{snapshot.models.map((model) => (
-										<option key={`${model.provider}/${model.id}`} value={`${model.provider}\0${model.id}`}>
-											{model.name || model.id}
-										</option>
-									))}
-								</select>
-							</span>
-						</label>
-						{snapshot.thinkingLevels.length > 0 && (
-							<label className="cl-pill cl-pill-inline">
-								<Brain size={13} />
-								<span className="cl-pill-select">
-									<select
-										aria-label="思考强度"
-										value={snapshot.state?.thinkingLevel ?? "off"}
-										disabled={changing || running || !snapshot.thinkingLevels.length}
-										onChange={(event) =>
-											void command({ type: "set_thinking_level", level: event.target.value as ThinkingLevel })
-										}
-									>
-										{snapshot.thinkingLevels.map((level) => (
-											<option key={level}>{level}</option>
-										))}
-									</select>
-								</span>
-							</label>
-						)}
-					</div>
-					<div className="cl-composer-row-right">
-						{running && (
-							<>
-								<label className="cc-composer-delivery">
-									<select
-										aria-label="补充指令发送时机"
-										value={delivery}
-										onChange={(event) => setDelivery(event.target.value as NonNullable<Prompt["streamingBehavior"]>)}
-										disabled={disabled}
-									>
-										<option value="followUp">本轮结束后</option>
-										<option value="steer">下一工具步骤</option>
-									</select>
-								</label>
-								<button type="button" className="cl-send stop" aria-label="停止任务" title="停止本轮回复和本机后台命令（Esc）" onClick={stop} disabled={stopping}>
-									<Square size={12} fill="currentColor" />
+									Skills · {snapshot.commands.length}
 								</button>
-							</>
-						)}
-						{!running && <span className="cl-composer-hint">Enter 发送</span>}
-						<button
-							type="submit"
-							className="cl-send"
-							aria-label={running ? "追加指令" : "发送任务"}
-							title={running ? "追加指令（Enter）" : "发送任务（Enter）"}
-							disabled={disabled || (!draft.trim() && !attachments.length)}
-						>
-							{snapshot.settings.theme === "grail" ? <CommandSealIcon width={17} height={17} /> : <ArrowUp size={17} />}
-						</button>
-					</div>
-				</div>
-			</form>
-			<div className="cl-composer-bar">
-				<div className="cl-pills">
-					<label className={`cl-pill cc-perm-pill cc-perm-${permissionMode}`}>
-						<span className={`cc-perm-dot ${permissionMode}`} aria-hidden="true" />
-						<ShieldCheck size={13} />
-						<span className="cl-pill-select">
-							<select
-								aria-label="权限模式"
-								value={permissionMode}
-								disabled={changing || !snapshot.active}
-								onChange={(event) => setPermission(event.target.value as PermissionMode)}
-							>
-								{(Object.keys(PERMISSION_LABEL) as PermissionMode[]).map((mode) => (
-									<option key={mode} value={mode}>
-										{PERMISSION_LABEL[mode]}
-									</option>
-								))}
-							</select>
-						</span>
-					</label>
-					<SandboxControl
-						enabled={Boolean(snapshot.settings.sandbox)}
-						offline={Boolean(snapshot.settings.sandbox && snapshot.settings.sandboxOffline)}
-						status={sandboxStatus}
-						projectPath={activeProject?.path}
-						disabled={changing || running}
-						open={sandboxOpen}
-						onOpenChange={setSandboxOpen}
-						onChange={onUpdateSandbox}
-					/>
-				</div>
-				<div className="cc-bar-right">
-					<StatusLine snapshot={snapshot} running={running} gitBranch={gitBranch} />
-					{snapshot.commands.length > 0 && (
-						<div className="cl-skills" ref={skillsRef}>
-							<button
-								type="button"
-								className={`cc-skills-trigger ${skillsOpen ? "open" : ""}`}
-								aria-expanded={skillsOpen}
-								onClick={() => {
-									setSkillsFilter("");
-									setSkillsIndex(0);
-									setSkillsOpen((open) => !open);
-								}}
-							>
-								Skills · {snapshot.commands.length}
-							</button>
-							{skillsOpen && (
-								<div className="cl-skills-list" role="region" aria-label="Skills 列表">
-									<input
-										className="cc-skills-filter"
-										placeholder="搜索技能或命令…"
-										aria-label="搜索技能或命令"
-										value={skillsFilter}
-										autoFocus data-autofocus
-										onChange={(event) => {
-											setSkillsFilter(event.target.value);
-											setSkillsIndex(0);
-										}}
-										onKeyDown={(event) => {
-											if (event.nativeEvent.isComposing || !skillMatches.length) return;
-											if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-												event.preventDefault();
-												const next = (activeSkill + (event.key === "ArrowDown" ? 1 : -1) + skillMatches.length) % skillMatches.length;
-												setSkillsIndex(next);
-												document.getElementById(`cc-skill-${next}`)?.scrollIntoView({ block: "nearest" });
-											} else if (event.key === "Enter") {
-												event.preventDefault();
-												pickSkill(skillMatches[activeSkill].name);
-											}
-										}}
-									/>
-									<div className="cc-skills-items" role="listbox" aria-label="技能与命令">
-										{skillMatches.length === 0 && <p className="cc-search-empty">没有匹配的技能或命令</p>}
-										{skillMatches.map((item, idx) => (
+								{skillsOpen && (
+									<div className="cl-skills-list" role="region" aria-label="Skills 列表">
+										<input
+											className="cc-skills-filter"
+											placeholder="搜索技能或命令…"
+											aria-label="搜索技能或命令"
+											value={skillsFilter}
+											autoFocus data-autofocus
+											onChange={(event) => {
+												setSkillsFilter(event.target.value);
+												setSkillsIndex(0);
+											}}
+											onKeyDown={(event) => {
+												if (event.nativeEvent.isComposing || !skillMatches.length) return;
+												if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+													event.preventDefault();
+													const next = (activeSkill + (event.key === "ArrowDown" ? 1 : -1) + skillMatches.length) % skillMatches.length;
+													setSkillsIndex(next);
+													document.getElementById(`cc-skill-${next}`)?.scrollIntoView({ block: "nearest" });
+												} else if (event.key === "Enter") {
+													event.preventDefault();
+													pickSkill(skillMatches[activeSkill].name);
+												}
+											}}
+										/>
+										<div className="cc-skills-items" role="listbox" aria-label="技能与命令">
+											{skillMatches.length === 0 && <p className="cc-search-empty">没有匹配的技能或命令</p>}
+											{skillMatches.map((item, idx) => (
 												<button
 													type="button"
 													key={`${item.source}-${item.name}`}
@@ -967,18 +926,46 @@ export function LiveComposer({
 													<span className="cc-skill-desc">{item.description || item.source}</span>
 												</button>
 											))}
+										</div>
 									</div>
-								</div>
-							)}
-						</div>
-					)}
-					{!snapshot.commands.length && (
-						<button type="button" className="cl-config" onClick={openSettings}>
-							配置
+								)}
+							</div>
+						)}
+						{!snapshot.commands.length && (
+							<button type="button" className="cl-config" onClick={openSettings}>
+								配置
+							</button>
+						)}
+						{running && (
+							<>
+								<SelectPopover
+									ariaLabel="补充指令发送时机"
+									align="right"
+									value={delivery}
+									disabled={disabled}
+									options={[
+										{ value: "followUp", label: "本轮结束后" },
+										{ value: "steer", label: "下一工具步骤" },
+									]}
+									onChange={(val) => setDelivery(val as NonNullable<Prompt["streamingBehavior"]>)}
+								/>
+								<button type="button" className="cl-send stop" aria-label="停止任务" title="停止本轮回复和本机后台命令（Esc）" onClick={stop} disabled={stopping}>
+									<Square size={12} fill="currentColor" />
+								</button>
+							</>
+						)}
+						<button
+							type="submit"
+							className="cl-send"
+							aria-label={running ? "追加指令" : "发送任务"}
+							title={running ? "追加指令（Enter）" : "发送任务（Enter）"}
+							disabled={disabled || (!draft.trim() && !attachments.length)}
+						>
+							{snapshot.settings.theme === "grail" ? <CommandSealIcon width={17} height={17} /> : <ArrowUp size={17} />}
 						</button>
-					)}
+					</div>
 				</div>
-			</div>
+			</form>
 			<input
 				ref={fileInput}
 				type="file"

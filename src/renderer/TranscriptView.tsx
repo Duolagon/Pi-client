@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { copyText } from "./clipboard.ts";
 import ReactMarkdown from "react-markdown";
-import { ArrowDownToLine, Check, Circle, CircleAlert, ChevronRight, Copy, ExternalLink, Eye, GitFork, LoaderCircle, RotateCcw, Square } from "lucide-react";
+import { ArrowDownToLine, Bot, Check, Circle, CircleAlert, ChevronRight, Copy, ExternalLink, Eye, FilePen, FileText, GitFork, Globe, ListChecks, LoaderCircle, RotateCcw, Search, Sparkles, Square, Terminal as TerminalIcon } from "lucide-react";
+import { SmoothCollapse } from "./SmoothCollapse.tsx";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
 import { formatRunningToolTimer } from "../task-eta.ts";
 import type { DesktopTask, ExternalTask, Message, MonitorRecord, TaskProgress } from "../shared.ts";
@@ -534,7 +535,7 @@ function turnItems({
 					<details className={`cl-think ${activeThink ? "thinking-active" : ""}`} key={key}>
 						<summary>
 							<span className={`cc-think-glyph ${activeThink ? "pulse" : ""}`}>∴</span>
-							<span>{activeThink ? "Thinking…" : "Thought"}</span>
+							<span className="cc-think-label">{activeThink ? "正在思考…" : "思考过程"}</span>
 							<ChevronRight size={12} className="cl-tool-chevron" />
 						</summary>
 						<div className="cl-markdown">
@@ -677,7 +678,10 @@ function ToolGroup({
 				</span>
 				<ChevronRight size={13} className="cl-tool-chevron" />
 			</button>
-			{open ? <div className="cc-tool-group-body">{children}</div> : live.length > 0 && <div className="cc-tool-group-body">{live}</div>}
+			<SmoothCollapse open={open}>
+				<div className="cc-tool-group-body">{children}</div>
+			</SmoothCollapse>
+			{!open && live.length > 0 && <div className="cc-tool-group-body">{live}</div>}
 		</div>
 	);
 }
@@ -686,10 +690,22 @@ interface ToolPresentation {
 	verb: string;
 	target: string;
 	badge?: string;
+	diffStat?: { additions: number; removals: number };
 	treeSummary?: string;
 	editPairs?: { oldText: string; newText: string }[];
 	lineContent?: { content: string; startLine?: number };
 	todos?: TodoItem[];
+}
+
+function toolGlyph(name: string): ReactNode {
+	if (name === "read") return <FileText size={11.5} />;
+	if (name === "edit" || name === "write" || name === "NotebookEdit") return <FilePen size={11.5} />;
+	if (name === "bash") return <TerminalIcon size={11.5} />;
+	if (name === "grep" || name === "find" || name === "ls") return <Search size={11.5} />;
+	if (name === "WebFetch" || name === "WebSearch") return <Globe size={11.5} />;
+	if (name === "TodoWrite" || name.startsWith("Todo")) return <ListChecks size={11.5} />;
+	if (name === "Agent" || name === "AgentSend" || name === "SendMessage") return <Bot size={11.5} />;
+	return <Sparkles size={11.5} />;
 }
 
 function asRecord(args: unknown): Record<string, unknown> {
@@ -756,15 +772,15 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 	if (name === "read") {
 		const offset = typeof a.offset === "number" ? a.offset : 1;
 		return {
-			verb: "Read",
-			target: path || "file",
-			badge: status === "done" && output ? linesLabel(lineCount) : undefined,
+			verb: "读取",
+			target: path || "文件",
+			badge: status === "done" && output ? `${lineCount} 行` : undefined,
 			treeSummary:
 				status === "running"
 					? "正在读取文件…"
 					: status === "error"
 						? output?.split("\n")[0] || "读取失败"
-						: `Read ${linesLabel(lineCount)}${offset > 1 ? ` (from line ${offset})` : ""}`,
+						: `已读取 ${lineCount} 行${offset > 1 ? `（第 ${offset} 行起）` : ""}`,
 			lineContent: output ? { content: output, startLine: offset } : undefined,
 		};
 	}
@@ -780,19 +796,19 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 				removals += d.removals;
 			}
 			return {
-				verb: "Update",
-				target: path || "file",
-				badge: `+${additions} -${removals}`,
+				verb: "更新",
+				target: path || "文件",
+				diffStat: { additions, removals },
 				treeSummary:
 					status === "error"
 						? output?.split("\n")[0] || "编辑失败"
-						: `Updated ${path || "file"} with ${additions} addition${additions === 1 ? "" : "s"} and ${removals} removal${removals === 1 ? "" : "s"}`,
+						: `已更新 ${path || "文件"}（新增 ${additions} 行，移除 ${removals} 行）`,
 				editPairs,
 			};
 		}
 		return {
-			verb: "Edit",
-			target: path || "file",
+			verb: "更新",
+			target: path || "文件",
 			treeSummary: output?.split("\n")[0] || (status === "running" ? "正在编辑…" : "已更新"),
 		};
 	}
@@ -801,32 +817,32 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 		const content = typeof a.content === "string" ? a.content : "";
 		const wroteLines = content ? countLines(content) : 0;
 		return {
-			verb: "Write",
-			target: path || "file",
-			badge: wroteLines && status !== "error" ? linesLabel(wroteLines) : undefined,
+			verb: "写入",
+			target: path || "文件",
+			badge: wroteLines && status !== "error" ? `${wroteLines} 行` : undefined,
 			treeSummary:
 				status === "running"
 					? "正在写入文件…"
 					: status === "error"
 						? output?.split("\n")[0] || "写入失败"
-						: `Wrote ${linesLabel(wroteLines)} to ${path || "file"}`,
+						: `已写入 ${wroteLines} 行至 ${path || "文件"}`,
 			lineContent: content ? { content, startLine: 1 } : undefined,
 		};
 	}
 
 	if (name === "bash") {
-		const cmd = typeof a.command === "string" ? a.command.split("\n")[0].slice(0, 120) : "command";
-		const firstLine = output?.trim() ? output.trim().split("\n")[0].slice(0, 110) : status === "running" ? "正在执行…" : "(No output)";
+		const cmd = typeof a.command === "string" ? a.command.split("\n")[0].slice(0, 120) : "命令";
+		const firstLine = output?.trim() ? output.trim().split("\n")[0].slice(0, 110) : status === "running" ? "正在执行…" : "无输出";
 		return {
-			verb: "Bash",
+			verb: "命令",
 			target: cmd,
-			badge: status === "error" ? "error" : status === "done" ? (a.run_in_background === true ? "已在后台启动" : "done") : undefined,
+			badge: status === "error" ? "失败" : status === "done" ? (a.run_in_background === true ? "后台运行" : "完成") : undefined,
 			treeSummary: firstLine,
 		};
 	}
 
 	if (name === "grep" || name === "find" || name === "ls") {
-		const verb = name === "grep" ? "Grep" : name === "find" ? "Glob" : "List";
+		const verb = name === "grep" ? "搜索内容" : name === "find" ? "查找文件" : "列出目录";
 		const target =
 			typeof a.pattern === "string"
 				? a.pattern
@@ -837,8 +853,8 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 		return {
 			verb,
 			target,
-			badge: status === "done" ? `${count} results` : undefined,
-			treeSummary: status === "running" ? "正在搜索…" : `Found ${count} line${count === 1 ? "" : "s"}`,
+			badge: status === "done" ? `${count} 项` : undefined,
+			treeSummary: status === "running" ? "正在检索…" : `匹配到 ${count} 条结果`,
 		};
 	}
 
@@ -847,9 +863,9 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 		const doneCount = rawTodos.filter((t) => t.status === "completed").length;
 		const inProgress = rawTodos.find((t) => t.status === "in_progress");
 		return {
-			verb: "Todos",
-			target: `${doneCount}/${rawTodos.length} completed`,
-			badge: inProgress ? "active" : "updated",
+			verb: "任务清单",
+			target: `已完成 ${doneCount}/${rawTodos.length}`,
+			badge: inProgress ? "进行中" : "已更新",
 			treeSummary: inProgress ? `正在进行：${inProgress.content}` : `已更新 ${rawTodos.length} 项任务清单`,
 			todos: rawTodos,
 		};
@@ -858,9 +874,9 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 	if (name === "WebFetch") {
 		const rawUrl = typeof a.url === "string" ? a.url : "";
 		return {
-			verb: "Fetch",
+			verb: "网页抓取",
 			target: rawUrl,
-			badge: status === "done" && output ? `${output.length} chars` : status,
+			badge: status === "done" && output ? `${output.length} 字符` : status,
 			treeSummary: status === "running" ? "正在抓取网页内容…" : output?.trim().split("\n")[0].slice(0, 110) || "已读取",
 		};
 	}
@@ -970,24 +986,24 @@ function InlineBashBlock({
 	return (
 		<div className={`cl-tool ${ok ? "done" : "error"} ${open ? "is-open" : ""}`}>
 			<button type="button" className="cc-tool-row" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
-				<span className={`cc-dot ${ok ? "ok" : "err"}`} />
+				<span className="cc-tool-icon" aria-hidden="true"><TerminalIcon size={11.5} /></span>
 				<span className="cc-tool-head">
-					<span className="cc-tool-verb">Bash</span>
-					<span className="cl-tool-name">({command})</span>
+					<span className="cc-tool-verb">命令</span>
+					<span className="cl-tool-name">{command}</span>
 				</span>
-				<span className={`cc-tool-badge ${ok ? "" : "err"}`}>exit {exitCode ?? "?"}</span>
+				<span className={`cc-tool-badge ${ok ? "" : "err"}`}>退出码 {exitCode ?? "?"}</span>
 				<ChevronRight size={13} className="cl-tool-chevron" />
 			</button>
 			<div className="cc-tree-summary">
 				<span className="cc-tree-arm">⎿</span>
 				<span className="cc-tree-text">{preview}</span>
 			</div>
-			{open && (
+			<SmoothCollapse open={open}>
 				<div className="cl-tool-body">
-					<pre className="cc-bash-out">{`$ ${command}\n${output || "(No output)"}`}</pre>
+					<pre className="cc-bash-out">{`$ ${command}\n${output || "(无输出)"}`}</pre>
 					{truncated && <p className="cl-truncated">输出已截断，完整输出：{fullOutputPath}</p>}
 				</div>
-			)}
+			</SmoothCollapse>
 		</div>
 	);
 }
@@ -1089,10 +1105,14 @@ function ToolCard({
 	return (
 		<div className={`cl-tool ${effectiveStatus} ${isOpen ? "is-open" : ""} ${fileTarget && onOpenFile ? "has-open-editor" : ""}`}>
 			<button type="button" className="cc-tool-row" onClick={() => setOpen((v) => !v)} aria-expanded={isOpen}>
-				<span className={`cc-dot ${dotClass}`} />
+				{effectiveStatus === "running" ? (
+					<span className={`cc-dot ${dotClass}`} />
+				) : (
+					<span className="cc-tool-icon" aria-hidden="true">{toolGlyph(name)}</span>
+				)}
 				<span className="cc-tool-head">
 					<span className="cc-tool-verb">{info.verb}</span>
-					{info.target && <span className="cl-tool-name">({info.target})</span>}
+					{info.target && <span className="cl-tool-name">{info.target}</span>}
 				</span>
 				{matchedTask && (
 					<span className="cc-tool-badge">
@@ -1101,7 +1121,15 @@ function ToolCard({
 				)}
 				{liveTimerLabel && <span className="cc-tool-badge cc-eta-pill">{liveTimerLabel}</span>}
 				{waitingForApproval && <span className="cc-tool-badge cc-tool-awaiting">待确认</span>}
-				{!waitingForApproval && !matchedTask && !liveTimerLabel && info.badge && <span className={`cc-tool-badge ${status === "error" ? "err" : ""}`}>{info.badge}</span>}
+				{!waitingForApproval && !matchedTask && !liveTimerLabel && info.diffStat && (
+					<span className="cc-tool-diff-stat">
+						<span className="add">+{info.diffStat.additions}</span>
+						<span className="del">−{info.diffStat.removals}</span>
+					</span>
+				)}
+				{!waitingForApproval && !matchedTask && !liveTimerLabel && !info.diffStat && info.badge && (
+					<span className={`cc-tool-badge ${status === "error" ? "err" : ""}`}>{info.badge}</span>
+				)}
 				<ChevronRight size={13} className="cl-tool-chevron" />
 			</button>
 			{fileTarget && onOpenFile && (
@@ -1161,7 +1189,7 @@ function ToolCard({
 					))}
 				</div>
 			)}
-			{isOpen && (!info.editPairs || info.editPairs.length === 0) && !info.todos && (
+			<SmoothCollapse open={isOpen && (!info.editPairs || info.editPairs.length === 0) && !info.todos}>
 				<div className="cl-tool-body">
 					{images.map((img, idx) => (
 						<img key={idx} className="cc-tool-image" alt="工具返回图片" src={`data:${img.mimeType};base64,${img.data}`} />
@@ -1180,7 +1208,7 @@ function ToolCard({
 						</details>
 					)}
 				</div>
-			)}
+			</SmoothCollapse>
 		</div>
 	);
 }

@@ -60,10 +60,12 @@
 @keyframes grail-pulse-aura {
 	0%,
 	100% {
-		filter: drop-shadow(0 0 10px rgba(242, 201, 107, 0.45));
+		opacity: 0.86;
+		transform: scale(0.98);
 	}
 	50% {
-		filter: drop-shadow(0 0 20px rgba(242, 201, 107, 0.8));
+		opacity: 1;
+		transform: scale(1.03);
 	}
 }
 
@@ -101,8 +103,7 @@
 .grail-magic-ring {
 	width: min(560px, 72vw);
 	height: min(560px, 72vw);
-	opacity: 0.075;
-	animation: grail-rotate-slow 72s linear infinite;
+	opacity: 0.045;
 }
 
 :root[data-theme="grail"] .cl-top,
