@@ -83,7 +83,7 @@ const env = {
 };
 for (const key of Object.keys(env))
 	if (
-		/(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|SECRET_KEY|AWS_|GOOGLE_APPLICATION_CREDENTIALS|PI_DESKTOP_KEY|PI_DESKTOP_CONNECTIONS)/.test(
+		/(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|SECRET_KEY|AWS_|GOOGLE_APPLICATION_CREDENTIALS|PI_DESKTOP_KEY|PI_DESKTOP_CONNECTIONS|^LANGFUSE_)/.test(
 			key,
 		)
 	)
@@ -666,8 +666,10 @@ try {
 	);
 	const planFile = (await page.evaluate(() => window.pi.readPlan())).relativePath;
 	assert.ok((await input.inputValue()).includes(planFile));
+	const planReply = page.getByText("已收到补充指令，客户端与 Pi 引擎连接正常。", { exact: true });
+	const earlierPlanReplies = await planReply.count();
 	await submit("请以只读方式分析实现计划。");
-	await page.getByText("已收到补充指令，客户端与 Pi 引擎连接正常。", { exact: true }).waitFor();
+	await until(async () => (await planReply.count()) > earlierPlanReplies, "the new response in Plan mode");
 	await idle();
 	await page.getByRole("region", { name: "计划审批", exact: true }).waitFor();
 	await page.getByText("等待 Pi 提交计划。也可以手动编写计划正文。", { exact: true }).waitFor();

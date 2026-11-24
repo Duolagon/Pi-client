@@ -133,6 +133,28 @@ npm run verify:client -- --screenshots
 
 模型连接测试另外启动本地 HTTP/SSE 服务，验证实际 Pi 请求的协议、认证、错误处理和密钥隔离。macOS 客户端另已完成 DeepSeek 真实连接及只读项目分析验收；凭据和会话数据不随源码发布。Google 协议尚未完成本地服务或真实服务验证，其他服务商的真实账户权限也未逐一验收。
 
+## Langfuse 追踪
+
+设置 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` 和 `LANGFUSE_BASE_URL` 后，从同一环境启动 Pi Desktop。自托管地址使用实例根地址，客户端会自动添加 `/api/public/otel/v1/traces`。追踪只在提供地址和两把密钥时启用。地址和密钥由本机启动环境提供。
+
+从 macOS 的 zsh 终端启动已打包的客户端时，可以用交互式输入避免密钥进入命令历史。先退出正在运行的客户端。
+
+```zsh
+read -r 'LANGFUSE_BASE_URL?Langfuse URL: '
+read -r 'LANGFUSE_PUBLIC_KEY?Langfuse public key: '
+read -rs 'LANGFUSE_SECRET_KEY?Langfuse secret key: '
+printf '\n'
+LANGFUSE_BASE_URL="$LANGFUSE_BASE_URL" \
+  LANGFUSE_PUBLIC_KEY="$LANGFUSE_PUBLIC_KEY" \
+  LANGFUSE_SECRET_KEY="$LANGFUSE_SECRET_KEY" \
+  '/Applications/Pi Desktop.app/Contents/MacOS/Pi Desktop'
+unset LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY LANGFUSE_BASE_URL
+```
+
+在 Langfuse 的 Traces 中筛选环境 `pi-desktop`。每轮 Pi Agent、`/btw` 和 `/grail` 模型评审各自记录一条运行 Trace，下面显示模型 Generation 和工具耗时。相同会话通过匿名 ID 分组。Generation 记录模型、结束状态、用量、缓存读写和 Pi 报告的美元费用。可设置 `LANGFUSE_RELEASE` 为提交号，用于区分版本。
+
+追踪只发送元数据。提示词、回答、文件内容、工具参数、命令、错误原文和凭据保留在本机。外部 Agent 适配器内部的独立模型调用目前由其各自的运行时管理。启用时请使用可访问且可信的实例，跨机器传输时使用 HTTPS。 [Langfuse OpenTelemetry 文档](https://langfuse.com/integrations/native/opentelemetry)
+
 ## 旧界面原型
 
 ```sh

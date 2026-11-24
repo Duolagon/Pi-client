@@ -14,6 +14,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { AgentProcess } from "./rpc.ts";
+import type { PiTracing } from "./langfuse-tracing.ts";
 import { GitSnapshots, MAX_CHECKPOINT_FILE_BYTES } from "./git-snapshots.ts";
 import {
 	annotateDiff,
@@ -356,6 +357,7 @@ const SESSION_END_HOOK_WAIT_MS = 60000;
 type FlushMode = "auto" | "settled" | "startup" | "now";
 export interface ServiceOptions {
 	dataDir: string;
+	tracing?: PiTracing;
 	runtimeDir?: string;
 	executable: string;
 	entry?: string;
@@ -4319,7 +4321,7 @@ export class DesktopService {
 		const before = await mkdtemp(join(tmpdir(), "pi-grail-blind-"));
 		try {
 			await this.git.materializeBefore(conversation.project, checkpoint.id, before);
-			const output = await this.grailModelRun(join(before, prefix), model, buildBlindPrompt(requirement), budget, deadline, signal);
+			const output = await this.grailModelRun(join(before, prefix), model, buildBlindPrompt(requirement), budget, deadline, signal, conversation.id);
 			steps.blind = parseBlindSolution(output);
 		} catch (error) {
 			if (signal.aborted) throw error;
@@ -4333,7 +4335,7 @@ export class DesktopService {
 		const annotated = annotateDiff(diff.files);
 		try {
 			const prompt = buildComparisonPrompt(requirement, steps.blind.solution!, annotated.text);
-			steps.comparison = parseComparison(await this.grailModelRun(join(workspace, prefix), model, prompt, budget, deadline, signal), lines);
+			steps.comparison = parseComparison(await this.grailModelRun(join(workspace, prefix), model, prompt, budget, deadline, signal, conversation.id), lines);
 		} catch (error) {
 			if (signal.aborted) throw error;
 			steps.comparison = { status: "unavailable", reason: error instanceof Error ? error.message : String(error), findings: [], dropped: 0 };
@@ -4391,7 +4393,9 @@ export class DesktopService {
 		budget: { spent: number; max: number },
 		deadline: number,
 		signal: AbortSignal,
+		conversationId: string,
 	): Promise<string> {
+		const traceId = this.options.tracing ? randomUUID() : "";
 		const env: NodeJS.ProcessEnv = {
 			...process.env,
 			...this.options.env,
@@ -4442,6 +4446,7 @@ export class DesktopService {
 				],
 				env,
 				onEvent: (event) => {
+					this.options.tracing?.observe(traceId, event, conversationId, undefined, last?.stopReason === "error", "grail");
 					if (event.type === "message_end" && event.message.role === "assistant") {
 						last = event.message;
 						budget.spent += finiteCount(event.message.usage?.cost?.total);
@@ -4466,6 +4471,7 @@ export class DesktopService {
 			clearTimeout(timer);
 			if (onAbort) signal.removeEventListener("abort", onAbort);
 			await agent?.stop();
+			this.options.tracing?.finishRun(traceId, signal.aborted ? "aborted" : "error");
 			await rm(controls, { recursive: true, force: true });
 		}
 	}
@@ -4493,6 +4499,7 @@ export class DesktopService {
 			? `You are answering an ephemeral side question (/btw) that must NOT assume edits or tool calls. Here is the recent conversation excerpt for context:\n\n${summaryTurns}\n\n---\nSide question:\n${q}\n\nAnswer concisely and accurately in the same language.`
 			: q;
 		const temporary = await mkdtemp(join(this.options.dataDir, "btw-"));
+		const traceId = this.options.tracing ? randomUUID() : "";
 		let agent: AgentProcess | undefined;
 		let timer: NodeJS.Timeout | undefined;
 		const started = Date.now();
@@ -4534,6 +4541,7 @@ export class DesktopService {
 				],
 				env,
 				onEvent: (event) => {
+					this.options.tracing?.observe(traceId, event, conv.id, undefined, resultMessage?.stopReason === "error", "btw");
 					if (event.type === "message_end" && event.message.role === "assistant") resultMessage = event.message;
 					if (event.type === "agent_settled") settle();
 					if (event.type === "desktop_error") fail(new Error(event.message));
@@ -4552,6 +4560,7 @@ export class DesktopService {
 		} finally {
 			clearTimeout(timer);
 			await agent?.stop();
+			this.options.tracing?.finishRun(traceId, "error");
 			await rm(temporary, { recursive: true, force: true });
 		}
 	}
@@ -6060,6 +6069,7 @@ export class DesktopService {
 		}
 		await this.persist();
 		await this.persistence;
+		await this.options.tracing?.close().catch(() => this.options.onDiagnostic?.("warn", "tracing_flush_failed", {}));
 		this.listeners.clear();
 		this.taskListeners.clear();
 		this.controlListeners.clear();
@@ -6398,6 +6408,7 @@ export class DesktopService {
 		await runtime.agent?.stop();
 		await runtime.loading;
 		await runtime.agent?.stop();
+		this.options.tracing?.finishRun(runtime.conversationId, "aborted");
 		runtime.agent = undefined;
 		// Background shells end with the runtime that started them (they use its sandbox profile).
 		await this.monitors.stopShellsForConversation(runtime.conversationId, "runtime_stop");
@@ -7081,6 +7092,10 @@ export class DesktopService {
 			void this.syncState(runtime).catch(() => {});
 		}
 		const task = this.store.tasks.find((item) => item.conversationId === conversationId);
+		if (this.options.tracing) {
+			const sessionId = event.type === "agent_start" ? this.rootConversationId(conversationId, false) : conversationId;
+			this.options.tracing.observe(conversationId, event, sessionId, task?.parentConversationId, !!runtime.lastError);
+		}
 		if (event.type === "extension_ui_request" && ["confirm", "select", "input", "editor"].includes(event.method)) {
 			runtime.pendingUI.set(event.id, event);
 			this.syncTaskPendingApprovals(runtime, task);

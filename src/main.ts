@@ -20,6 +20,7 @@ import { MAX_USAGE_DAYS } from "./usage-stats.ts";
 import { EDITOR_CHOICES, editorChoice, editorUrl, launchesCode, parseOpenInEditorInput, resolveEditorTarget, type EditorChoice } from "./editor-open.ts";
 import { validOutputStyleName } from "./output-styles.ts";
 import { parseGrailModelUpdate, validGrailMaxCost, validGrailTimeout } from "./grail-judge.ts";
+import { createPiTracing, takeLangfuseEnvironment } from "./langfuse-tracing.ts";
 
 app.setName("Pi Desktop");
 if (process.env.PI_DESKTOP_DATA_DIR) app.setPath("userData", process.env.PI_DESKTOP_DATA_DIR);
@@ -36,6 +37,7 @@ app.on("second-instance", () => {
 // Local diagnostic log only; nothing is uploaded. Records carry no prompts, model output or settings.
 const logDir = join(app.getPath("userData"), "logs");
 const log = new DesktopLog({ dir: logDir });
+const tracingEnvironment = takeLangfuseEnvironment(process.env);
 process.on("uncaughtExceptionMonitor", (error) => log.error("uncaughtException", { error: describeError(error) }));
 process.on("unhandledRejection", (reason) => log.error("unhandledRejection", { error: describeError(reason) }));
 app.on("render-process-gone", (_event, _contents, details) =>
@@ -493,6 +495,8 @@ void app.whenReady().then(() => {
 	const environment: NodeJS.ProcessEnv = { ...process.env, ELECTRON_RUN_AS_NODE: "1" };
 	service = new DesktopService({
 		dataDir: app.getPath("userData"),
+		tracing: createPiTracing({ ...tracingEnvironment, LANGFUSE_RELEASE: tracingEnvironment.LANGFUSE_RELEASE || app.getVersion() },
+			() => log.warn("tracing_configuration_invalid", {})),
 		runtimeDir,
 		ptyHelperPath: app.isPackaged ? join(process.resourcesPath, "native/pty-host") : join(__dirname, "native/pty-host"),
 		executable: process.execPath,
