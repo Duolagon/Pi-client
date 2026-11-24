@@ -609,7 +609,7 @@ export function WorkspacePanel({
 									</form>
 									{intelligence.definitions.map((item, index) => <button type="button" key={index} onClick={() => open(item.path, item.line)}>{item.path}:{item.line}:{item.column}</button>)}
 									<details open={intelligence.diagnostics.length > 0}>
-										<summary>诊断 {intelligence.diagnostics.length}</summary>
+										<summary>{intelligence.diagnosticsComplete === false ? "语言服务器尚未报告诊断" : `诊断 ${intelligence.diagnostics.length}`}</summary>
 										{intelligence.diagnostics.map((item, index) => <button type="button" key={index} onClick={() => updateView((current) => ({ ...current, files: { ...current.files, line: item.line } }))}>{item.line}:{item.column} {item.message}</button>)}
 									</details>
 									<details>

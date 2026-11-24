@@ -106,6 +106,17 @@ test("dirty and ignored files prevent deletion without losing user data", { time
 		await writeFile(join(tree.path, "ignored.txt"), "local private data\n");
 		await assert.rejects(service.remove(tree.id), /忽略/);
 		assert.equal(await readFile(join(tree.path, "ignored.txt"), "utf8"), "local private data\n");
+		await writeFile(join(tree.path, "new.txt"), "still unsaved\n");
+		await assert.rejects(service.remove(tree.id, { preserveIgnored: true }), /未提交|未跟踪/);
+		assert.equal(await readFile(join(tree.path, "ignored.txt"), "utf8"), "local private data\n");
+		await rm(join(tree.path, "new.txt"));
+		await mkdir(join(tree.path, "node_modules"));
+		await writeFile(join(tree.path, "node_modules", "artifact.txt"), "build artifact\n");
+		const removed = await service.remove(tree.id, { preserveIgnored: true });
+		assert.ok(removed.retainedIgnoredPath);
+		assert.equal(await readFile(join(removed.retainedIgnoredPath, "ignored.txt"), "utf8"), "local private data\n");
+		assert.equal(await readFile(join(removed.retainedIgnoredPath, "node_modules", "artifact.txt"), "utf8"), "build artifact\n");
+		await assert.rejects(access(tree.path));
 	} finally { await data.cleanup(); }
 });
 
@@ -222,7 +233,7 @@ test("missing base references and unborn repositories fail without creating work
 	} finally { await data.cleanup(); }
 });
 
-test("omitted baseRef prefers origin/HEAD when present and falls back to HEAD otherwise", { timeout: 30000 }, async () => {
+test("omitted baseRef includes local commits and an explicit origin/HEAD is still supported", { timeout: 30000 }, async () => {
 	const data = await fixture();
 	const bareRemote = join(data.root, "remote.git");
 	const localClone = join(data.root, "local-clone");
@@ -236,14 +247,18 @@ test("omitted baseRef prefers origin/HEAD when present and falls back to HEAD ot
 		await git(localClone, "remote", "set-head", "origin", "main");
 		const originCommit = await git(localClone, "rev-parse", "origin/HEAD");
 
-		// Advance local main past origin/HEAD; omitted baseRef must still branch from origin/HEAD.
+		// Advance local main past origin/HEAD so the default and the explicit base differ.
 		await writeFile(join(localClone, "local-only.txt"), "local ahead\n");
 		await git(localClone, "add", "--", "local-only.txt");
 		await commit(localClone, "local commit ahead of origin");
 		const localHead = await git(localClone, "rev-parse", "HEAD");
 		assert.notEqual(localHead, originCommit);
 
-		const fromOrigin = await service.create({ project: localClone });
+		const fromLocal = await service.create({ project: localClone });
+		assert.equal(fromLocal.baseRef, "HEAD");
+		assert.equal(fromLocal.baseCommit, localHead);
+		assert.equal(await readFile(join(fromLocal.path, "local-only.txt"), "utf8"), "local ahead\n");
+		const fromOrigin = await service.create({ project: localClone, baseRef: "origin/HEAD" });
 		assert.equal(fromOrigin.baseRef, "origin/HEAD");
 		assert.equal(fromOrigin.baseCommit, originCommit);
 	} finally { await data.cleanup(); }

@@ -121,17 +121,24 @@ test(
 	},
 );
 
-test("read mode closes existing PTYs and rejects further creation and input", { timeout: 15000 }, async () => {
+test("read mode closes its own PTYs and leaves explicitly writable conversations alone", { timeout: 15000 }, async () => {
 	const { fixture, service, conversationId } = await setup();
 	try {
 		const terminal = await service.createTerminal({ conversationId, shell: "/bin/bash" });
 		await service.writeTerminal(terminal.id, "printf '%s%s\\n' 'BEFORE_' 'READ'\n");
 		await output(service, terminal.id, /BEFORE_READ/);
+		const other = (await service.newConversation()).active!.id;
+		await service.setConversationPermission(other, "ask");
+		const otherTerminal = await service.createTerminal({ conversationId: other, shell: "/bin/bash" });
 		await service.saveSettings({ permission: "read", theme: "light" });
 		assert.equal(service.listTerminals(conversationId)[0].status, "exited");
 		await assert.rejects(service.createTerminal({ conversationId }), /只读/);
 		await assert.rejects(service.writeTerminal(terminal.id, "touch forbidden.txt\n"), /不可|只读/);
 		await assert.rejects(access(join(fixture.project, "forbidden.txt")));
+		await service.writeTerminal(otherTerminal.id, "printf '%s%s\\n' 'STILL_' 'WRITABLE'\n");
+		await output(service, otherTerminal.id, /STILL_WRITABLE/);
+		await service.setConversationPermission(other, "plan");
+		assert.equal(service.listTerminals(other)[0].status, "exited");
 	} finally {
 		await service.close();
 		await fixture.cleanup();

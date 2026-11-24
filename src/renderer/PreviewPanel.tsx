@@ -2,6 +2,7 @@ import type { PreviewCheck } from "../shared.ts";
 import { useEffect, useState } from "react";
 import { ExternalLink, Globe, Monitor, RefreshCw, Smartphone, X } from "lucide-react";
 import { IconButton } from "../prototype/ui.tsx";
+import { DEFAULT_LOCAL_PREVIEW_URL } from "../preview-check-types.ts";
 
 function normalizeLocalUrl(raw: string): string | null {
 	try {
@@ -28,7 +29,7 @@ export function PreviewPanel({
 	onNavigate: (url: string) => void;
 }) {
 	const [inputUrl, setInputUrl] = useState(url);
-	const activeUrl = normalizeLocalUrl(url) ?? "http://localhost:3000";
+	const activeUrl = normalizeLocalUrl(url) ?? DEFAULT_LOCAL_PREVIEW_URL;
 	const [reloadKey, setReloadKey] = useState(0);
 	const [mobile, setMobile] = useState(false);
 	const [error, setError] = useState("");
@@ -100,7 +101,7 @@ export function PreviewPanel({
 					aria-label="预览地址"
 					value={inputUrl}
 					onChange={(e) => setInputUrl(e.target.value)}
-					placeholder="http://localhost:3000"
+					placeholder={DEFAULT_LOCAL_PREVIEW_URL}
 				/>
 				<button type="submit" className="cc-mini-btn" disabled={checking}>
 					访问

@@ -73,10 +73,22 @@ test("Claude SDK hooks authorize all tools before native auto-allow and retain o
 		assert.equal(harness.config!.resume, "resumed-session");
 		assert.equal(harness.config!.pathToClaudeCodeExecutable, "/fake/claude");
 		assert.equal(harness.config!.permissionMode, "default");
+		assert.deepEqual(harness.config!.settingSources, ["user"]);
 		assert.equal(harness.packets.filter((packet) => packet.type === "permission").length, 2);
 		const request = harness.packets.find((packet) => packet.type === "permission");
 		assert.equal(request?.type === "permission" && request.request.input.path, join(data.cwd, "target.txt"));
 		assert.deepEqual(harness.hookResult, { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" } });
+	} finally { await harness.helper.close(); await data.cleanup(); }
+});
+
+test("Claude SDK enables project and local settings only after explicit host trust", async () => {
+	const data = await fixture();
+	const policy = basePolicy(data.cwd);
+	const harness = sdkHarness(policy);
+	try {
+		await harness.helper.receive({ type: "init", id: "init", config: { executable: "/fake/claude", cwd: data.cwd, policy, projectTrusted: true, maxBudgetUsd: 0.5 } });
+		assert.deepEqual(harness.config!.settingSources, ["user", "project", "local"]);
+		assert.equal(harness.config!.maxBudgetUsd, 0.5);
 	} finally { await harness.helper.close(); await data.cleanup(); }
 });
 
@@ -118,6 +130,8 @@ test("Claude helper validates configuration and protocol requests without starti
 	const helper = new ClaudeSdkHelper((packet) => packets.push(packet), () => { throw new Error("must not start"); });
 	await helper.receive({ type: "init", id: "invalid", config: { executable: "relative", cwd: "/project", policy: basePolicy("/project") } });
 	assert.equal(packets[0].type === "response" && packets[0].ok, false);
+	await helper.receive({ type: "init", id: "invalid-trust", config: { executable: "/fake/claude", cwd: "/project", policy: basePolicy("/project"), projectTrusted: "true" } });
+	assert.equal(packets[1].type === "response" && !packets[1].ok && packets[1].error, "Invalid Claude project trust");
 	await helper.close();
 });
 

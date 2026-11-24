@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, cp, mkdir, mkdtemp, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
+import { access, chmod, cp, mkdir, mkdtemp, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -99,6 +99,7 @@ try {
 	const pageErrors = [];
 	page.on("pageerror", (error) => pageErrors.push(error.message));
 	const snapshot = () => page.evaluate(() => window.pi.snapshot());
+	const permissionOf = (value) => value.active?.permissionMode ?? value.settings.permission;
 	const ready = () =>
 		until(async () => {
 			const value = await snapshot();
@@ -376,10 +377,18 @@ try {
 	await page.getByRole("button", { name: "关闭终端", exact: true }).click();
 	checks.push("legacy shell command panel");
 	await page.getByRole("button", { name: "设置", exact: true }).click();
-	await page.getByRole("combobox", { name: "模型服务商", exact: true }).selectOption("deepseek");
+	const providerSelection = page.getByRole("combobox", { name: "模型服务商", exact: true });
+	await providerSelection.selectOption("deepseek");
 	assert.ok((await page.getByRole("combobox", { name: "默认模型", exact: true }).locator("option").count()) >= 2);
-	assert.equal(await page.getByLabel("API Key", { exact: true }).inputValue(), "");
-	await page.getByText("权限与外观", { exact: true }).click();
+	const providerKey = page.getByLabel("API Key", { exact: true });
+	assert.equal(await providerKey.inputValue(), "");
+	await providerKey.fill("demo-provider-draft");
+	await providerSelection.selectOption("openai");
+	assert.equal(await providerKey.inputValue(), "");
+	await providerSelection.selectOption("deepseek");
+	assert.equal(await providerKey.inputValue(), "demo-provider-draft");
+	await providerKey.fill("");
+	await page.getByText("Agent 与自动化", { exact: true }).click();
 	assert.equal(await page.getByRole("checkbox", { name: "允许 fork 子 Agent", exact: true }).isChecked(), true);
 	assert.equal(await page.getByRole("checkbox", { name: "隔离可写 worktree 子 Agent Bash", exact: true }).isChecked(), true);
 	await page.getByRole("checkbox", { name: "允许 fork 子 Agent", exact: true }).uncheck();
@@ -394,7 +403,7 @@ try {
 		"P6/P7 settings saved",
 	);
 	await page.getByRole("button", { name: "设置", exact: true }).click();
-	await page.getByText("权限与外观", { exact: true }).click();
+	await page.getByText("Agent 与自动化", { exact: true }).click();
 	await page.getByRole("checkbox", { name: "允许 fork 子 Agent", exact: true }).check();
 	await page.getByRole("spinbutton", { name: "子 Agent 最大嵌套深度", exact: true }).fill("1");
 	await page.getByRole("spinbutton", { name: "最大并发子 Agent 数", exact: true }).fill("8");
@@ -451,7 +460,24 @@ try {
 		"completed",
 	);
 	assert.equal((await snapshot()).active.id, state.active.id);
-	await page.evaluate((id) => window.pi.worktrees.remove(id), task.worktreeId);
+	const ignoredWorktreeFile = "pi-ui-ignored-cache.txt";
+	const gitExclude = join(project, ".git", "info", "exclude");
+	await writeFile(gitExclude, (await readFile(gitExclude, "utf8")) + "\n" + ignoredWorktreeFile + "\n");
+	await writeFile(join(task.workingDirectory, ignoredWorktreeFile), "ignored fixture\n");
+	await page.getByRole("button", { name: "后台任务与 Worktree", exact: true }).click();
+	const worktreeDrawer = page.getByRole("dialog", { name: "后台任务、子 Agent 与 Worktree (/tasks)", exact: true });
+	await worktreeDrawer.getByRole("tab", { name: /Worktrees/ }).click();
+	await worktreeDrawer.getByRole("button", { name: "清理", exact: true }).click();
+	const cleanupWorktree = worktreeDrawer.getByRole("group", { name: "确认清理 Worktree", exact: true });
+	await cleanupWorktree.getByRole("button", { name: "取消", exact: true }).click();
+	assert.equal(await readFile(join(task.workingDirectory, ignoredWorktreeFile), "utf8"), "ignored fixture\n");
+	await worktreeDrawer.getByRole("button", { name: "清理", exact: true }).click();
+	await cleanupWorktree.getByRole("button", { name: "确认清理", exact: true }).click();
+	const retainedWorktree = worktreeDrawer.getByRole("status").filter({ hasText: "忽略文件已保留在" }).locator("code");
+	await retainedWorktree.waitFor();
+	assert.equal(await readFile(join(await retainedWorktree.innerText(), ignoredWorktreeFile), "utf8"), "ignored fixture\n");
+	await assert.rejects(access(task.workingDirectory), { code: "ENOENT" });
+	await worktreeDrawer.getByRole("button", { name: "关闭对话框", exact: true }).click();
 	checks.push("checkpoint, session tree, PTY, background task and worktree preload interfaces");
 	const tools = await page.evaluate(() => window.pi.tools.list());
 	assert.ok(tools.some((tool) => tool.name === "Agent" && tool.modelVisible && tool.source === "desktop"));
@@ -474,6 +500,27 @@ try {
 	assert.equal(configured.find((item) => item.id === "codex").enabled, false);
 	await page.evaluate(() => window.pi.externalAgents.configure({ id: "codex", enabled: true }));
 	checks.push("local external executor discovery, configuration and task namespace through real preload");
+	const fakeKimi = join(root, "kimi-fixture");
+	await cp(join(repo, "test/fixtures/fake-kimi-acp.mjs"), fakeKimi);
+	await chmod(fakeKimi, 0o700);
+	await input.focus();
+	const externalQuestionTask = await page.evaluate(async (executable) => {
+		await window.pi.externalAgents.configure({ id: "kimi", executable, enabled: true });
+		return window.pi.externalAgents.start({ executor: "kimi", description: "外部提问回归", prompt: "form" });
+	}, fakeKimi);
+	const externalQuestion = page.getByRole("region", { name: "外部 Agent 提问", exact: true });
+	await externalQuestion.waitFor();
+	assert.equal(await input.evaluate((node) => node === document.activeElement), true);
+	const submitExternalAnswers = externalQuestion.getByRole("button", { name: "提交回答", exact: true });
+	assert.equal(await submitExternalAnswers.isDisabled(), true);
+	await externalQuestion.getByRole("combobox", { name: "q0", exact: true }).selectOption("blue");
+	await externalQuestion.getByRole("checkbox", { name: "test", exact: true }).check();
+	await submitExternalAnswers.click();
+	await externalQuestion.waitFor({ state: "hidden" });
+	await until(async () => (await page.evaluate((id) => window.pi.externalAgents.snapshot(id), externalQuestionTask.id)).status === "completed", "external question completes");
+	const answeredExternalQuestion = await page.evaluate((id) => window.pi.externalAgents.snapshot(id), externalQuestionTask.id);
+	assert.deepEqual(JSON.parse(answeredExternalQuestion.output), { action: "accept", content: { q0: "blue", q1: ["test"] } });
+	checks.push("external structured questions stay inline, preserve the chat focus and return native structured answers");
 
 	// Verify Claude Code UI modals, autocomplete, and interactive PTY tab
 	await openMore("检查点与回滚");
@@ -563,11 +610,6 @@ try {
 	await page.getByText("工具与 MCP 挂载", { exact: true }).waitFor();
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
-	await openMore("本地网页预览");
-	await page.locator("aside[aria-label='本地应用预览']").waitFor();
-	await page.getByRole("textbox", { name: "预览地址", exact: true }).fill("https://example.com");
-	await page.getByRole("button", { name: "访问", exact: true }).click();
-	await page.getByRole("alert").filter({ hasText: /localhost/ }).waitFor();
 	previewServer = createServer(async (request, response) => {
 		if (request.url === "/mcp") {
 			try {
@@ -589,7 +631,17 @@ try {
 	});
 	await new Promise((resolve) => previewServer.listen(0, "127.0.0.1", resolve));
 	const previewUrl = `http://127.0.0.1:${previewServer.address().port}/`;
-	await page.getByRole("textbox", { name: "预览地址", exact: true }).fill(previewUrl);
+	await mkdir(join(project, ".claude"), { recursive: true });
+	const previewConfig = join(project, ".claude", "launch.json");
+	await writeFile(previewConfig, JSON.stringify({ configurations: [{ name: "local-preview-fixture", runtimeExecutable: "node", port: previewServer.address().port }] }));
+	await openMore("本地网页预览");
+	await page.locator("aside[aria-label='本地应用预览']").waitFor();
+	const previewAddress = page.getByRole("textbox", { name: "预览地址", exact: true });
+	assert.equal(await previewAddress.inputValue(), previewUrl);
+	await previewAddress.fill("https://example.com");
+	await page.getByRole("button", { name: "访问", exact: true }).click();
+	await page.getByRole("alert").filter({ hasText: /localhost/ }).waitFor();
+	await previewAddress.fill(previewUrl);
 	await page.getByRole("button", { name: "访问", exact: true }).click();
 	assert.equal(await page.locator("aside.cc-preview-panel iframe").getAttribute("src"), previewUrl);
 	await page.frameLocator("aside.cc-preview-panel iframe").getByRole("heading", { name: "Preview fixture" }).waitFor();
@@ -597,8 +649,9 @@ try {
 	await page.getByText("Pi Local Preview", { exact: true }).waitFor();
 	await page.getByText("fixture console", { exact: true }).waitFor();
 	assert.match(await page.locator(".cc-preview-result").innerText(), /HTTP 200/);
-	checks.push("local Chromium preview and console validation");
+	checks.push("local preview opens the configured port, rejects remote addresses, and reports browser console errors");
 	await page.getByRole("button", { name: "关闭预览面板", exact: true }).click();
+	await rm(previewConfig);
 
 	await openMore("命令面板");
 	await page.getByRole("dialog", { name: "命令面板 (⌘P)", exact: true }).waitFor();
@@ -606,15 +659,18 @@ try {
 	await page.locator(".search-results button").filter({ hasText: "/memory" }).waitFor();
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
-	await page.locator("button.cc-plan-pill").click();
+	await page.getByRole("combobox", { name: "权限模式", exact: true }).selectOption("plan");
 	await until(
 		async () => (await page.getByRole("combobox", { name: "权限模式", exact: true }).inputValue()) === "plan",
 		"Plan mode switch",
 	);
+	const planFile = (await page.evaluate(() => window.pi.readPlan())).relativePath;
+	assert.ok((await input.inputValue()).includes(planFile));
 	await submit("请以只读方式分析实现计划。");
 	await page.getByText("已收到补充指令，客户端与 Pi 引擎连接正常。", { exact: true }).waitFor();
 	await idle();
 	await page.getByRole("region", { name: "计划审批", exact: true }).waitFor();
+	await page.getByText("等待 Pi 提交计划。也可以手动编写计划正文。", { exact: true }).waitFor();
 	assert.equal(await page.getByRole("button", { name: "批准计划 · 接受编辑", exact: true }).count(), 0);
 	await page.getByRole("button", { name: "编写计划正文", exact: true }).click();
 	await page.getByRole("textbox", { name: "编辑计划内容", exact: true }).fill("# E2E Plan\n1. Check plan persistence\n");
@@ -624,10 +680,10 @@ try {
 	await writeFile(plan.path, "# 另一份计划\n");
 	await page.getByRole("button", { name: "批准计划 · 接受编辑", exact: true }).click();
 	await page.getByRole("alert").filter({ hasText: "计划文件在编辑期间发生了变化" }).waitFor();
-	assert.equal((await snapshot()).settings.permission, "plan");
+	assert.equal(permissionOf(await snapshot()), "plan");
 	assert.equal(await readFile(plan.path, "utf8"), "# 另一份计划\n");
-	page.once("dialog", (dialog) => dialog.accept());
 	await page.getByRole("button", { name: "重新读取计划", exact: true }).click();
+	await page.getByRole("dialog", { name: "重新读取计划", exact: true }).getByRole("button", { name: "重新读取", exact: true }).click();
 	const planEditor = page.getByRole("textbox", { name: "编辑计划内容", exact: true });
 	await until(async () => (await planEditor.inputValue()) === "# 另一份计划\n", "latest plan file in editor");
 	await submit("提交本地演示计划");
@@ -641,7 +697,7 @@ try {
 	await until(
 		async () => {
 			const value = await snapshot();
-			return value.settings.permission === "ask" && value.messages.some((message) => message.role === "user" &&
+			return permissionOf(value) === "ask" && value.messages.some((message) => message.role === "user" &&
 				message.content.some((part) => part.type === "text" && part.text.startsWith("计划已批准") && part.text.trimEnd().endsWith(approvedBody.trimEnd())));
 		},
 		"the approved revision reaches the model in the selected permission mode",
@@ -763,7 +819,9 @@ try {
 	await until(async () => (await snapshot()).active?.project?.endsWith("parallel-project"), "workspace picker switch to parallel-project");
 	// Verify composer sandbox pill & popover control
 	await page.getByRole("button", { name: "命令沙箱设置", exact: true }).click();
-	await page.getByRole("region", { name: "命令沙箱控制", exact: true }).waitFor();
+	const sandboxPanel = page.getByRole("region", { name: "命令沙箱控制", exact: true });
+	await sandboxPanel.getByText("文件工具可写", { exact: true }).waitFor();
+	await sandboxPanel.getByText(/内置文件工具也会保护 \.env 文件/).waitFor();
 	const sbStatus = await page.evaluate(() => window.pi.sandboxStatus());
 	if (sbStatus.supported) {
 		assert.equal(await page.getByRole("checkbox", { name: "快捷开启 macOS Seatbelt 命令沙箱", exact: true }).isChecked(), true);
@@ -815,7 +873,12 @@ try {
 	await submit("模型上下文验证 @ref.md");
 	await page.getByText("收到项目记忆、规则和文件引用。", { exact: true }).waitFor();
 	await idle();
-	checks.push("approved scoped rules, private memory and references reach the real model request");
+	assert.equal(await page.locator(".cl-msg-user").filter({ hasText: "PI_REFERENCE_FIXTURE" }).count(), 0);
+	await writeFile(join(secondProject, "ref.md"), "UPDATED_CONTENT_NOT_NEEDED");
+	await submit("文件引用续问验证");
+	await page.getByText("仍能看到前一轮的文件引用。", { exact: true }).waitFor();
+	await idle();
+	checks.push("approved rules and private memory load once; referenced file snapshots survive follow-up without cluttering the user bubble");
 
 	await page.getByRole("button", { name: "终端", exact: true }).click();
 	await page.getByRole("button", { name: "Pi 扩展", exact: true }).click();
@@ -838,15 +901,22 @@ try {
 	await page.getByRole("region", { name: "子 Agent 面板", exact: true }).waitFor();
 	await page.locator(".cc-subagent-row").filter({ hasText: "E2E 子审批" }).waitFor();
 	await page.getByRole("button", { name: "展开 1 个子 Agent 会话", exact: true }).waitFor();
-	await page.getByRole("dialog", { name: /子 Agent ‹E2E 子审批›.*允许执行 write？/ }).waitFor();
+	const childApproval = page.getByRole("region", { name: /子 Agent ‹E2E 子审批›.*允许执行 write？/ });
+	const reviewChild = page.getByRole("button", { name: "查看子 Agent 审批 (1)", exact: true });
+	await input.focus();
+	await reviewChild.waitFor();
+	assert.equal(await page.getByRole("dialog", { name: /允许执行 write？/ }).count(), 0);
+	assert.ok(await input.evaluate((element) => document.activeElement === element));
+	await reviewChild.click();
+	await childApproval.getByText("should be denied", { exact: true }).waitFor();
 	await page.getByRole("button", { name: "稍后处理", exact: true }).click();
-	await page.getByRole("button", { name: "继续处理子 Agent 审批 (1)", exact: true }).waitFor();
+	await reviewChild.waitFor();
 	await page.locator(".cc-subagent-row").filter({ hasText: "E2E 子审批" }).click();
 	await page.getByRole("button", { name: "返回主会话", exact: true }).waitFor();
+	await childApproval.getByText("should be denied", { exact: true }).waitFor();
 	await page.getByRole("button", { name: "返回主会话", exact: true }).click();
-	await page.getByRole("button", { name: "继续处理子 Agent 审批 (1)", exact: true }).click();
-	await page.getByRole("dialog", { name: /子 Agent ‹E2E 子审批›.*允许执行 write？/ }).waitFor();
-	await page.getByRole("button", { name: "拒绝", exact: true }).click();
+	await reviewChild.click();
+	await childApproval.getByRole("button", { name: "拒绝", exact: true }).click();
 	await until(async () => {
 		const list = await page.evaluate(() => window.pi.tasks.list());
 		const sub = list.find((t) => t.title === "E2E 子审批");
@@ -858,7 +928,7 @@ try {
 
 	// P8 UI & Electron utilityProcess Workflow E2E check
 	await page.getByRole("button", { name: "设置", exact: true }).click();
-	await page.getByText("权限与外观", { exact: true }).click();
+	await page.getByText("Agent 与自动化", { exact: true }).click();
 	assert.equal(await page.getByRole("checkbox", { name: "启用定时唤醒与 /loop 自动任务", exact: true }).isChecked(), true);
 	await page.getByText(/会自动消耗额度/).waitFor();
 	assert.equal(await page.getByRole("checkbox", { name: "实验性 Agent Teams 多成员协作", exact: true }).isChecked(), false);
@@ -978,7 +1048,14 @@ try {
 	page.on("pageerror", (error) => pageErrors.push(error.message));
 	await ready();
 	await page.getByRole("button", { name: "移除附件 regression.png", exact: true }).waitFor();
-	assert.equal(await page.getByRole("textbox", { name: "输入任务", exact: true }).inputValue(), "重启后保留的草稿");
+	const recoveredInput = page.getByRole("textbox", { name: "输入任务", exact: true });
+	assert.equal(await recoveredInput.inputValue(), "重启后保留的草稿");
+	await page.getByRole("button", { name: "移除附件 regression.png", exact: true }).click();
+	await recoveredInput.fill("");
+	await recoveredInput.press("ArrowUp");
+	assert.equal(await recoveredInput.inputValue(), "持久草稿会话");
+	await recoveredInput.press("ArrowDown");
+	assert.equal(await recoveredInput.inputValue(), "");
 	checks.push("draft text and attachments are isolated per conversation and survive reload and restart");
 
 	await page.evaluate(async (project) => {
@@ -987,13 +1064,16 @@ try {
 	}, project);
 	await page.reload();
 	await ready();
+	await page.getByRole("textbox", { name: "输入任务", exact: true }).press("ArrowUp");
+	assert.equal(await page.getByRole("textbox", { name: "输入任务", exact: true }).inputValue(), "");
+	checks.push("composer history comes from its own persisted conversation after restart");
 	const oversized = join(project, "checkpoint-oversized.bin");
 	await writeFile(oversized, "");
 	await truncate(oversized, 65 * 1024 * 1024);
 	const permissions = page.getByRole("combobox", { name: "权限模式", exact: true });
 	for (const [mode, text] of [["read", "有大文件时的只读提问"], ["ask", "有大文件时的普通提问"]]) {
 		await permissions.selectOption(mode);
-		await until(async () => (await snapshot()).settings.permission === mode && !(await permissions.isDisabled()), mode);
+		await until(async () => permissionOf(await snapshot()) === mode && !(await permissions.isDisabled()), mode);
 		await submit(text);
 		await until(async () => Boolean(queuedUserMessage((await snapshot()).messages, text)), text);
 		await idle();
@@ -1009,12 +1089,15 @@ try {
 	const kaggleLog = join(project, "fake-kaggle.log");
 	await writeFile(join(project, ".venv/bin/kaggle"), '#!/bin/sh\nprintf "%s\\n" "$2" >> fake-kaggle.log\nprintf "%s\\n" QUEUED\n', { mode: 0o755 });
 	const setPermissionMode = async (mode) => {
-		if (mode === "auto") page.once("dialog", (dialog) => dialog.accept());
+		const requiresConfirmation = mode === "auto" && permissionOf(await snapshot()) !== "auto";
 		await permissions.selectOption(mode);
-		await until(async () => (await snapshot()).settings.permission === mode && !(await permissions.isDisabled()), mode);
+		if (requiresConfirmation)
+			await page.getByRole("dialog", { name: "为当前会话启用「全部放行」？" }).getByRole("button", { name: "启用全部放行" }).click();
+		await until(async () => permissionOf(await snapshot()) === mode && !(await permissions.isDisabled()), mode);
 	};
-	await setPermissionMode("auto");
 	await newChat();
+	await setPermissionMode("auto");
+	const autoConversationId = (await snapshot()).active.id;
 	await submit("为啥要排队，现在在跑什么");
 	await page.getByText("演示队列状态查询结束。", { exact: true }).waitFor();
 	await idle();
@@ -1028,8 +1111,9 @@ try {
 	assert.equal(await remoteApproval.count(), 0);
 	assert.equal(await readFile(kaggleLog, "utf8"), "status\ndelete\n");
 
-	await setPermissionMode("ask");
 	await newChat();
+	assert.equal(permissionOf(await snapshot()), "ask");
+	assert.equal((await snapshot()).conversations.find((item) => item.id === autoConversationId)?.permissionMode, "auto");
 	await submit("请删除演示云端作业");
 	await remoteApproval.waitFor();
 	assert.equal(await remoteApproval.getByRole("button", { name: /始终允许/ }).count(), 0);
@@ -1040,8 +1124,8 @@ try {
 	assert.equal(await readFile(kaggleLog, "utf8"), "status\ndelete\ndelete\n");
 	checks.push("status-only requests cannot mutate the remote queue; explicit writes follow auto and manual approval modes");
 
-	await setPermissionMode("auto");
 	await newChat();
+	await setPermissionMode("auto");
 	const listShells = () => page.evaluate(async () => window.pi.monitors.list((await window.pi.snapshot()).active.id));
 	const olderPidPath = join(project, "previous-shell.pid");
 	const latestPidPath = join(project, "current-shell.pid");
@@ -1078,6 +1162,7 @@ try {
 	checks.push("stop remains available after the reply and reload, rejects another run ID, and exits only the current process");
 
 	await newChat();
+	await setPermissionMode("auto");
 	await writeFile(join(project, "test/background-check.test.mjs"), [
 		'import { access } from "node:fs/promises";',
 		'import { test } from "node:test";',

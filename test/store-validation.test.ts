@@ -78,6 +78,42 @@ async function seededStore() {
 
 const quarantinedIds = ["comma-tools", "huge-turns", "forged-parent", "mismatch", "cycle-a", "bad-status"];
 
+test("the WebSearch key and disabled preference survive desktop restart", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-search-settings-"));
+	const dataDir = join(root, "desktop");
+	const settingsFile = join(dataDir, "desktop.json");
+	const makeDesktop = () => new DesktopService({
+		dataDir,
+		executable: process.execPath,
+		env: isolatedEnv(root),
+		encrypt: () => "fake-ciphertext",
+	});
+	let desktop = makeDesktop();
+	const base = { permission: "ask", theme: "light", sandbox: false } as const;
+	try {
+		await desktop.initialize();
+		await desktop.saveSettings({ ...base, webSearchEnabled: false, webSearchApiKey: "local-search-test-key" });
+		await desktop.close();
+		desktop = makeDesktop();
+		const snapshot = await desktop.initialize();
+		assert.equal(snapshot.settings.webSearchEnabled, false);
+		assert.equal(snapshot.settings.webSearchApiKeyConfigured, true);
+		assert.doesNotMatch(JSON.stringify(snapshot), /fake-ciphertext|local-search-test-key/);
+		const stored = JSON.parse(await readFile(settingsFile, "utf8"));
+		assert.equal(stored.settings.webSearchEnabled, false);
+		assert.equal(stored.webSearchApiKey, "fake-ciphertext");
+		await desktop.saveSettings({ ...base, webSearchEnabled: true, webSearchApiKey: "" });
+		await desktop.close();
+		desktop = makeDesktop();
+		const cleared = await desktop.initialize();
+		assert.notEqual(cleared.settings.webSearchEnabled, false);
+		assert.equal(cleared.settings.webSearchApiKeyConfigured, false);
+	} finally {
+		await desktop.close();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 test("Plan sessions can submit a plan while task tool restrictions remain enforced", () => {
 	const tools = (task: Parameters<typeof piToolArgs>[0], mode: "plan" | "read") => piToolArgs(task, mode)[1].split(",");
 	assert.ok(tools(undefined, "plan").includes("ExitPlanMode"));

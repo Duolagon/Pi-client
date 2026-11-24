@@ -115,7 +115,7 @@ for (const cancelled of [false, true]) {
 					join(data.fixture.agentDir, "extensions", "parent-name.js"),
 					`export default function(pi) { pi.on("session_before_fork", () => { pi.setSessionName("parent renamed by hook"); return { cancel: ${cancelled} }; }); }`,
 				);
-				await data.service.saveSettings({ permission: "auto", theme: "light" });
+				await data.service.saveSettings({ permission: "auto", theme: "light", agentDir: data.fixture.agentDir });
 				const result = await data.service.cloneSession({ conversationId: data.id, title: "explicit child title" });
 				assert.equal(result.cancelled, cancelled);
 				assert.equal(

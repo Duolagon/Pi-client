@@ -1,5 +1,7 @@
 /** Shared types for the PreviewCheck model tool and Electron headless verification. */
 
+export const DEFAULT_LOCAL_PREVIEW_URL = "http://localhost:3000/";
+
 export type PreviewInteraction =
 	| { type: "click"; selector: string }
 	| { type: "fill"; selector: string; value: string }
@@ -37,6 +39,7 @@ export interface PreviewInspectResult {
 	interactiveElements?: PreviewInteractiveElement[];
 	screenshotPath?: string;
 	screenshotBase64?: string;
+	screenshotMimeType?: "image/jpeg";
 }
 
 export function formatPreviewInspectSummary(result: PreviewInspectResult): string {

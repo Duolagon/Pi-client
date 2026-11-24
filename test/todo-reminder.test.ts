@@ -1,45 +1,53 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import permissions from "../src/permission-extension.ts";
 import { staleTodoReminder } from "../src/todo-reminder.ts";
 
-const todo = (todos: Array<{ id: string; content: string; status: string }>) => ({
-	role: "assistant",
-	content: [{ type: "toolCall", id: "t", name: "TodoWrite", arguments: { todos } }],
-});
-const bash = (n: number) =>
-	Array.from({ length: n }, (_, i) => ({ role: "assistant", content: [{ type: "toolCall", id: `b${i}`, name: "bash", arguments: {} }] }));
-const open = [
-	{ id: "1", content: "download data", status: "in_progress" },
-	{ id: "2", content: "submit baseline", status: "pending" },
-];
-
-test("no reminder without any TodoWrite", () => {
-	assert.equal(staleTodoReminder(bash(30)), undefined);
+test("only unfinished items appear in the current checklist reminder", () => {
+	const completed = { content: "Done already", status: "completed" };
+	const active = { content: "Still running", status: "in_progress" };
+	assert.equal(staleTodoReminder("simple", []), undefined);
+	assert.equal(staleTodoReminder("simple", [completed]), undefined);
+	assert.equal(staleTodoReminder("shared", [completed, { content: "Removed", status: "deleted" }]), undefined);
+	assert.match(staleTodoReminder("simple", [active, completed]) ?? "", /TodoWrite with the full checklist[\s\S]*Still running/);
+	assert.doesNotMatch(staleTodoReminder("shared", [active, completed]) ?? "", /Done already|TodoWrite/);
 });
 
-test("no reminder while the checklist is recent", () => {
-	assert.equal(staleTodoReminder([todo(open), ...bash(9)]), undefined);
-});
-
-test("reminds after the threshold with the current checklist", () => {
-	const text = staleTodoReminder([todo(open), ...bash(10)]);
-	assert.ok(text);
-	assert.match(text, /\[in_progress\] download data/);
-	assert.match(text, /\[pending\] submit baseline/);
-});
-
-test("finished checklist with continued work asks for a new checklist", () => {
-	const done = open.map((t) => ({ ...t, status: "completed" }));
-	assert.equal(staleTodoReminder([todo(done), ...bash(9)]), undefined);
-	const text = staleTodoReminder([todo(done), ...bash(10)]);
-	assert.ok(text?.includes("new checklist"));
-});
-
-test("a newer TodoWrite resets the count", () => {
-	assert.equal(staleTodoReminder([todo(open), ...bash(20), todo(open), ...bash(3)]), undefined);
-});
-
-test("counts several tool calls inside one assistant message", () => {
-	const multi = { role: "assistant", content: Array.from({ length: 10 }, (_, i) => ({ type: "toolCall", id: `m${i}`, name: "Read", arguments: {} })) };
-	assert.ok(staleTodoReminder([todo(open), multi]));
+test("stale reminders are attached once to tool output, with no reminder after completion", async () => {
+	const original = process.env.PI_DESKTOP_HOST_URL;
+	const originalToken = process.env.PI_DESKTOP_HOST_TOKEN;
+	process.env.PI_DESKTOP_HOST_URL = "http://127.0.0.1:0";
+	delete process.env.PI_DESKTOP_HOST_TOKEN;
+	try {
+		const hooks = new Map<string, (event: unknown) => Promise<unknown>>();
+		const tools = new Map<string, { execute: (id: string, input: unknown) => Promise<unknown> }>();
+		permissions({
+			registerTool: (tool: { name: string; execute: (id: string, input: unknown) => Promise<unknown> }) => tools.set(tool.name, tool),
+			registerProvider() {},
+			on: (event: string, fn: (event: unknown) => Promise<unknown>) => hooks.set(event, fn),
+		} as unknown as ExtensionAPI);
+		assert.equal(hooks.has("context_with_system"), false);
+		const write = tools.get("TodoWrite")!;
+		await write.execute("todo", { todos: [{ id: "one", content: "First", status: "in_progress" }] });
+		const emit = async (toolName = "read", details?: unknown) => hooks.get("tool_result")!({
+			toolName, toolCallId: "call", input: { path: "fixture" }, content: [], details, isError: false,
+		});
+		const turn = [];
+		for (let index = 0; index < 12; index++) turn.push(await emit());
+		assert.equal(turn.filter(Boolean).length, 1);
+		assert.match(JSON.stringify(turn[3]), /TodoWrite/);
+		await write.execute("complete", { todos: [{ id: "one", content: "First", status: "completed" }] });
+		for (let index = 0; index < 8; index++) assert.equal(await emit(), undefined);
+		await emit("TodoList", { todos: [{ id: "s1", subject: "Shared", status: "in_progress" }] });
+		for (let index = 0; index < 3; index++) assert.equal(await emit(), undefined);
+		assert.match(JSON.stringify(await emit()), /TodoUpdate[\s\S]*Shared/);
+		await emit("TodoUpdate", { todo: { id: "s1", subject: "Shared", status: "completed" } });
+		for (let index = 0; index < 8; index++) assert.equal(await emit(), undefined);
+	} finally {
+		if (original === undefined) delete process.env.PI_DESKTOP_HOST_URL;
+		else process.env.PI_DESKTOP_HOST_URL = original;
+		if (originalToken === undefined) delete process.env.PI_DESKTOP_HOST_TOKEN;
+		else process.env.PI_DESKTOP_HOST_TOKEN = originalToken;
+	}
 });

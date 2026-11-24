@@ -202,6 +202,13 @@ test("model tools validate inputs, use authenticated host calls, and clamp child
 		assert.equal(item.definitions.size, desktopModelToolNames.length + 1);
 		assert.ok(item.definitions.has("bash"));
 		assert.ok(item.definitions.has("TodoCreate") && item.definitions.has("TodoGet") && item.definitions.has("TodoUpdate") && item.definitions.has("TodoList"));
+		const checklist = item.definitions.get("TodoList")!;
+		assert.deepEqual(checklist.prepareLoadout?.({} as never)?.hiddenDeclarations, ["TodoCreate", "TodoGet", "TodoUpdate", "TodoList"]);
+		await item.write({ TodoList: true });
+		await item.request("apply");
+		assert.deepEqual(checklist.prepareLoadout?.({} as never)?.hiddenDeclarations, ["TodoWrite"]);
+		await item.write({});
+		await item.request("apply");
 		assert.ok(item.definitions.has("SendMessage") && item.definitions.has("AgentSend") && item.definitions.has("AgentExecutors"));
 		assert.deepEqual((item.definitions.get("AgentSend") as { prepareLoadout?: () => unknown }).prepareLoadout?.(), { hiddenDeclarations: ["AgentSend"] });
 		assert.equal((item.definitions.get("SendMessage") as { prepareLoadout?: unknown }).prepareLoadout, undefined);

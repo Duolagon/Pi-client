@@ -1,9 +1,10 @@
-import { access, readFile, realpath } from "node:fs/promises";
+import { access, readFile, readlink, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_AGENT_MCP_SERVERS } from "./delegation-limits.ts";
 import { knownRemoteOperation } from "./remote-operation.ts";
+import { isProtectedFileToolPath } from "./sandbox.ts";
 import type {
 	PermissionAction,
 	PermissionCommandSelector,
@@ -173,11 +174,13 @@ function agentTypeMatches(rule: PermissionRule, pattern: string, type: string | 
 
 export function validateRuntimePolicy(value: unknown): RuntimePermissionPolicy {
 	const record = object(value, "运行时权限配置");
-	keys(record, ["version", "mode", "dontAsk", "rules", "disabledTools", "allowedMcpServers", "project"], "运行时权限配置");
+	keys(record, ["version", "mode", "dontAsk", "rules", "disabledTools", "allowedMcpServers", "project", "additionalDirs", "sandbox"], "运行时权限配置");
 	if (record.version !== 1 || !["ask", "acceptEdits", "auto", "read", "plan"].includes(record.mode as string))
 		throw new Error("运行时权限版本或模式无效。");
 	if (record.dontAsk !== undefined && typeof record.dontAsk !== "boolean")
 		throw new Error("运行时 dontAsk 配置无效。");
+	if (record.sandbox !== undefined && typeof record.sandbox !== "boolean")
+		throw new Error("运行时沙箱配置无效。");
 	if (!Array.isArray(record.rules) || record.rules.length > 2000) throw new Error("权限规则列表无效。");
 	if (!Array.isArray(record.disabledTools) || record.disabledTools.length > 10000) throw new Error("停用工具列表无效。");
 	const rules = record.rules.map(validatePermissionRule);
@@ -199,6 +202,15 @@ export function validateRuntimePolicy(value: unknown): RuntimePermissionPolicy {
 	}
 	const project = text(record.project, "运行时项目目录");
 	if (!isAbsolute(project)) throw new Error("运行时项目目录必须为绝对路径。");
+	let additionalDirs: string[] | undefined;
+	if (record.additionalDirs !== undefined) {
+		if (!Array.isArray(record.additionalDirs)) throw new Error("运行时附加目录列表无效。");
+		additionalDirs = record.additionalDirs.map((item) => {
+			const path = text(item, "运行时附加目录");
+			if (!isAbsolute(path)) throw new Error("运行时附加目录必须为绝对路径。");
+			return path;
+		});
+	}
 	return {
 		version: 1,
 		mode: record.mode as RuntimePermissionPolicy["mode"],
@@ -207,6 +219,8 @@ export function validateRuntimePolicy(value: unknown): RuntimePermissionPolicy {
 		disabledTools,
 		...(allowedMcpServers !== undefined ? { allowedMcpServers } : {}),
 		project,
+		...(additionalDirs !== undefined ? { additionalDirs } : {}),
+		...(record.sandbox !== undefined ? { sandbox: record.sandbox } : {}),
 	};
 }
 
@@ -231,12 +245,22 @@ export async function canonicalPermissionPath(path: string, project: string): Pr
 	const expanded = path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
 	let candidate = resolve(project, expanded);
 	const missing: string[] = [];
+	let followedLinks = 0;
 	for (;;) {
 		try {
 			return resolve(await realpath(candidate), ...missing.reverse());
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+			// A dangling symlink can still be the destination of a successful write.
+			const link = await readlink(candidate).catch((linkError: NodeJS.ErrnoException) => {
+				if (!["ENOENT", "ENOTDIR", "EINVAL"].includes(linkError.code ?? "")) throw linkError;
+			});
+			if (link !== undefined) {
+				if (++followedLinks > 40) throw new Error("无法解析文件路径中的符号链接。");
+				candidate = resolve(dirname(candidate), link);
+				continue;
+			}
 			const parent = dirname(candidate);
 			if (parent === candidate) throw error;
 			missing.push(candidate.slice(parent.length + (parent.endsWith(sep) ? 0 : 1)));
@@ -456,20 +480,29 @@ export async function redactSearchOutput(
 	const rules = policy.rules.filter(
 		(rule) => rule.action !== "allow" && rule.path !== undefined && !rule.command && !rule.domain && segmentMatches(rule.tool, toolName),
 	);
-	if (!rules.length || !["grep", "find", "ls"].includes(toolName)) return { text, removed: 0 };
+	if ((!rules.length && !policy.sandbox) || !["grep", "find", "ls"].includes(toolName)) return { text, removed: 0 };
 	const project = await canonicalPermissionPath(policy.project, policy.project);
+	const home = policy.sandbox ? await canonicalPermissionPath(homedir(), project) : undefined;
 	const record = input && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
 	const root = await nativeToolTarget(typeof record.path === "string" ? record.path : ".", project, false);
 	let removed = 0;
 	const kept: string[] = [];
+	const checked = new Map<string, boolean>();
 	for (const line of text.split("\n")) {
 		let relativePath: string | undefined;
 		if (toolName === "grep") relativePath = /^(.+?)(?::\d+: |-\d+- )/.exec(line)?.[1];
 		else if (line.trim() && !line.startsWith("[")) relativePath = line.replace(/\/$/, "");
 		if (relativePath !== undefined) {
 			const target = relativePath === "" ? root : resolve(root, relativePath);
-			const hidden = await Promise.all(rules.map((rule) => pathMatches(rule.path!, target, project)));
-			if (hidden.some(Boolean)) {
+			let hidden = checked.get(target);
+			if (hidden === undefined) {
+				const resolved = home === undefined ? target : await canonicalPermissionPath(target, project).catch(() => null);
+				hidden = (home !== undefined && (
+					resolved === null || isProtectedFileToolPath(target, home) || isProtectedFileToolPath(resolved, home)
+				)) || (await Promise.all(rules.map((rule) => pathMatches(rule.path!, target, project)))).some(Boolean);
+				checked.set(target, hidden);
+			}
+			if (hidden) {
 				removed++;
 				continue;
 			}
@@ -497,6 +530,8 @@ export async function evaluatePermission(
 	const inAllowedRoots = (target: string) => allowedRoots.some((root) => contained(root, target));
 	const inExtraDirs = (target: string) => extraDirs.some((root) => contained(root, target));
 	if (policy.disabledTools.includes(call.toolName)) return { action: "deny", reason: "该工具已停用。" };
+	if (call.toolName === "ExitPlanMode" && policy.mode !== "plan")
+		return { action: "deny", reason: "请先进入计划模式，再提交计划。" };
 	if (policy.allowedMcpServers !== undefined && call.toolName.startsWith("mcp__")) {
 		const rest = call.toolName.slice(5);
 		const sepIndex = rest.indexOf("__");
@@ -517,26 +552,30 @@ export async function evaluatePermission(
 			input.subagent_type !== "fork");
 	const previewReadOnly =
 		call.toolName === "PreviewCheck" &&
-		(input.action === undefined ||
-			input.action === "list_configs" ||
-			input.action === "server_logs" ||
-			input.action === "stop_server" ||
-			input.action === "check");
+		(input.action === "list_configs" || input.action === "server_logs" ||
+			((input.action === undefined || input.action === "check") &&
+				(input.actions === undefined || (Array.isArray(input.actions) && input.actions.length === 0))));
 	if (policy.mode === "read" && !readingTools.has(call.toolName) && !harmlessDesktopTools.has(call.toolName) && call.toolName !== "WebSearch" && !previewReadOnly && !readModeSafeDelegation)
 		return { action: "deny", reason: "当前为只读模式，此工具不可执行。" };
 	let targets: string[] = [];
-	const rawPath =
-		typeof input.path === "string"
-			? input.path
-			: call.toolName === "NotebookEdit" && typeof input.notebook_path === "string"
-				? input.notebook_path
-				: undefined;
-	if (typeof rawPath === "string") targets = [pathTools.has(call.toolName)
+	const pathInput = call.toolName === "NotebookEdit" ? input.notebook_path : input.path;
+	const rawPath = typeof pathInput === "string" ? pathInput : undefined;
+	const notebookPath = call.toolName === "NotebookEdit" && rawPath !== undefined ? resolve(project, rawPath) : undefined;
+	if (notebookPath !== undefined) targets = [await canonicalPermissionPath(notebookPath, project)];
+	else if (rawPath !== undefined) targets = [pathTools.has(call.toolName)
 		? await nativeToolTarget(rawPath, project, call.toolName === "read")
 		: await canonicalPermissionPath(rawPath, project)];
 	else if (pathTools.has(call.toolName)) {
 		if (["read", "edit", "write", "NotebookEdit"].includes(call.toolName)) return { action: "deny", reason: "工具缺少有效的文件路径。" };
 		targets = [project];
+	}
+	if (policy.sandbox && pathTools.has(call.toolName)) {
+		const home = await canonicalPermissionPath(homedir(), project);
+		const lexicalTarget = notebookPath ?? (rawPath === undefined ? project : resolve(project, nativeToolPath(rawPath)));
+		if (isProtectedFileToolPath(lexicalTarget, homedir()) || targets.some((target) => isProtectedFileToolPath(target, home)))
+			return { action: "deny", reason: "文件保护已拦截敏感凭据路径。", targets };
+		if (editTools.has(call.toolName) && !targets.every(inAllowedRoots))
+			return { action: "deny", reason: "文件工具只能写入当前工作区和附加目录。", targets };
 	}
 	let writingPlanFile = false;
 	if (policy.mode === "plan") {

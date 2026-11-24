@@ -8,6 +8,7 @@ import { MAX_AGENT_OUTPUT, exceedsLength } from "./delegation-limits.ts";
 import { evaluatePermission, validateRuntimePolicy } from "./permission-policy.ts";
 import type { PermissionRule, RuntimePermissionPolicy } from "./permission-types.ts";
 import type { WorktreeCreateInput, WorktreeInfo } from "./worktree-types.ts";
+import { localDay, type UsageRecord } from "./usage-stats.ts";
 import type {
 	ExternalAdapter, ExternalAdapterEvent, ExternalApprovalRequest, ExternalApprovalResponse, ExternalEvent,
 	ExternalExecutor, ExternalExecutorInput, ExternalProvider, ExternalReplay, ExternalSession,
@@ -16,6 +17,7 @@ import type {
 
 const active = new Set(["queued", "running", "waiting_for_input"]);
 const outputLimit = MAX_AGENT_OUTPUT;
+const policyModesByRestriction: RuntimePermissionPolicy["mode"][] = ["read", "plan", "ask", "acceptEdits", "auto"];
 /**
  * Why an external task stopped. A background parent is told about every stop except its own
  * TaskStop (`model_stop`, the tool result already said so) and its own abort (`parent_abort`).
@@ -26,7 +28,13 @@ export type ExternalStopReason = "user_stop" | "model_stop" | "parent_abort" | "
 const stopReasons: readonly ExternalStopReason[] = ["user_stop", "model_stop", "parent_abort", "policy_change", "restart", "executor_stop"];
 const silentStops: ReadonlySet<ExternalStopReason> = new Set(["model_stop", "parent_abort"]);
 /** `notify` marks a background task whose result is delivered through the host's outbox. */
-interface StoredTask { task: ExternalTask; policy: RuntimePermissionPolicy; prompt: string; notify: boolean; notifiedTurn?: number; stopReason?: ExternalStopReason }
+interface StoredNativeUsage {
+	/** Latest cumulative native session cost, kept separate from cost observed by this app. */
+	observedCostUsd?: number;
+	costUsd: number;
+	days: Record<string, { input: number; output: number; cost: number; turns: number }>;
+}
+interface StoredTask { task: ExternalTask; policy: RuntimePermissionPolicy; prompt: string; notify: boolean; notifiedTurn?: number; stopReason?: ExternalStopReason; usage?: StoredNativeUsage }
 /** A finished background turn whose result the parent has not received yet. */
 export interface ExternalNotification { task: ExternalTask; stopReason?: ExternalStopReason }
 interface Runtime {
@@ -40,20 +48,26 @@ interface Runtime {
 	approvals: Map<string, { request: ExternalApprovalRequest; resolve(response: ExternalApprovalResponse): void }>;
 	/** The run has not recorded its final output yet; a stopped task is delivered after it has. */
 	executing?: boolean;
+	usage?: Extract<ExternalAdapterEvent, { type: "usage" }>;
 }
 export interface ExternalAgentOptions {
 	dataDir: string;
 	env: NodeJS.ProcessEnv;
+	networkEnv?(): NodeJS.ProcessEnv;
 	nodeExecutable: string;
 	claudeHelperPath: string;
 	adapters: Record<ExternalProvider, ExternalAdapter>;
 	maxConcurrent?: number;
 	project(conversationId: string): string;
+	isProjectTrusted(project: string): boolean;
 	policy(conversationId: string): RuntimePermissionPolicy;
 	delegated(conversationId: string): boolean;
 	createWorktree(input: WorktreeCreateInput): Promise<WorktreeInfo>;
 	listWorktrees(): Promise<WorktreeInfo[]>;
 	canStart(task: ExternalTask): boolean;
+	beginCheckpoint?(task: ExternalTask): Promise<() => Promise<void>>;
+	checkBudget?(executor: ExternalProvider): void;
+	reserveBudget?(task: ExternalTask): Promise<{ maxBudgetUsd: number; release(): Promise<void> } | undefined>;
 	capacity(): number;
 	/** Deliver pending background results of a parent from the host's persisted outbox. */
 	flushNotifications(conversationId: string): void;
@@ -100,7 +114,8 @@ export class ExternalAgents {
 				// A turn the app lost while it ran is reported to a background parent as stopped.
 				// Records interrupted before stop reasons existed carry none and are never replayed.
 				if (active.has(task.status)) { task.status = "interrupted"; task.error = "应用已重启；未重放任务，可显式发送新指令恢复原生会话。"; record.stopReason = "restart"; }
-				this.tasks.set(task.id, { task, policy: validateRuntimePolicy(record.policy), prompt: record.prompt, notify: Boolean(record.notify), notifiedTurn: record.notifiedTurn, stopReason: record.stopReason });
+				this.tasks.set(task.id, { task, policy: validateRuntimePolicy(record.policy), prompt: record.prompt, notify: Boolean(record.notify), notifiedTurn: record.notifiedTurn, stopReason: record.stopReason,
+					usage: validatedUsage(record.usage) });
 				// The event log can be newer than the last atomic task snapshot after a crash.
 				const recovered = await this.replay(task.id);
 				task.eventSequence = Math.max(task.eventSequence, recovered.latestSequence);
@@ -117,8 +132,39 @@ export class ExternalAgents {
 	subscribe(listener: (event: ExternalEvent) => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
 	has(id: string): boolean { return this.tasks.has(id); }
 	countRunning(): number { return [...this.tasks.values()].filter(({ task }) => ["running", "waiting_for_input"].includes(task.status)).length; }
-	activeInPath(path: string): boolean { return [...this.tasks.values()].some(({ task }) => active.has(task.status) && overlaps(path, task.workingDirectory)); }
-	conflicts(path: string, exceptId?: string): boolean { return [...this.tasks.values()].some(({ task }) => task.id !== exceptId && ["running", "waiting_for_input"].includes(task.status) && overlaps(path, task.workingDirectory)); }
+	pendingApprovalCount(): number {
+		let count = 0;
+		for (const runtime of this.runtimes.values()) count += runtime.approvals.size;
+		return count;
+	}
+	measuredCostUsd(owner: string): number {
+		let total = 0;
+		for (const { task, usage } of this.tasks.values()) if (task.parentConversationId === owner) total += usage?.costUsd ?? 0;
+		return total;
+	}
+	usageRecords(): UsageRecord[] {
+		const entries: UsageRecord[] = [];
+		for (const { task, usage } of this.tasks.values()) {
+			for (const [day, entry] of Object.entries(usage?.days ?? {})) {
+				entries.push({ key: `${task.id}:${day}`, day, model: `external/${task.executor}`, input: entry.input, output: entry.output,
+					cacheRead: 0, cacheWrite: 0, cost: entry.cost, samples: entry.turns });
+			}
+		}
+		return entries;
+	}
+	activeClaudeInProject(project: string): boolean {
+		return [...this.tasks.values()].some(({ task }) => task.executor === "claude" && task.project === project &&
+			(active.has(task.status) || this.runtimes.get(task.id)?.executing === true));
+	}
+	activeInPath(path: string): boolean {
+		return [...this.tasks.values()].some(({ task }) =>
+			(active.has(task.status) || this.runtimes.get(task.id)?.executing) && overlaps(path, task.workingDirectory));
+	}
+	conflicts(path: string, exceptId?: string): boolean {
+		return [...this.tasks.values()].some(({ task }) => task.id !== exceptId &&
+			(["running", "waiting_for_input"].includes(task.status) || this.runtimes.get(task.id)?.executing) &&
+			overlaps(path, task.workingDirectory));
+	}
 	list(owner?: string): ExternalTask[] { return structuredClone([...this.tasks.values()].map(({ task }) => task).filter((task) => !owner || task.parentConversationId === owner).reverse()); }
 	snapshot(id: string): ExternalTask { return structuredClone(this.record(id).task); }
 	async executors(): Promise<ExternalExecutor[]> {
@@ -145,6 +191,7 @@ export class ExternalAgents {
 			if (!["codex", "claude", "kimi", "antigravity"].includes(input.executor)) throw new Error("未知外部执行器。");
 			const previous = toolCallId && [...this.tasks.values()].find(({ task }) => task.parentConversationId === owner && task.parentToolCallId === toolCallId);
 			if (previous) return structuredClone(previous.task);
+			this.options.checkBudget?.(input.executor);
 			if (this.tasks.size >= 500 || this.list(owner).filter((task) => active.has(task.status)).length >= 8) throw new Error("外部任务数量已达上限，请先完成或停止已有子任务。");
 			const executor = (await this.executors()).find((item) => item.id === input.executor)!;
 			if (!executor.enabled || !executor.available) throw new Error(executor.error ?? "执行器已停用。");
@@ -152,7 +199,7 @@ export class ExternalAgents {
 			if (!["Explore", "Plan", "general-purpose"].includes(subagentType)) throw new Error("未知子任务类型。");
 			const project = await realpath(this.options.project(owner));
 			const policy = structuredClone(this.options.policy(owner));
-			const readOnly = policy.mode === "read" || subagentType !== "general-purpose";
+			const readOnly = policy.mode === "read" || policy.mode === "plan" || subagentType !== "general-purpose";
 			if (readOnly && !executor.capabilities.readOnly) throw new Error(`${executor.id} 当前协议无法强制只读权限，不能启动 Explore/Plan。`);
 			const isolation = input.isolation ?? (readOnly ? "shared" : "worktree");
 			if (!["shared", "worktree"].includes(isolation) || (!readOnly && isolation === "shared")) throw new Error("外部可写任务必须使用独立 Worktree。");
@@ -176,6 +223,7 @@ export class ExternalAgents {
 			validatePrompt(input.message);
 			const record = this.record(input.taskId, owner); const task = record.task;
 			if (active.has(task.status)) throw new Error("子任务仍在运行；请先等待完成或取消，再发送下一轮指令。");
+			this.options.checkBudget?.(task.executor);
 			await this.runtimes.get(task.id)?.running;
 			await realpath(task.workingDirectory);
 			record.prompt = input.message; record.notify = input.runInBackground ?? false; record.stopReason = undefined;
@@ -239,6 +287,12 @@ export class ExternalAgents {
 			!(options.foregroundOnly && notify) && !(options.backgroundOnly && !notify));
 		return Promise.all(targets.map(({ task }) => this.cancel(task.id, owner, options.reason ?? "parent_abort")));
 	}
+	/** Background children that can wake this parent's current goal when they settle. */
+	hasActiveBackgroundChildren(owner: string, since: number): boolean {
+		return [...this.tasks.values()].some(({ task, notify }) => notify && task.parentConversationId === owner &&
+			task.createdAt >= since && (active.has(task.status) || this.runtimes.get(task.id)?.executing === true));
+	}
+
 	/** Finished background turns of `owner` that have not been delivered yet. */
 	pendingNotifications(owner: string): ExternalNotification[] {
 		return [...this.tasks.values()]
@@ -333,15 +387,30 @@ export class ExternalAgents {
 
 	private async run(record: StoredTask, runtime: Runtime): Promise<void> {
 		const task = record.task;
+		let finishCheckpoint: (() => Promise<void>) | undefined;
+		let budget: Awaited<ReturnType<NonNullable<ExternalAgentOptions["reserveBudget"]>>>;
+		let status: ExternalTask["status"] = "completed";
+		let failure: string | undefined;
+		const resumed = task.nativeSessionId !== undefined;
+		runtime.usage = undefined;
 		try {
 			await realpath(task.workingDirectory);
 			const executor = (await this.executors()).find((item) => item.id === task.executor)!;
 			if (!executor.enabled || !executor.available || !executor.executable) throw new Error(executor.error ?? "执行器不可用。");
-			const env = { ...this.options.env };
+			const policy = this.policyFor(record);
+			runtime.abort!.signal.throwIfAborted();
+			this.options.checkBudget?.(task.executor);
+			budget = await this.options.reserveBudget?.(task);
+			runtime.abort!.signal.throwIfAborted();
+			if (policy.mode !== "read" && policy.mode !== "plan") finishCheckpoint = await this.options.beginCheckpoint?.(task);
+			runtime.abort!.signal.throwIfAborted();
+			const env = { ...this.options.env, ...this.options.networkEnv?.() };
 			for (const key of Object.keys(env)) if (key.startsWith("PI_DESKTOP_") || key.startsWith("PI_CODING_")) delete env[key];
 			if (!runtime.session) runtime.session = await this.options.adapters[task.executor].open({
 				executable: executor.executable, cwd: task.workingDirectory, env, resumeSessionId: task.nativeSessionId,
 				policy: this.policyFor(record), helperPath: this.options.claudeHelperPath, nodeExecutable: this.options.nodeExecutable,
+				projectTrusted: this.options.isProjectTrusted(task.project),
+				maxBudgetUsd: budget?.maxBudgetUsd,
 				onEvent: (event) => this.adapterEvent(task, event), onPermission: (request, signal) => this.permission(record, runtime, request, signal),
 			});
 			if (runtime.session.sessionId) task.nativeSessionId = runtime.session.sessionId;
@@ -350,22 +419,51 @@ export class ExternalAgents {
 			const result = await runtime.session.run(record.prompt, runtime.abort!.signal);
 			if (result.sessionId) task.nativeSessionId = result.sessionId;
 			if (result.text) { task.output = result.text.slice(0, outputLimit); task.truncated = result.text.length > outputLimit; }
-			if (active.has(task.status)) {
-				if (result.status === "cancelled") record.stopReason = "executor_stop";
-				this.update(task, result.status === "cancelled" ? "cancelled" : "completed");
-			}
+			await runtime.session.close();
+			runtime.session = undefined;
+			await finishCheckpoint?.();
+			finishCheckpoint = undefined;
+			status = result.status;
 		} catch (error) {
-			if (active.has(task.status)) {
-				if (runtime.abort?.signal.aborted) record.stopReason = "executor_stop";
-				this.update(task, runtime.abort?.signal.aborted ? "cancelled" : "failed", error instanceof Error ? error.message : String(error));
-			}
+			status = runtime.abort?.signal.aborted ? "cancelled" : "failed";
+			failure = error instanceof Error ? error.message : String(error);
 		} finally {
 			this.clearApprovals(task, runtime);
 			await runtime.session?.close().catch(() => {}); runtime.session = undefined;
+			await finishCheckpoint?.().catch((error: unknown) => {
+				this.event(task, { type: "diagnostic", message: `无法完成恢复点：${error instanceof Error ? error.message : String(error)}` });
+			});
+			if (runtime.usage) this.recordUsage(record, runtime.usage, resumed);
+			await budget?.release().catch(() => {});
+			if (active.has(task.status)) {
+				if (status === "cancelled") record.stopReason = "executor_stop";
+				this.update(task, status, failure);
+			}
 			runtime.executing = false;
 			await this.persist();
 			if (!this.closed && record.notify) this.options.flushNotifications(task.parentConversationId);
 		}
+	}
+
+	private recordUsage(record: StoredTask, reported: Extract<ExternalAdapterEvent, { type: "usage" }>, resumed: boolean): void {
+		const input = usageNumber(reported.inputTokens) ?? 0;
+		const output = usageNumber(reported.outputTokens) ?? 0;
+		const cost = usageNumber(reported.sessionCostUsd);
+		const totals = record.usage ??= { costUsd: 0, days: {} };
+		const previous = totals.observedCostUsd;
+		// Old native sessions have no local baseline. Their first cumulative observation
+		// establishes one, instead of charging historical usage to this app's current turn.
+		const delta = cost === undefined || (previous === undefined && resumed) ? 0 : cost - (previous !== undefined && cost >= previous ? previous : 0);
+		if (cost !== undefined) totals.observedCostUsd = cost;
+		if (!input && !output && !delta) return;
+		totals.costUsd += delta;
+		const day = localDay(Date.now());
+		const entry = totals.days[day] ??= { input: 0, output: 0, cost: 0, turns: 0 };
+		entry.input += input;
+		entry.output += output;
+		entry.cost += delta;
+		entry.turns++;
+		for (const key of Object.keys(totals.days).sort().slice(0, -365)) delete totals.days[key];
 	}
 
 	private async permission(record: StoredTask, runtime: Runtime, request: ExternalApprovalRequest, signal?: AbortSignal): Promise<ExternalApprovalResponse> {
@@ -394,7 +492,8 @@ export class ExternalAgents {
 		const pending = runtime.approvals.get(id); if (!pending) return;
 		runtime.approvals.delete(id); task.pendingApprovals = task.pendingApprovals.filter((item) => item.id !== id);
 		this.event(task, { type: "approval_resolved", id });
-		if (!task.pendingApprovals.length && task.status === "waiting_for_input") this.update(task, "running");
+		const status = !task.pendingApprovals.length && task.status === "waiting_for_input" ? "running" : task.status;
+		this.update(task, status, task.error);
 		pending.resolve(response);
 	}
 	private clearApprovals(task: ExternalTask, runtime?: Runtime): void {
@@ -410,11 +509,16 @@ export class ExternalAgents {
 			unique.set(JSON.stringify(mapped), mapped);
 		}
 		const rules = [...unique.values()].map((rule, index) => ({ ...rule, id: `external-${index}-${rule.id.slice(0, 150)}` }));
-		return { version: 1, project: task.workingDirectory, mode: task.readOnly || current.mode === "read" || record.policy.mode === "read" ? "read" : current.mode === "ask" || record.policy.mode === "ask" ? "ask" : "auto",
+		const modes = [record.policy.mode, current.mode];
+		if (task.readOnly && (task.subagentType !== "general-purpose" || record.policy.mode !== "plan")) modes.push("read");
+		const mode = policyModesByRestriction.find((candidate) => modes.includes(candidate)) ?? "read";
+		return { version: 1, project: task.workingDirectory, mode,
 			...(record.policy.dontAsk || current.dontAsk ? { dontAsk: true } : {}),
+			...(record.policy.sandbox || current.sandbox ? { sandbox: true } : {}),
 			rules, disabledTools: [...new Set([...record.policy.disabledTools, ...current.disabledTools, "Agent", "SendMessage", "AgentSend"])] };
 	}
 	private adapterEvent(task: ExternalTask, event: ExternalAdapterEvent): void {
+		if (event.type === "usage") this.runtime(task.id).usage = event;
 		if (event.type === "session") {
 			task.nativeSessionId = event.sessionId;
 			void this.persist().catch(() => this.runtimes.get(task.id)?.abort?.abort(new Error("无法保存原生会话标识。")));
@@ -466,6 +570,25 @@ export class ExternalAgents {
 			await writeFile(`${target}.tmp`, body, { mode: 0o600 }); await rename(`${target}.tmp`, target);
 		}); return this.persistence;
 	}
+}
+
+function usageNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function validatedUsage(value: unknown): StoredNativeUsage | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const candidate = value as Partial<StoredNativeUsage>;
+	const costUsd = usageNumber(candidate.costUsd);
+	if (costUsd === undefined || !candidate.days || typeof candidate.days !== "object" || Array.isArray(candidate.days)) return undefined;
+	const days: StoredNativeUsage["days"] = {};
+	for (const [day, entry] of Object.entries(candidate.days).slice(-365)) {
+		if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !entry || typeof entry !== "object") continue;
+		const input = usageNumber(entry.input), output = usageNumber(entry.output), cost = usageNumber(entry.cost), turns = usageNumber(entry.turns);
+		if (input !== undefined && output !== undefined && cost !== undefined && turns)
+			days[day] = { input, output, cost, turns };
+	}
+	return { costUsd, observedCostUsd: usageNumber(candidate.observedCostUsd), days };
 }
 
 function validatePrompt(value: string): void { if (typeof value !== "string" || !value.trim() || exceedsLength(value, 2 * 1024 * 1024) || value.includes("\0")) throw new Error("外部任务指令无效。"); }

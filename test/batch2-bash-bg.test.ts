@@ -63,8 +63,11 @@ test("background shell: start, incremental reads, filter, completion notice", as
 	assert.equal(filtered.status, "completed");
 	assert.equal(filtered.exit_code, 0);
 	assert.match(filtered.stdout, /^gamma\n\/.*pi-bash-bg-/);
-	assert.equal(filtered.filtered_out, 1);
-	// Filtered-out lines are consumed as well.
+	assert.equal(filtered.filtered_out, 4);
+	assert.equal(monitors.readShell(record.id, "too-specific").stdout, "");
+	assert.equal(monitors.readShell(record.id, "^beta$").stdout, "beta");
+	assert.equal(monitors.readShell(record.id, "gamma", filtered.next_cursor).stdout, "");
+	assert.match(monitors.readShell(record.id).stdout, /^gamma\ndelta\n\/.*pi-bash-bg-/);
 	assert.equal(monitors.readShell(record.id).stdout, "");
 	await waitFor(() => delivered.length === 1);
 	assert.equal(delivered[0].customType, SHELL_EVENT_TYPE);
@@ -166,6 +169,7 @@ test("background Bash permission equals foreground bash; BashOutput and KillShel
 	// Host-boundary validation.
 	assert.throws(() => validateDesktopToolInput("BashOutput", {}), /bash_id/);
 	assert.throws(() => validateDesktopToolInput("BashOutput", { bash_id: "x", extra: 1 }), /Unknown/);
+	assert.throws(() => validateDesktopToolInput("BashOutput", { bash_id: "x", cursor: -1 }), /cursor/);
 	assert.throws(() => validateDesktopToolInput("KillShell", { shell_id: "" }), /shell_id/);
 	assert.throws(() => validateDesktopToolInput("BashBackground", { command: "x\0" }), /command/);
 	for (const badTimeout of [0, -1, Infinity, 86401, "30"]) {

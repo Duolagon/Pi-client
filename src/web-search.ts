@@ -151,19 +151,24 @@ export function formatWebSearchResults(response: WebSearchResponse, maxContentCh
 	if (response.results.length === 0) {
 		return `WebSearch（"${response.query}"）未找到相关结果。`;
 	}
-	const lines: string[] = [`WebSearch 结果（"${response.query}"，共 ${response.results.length} 条）：`, ""];
+	const maximumResultChars = 24_000;
+	let text = `WebSearch 结果（"${response.query}"，共 ${response.results.length} 条）：\n\n`;
 	for (const [index, item] of response.results.entries()) {
 		const meta = [item.siteName, item.publishedAt].filter(Boolean).join(" · ");
-		lines.push(`${index + 1}. **${item.title}**${meta ? ` (${meta})` : ""}`);
+		const lines = [`${index + 1}. **${item.title}**${meta ? ` (${meta})` : ""}`];
 		if (item.url) lines.push(`   URL: ${item.url}`);
 		if (item.snippet) lines.push(`   ${item.snippet}`);
 		if (item.content) {
 			const trimmed = item.content.length > maxContentChars ? `${item.content.slice(0, maxContentChars)}…` : item.content;
 			lines.push(`   正文摘录: ${trimmed}`);
 		}
-		lines.push("");
+		const entry = lines.join("\n");
+		const omitted = `\n\n[已达搜索输出上限，省略后续 ${response.results.length - index} 条结果]`;
+		if (text.length + entry.length + omitted.length > maximumResultChars)
+			return text.trimEnd() + omitted;
+		text += `${entry}\n\n`;
 	}
-	return lines.join("\n").trim();
+	return text.trimEnd();
 }
 
 export function isDeepSeekModel(model?: { provider?: string; id?: string; baseUrl?: string }): boolean {

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { createRoot } from "react-dom/client";
 import { copyText } from "./clipboard.ts";
+import { useConfirmation } from "./ConfirmationDialog.tsx";
 import {
 	FolderOpen,
 	Plus,
@@ -64,6 +65,7 @@ import { TranscriptView, type TodoItem } from "./TranscriptView.tsx";
 import { computeChecklistEta, computeTodoTiming, isChecklistStale } from "../task-eta.ts";
 import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
 import { parseGoalCommand } from "../goal-mode.ts";
+import { planRelativePath } from "../plan-path.ts";
 import { WorkspacePicker } from "./WorkspacePicker.tsx";
 import { GrailEmblem, HolyGrailIcon, MagicCircleBackdrop, MagicCircleLoader, getServantInfo } from "./GrailIcons.tsx";
 import { SubagentPanel, type SubagentPanelHandle } from "./SubagentPanel.tsx";
@@ -72,6 +74,7 @@ import { SubagentApprovals } from "./SubagentApprovals.tsx";
 import { collectDescendantApprovals, groupSidebarConversations, isActiveTaskStatus } from "./subagent-panel-state.ts";
 import { PermissionDialog } from "./PermissionDialog.tsx";
 import { SettingsDialog } from "./SettingsDialog.tsx";
+import { ExternalApprovalCard } from "./ExternalApprovalCard.tsx";
 import { WorkspacePanel } from "./WorkspacePanel.tsx";
 import { ControlsDialog, type ControlsTab } from "./ControlsDialog.tsx";
 import { CheckpointsDialog } from "./CheckpointsDialog.tsx";
@@ -114,6 +117,7 @@ function savedInspectorWidth(key: string, fallback: number): number {
 }
 
 function Desktop({ api }: { api: DesktopAPI }) {
+	const { confirm, confirmation } = useConfirmation();
 	const app = useDesktop(api);
 	const { snapshot, history, running, changing, bashBusy } = app;
 	const shellRecords = useBackgroundShells(api);
@@ -150,7 +154,6 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [sessionsOpen, setSessionsOpen] = useState(false);
 	const [memoryTab, setMemoryTab] = useState<"memory" | "context" | "status" | null>(null);
 	const [paletteOpen, setPaletteOpen] = useState(false);
-	const [planMode, setPlanMode] = useState(false);
 	const [planState, setPlanState] = useState<PlanFileState | null>(null);
 	const [planEditorOpen, setPlanEditorOpen] = useState(false);
 	const [planDraft, setPlanDraft] = useState("");
@@ -612,8 +615,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		setTasksOpen(true);
 	};
 	const blocked = running || changing || bashBusy || planApplying;
+	const activePermMode = snapshot?.active?.permissionMode ?? snapshot?.settings.permission;
 	const project = snapshot?.projects.find((item) => item.path === snapshot.active?.project);
 	const taskList = [...Object.values(tasksMap), ...Object.values(externalTasksMap)];
+	const externalApprovalTask = Object.values(externalTasksMap)
+		.find((task) => task.parentConversationId === snapshot?.active?.id && task.pendingApprovals.length > 0);
+	const externalApproval = externalApprovalTask?.pendingApprovals[0];
 	const activeTaskCount = taskList.filter((t) => t.status === "running" || t.status === "queued").length;
 	const waitingTaskCount = taskList.filter((t) => t.status === "waiting_for_input").length;
 	const switchTo = (operation: () => ReturnType<DesktopAPI["snapshot"]>) => {
@@ -622,17 +629,21 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		void app.switchTo(operation);
 	};
 	const savePermission = async (permission: PermissionMode) => {
-		if (!snapshot) return;
-		if (permission === "auto" && snapshot.settings.permission !== "auto" &&
-			!window.confirm("为客户端启用「全部放行」？模型工具将按规则执行，常规操作不再逐项询问。")) return;
+		const id = snapshot?.active?.id;
+		if (!id) return;
+		if (permission === "auto" && activePermMode !== "auto" &&
+			!await confirm({
+				title: "为当前会话启用「全部放行」？",
+				message: "模型工具将按规则执行，常规操作不再逐项询问。",
+				confirmLabel: "启用全部放行",
+			})) return;
 		let saved = false;
 		await app.switchTo(async () => {
-			const next = await api.saveSettings({ permission, theme: snapshot.settings.theme });
-			saved = next.settings.permission === permission && next.engineStatus === "ready";
+			const next = await api.permissions.setMode(id, permission);
+			saved = next.active?.id === id && next.active.permissionMode === permission && next.engineStatus === "ready";
 			return next;
 		});
 		if (saved) {
-			setPlanMode(permission === "plan");
 			if (permission === "plan") setPlanError("");
 			if (permission === "auto") setFlash("已切换为全部放行");
 		}
@@ -667,7 +678,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		void app.switchTo(() => api.openProject());
 	};
 	const cycleTheme = async () => {
-		if (!snapshot || blocked) return;
+		if (!snapshot || changing) return;
 		const order: Array<"light" | "dark" | "grail"> = ["light", "dark", "grail"];
 		const current = snapshot.settings.theme === "system" ? "light" : snapshot.settings.theme;
 		const next = order[(order.indexOf(current) + 1) % order.length];
@@ -694,10 +705,13 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		}
 		switchTo(() => api.newConversation());
 	};
-	const PLAN_TEMPLATE = "请先调研相关代码并将实施计划写入 .pi/plans/，完成后调用 ExitPlanMode 提交审批：\n";
+	const planPath = snapshot?.active && planRelativePath(snapshot.active.id);
+	const PLAN_TEMPLATE = planPath
+		? `请先调研相关代码。完成后调用 ExitPlanMode，将完整计划传入 plan 参数，或先写入 ${planPath} 再提交审批。\n`
+		: "请先调研相关代码，完成后调用 ExitPlanMode 提交完整的计划正文。\n";
 	const togglePlanMode = async () => {
 		if (!snapshot) return;
-		const inPlan = planMode || snapshot.settings.permission === "plan";
+		const inPlan = activePermMode === "plan";
 		if (inPlan) {
 			if (!await savePermission("ask")) return;
 			setPlanEditorOpen(false);
@@ -722,8 +736,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			const saved = current.content === planDraft && current.exists ? current : await api.writePlan(planDraft, id);
 			if (!saved.exists || saved.content !== planDraft) throw new Error("计划保存结果不完整，请重试。");
 			setPlanState(saved);
-			const updated = await api.saveSettings({ permission: mode, theme: snapshot.settings.theme });
-			modeChanged = updated.settings.permission === mode;
+			const updated = await api.permissions.setMode(id, mode);
+			modeChanged = updated.active?.permissionMode === mode;
 			if (!modeChanged || updated.active?.id !== id || updated.engineStatus !== "ready")
 				throw new Error("执行模式尚未就绪。请返回计划后重试。");
 			const approved = await api.readPlan(id);
@@ -734,13 +748,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				message: `计划已批准（存档：${saved.relativePath}）。请按以下已批准的正文实施并运行相关检查。\n\n${saved.content}`,
 			}, id);
 			modeChanged = false;
-			setPlanMode(false);
 			setManualPlan(false);
 			planDraftEdited.current = false;
 			setPlanEditorOpen(false);
 			await app.refresh();
 		} catch (error) {
-			if (modeChanged) await api.saveSettings({ permission: "plan", theme: snapshot.settings.theme }).then(app.apply).catch(app.fail);
+			if (modeChanged) await api.permissions.setMode(id, "plan").then(app.apply).catch(app.fail);
 			setPlanError(error instanceof Error ? error.message : String(error));
 		} finally {
 			planApplyingRef.current = false;
@@ -786,6 +799,15 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			return;
 		}
 		void api.openInEditor({ path: target, ...(line ? { line } : {}) }).catch(app.fail);
+	};
+	const openPreview = (toggle = false) => {
+		if (!snapshot?.active) return;
+		setPane(null);
+		if (previewUrl) {
+			if (toggle) setPreviewUrl(null);
+			return;
+		}
+		void api.defaultPreviewUrl(snapshot.active.id).then((url) => setPreviewUrl((current) => current ?? url)).catch(app.fail);
 	};
 	const handleBuiltinSlash = (action: BuiltinSlashAction, argument = "") => {
 		if (action === "output-style") {
@@ -972,8 +994,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		} else if (action === "init") {
 			sendInitPrompt();
 		} else if (action === "preview") {
-			setPane(null);
-			setPreviewUrl((prev) => prev ?? "http://localhost:3000");
+			openPreview();
 		} else if (action === "cost") {
 			const s = snapshot?.stats;
 			if (s) {
@@ -1057,9 +1078,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		return () => window.removeEventListener("keydown", onKey);
 	});
 	const activeConvId = snapshot?.active?.id;
-	const activePermMode = snapshot?.settings.permission;
 	useEffect(() => {
-		if (!activeConvId || !(planMode || activePermMode === "plan")) {
+		if (!activeConvId || activePermMode !== "plan") {
 			setPlanState(null);
 			return;
 		}
@@ -1072,7 +1092,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			if (mounted) setPlanError(error instanceof Error ? error.message : String(error));
 		});
 		return () => { mounted = false; };
-	}, [api, activeConvId, planMode, activePermMode, app.revision, running]);
+	}, [api, activeConvId, activePermMode, app.revision, running]);
 	const pinnedTodoState = (() => {
 		const startedById = new Map<string, number>();
 		const completedById = new Map<string, number>();
@@ -1214,8 +1234,19 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const groups = sidebarGroups.groups;
 	const focusedSubagentTask = focusedSubagentTaskId ? tasksMap[focusedSubagentTaskId] : undefined;
 	const liveChildApprovals = collectDescendantApprovals(Object.values(tasksMap), snapshot.active?.id);
-	const childApprovals = liveChildApprovals.length > 0 ? liveChildApprovals : (snapshot.childApprovals ?? []);
-	const inPlanMode = planMode || snapshot.settings.permission === "plan";
+	const knownChildTasks = Object.values(tasksMap).some((task) => task.parentConversationId === snapshot.active?.id);
+	const childApprovals = liveChildApprovals.length > 0 || knownChildTasks ? liveChildApprovals : (snapshot.childApprovals ?? []);
+	const respondToChild = async (taskId: string, response: Parameters<DesktopAPI["respond"]>[0]) => {
+		await api.tasks.respond(taskId, response);
+		setTasksMap((prev) => {
+			const target = prev[taskId];
+			if (!target?.pendingApprovals) return prev;
+			const remaining = target.pendingApprovals.filter((request) => request.id !== response.id);
+			return { ...prev, [taskId]: { ...target, pendingApprovals: remaining.length ? remaining : undefined } };
+		});
+	};
+	const inPlanMode = activePermMode === "plan";
+	const showGrailStatus = Boolean(snapshot.active && (grail?.hasDiff || grail?.running || grail?.verdicts.length));
 	const showPlanApproval = inPlanMode && !running && !changing;
 	const planReady = Boolean(planState && planDraft.trim() &&
 		(manualPlan || (planSubmission && planState.exists && planState.content === planSubmission.content)));
@@ -1262,7 +1293,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		{ id: "context", label: "上下文占用与压缩控制 (/context)", keywords: "context tokens autocompact", disabled: !snapshot.active, run: () => setMemoryTab("context") },
 		{ id: "status", label: "运行与上下文状态 (/status)", keywords: "status tokens cost model", run: () => setMemoryTab("status") },
 		{ id: "init", label: "/init 生成项目 AGENTS.md 指南", keywords: "init onboard agents.md", disabled: !snapshot.active, run: () => sendInitPrompt() },
-		{ id: "preview", label: previewUrl ? "关闭本地网页预览" : "打开本地网页预览 (/preview)", keywords: "web preview localhost", run: () => { setPane(null); setPreviewUrl((v) => (v ? null : "http://localhost:3000")); } },
+		{ id: "preview", label: previewUrl ? "关闭本地网页预览" : "打开本地网页预览 (/preview)", keywords: "web preview localhost", disabled: !snapshot.active, run: () => openPreview(true) },
 		{ id: "terminal", label: terminalOpen ? "关闭终端面板" : "打开终端 / PTY 面板", keywords: "terminal bash pty", run: () => setTerminalOpen((v) => !v) },
 		{ id: "changes", label: "查看 Git 修改与暂存提交", keywords: "git diff stage commit", run: () => { setPane(pane === "changes" ? null : "changes"); } },
 		{ id: "files", label: "浏览项目文件", keywords: "files explorer", run: () => { setPane(pane === "files" ? null : "files"); } },
@@ -1318,6 +1349,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	}
 	const isGrail = snapshot.settings.theme === "grail";
 	const grailText = grailWording(isGrail);
+	const secondaryStatus = [
+		btwState && "侧问",
+		snapshot.active?.goal?.active && `目标 ${snapshot.active.goal.turnsUsed}/${snapshot.active.goal.maxTurns} 轮`,
+		showGrailStatus && grailText.report,
+	].filter(Boolean).join(" · ");
 	const latestGrailVerdict = latestVerdict(grail);
 	// The latest 圣杯显灵 keeps a persistent gold badge even after later verdicts.
 	const grailBest = grail?.verdicts.filter((verdict) => verdict.grade === "grail").at(-1);
@@ -1804,10 +1840,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											type="button"
 											role="menuitem"
 											className="cc-more-item"
+											disabled={!snapshot.active}
 											onClick={() => {
 												setMoreMenuOpen(false);
-												setPane(null);
-												setPreviewUrl((v) => (v ? null : "http://localhost:3000"));
+												openPreview(true);
 											}}
 										>
 											<Globe size={14} />
@@ -2033,6 +2069,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					<div className="cl-conversation">
 						{focusedSubagentTask ? (
 							<SubagentTranscriptView
+								rootConversationId={snapshot.active?.id ?? focusedSubagentTask.conversationId}
 								api={api}
 								task={focusedSubagentTask}
 								progress={taskProgressMap[focusedSubagentTask.id]}
@@ -2129,9 +2166,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											)}
 											<h1>
 												{snapshot.active
-													? isGrail
-														? "向圣杯许下你的编程愿望"
-														: snapshot.models.length ? "今天想一起做什么？" : "连接模型，开始第一个任务"
+													? !snapshot.models.length
+														? "连接模型，开始第一个任务"
+														: isGrail ? "向圣杯许下你的编程愿望" : "今天想一起做什么？"
 													: isGrail
 														? "选择召唤结界（工作目录）"
 														: "选择工作目录开始"}
@@ -2184,6 +2221,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 														</button>
 													</div>
 												</>
+											) : snapshot.active ? (
+												<button type="button" className="primary-button cc-connect-first" onClick={() => { setConnecting(true); setSettings(true); }}>连接模型</button>
 											) : (
 												<>
 													<p>选择一个本地项目文件夹，Pi 会在该目录中读取代码、安全编辑并在沙箱内执行命令。</p>
@@ -2193,7 +2232,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 													</button>
 												</>
 											)}
-											{snapshot.active && !snapshot.models.length ? <button type="button" className="primary-button cc-connect-first" onClick={() => { setConnecting(true); setSettings(true); }}>连接模型</button> : <div className="cc-empty-hints">
+											{(!snapshot.active || snapshot.models.length > 0) && <div className="cc-empty-hints">
 												<span><kbd>⌘N</kbd> 新建会话</span>
 												<span><kbd>⌘K</kbd> 搜索会话</span>
 												<span><kbd>/</kbd> 斜杠命令</span>
@@ -2352,24 +2391,6 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							</div>
 							);
 						})()}
-						{btwState && (
-							<div className="cc-btw-card" role="region" aria-label="侧问结果">
-								<div className="cc-btw-head">
-									<strong>/btw {btwState.question}</strong>
-									<button type="button" className="cc-mini-btn" onClick={() => setBtwState(null)}>关闭</button>
-								</div>
-								{btwState.loading ? (
-									<p className="subtle-note">正在独立思考（不写入当前会话历史）…</p>
-								) : btwState.error ? (
-									<p className="live-error">{btwState.error}</p>
-								) : (
-									<div className="cc-btw-body">
-										<p>{btwState.answer}</p>
-										{btwState.model && <small className="subtle-note">模型：{btwState.model} · 未写入主会话</small>}
-									</div>
-								)}
-							</div>
-						)}
 						{showPlanApproval && (
 							<section className="cc-plan-bar" role="region" aria-label="计划审批">
 								<div className="cc-plan-bar-top">
@@ -2389,13 +2410,20 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										<button type="button" className="cc-mini-btn" disabled={planApplying} onClick={() => void togglePlanMode()}>退出 Plan</button>
 									</div>
 								</div>
+								{planState?.exists === false && !planEditorOpen && <p className="subtle-note">等待 Pi 提交计划。也可以手动编写计划正文。</p>}
 								{planEditorOpen && <textarea className="cc-plan-editor" rows={6} aria-label="编辑计划内容"
 									placeholder="审查或补充实施步骤" value={planDraft} disabled={planApplying || !planState}
 									onChange={(event) => { planDraftEdited.current = true; setPlanDraft(event.target.value); }} />}
 								{planError && <div role="alert" className="cc-plan-error">
 									{planError}
-									<button type="button" className="cc-mini-btn" onClick={() => {
-										if (planDraftEdited.current && !window.confirm("重新读取会替换当前计划草稿，继续吗？")) return;
+									<button type="button" className="cc-mini-btn" onClick={async () => {
+										if (planDraftEdited.current && !await confirm({
+											title: "重新读取计划",
+											message: "磁盘上的计划会替换编辑框中的草稿。",
+											confirmLabel: "重新读取",
+										})) return;
+										const active = await api.snapshot().catch((error) => { setPlanError(String(error)); return undefined; });
+										if (!active || active.active?.id !== snapshot.active?.id) return;
 										void api.readPlan(snapshot.active?.id).then((current) => {
 											planDraftEdited.current = false;
 											setPlanState(current);
@@ -2456,6 +2484,21 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									</div>
 								);
 							})}
+						{externalApprovalTask && externalApproval && !tasksOpen && (
+							<ExternalApprovalCard key={externalApproval.id} task={externalApprovalTask}
+								request={externalApproval} fail={app.fail}
+								onRespond={(response) => api.externalAgents.respond(externalApprovalTask.id, externalApproval.id, response)} />
+						)}
+						{(!app.requests[0] || app.requests[0].id === deferredApproval) && snapshot.active && childApprovals.length > 0 && (
+							<SubagentApprovals
+								key={`child-approvals:${snapshot.active.id}`}
+								approvals={childApprovals}
+								rootConversationId={snapshot.active.id}
+								project={snapshot.active.project}
+								onRespond={respondToChild}
+								fail={app.fail}
+							/>
+						)}
 						<SubagentPanel
 							ref={subagentPanelRef}
 							parentConversationId={snapshot.active?.id}
@@ -2477,9 +2520,30 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							}}
 							onReturnToComposer={() => composerInputRef.current?.focus()}
 						/>
+						{secondaryStatus && <details className="cc-conversation-status" open={Boolean(btwState) || undefined}>
+							<summary>会话动态 <span>{secondaryStatus}</span></summary>
+							<div className="cc-conversation-status-body">
+								{btwState && (
+									<div className="cc-btw-card" role="region" aria-label="侧问结果">
+										<div className="cc-btw-head">
+											<strong>/btw {btwState.question}</strong>
+											<button type="button" className="cc-mini-btn" onClick={() => setBtwState(null)}>关闭</button>
+										</div>
+										{btwState.loading ? (
+											<p className="subtle-note">正在独立思考…</p>
+										) : btwState.error ? (
+											<p className="live-error">{btwState.error}</p>
+										) : (
+											<div className="cc-btw-body">
+												<p>{btwState.answer}</p>
+												{btwState.model && <small className="subtle-note">模型：{btwState.model} · 未写入主会话</small>}
+											</div>
+										)}
+									</div>
+								)}
 						{snapshot.active?.goal?.active && (
-							<div className="cc-goal-banner" role="status" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", padding: "6px 12px", margin: "0 16px 6px", borderRadius: "8px", border: "1px solid var(--border)", background: "var(--bg-elevated, var(--surface))", fontSize: "12px" }}>
-								<span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+							<div className="cc-goal-banner" role="status">
+								<span>
 									<strong>目标模式</strong>（{snapshot.active.goal.turnsUsed}/{snapshot.active.goal.maxTurns} 轮
 									{snapshot.active.goal.maxCostUsd ? ` · 上限 $${snapshot.active.goal.maxCostUsd}` : ""}）：
 									{snapshot.active.goal.objective}
@@ -2500,7 +2564,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								</button>
 							</div>
 						)}
-						{snapshot.active && Boolean(grail?.hasDiff || grail?.running || grail?.verdicts.length) && (
+						{showGrailStatus && (
 							<div className="cc-grail-bar" role="region" aria-label={grailText.report}>
 								{grail?.running ? (
 									<span className="cc-grail-running" role="status">
@@ -2533,23 +2597,24 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								</span>
 							</div>
 						)}
+							</div>
+						</details>}
 						<LiveComposer
 							key={snapshot.active?.id ?? "no-conversation"}
 							snapshot={snapshot}
 							activeProject={project}
 							draft={app.draft}
+							messages={history.messages}
 							attachments={app.attachments}
 							updateAttachments={(update) => { if (snapshot.active) app.updateAttachments(snapshot.active.id, update); }}
 							setDraft={app.setDraft}
 							running={running}
 							changing={changing || bashBusy || planApplying || app.draftLoading || queueActionId === snapshot.active?.id && queueActionId !== undefined}
-							planMode={inPlanMode}
-							onTogglePlanMode={() => void togglePlanMode()}
 							send={app.send}
 							stop={() => void stopTurn()}
 							stopping={Boolean(stoppingRunId && stoppingRunId === turn?.id)}
 							command={app.command}
-							setPermission={(permission) => void savePermission(permission)}
+							setPermission={(permission) => void (permission === "plan" && !inPlanMode ? togglePlanMode() : savePermission(permission))}
 							onSelectProject={selectWorkspace}
 							onOpenProject={openWorkspace}
 							sandboxStatus={sandboxStatus}
@@ -2577,7 +2642,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							project={snapshot.active?.project}
 							ready={ready}
 							blocked={blocked}
-							readOnly={snapshot.settings.permission === "read" || snapshot.settings.permission === "plan"}
+							readOnly={activePermMode === "read" || activePermMode === "plan"}
 							bashBusy={bashBusy}
 							bashOutput={app.terminal}
 							prefill={rerun?.conversationId === snapshot.active?.id ? rerun : undefined}
@@ -2608,7 +2673,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					close={() => setPane(null)}
 					revision={app.revision}
 					project={snapshot.active?.project}
-					readOnly={snapshot.settings.permission === "read" || snapshot.settings.permission === "plan"}
+					readOnly={activePermMode === "read" || activePermMode === "plan"}
 					onOpenInEditor={openInEditor}
 					onReferenceFile={(filePath) => {
 						const ref = formatFileReference(filePath);
@@ -2655,7 +2720,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			)}
 			{mcpOpen && (
 				<McpDialog
-					onOAuth={snapshot.active && snapshot.settings.permission !== "read" && snapshot.settings.permission !== "plan" ? async (name) => {
+					onOAuth={snapshot.active && activePermMode !== "read" && activePermMode !== "plan" ? async (name) => {
 						const id = snapshot.active!.id;
 						const terminal = await api.terminals.mcpOAuth(id, name);
 						setFocusedTerminal({ conversationId: id, terminalId: terminal.id });
@@ -2855,9 +2920,14 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								className="cc-more-item danger"
 								disabled={changing || busyHere}
 								title={busyHere ? "会话正在运行或等待审批，暂不能删除" : undefined}
-								onClick={() => {
+								onClick={async () => {
 									closeMenu(false);
-									if (!window.confirm(`删除「${target.title}」？\n会话记录文件将移到废纸篓。`)) return;
+									if (!await confirm({
+										title: "移到废纸篓",
+										message: `会话「${target.title}」的记录文件将移到废纸篓。`,
+										confirmLabel: "移到废纸篓",
+										destructive: true,
+									})) return;
 									void api
 										.removeConversation(target.id)
 										.then((next) => {
@@ -2904,8 +2974,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							/>
 						</label>
 						<div className="dialog-actions">
-							<button type="button" className="btn-secondary" onClick={() => setGroupEdit(null)}>取消</button>
-							<button type="submit" className="btn-primary">保存</button>
+							<button type="button" className="secondary-button" onClick={() => setGroupEdit(null)}>取消</button>
+							<button type="submit" className="primary-button">保存</button>
 						</div>
 					</form>
 				</Modal>
@@ -2942,29 +3012,6 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				</Modal>
 			)}
 
-			{(!app.requests[0] || app.requests[0].id === deferredApproval) && snapshot.active && childApprovals.length > 0 && (
-				<SubagentApprovals
-					approvals={childApprovals}
-					rootConversationId={snapshot.active.id}
-					project={snapshot.active.project}
-					onRespond={async (taskId, response) => {
-						await api.tasks.respond(taskId, response);
-						setTasksMap((prev) => {
-							const target = prev[taskId];
-							if (!target?.pendingApprovals) return prev;
-							const remaining = target.pendingApprovals.filter((r) => r.id !== response.id);
-							return {
-								...prev,
-								[taskId]: {
-									...target,
-									...(remaining.length ? { pendingApprovals: remaining } : { pendingApprovals: undefined }),
-								},
-							};
-						});
-					}}
-					fail={app.fail}
-				/>
-			)}
 			{controlsTab && (
 				<ControlsDialog
 					conversationId={snapshot.active?.id}
@@ -2986,7 +3033,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						app.setNotice(msg);
 						void app.refresh();
 					}}
-					readOnly={snapshot.settings.permission === "read" || snapshot.settings.permission === "plan"}
+					readOnly={activePermMode === "read" || activePermMode === "plan"}
 				/>
 			)}
 			{tasksOpen && (
@@ -3058,6 +3105,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					close={() => setPaletteOpen(false)}
 				/>
 			)}
+			{confirmation}
 		</div>
 	);
 }

@@ -4,6 +4,24 @@ export interface FileReference {
 	to: number;
 }
 
+const desktopContextStart = "<pi-desktop-workspace-context>\n";
+const desktopContextEnd = "\n</pi-desktop-workspace-context>";
+
+export function wrapDesktopWorkspaceContext(text: string): string {
+	return desktopContextStart + text + desktopContextEnd;
+}
+
+export function isDesktopWorkspaceContext(text: string): boolean {
+	return text.startsWith(desktopContextStart) && text.endsWith(desktopContextEnd);
+}
+
+/** Remove the model-only appendix from plain-text draft or history previews. */
+export function visiblePromptText(text: string): string {
+	if (!text.endsWith(desktopContextEnd)) return text;
+	const start = text.lastIndexOf(desktopContextStart);
+	return start < 0 ? text : text.slice(0, start).trimEnd();
+}
+
 interface ReferenceQuery {
 	query: string;
 	from: number;

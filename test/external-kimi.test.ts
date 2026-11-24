@@ -144,6 +144,7 @@ test("Kimi fails closed before spawning for unsupported readonly or fine-grained
 	try {
 		assert.doesNotThrow(() => assertKimiPolicy({ ...data.options, policy: { ...data.options.policy, rules: [{ id: "allow-tests", scope: "global", action: "allow", tool: "bash", command: { type: "prefix", argv: ["npm", "test"] } }] } }));
 		await assert.rejects(new KimiAdapter().open({ ...data.options, policy: { ...data.options.policy, mode: "read" } }), /read-only/);
+		await assert.rejects(new KimiAdapter().open({ ...data.options, policy: { ...data.options.policy, mode: "plan" } }), /read-only/);
 		await assert.rejects(new KimiAdapter().open({ ...data.options, policy: { ...data.options.policy, disabledTools: ["bash"] } }), /fine-grained/);
 		await assert.rejects(new KimiAdapter().open({ ...data.options, policy: { ...data.options.policy, rules: [{ id: "deny-env", scope: "global", action: "deny", tool: "read", path: "**\/.env" }] } }), /fine-grained/);
 		await assert.rejects(readFile(join(data.root, "protocol.jsonl")), /ENOENT/);

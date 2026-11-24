@@ -54,6 +54,7 @@ test("engine-level plan mode allows reads, plans, Explore/Plan subagents and blo
 		assert.equal((await evaluatePermission(policy(), { toolName: "Agent", input: { subagent_type: "general-purpose", prompt: "edit", description: "write" } })).action, "deny");
 		assert.equal((await evaluatePermission(policy(), { toolName: "AskUserQuestion", input: { questions: [] } })).action, "allow");
 		assert.equal((await evaluatePermission(policy(), { toolName: "ExitPlanMode", input: {} })).action, "allow");
+		assert.equal((await evaluatePermission(policy({ mode: "auto" }), { toolName: "ExitPlanMode", input: {} })).action, "deny");
 		assert.equal((await evaluatePermission(policy(), { toolName: "WebFetch", input: { url: "https://example.com" } })).action, "allow");
 
 		// NotebookEdit permission modes outside plan mode

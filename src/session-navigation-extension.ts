@@ -3,6 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { contentText } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { isDesktopWorkspaceContext } from "./file-references.ts";
 
 export type SessionNavigationBridgeRequest =
 	| { requestId: string; operation: "navigate"; targetId: string; label?: string }
@@ -116,8 +117,11 @@ export default function sessionNavigation(pi: ExtensionAPI): void {
 				const result = await ctx.navigateTree(request.targetId, { summarize: false, label: request.label });
 				let editorText: string | undefined;
 				if (!result.cancelled && request.targetId !== oldLeafId) {
-					if (target.type === "message" && target.message.role === "user")
-						editorText = contentText(target.message.content, "");
+					if (target.type === "message" && target.message.role === "user") {
+						const content = target.message.content;
+						editorText = contentText(typeof content === "string" ? content : content.filter((block, index) =>
+							index === 0 || block.type !== "text" || !isDesktopWorkspaceContext(block.text)), "");
+					}
 					else if (target.type === "custom_message") editorText = contentText(target.content, "");
 				}
 				await respond({

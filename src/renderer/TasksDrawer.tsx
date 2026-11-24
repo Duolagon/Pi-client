@@ -1,7 +1,10 @@
 import { useEffect, useState } from "react";
 import { ArrowDownToLine, Check, Circle, Clock, Eye, GitBranch, GitMerge, ListTodo, LoaderCircle, Play, Send, Square, Trash2, Users, Workflow } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
+import { useConfirmation } from "./ConfirmationDialog.tsx";
 import { TranscriptView } from "./TranscriptView.tsx";
+import { ExternalApprovalCard } from "./ExternalApprovalCard.tsx";
+import { CheckpointsDialog } from "./CheckpointsDialog.tsx";
 import { applyEvent, transcript, type Transcript } from "./messages.ts";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
 import { computeChecklistEta, computeMonitorTiming, computeTodoTiming } from "../task-eta.ts";
@@ -25,6 +28,7 @@ export function TasksDrawer({
 	onNotice: (msg: string) => void;
 	fail: (error: unknown) => void;
 }) {
+	const { confirm, confirmation } = useConfirmation();
 	const [tab, setTab] = useState<"tasks" | "todos" | "cron" | "workflows" | "teams" | "worktrees">("tasks");
 	const [tasks, setTasks] = useState<DesktopTask[]>([]);
 	const [externalTasks, setExternalTasks] = useState<ExternalTask[]>([]);
@@ -35,6 +39,8 @@ export function TasksDrawer({
 	const [team, setTeam] = useState<TeamRecord | null>(null);
 	const [progressMap, setProgressMap] = useState<Record<string, TaskProgress>>({});
 	const [worktrees, setWorktrees] = useState<WorktreeInfo[]>([]);
+	const [confirmWorktreeCleanup, setConfirmWorktreeCleanup] = useState<string>();
+	const [retainedWorktreePath, setRetainedWorktreePath] = useState<string>();
 	const [detailTranscript, setDetailTranscript] = useState<Transcript | null>(null);
 	const [detailPendingUI, setDetailPendingUI] = useState<RpcExtensionUIRequest[]>([]);
 	const [approvalInputs, setApprovalInputs] = useState<Record<string, string>>({});
@@ -53,6 +59,7 @@ export function TasksDrawer({
 	}, [hasActiveItems]);
 	const [detailTask, setDetailTask] = useState<DesktopTask | null>(null);
 	const [extDetail, setExtDetail] = useState<ExternalTask | null>(null);
+	const [checkpointTask, setCheckpointTask] = useState<string>();
 	const [extFollowUp, setExtFollowUp] = useState("");
 	const [piFollowUp, setPiFollowUp] = useState("");
 	const [notifyParent, setNotifyParent] = useState(false);
@@ -306,7 +313,9 @@ export function TasksDrawer({
 	const removeWorktree = async (id: string) => {
 		setBusy(true);
 		try {
-			await window.pi.worktrees.remove(id);
+			const result = await window.pi.worktrees.remove(id, { preserveIgnored: true });
+			setConfirmWorktreeCleanup(undefined);
+			setRetainedWorktreePath(result.retainedIgnoredPath);
 			onNotice("已清理 Worktree。");
 			await refresh();
 		} catch (error) {
@@ -327,7 +336,12 @@ export function TasksDrawer({
 	const backgroundCount = backgroundChildren + backgroundMonitors;
 	const stopAllBackground = async () => {
 		if (!conversationId || !backgroundCount) return;
-		if (!window.confirm(`停止当前会话的全部 ${backgroundCount} 项后台任务？这会停止所有回合中的子 Agent、后台命令和监听，已完成的修改会保留。`)) return;
+		if (!await confirm({
+			title: `停止 ${backgroundCount} 项后台任务`,
+			message: "这会停止当前会话所有回合中的子 Agent、后台命令和监听。已完成的修改会保留。",
+			confirmLabel: "停止全部",
+			destructive: true,
+		})) return;
 		setBusy(true);
 		try {
 			const { stopped } = await window.pi.tasks.stopAll(conversationId);
@@ -340,6 +354,9 @@ export function TasksDrawer({
 		}
 	};
 
+	if (checkpointTask) return (
+		<CheckpointsDialog conversationId={checkpointTask} close={() => setCheckpointTask(undefined)} onRestored={onNotice} />
+	);
 	return (
 		<Modal title="后台任务、子 Agent 与 Worktree (/tasks)" close={close} wide>
 			<div className="simple-dialog">
@@ -563,60 +580,16 @@ export function TasksDrawer({
 										<span className="cc-source-tag">turn {extDetail.turn}</span>
 										<span className="cc-source-tag">{extDetail.status}</span>
 									</div>
-									<button type="button" className="secondary-button" onClick={() => setExtDetail(null)}>
-										返回列表
-									</button>
+									<div className="cc-tool-ctrl-actions">
+										{!extDetail.readOnly && (
+											<button type="button" className="secondary-button" onClick={() => setCheckpointTask(extDetail.id)}>查看检查点</button>
+										)}
+										<button type="button" className="secondary-button" onClick={() => setExtDetail(null)}>返回列表</button>
+									</div>
 								</div>
 								{extDetail.pendingApprovals.map((req) => (
-									<div key={req.id} className="cc-task-approval">
-										<span>
-											待审批 ({req.toolName})：{req.description || JSON.stringify(req.input)}
-										</span>
-										<div>
-											<button
-												type="button"
-												className="secondary-button"
-												onClick={() =>
-													void window.pi.externalAgents
-														.respond(extDetail.id, req.id, { decision: "deny" })
-														.then(() => openExternalDetail(extDetail))
-														.catch(fail)
-												}
-											>
-												拒绝
-											</button>
-											{req.options?.length ? (
-												req.options.map((opt) => (
-													<button
-														key={opt.id}
-														type="button"
-														className="primary-button"
-														onClick={() =>
-															void window.pi.externalAgents
-																.respond(extDetail.id, req.id, { decision: "allow", optionId: opt.id })
-																.then(() => openExternalDetail(extDetail))
-																.catch(fail)
-														}
-													>
-														{opt.label}
-													</button>
-												))
-											) : (
-												<button
-													type="button"
-													className="primary-button"
-													onClick={() =>
-														void window.pi.externalAgents
-															.respond(extDetail.id, req.id, { decision: "allow" })
-															.then(() => openExternalDetail(extDetail))
-															.catch(fail)
-													}
-												>
-													允许
-												</button>
-											)}
-										</div>
-									</div>
+									<ExternalApprovalCard key={req.id} task={extDetail} request={req}
+										onRespond={(response) => window.pi.externalAgents.respond(extDetail.id, req.id, response)} fail={fail} />
 								))}
 								<div className="cc-task-transcript">
 									<pre className="cc-bash-out">{extDetail.output || extDetail.error || "(暂无输出)"}</pre>
@@ -965,9 +938,11 @@ export function TasksDrawer({
 
 				{tab === "worktrees" && (
 					<div className="cc-controls-body">
+						{retainedWorktreePath && <p className="subtle-note" role="status">忽略文件已保留在 <code>{retainedWorktreePath}</code></p>}
 						<div className="cc-list-scroll">
 							{worktrees.map((wt) => (
-								<div key={wt.id} className="cc-tool-ctrl-row">
+								<div key={wt.id}>
+								<div className="cc-tool-ctrl-row">
 									<div className="cc-tool-ctrl-info">
 										<div className="cc-tool-ctrl-name">
 											<strong>{wt.branch}</strong>
@@ -979,10 +954,20 @@ export function TasksDrawer({
 										<button type="button" className="cc-mini-btn" disabled={busy || wt.status !== "ready"} onClick={() => void mergeWorktree(wt.id)}>
 											<GitMerge size={13} /> 合并
 										</button>
-										<button type="button" className="cc-mini-btn danger" disabled={busy} onClick={() => void removeWorktree(wt.id)}>
+										<button type="button" className="cc-mini-btn danger" disabled={busy || wt.status !== "ready"} onClick={() => setConfirmWorktreeCleanup(wt.id)}>
 											<Trash2 size={13} /> 清理
 										</button>
 									</div>
+								</div>
+								{confirmWorktreeCleanup === wt.id && (
+									<div className="cc-task-approval" role="group" aria-label="确认清理 Worktree">
+										<span>忽略文件会移到保留目录。请先提交或移出其他改动。</span>
+										<div>
+											<button type="button" className="secondary-button" disabled={busy} onClick={() => setConfirmWorktreeCleanup(undefined)}>取消</button>
+											<button type="button" className="primary-button" disabled={busy} onClick={() => void removeWorktree(wt.id)}>确认清理</button>
+										</div>
+									</div>
+								)}
 								</div>
 							))}
 							{!worktrees.length && <p className="subtle-note">当前项目没有受管 Worktree。</p>}
@@ -990,6 +975,7 @@ export function TasksDrawer({
 					</div>
 				)}
 			</div>
+			{confirmation}
 		</Modal>
 	);
 }

@@ -48,6 +48,7 @@ const api: DesktopAPI = {
 		onEvent: (listener) => listen("pi:controls:event", listener),
 	},
 	permissions: {
+		setMode: (conversationId, mode) => ipcRenderer.invoke("pi:permissions:set-mode", conversationId, mode),
 		list: (conversationId) => ipcRenderer.invoke("pi:permissions:list", conversationId),
 		upsert: (rule) => ipcRenderer.invoke("pi:permissions:upsert", rule),
 		remove: (id) => ipcRenderer.invoke("pi:permissions:remove", id),
@@ -106,7 +107,7 @@ const api: DesktopAPI = {
 	worktrees: {
 		create: (input) => ipcRenderer.invoke("pi:worktree:create", input),
 		list: (project) => ipcRenderer.invoke("pi:worktree:list", project),
-		remove: (id) => ipcRenderer.invoke("pi:worktree:remove", id),
+		remove: (id, options) => ipcRenderer.invoke("pi:worktree:remove", id, options),
 		merge: (id) => ipcRenderer.invoke("pi:worktree:merge", id),
 	},
 	todos: {
@@ -189,6 +190,7 @@ const api: DesktopAPI = {
 	btw: (question) => ipcRenderer.invoke("pi:btw", question),
 	checkPreview: (url, mobile) => ipcRenderer.invoke("pi:preview:check", url, mobile),
 	probePreview: (url) => ipcRenderer.invoke("pi:preview:probe", url),
+	defaultPreviewUrl: (conversationId) => ipcRenderer.invoke("pi:preview:default", conversationId),
 	inspectCode: (conversationId, path, at) => ipcRenderer.invoke("pi:code:inspect", conversationId, path, at),
 	sandboxStatus: () => ipcRenderer.invoke("pi:sandbox:status"),
 	doctor: () => ipcRenderer.invoke("pi:doctor"),

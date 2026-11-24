@@ -1,5 +1,6 @@
-import { projectMemoryContext, userMemoryContext } from "./project-memory.ts";
+import { memoryLimit, projectMemoryContext, projectReferenceContext, userMemoryContext } from "./project-memory.ts";
 import { staleTodoReminder } from "./todo-reminder.ts";
+import { isDesktopWorkspaceContext, wrapDesktopWorkspaceContext } from "./file-references.ts";
 import { get as getHttp } from "node:http";
 import { get as getHttps } from "node:https";
 import { Readable } from "node:stream";
@@ -7,7 +8,7 @@ import { lookup } from "node:dns/promises";
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import { isIP } from "node:net";
 import { resolve } from "node:path";
-import type { ExtensionAPI, ModelRegistry, ProviderModelConfig, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ModelRegistry, ProviderModelConfig, ToolDefinition, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
 import type { ConnectionMode, ConnectionProtocol, Provider } from "./shared.ts";
 import { connectionDefaults, connectionMode } from "./model-connections.ts";
 import { providerModels } from "./provider-presets.ts";
@@ -15,6 +16,7 @@ import { BALANCE_PROVIDER_NAMES, balanceFor, fetchBalance, formatBalance, validB
 import { evaluatePermission, loadRuntimePermissionPolicy, redactSearchOutput } from "./permission-policy.ts";
 import { isStatusOnlyRequest } from "./remote-operation.ts";
 import { formatWebSearchResults, injectDeepSeekBuiltinSearch, isDeepSeekModel, searchWithDeepSeekApi } from "./web-search.ts";
+import { planRelativePath } from "./plan-path.ts";
 
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
@@ -267,13 +269,17 @@ export function fallbackReason(errorMessage: unknown): string | undefined {
 	// Never fall back on errors another model cannot fix or that the user caused.
 	if (/abort|cancel/i.test(text)) return undefined;
 	if (code("400|401|403|404|413|422").test(text)) return undefined;
+	if (/insufficient.?(?:quota|balance|funds)|quota.?exceeded|billing|out of budget|usage limit|available balance/i.test(text)) return undefined;
+	if (code("529").test(text)) return "过载";
+	if (code("429").test(text)) return "限流";
+	if (code("5[0-9]{2}").test(text)) return "服务端错误";
 	if (/unauthori[sz]ed|forbidden|authenticat|permission.?denied|invalid.{0,12}(?:api.?key|token|x-api-key)|incorrect api key|api.?key/i.test(text)) return undefined;
 	if (/invalid.?request|bad.?request|validation/i.test(text)) return undefined;
 	if (/context.?(?:length|window|overflow)|maximum context|too many tokens|prompt is too long|token limit|exceeds? the (?:model'?s? )?(?:maximum|limit)/i.test(text)) return undefined;
 	if (/insufficient.?(?:quota|balance|funds)|quota.?exceeded|billing|out of budget|credit|usage limit|available balance/i.test(text)) return undefined;
-	if (/overload|server.?busy|servers are currently busy|high demand|at capacity|capacity/i.test(text) || code("529").test(text)) return "过载";
-	if (/rate.?limit|too many requests|throttl/i.test(text) || code("429").test(text)) return "限流";
-	if (/service.?(?:is.?)?(?:temporarily.?)?unavailable|bad.?gateway|gateway.?time.?out|server.?error|internal.?(?:server.?)?error/i.test(text) || code("5[0-9]{2}").test(text))
+	if (/overload|server.?busy|servers are currently busy|high demand|at capacity|capacity/i.test(text)) return "过载";
+	if (/rate.?limit|too many requests|throttl/i.test(text)) return "限流";
+	if (/service.?(?:is.?)?(?:temporarily.?)?unavailable|bad.?gateway|gateway.?time.?out|server.?error|internal.?(?:server.?)?error/i.test(text))
 		return "服务端错误";
 	return undefined;
 }
@@ -311,10 +317,13 @@ export function sessionCost(entries: readonly unknown[]): number {
 export default function permissions(pi: ExtensionAPI) {
 	// This JSON is supplied by the desktop host, separate from the user's Pi files.
 	const connections = JSON.parse(process.env.PI_DESKTOP_CONNECTIONS ?? "{}") as Partial<Record<Provider, Connection>>;
-	const testingConnection = process.env.PI_DESKTOP_CONNECTION_TEST === "1";
+	const limitConnectionOutput = process.env.PI_DESKTOP_CONNECTION_TEST === "1";
+	const testingConnection = limitConnectionOutput || process.env.PI_DESKTOP_GRAIL_REVIEW === "1";
 	const forkChild = process.env.PI_DESKTOP_FORK_CHILD === "1";
 	const isChild = process.env.PI_DESKTOP_CHILD === "1" || process.env.PI_DESKTOP_READ_ONLY_CHILD === "1";
 	let activeTodoWriteItems: Array<{ id: string; content: string; status: string; estimatedSeconds?: number }> = [];
+	const sharedTodoItems = new Map<string, { content: string; status: string }>();
+	let checklist: "simple" | "shared" = "simple";
 	let callsSinceTodoUpdate = 0;
 	if (!testingConnection && (!isChild || forkChild) && process.env.PI_DESKTOP_HOST_URL) {
 		pi.registerTool({
@@ -360,6 +369,7 @@ export default function permissions(pi: ExtensionAPI) {
 				const rec = input as { todos?: Array<{ id: string; content: string; status: string; estimatedSeconds?: number }> };
 				const todos = Array.isArray(rec?.todos) ? rec.todos.slice(0, 50) : [];
 				activeTodoWriteItems = todos;
+				checklist = "simple";
 				callsSinceTodoUpdate = 0;
 				return {
 					content: [
@@ -375,12 +385,6 @@ export default function permissions(pi: ExtensionAPI) {
 					details: { todos },
 				};
 			},
-		});
-		pi.on("context_with_system", (event) => {
-			const reminder = staleTodoReminder(event.messages, 4);
-			const first = event.messages[0];
-			if (!reminder || first?.role !== "system") return;
-			return { messages: [{ ...first, sections: { ...first.sections, desktopTodoReminder: reminder } }, ...event.messages.slice(1)] };
 		});
 		pi.registerTool({
 			name: "WebFetch",
@@ -557,11 +561,16 @@ export default function permissions(pi: ExtensionAPI) {
 				};
 			},
 		});
+		let planFile: string | undefined;
+		const describePlan = "Submit the implementation plan for approval. Pass the full Markdown in plan.";
 		pi.registerTool({
 			name: "ExitPlanMode",
 			label: "ExitPlanMode",
-			description: "Finalize and save the implementation plan (.pi/plans/) and signal readiness for user plan approval before exiting Plan mode.",
-			promptSnippet: "Save the plan and request user approval to begin implementation",
+			description: describePlan,
+			prepareLoadout: () => planFile ? { descriptions: {
+				ExitPlanMode: `${describePlan} You may omit plan only if already saved to \`${planFile}\`.`,
+			} } : undefined,
+			promptSnippet: "Submit the implementation plan's Markdown for user approval",
 			parameters: {
 				type: "object",
 				additionalProperties: false,
@@ -571,7 +580,7 @@ export default function permissions(pi: ExtensionAPI) {
 				},
 			} as ToolDefinition["parameters"],
 			exposure: "model-only",
-			defaultActive: true,
+			defaultActive: false,
 			executionMode: "sequential",
 			async execute(toolCallId, input, signal) {
 				const rec = input as { title?: string; plan?: string };
@@ -580,12 +589,17 @@ export default function permissions(pi: ExtensionAPI) {
 					title: typeof rec?.title === "string" ? rec.title : undefined,
 					plan: typeof rec?.plan === "string" ? rec.plan : undefined,
 				}, signal);
-				const data = hostResult ?? { saved: false, status: "awaiting_user_approval" };
+				if (hostResult?.saved !== true) throw new Error("计划未提交，请确认客户端已连接，并提供计划正文。");
 				return {
-					content: [{ type: "text", text: JSON.stringify(data) }],
-					details: data,
+					content: [{ type: "text", text: JSON.stringify(hostResult) }],
+					details: hostResult,
 				};
 			},
+		});
+		pi.on("session_start", (_event, ctx) => {
+			planFile = planRelativePath(ctx.sessionManager.getSessionId());
+			const active = pi.getActiveTools();
+			if (active.includes("ExitPlanMode")) pi.setActiveTools(active);
 		});
 		pi.registerTool({
 			name: "NotebookEdit",
@@ -678,7 +692,7 @@ export default function permissions(pi: ExtensionAPI) {
 					inputLimits: model?.inputLimits,
 					cost: model?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					contextWindow: model?.contextWindow ?? 128000,
-					maxTokens: testingConnection ? Math.min(model?.maxTokens ?? 8192, 4096) : (model?.maxTokens ?? 8192),
+					maxTokens: limitConnectionOutput ? Math.min(model?.maxTokens ?? 8192, 4096) : (model?.maxTokens ?? 8192),
 					thinkingLevelMap: model?.thinkingLevelMap,
 					promptCache: model?.promptCache,
 					samplingParams: model?.samplingParams,
@@ -704,42 +718,57 @@ export default function permissions(pi: ExtensionAPI) {
 	registerOutputStyle(pi, process.env.PI_DESKTOP_OUTPUT_STYLE_FILE);
 	const memoryRoot = process.env.PI_DESKTOP_MEMORY_ROOT;
 	const userMemoryFile = process.env.PI_DESKTOP_USER_MEMORY_FILE;
-	const memoryToolPaths = new Set<string>();
+	const seenRules = new Set<string>();
+	let scopedBudget = memoryLimit;
+	let scopedQueue = Promise.resolve();
+	const scopedContext = (prompt: string, paths: string[] = []) => {
+		if (!memoryRoot) return Promise.resolve("");
+		const context = scopedQueue.then(async () => {
+			const scoped = await projectMemoryContext(memoryRoot, prompt, undefined, paths, "", {
+				mode: "scoped", seenRules, limit: scopedBudget,
+			});
+			scopedBudget -= Buffer.byteLength(scoped);
+			return scoped;
+		});
+		scopedQueue = context.then(() => {}, () => {});
+		return context;
+	};
 	if (memoryRoot || userMemoryFile) {
-		let prompt = "";
-		let system = "";
-		let context: string | undefined;
-		let analyzedPaths = -1;
-		pi.on("before_agent_start", (event) => {
-			prompt = event.messageType === "user" ? event.prompt : "";
-			system = event.systemPrompt;
-			memoryToolPaths.clear();
-			analyzedPaths = -1;
+		pi.on("before_agent_start", async (event) => {
+			seenRules.clear();
+			scopedBudget = memoryLimit;
+			const [user, project] = await Promise.all([
+				userMemoryFile ? userMemoryContext(userMemoryFile, event.systemPrompt) : "",
+				memoryRoot
+					? projectMemoryContext(memoryRoot, "", process.env.PI_DESKTOP_MEMORY_FILE, [], event.systemPrompt, { mode: "base" })
+					: "",
+			]);
+			const context = [user, project].filter(Boolean).join("\n\n");
+			const sections = event.systemPromptOptions?.sections;
+			if (context && sections) sections.desktop_project_memory = context;
 		});
-		// Steering and follow-up inputs enter the active run as user messages, without
-		// another before_agent_start event. Resolve references when the input is delivered.
-		pi.on("message_start", ({ message }) => {
+	}
+	if (memoryRoot) {
+		// Finalized native user messages include queued inputs and are persisted before the model call.
+		pi.on("message_end", async ({ message }) => {
 			if (message.role !== "user") return;
-			const next = typeof message.content === "string" ? message.content : message.content
-				.filter((part) => part.type === "text").map((part) => part.text).join("\n");
-			if (next !== prompt) {
-				prompt = next;
-				analyzedPaths = -1;
-			}
-		});
-		pi.on("context_with_system", async (event) => {
-			if (analyzedPaths !== memoryToolPaths.size) {
-				const user = userMemoryFile ? await userMemoryContext(userMemoryFile, system) : "";
-				const project = memoryRoot
-					? await projectMemoryContext(memoryRoot, prompt, process.env.PI_DESKTOP_MEMORY_FILE, [...memoryToolPaths], system)
-					: "";
-				context = [user, project].filter(Boolean).join("\n\n") || undefined;
-				analyzedPaths = memoryToolPaths.size;
-			}
-			const first = event.messages[0];
-			if (context && first?.role === "system") {
-				return { messages: [{ ...first, sections: { ...first.sections, desktopProjectMemory: context } }, ...event.messages.slice(1)] };
-			}
+			const original = typeof message.content === "string"
+				? [{ type: "text" as const, text: message.content }]
+				: message.content;
+			if (original.some((part) => part.type === "text" && isDesktopWorkspaceContext(part.text))) return;
+			const prompt = textFromBlocks(original);
+			if (!prompt.includes("@")) return;
+			const policy = await loadRuntimePermissionPolicy().catch(() => undefined);
+			const [references, rules] = await Promise.all([
+				policy
+					? projectReferenceContext(memoryRoot, prompt, async (path) => (await evaluatePermission(policy, {
+						toolName: "read", input: { path },
+					}).catch(() => undefined))?.action === "allow")
+					: "",
+				scopedContext(prompt),
+			]);
+			const context = [references, rules].filter(Boolean).join("\n\n");
+			if (context) return { message: { ...message, content: [...original, { type: "text" as const, text: wrapDesktopWorkspaceContext(context) }] } };
 		});
 	}
 	pi.on("session_start", async (_event, ctx) => {
@@ -796,46 +825,55 @@ export default function permissions(pi: ExtensionAPI) {
 	});
 	const maxCostRaw = Number(process.env.PI_DESKTOP_MAX_COST);
 	const maxCost = Number.isFinite(maxCostRaw) && maxCostRaw > 0 ? maxCostRaw : 0;
-	if (maxCost > 0) {
-		const costNotice = (spent: number) =>
+	const costFile = process.env.PI_DESKTOP_MAX_COST_FILE;
+	if (maxCost > 0 || costFile) {
+		const readMaximumCost = async () => {
+			if (!costFile) return maxCost;
+			const value = Number(await readFile(costFile, "utf8").catch(() => ""));
+			return Number.isFinite(value) && value > 0 ? value : 0;
+		};
+		const costNotice = (spent: number, limit: number) =>
 			isChild
 				? `子 Agent 已用完会话剩余的费用额度（$${spent.toFixed(2)}），已自动停止。`
-				: `本会话花费 $${spent.toFixed(2)}，已达到上限 $${maxCost.toFixed(2)}，已自动停止。可在设置中调高上限，或新建会话继续。`;
+				: `本会话已花费 $${spent.toFixed(2)}，可用上限为 $${limit.toFixed(2)}，已自动停止。运行中的子任务可能占用了部分额度。`;
 		let costStopped = false;
 		let noticeShown = false;
-		pi.on("input", (_event, ctx) => {
+		pi.on("input", async (_event, ctx) => {
 			const spent = sessionCost(ctx.sessionManager.getEntries());
-			if (spent < maxCost) return { action: "continue" };
-			ctx.ui.notify(costNotice(spent), "warning");
+			const limit = await readMaximumCost();
+			if (spent < limit) return { action: "continue" };
+			ctx.ui.notify(costNotice(spent, limit), "warning");
 			return { action: "handled" };
 		});
 		pi.on("before_agent_start", () => {
 			costStopped = false;
 		});
 		// Wakeups and follow-ups that bypass `input` are stopped before any paid request.
-		pi.on("before_provider_request", (_event, ctx) => {
+		pi.on("before_provider_request", async (_event, ctx) => {
 			const spent = sessionCost(ctx.sessionManager.getEntries());
-			if (spent < maxCost) {
+			const limit = await readMaximumCost();
+			if (spent < limit) {
 				noticeShown = false;
 				return undefined;
 			}
 			if (!noticeShown) {
 				noticeShown = true;
-				ctx.ui.notify(costNotice(spent), "warning");
+				ctx.ui.notify(costNotice(spent, limit), "warning");
 			}
 			costStopped = true;
 			ctx.abort();
 			return undefined;
 		});
-		pi.on("turn_end", (_event, ctx) => {
+		pi.on("turn_end", async (_event, ctx) => {
 			if (costStopped) return;
 			const spent = sessionCost(ctx.sessionManager.getEntries());
-			if (spent < maxCost) return;
+			const limit = await readMaximumCost();
+			if (spent < limit) return;
 			costStopped = true;
 			ctx.abort();
 			return {
 				continue: false,
-				entries: [{ type: "custom_message", customType: "desktop_max_cost", content: costNotice(spent), display: true }],
+				entries: [{ type: "custom_message", customType: "desktop_max_cost", content: costNotice(spent, limit), display: true }],
 			};
 		});
 	}
@@ -939,6 +977,7 @@ export default function permissions(pi: ExtensionAPI) {
 	const fallback = testingConnection ? undefined : parseFallbackModel(process.env.PI_DESKTOP_FALLBACK_MODEL);
 	if (fallback) {
 		let fallbackUsed = false;
+		let primaryModel: { provider: string; id: string } | undefined;
 		let lastError: string | undefined;
 		// One automatic fallback per prompt (user message, wakeup or other run start).
 		pi.on("before_agent_start", () => {
@@ -970,6 +1009,7 @@ export default function permissions(pi: ExtensionAPI) {
 				ctx.ui.notify(`主模型 ${primary} 暂不可用（${reason}），但备用模型 ${fallback.id} 当前不可用，未自动切换。`, "warning");
 				return;
 			}
+			primaryModel = { provider: current.provider, id: current.id };
 			const notice = `主模型 ${primary} 暂不可用（${reason}），已切换到备用模型 ${target.name || target.id} 继续。`;
 			ctx.ui.notify(notice, "warning");
 			lastError = undefined;
@@ -985,6 +1025,13 @@ export default function permissions(pi: ExtensionAPI) {
 					},
 				],
 			};
+		});
+		pi.on("agent_settled", async (_event, ctx) => {
+			const primary = primaryModel;
+			primaryModel = undefined;
+			if (!primary || ctx.model?.provider !== fallback.provider || ctx.model.id !== fallback.id) return;
+			const target = ctx.modelRegistry.find(primary.provider, primary.id);
+			if (target) await pi.setModel(target).catch(() => false);
 		});
 	}
 	pi.on("session_before_compact", async (event) => {
@@ -1044,7 +1091,8 @@ export default function permissions(pi: ExtensionAPI) {
 				if (lastUser?.type !== "message" || lastUser.message.role !== "user") return false;
 				const content = lastUser.message.content;
 				if (typeof content === "string") return isStatusOnlyRequest(content);
-				return content.every((item) => item.type === "text") && isStatusOnlyRequest(content.map((item) => item.text).join("\n"));
+				return content.every((item) => item.type === "text") &&
+					isStatusOnlyRequest(content.filter((item) => !isDesktopWorkspaceContext(item.text)).map((item) => item.text).join("\n"));
 			};
 			const statusBlockReason = "本轮仅查询状态，不能执行远端写操作。";
 			if (decision.remoteMutation && statusOnlyTurn()) return { block: true, reason: statusBlockReason };
@@ -1131,36 +1179,54 @@ export default function permissions(pi: ExtensionAPI) {
 		const bashExitCode = event.toolName === "bash" && event.structuredContent &&
 			typeof event.structuredContent === "object" && "exit_code" in event.structuredContent
 			? event.structuredContent.exit_code : undefined;
-		const recorded = typeof bashExitCode === "number" && Number.isInteger(bashExitCode)
+		let recorded: Pick<ToolResultEventResult, "details"> | undefined = typeof bashExitCode === "number" && Number.isInteger(bashExitCode)
 			? { details: { ...(event.details && typeof event.details === "object" ? event.details : {}), exitCode: bashExitCode } }
 			: undefined;
-		if (memoryRoot && !event.isError && ["read", "write", "edit"].includes(event.toolName) && typeof event.input.path === "string" && memoryToolPaths.size < 64)
-			memoryToolPaths.add(event.input.path);
-		// grep/find/ls search a directory; hide individual results that path deny
-		// rules (e.g. an imported Claude `Read(.env)`) would refuse to read.
-		const redacted = event.isError
-			? undefined
-			: await redactSearchResult(await loadRuntimePermissionPolicy().catch(() => undefined), event.toolName, event.input, event.content);
-		if (redacted) event = { ...event, content: redacted } as typeof event;
-		let postTodoReminder: string | undefined;
-		if (["TodoWrite", "TodoCreate", "TodoUpdate"].includes(event.toolName)) {
-			callsSinceTodoUpdate = 0;
-		} else if (!testingConnection && activeTodoWriteItems.some((t) => t.status !== "completed")) {
-			callsSinceTodoUpdate += 1;
-			if (callsSinceTodoUpdate >= 4 && callsSinceTodoUpdate % 4 === 0) {
-				const list = activeTodoWriteItems
-					.map((t) => `- [${t.status}] ${String(t.content).slice(0, 160)}`)
-					.join("\n");
-				postTodoReminder = `\n\n<system-reminder>\nThe TodoWrite checklist shown to the user has not been updated for ${callsSinceTodoUpdate} tool calls. Call TodoWrite now if any item finished or started so the user's progress bar stays current.\n${list}\n</system-reminder>`;
+		const pathRules = !event.isError && ["read", "write", "edit"].includes(event.toolName) && typeof event.input.path === "string"
+			? await scopedContext("", [event.input.path]).catch(() => "")
+			: "";
+		let redacted: typeof event.content | undefined;
+		if (!event.isError && ["grep", "find", "ls"].includes(event.toolName)) {
+			try {
+				const policy = await loadRuntimePermissionPolicy();
+				redacted = await redactSearchResult(policy, event.toolName, event.input, event.content);
+				if ((policy.sandbox || redacted) && event.details && typeof event.details === "object" &&
+					"truncation" in event.details && event.details.truncation && typeof event.details.truncation === "object") {
+					const { content: _unfiltered, ...truncation } = event.details.truncation as Record<string, unknown>;
+					recorded = { details: { ...event.details, truncation } };
+				}
+			} catch {
+				return {
+					content: [{ type: "text" as const, text: "无法确认搜索结果中的文件权限，已隐藏结果。" }],
+					details: {},
+					isError: true,
+				};
 			}
 		}
-		const withTodoNudge = <T extends { type: string }>(blocks: T[]): T[] =>
-			postTodoReminder
-				? ([...blocks, { type: "text", text: postTodoReminder } as unknown as T])
-				: blocks;
+		if (redacted) event = { ...event, content: redacted } as typeof event;
+		if (!event.isError && ["TodoCreate", "TodoUpdate", "TodoGet", "TodoList"].includes(event.toolName)) {
+			const details = event.details as { todo?: unknown; todos?: unknown } | undefined;
+			if (event.toolName === "TodoList" && Array.isArray(details?.todos)) sharedTodoItems.clear();
+			const items = Array.isArray(details?.todos) ? details.todos : [details?.todo];
+			for (const item of items) {
+				if (!item || typeof item !== "object") continue;
+				const todo = item as { id?: unknown; subject?: unknown; status?: unknown };
+				if (typeof todo.id === "string" && typeof todo.subject === "string" && typeof todo.status === "string")
+					sharedTodoItems.set(todo.id, { content: todo.subject, status: todo.status });
+			}
+			checklist = "shared";
+			callsSinceTodoUpdate = 0;
+		} else if (event.toolName !== "TodoWrite" || event.isError) {
+			callsSinceTodoUpdate++;
+		}
+		const postTodoReminder = !testingConnection && callsSinceTodoUpdate === 4
+			? staleTodoReminder(checklist, checklist === "simple" ? activeTodoWriteItems : [...sharedTodoItems.values()])
+			: undefined;
+		const additions = [pathRules, postTodoReminder].filter(Boolean).join("\n\n");
+		const content = additions ? [...event.content, { type: "text" as const, text: additions }] : event.content;
 		const changed = () => {
-			if (!redacted && !postTodoReminder) return recorded;
-			return { ...recorded, content: withTodoNudge(event.content) };
+			if (!redacted && !additions) return recorded;
+			return { ...recorded, content };
 		};
 		if (testingConnection) return changed();
 		const errorText = event.isError ? textFromBlocks(event.content).slice(0, 4000) : undefined;
@@ -1176,10 +1242,10 @@ export default function permissions(pi: ExtensionAPI) {
 		if (!hook) return changed();
 		if (hook.blocked && !event.isError) {
 			const reason = typeof hook.reason === "string" ? hook.reason : "PostToolUse Hook 报告检查失败。";
-			return { ...recorded, content: [...event.content, { type: "text" as const, text: `\n\n[Hook Blocked] ${reason}` }], isError: true };
+			return { ...recorded, content: [...content, { type: "text" as const, text: `\n\n[Hook Blocked] ${reason}` }], isError: true };
 		}
 		if (!hook.suppressOutput && typeof hook.additionalContext === "string" && hook.additionalContext.trim()) {
-			return { ...recorded, content: [...event.content, { type: "text" as const, text: `\n\n[Hook Context]\n${hook.additionalContext.trim()}` }] };
+			return { ...recorded, content: [...content, { type: "text" as const, text: `\n\n[Hook Context]\n${hook.additionalContext.trim()}` }] };
 		}
 		return changed();
 	});

@@ -79,8 +79,8 @@ export function SandboxControl({
 				title={
 					draftEnabled
 						? draftOffline
-							? "macOS Seatbelt 离线沙箱已开启：仅允许写入当前项目，并禁止 Bash 联网"
-							: "macOS Seatbelt 沙箱已开启：限制 Bash 写操作至当前项目与临时目录，并屏蔽敏感凭据读取"
+								? "已开启命令沙箱与内置文件保护，Bash 无法联网"
+								: "已开启命令沙箱与内置文件保护"
 						: "当前未开启 OS 命令沙箱，点击配置"
 				}
 				onClick={() => onOpenChange(!open)}
@@ -105,7 +105,7 @@ export function SandboxControl({
 								{unsupported ? "不可用" : draftEnabled ? (draftOffline ? "离线隔离" : "已保护") : "未开启"}
 							</span>
 						</div>
-						<p>通过内核级 Seatbelt 隔离 Agent 执行的 Bash 与 Monitor 命令。</p>
+						<p>Seatbelt 隔离 Bash 与 Monitor。开启沙箱时，内置文件工具也会限制写入范围并保护凭据。</p>
 					</div>
 
 					<label className={`cc-sandbox-toggle ${unsupported && !draftEnabled ? "disabled" : ""}`}>
@@ -118,7 +118,7 @@ export function SandboxControl({
 						/>
 						<span>
 							<strong>开启 OS 命令沙箱</strong>
-							<small>仅允许写入当前工作目录与系统临时目录</small>
+							<small>命令可写工作区、附加目录与系统临时目录</small>
 						</span>
 					</label>
 
@@ -142,14 +142,14 @@ export function SandboxControl({
 
 					<div className="cc-sandbox-scope">
 						<div>
-							<span>可写目录</span>
-							<code>{projectPath || "当前项目目录"}</code>
+							<span>文件工具可写</span>
+							<code>{projectPath || "当前项目目录"}及附加目录</code>
 						</div>
 						<div>
-							<span>屏蔽读取</span>
+							<span>保护凭据</span>
 							<code>~/.ssh · ~/.aws · ~/.gnupg · ~/.kube · ~/.netrc · Keychains</code>
 						</div>
-						<p>交互终端、MCP 与 Hooks 使用各自权限；切换沙箱设置后立即生效。</p>
+						<p>内置文件工具也会保护 .env 文件。交互终端、MCP 与 Hooks 使用各自的权限。</p>
 					</div>
 				</div>
 			)}

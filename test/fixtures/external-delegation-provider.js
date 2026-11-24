@@ -17,7 +17,18 @@ export default function externalDelegationProvider(pi) {
 			const results = context.messages.slice(index + 1).filter((message) => message.role === "toolResult");
 			const executor = text.split(" ")[1] ?? "codex";
 			let response;
-			if (text.includes("<task-notification>") && text.includes("<task-id>external-")) {
+			if (text.includes("<team-message") && text.includes("TEAM_WAKE_MARKER")) {
+				response = fauxAssistantMessage("TEAM_MEMBER_WOKE");
+			} else if (text === "TEAM_BOOT") {
+				if (!results.length) response = tool("TeamCreate", { team_name: "test-team" });
+				else if (results.length === 1) response = tool("Agent", { team_name: "test-team", name: "reviewer", description: "Foreground teammate", prompt: "TEAM_MEMBER", subagent_type: "Explore", run_in_background: false });
+				else response = fauxAssistantMessage("TEAM_BOOT_COMPLETE " + textOf(results[1]));
+			} else if (text === "TEAM_MEMBER") {
+				response = fauxAssistantMessage("TEAM_MEMBER_READY");
+			} else if (text === "TEAM_SEND") {
+				response = !results.length ? tool("SendMessage", { to: "reviewer", message: "TEAM_WAKE_MARKER", message_type: "message" })
+					: fauxAssistantMessage("TEAM_SEND_COMPLETE " + textOf(results[0]));
+			} else if (text.includes("<task-notification>") && text.includes("<task-id>external-")) {
 				response = fauxAssistantMessage("EXTERNAL_HANDBACK_COMPLETE " + text);
 			} else if (text.startsWith("EXTERNAL_CONTINUE ")) {
 				if (!results.length) response = tool("AgentExecutors", {});

@@ -65,6 +65,8 @@ class ClaudeSession implements ExternalSession {
 	async initialize(): Promise<void> {
 		await this.request({ type: "init", id: randomUUID(), config: {
 			executable: this.options.executable, cwd: this.options.cwd, policy: this.options.policy, resumeSessionId: this.options.resumeSessionId,
+			projectTrusted: this.options.projectTrusted === true,
+			maxBudgetUsd: this.options.maxBudgetUsd,
 		} }, 15000);
 	}
 	async run(prompt: string, signal?: AbortSignal): Promise<ExternalTurnResult> {

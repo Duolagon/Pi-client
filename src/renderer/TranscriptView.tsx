@@ -10,6 +10,7 @@ import { CodeLines, InlineEditDiff, computeLineDiff } from "./DiffView.tsx";
 import { highlightCode } from "./highlight.tsx";
 import { collectVerificationEvidence, scoreTurn, type QualityVerdict, type VerificationCheck } from "./quality-verdict.ts";
 import { OmenGlyph } from "./GrailIcons.tsx";
+import { isDesktopWorkspaceContext } from "../file-references.ts";
 
 export interface TodoItem {
 	id: string;
@@ -336,7 +337,7 @@ export function TranscriptView({
 									) : (
 										message.content.map((block, part) =>
 											block.type === "text" ? (
-												<p key={part}>{block.text}</p>
+												message.role === "user" && part > 0 && isDesktopWorkspaceContext(block.text) ? null : <p key={part}>{block.text}</p>
 											) : (
 												<img key={part} alt="用户附件" src={`data:${block.mimeType};base64,${block.data}`} />
 											),

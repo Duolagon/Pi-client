@@ -280,7 +280,7 @@ test(
 					},
 				}),
 			);
-			await service.saveSettings({ permission: "read", theme: "light" });
+			await service.saveSettings({ permission: "read", theme: "light", agentDir: fixture.agentDir });
 			await service.command({ type: "set_model", provider: "openai", modelId: "o3-mini" });
 			const native = (await service.snapshot()).state?.model;
 			assert.ok(native);

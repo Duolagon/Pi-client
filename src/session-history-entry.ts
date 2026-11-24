@@ -5,6 +5,7 @@ import type {
 	SessionHistoryHelperResponse,
 	SessionHistorySourceInspection,
 } from "./session-history-types.ts";
+import { isDesktopWorkspaceContext } from "./file-references.ts";
 
 // Keep the SDK in this ESM sidecar: its import.meta asset URLs cannot run inside Electron's CJS host.
 process.stdin.setEncoding("utf8");
@@ -142,7 +143,7 @@ function userMessages(entries: SessionEntry[]): Array<{ entryId: string; text: s
 	for (const entry of entries) {
 		if (entry.type !== "message" || entry.message.role !== "user") continue;
 		const text = typeof entry.message.content === "string" ? entry.message.content :
-			entry.message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
+			entry.message.content.flatMap((block, index) => block.type === "text" && (index === 0 || !isDesktopWorkspaceContext(block.text)) ? [block.text] : []).join("");
 		if (text) result.push({ entryId: entry.id, text });
 	}
 	return result;

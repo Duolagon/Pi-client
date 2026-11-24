@@ -119,7 +119,7 @@ export function GrailReportDialog({
 						<ul className="cc-grail-hits">
 							{distortion.hits.map((hit, index) => (
 								<li key={index}>
-									<code>{citationText(hit)}</code> {hit.rule}
+									<code>{citationText(hit)}</code> {hit.rule}{hit.review ? " · 待评审" : ""}
 									<pre>{hit.text}</pre>
 								</li>
 							))}

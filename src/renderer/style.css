@@ -4002,6 +4002,8 @@ button.cc-review-line { border: 0; background: transparent; color: inherit; text
 .cc-interactive-terminal { padding: 4px 8px; height: min(42vh, 440px); background: #000; }
 .cc-interactive-terminal > .terminal { height: 100%; }
 .cc-return-approval { position: fixed; right: 22px; bottom: 22px; z-index: 12; }
+.cc-confirmation > p { margin: 0 0 16px; color: var(--cl-2); overflow-wrap: anywhere; }
+.cc-confirmation .cc-confirm-danger { color: var(--cl-red); }
 
 /* Background sub-agent controls */
 .cc-task-stop-all {
@@ -4014,7 +4016,7 @@ button.cc-review-line { border: 0; background: transparent; color: inherit; text
 	border: 1px solid var(--cl-line);
 	border-radius: var(--r-md);
 	font-size: var(--fs-sm);
-	color: var(--cl-soft);
+	color: var(--cl-3);
 }
 .cc-held-results {
 	border-color: var(--cl-line);
@@ -4029,11 +4031,11 @@ button.cc-review-line { border: 0; background: transparent; color: inherit; text
 }
 .cc-task-notice-status.completed { color: var(--cl-green); }
 .cc-task-notice-status.failed { color: var(--cl-red); }
-.cc-task-notice-status.stopped { color: var(--cl-soft); }
+.cc-task-notice-status.stopped { color: var(--cl-3); }
 .cc-task-notice-meta {
 	margin: 0 0 6px;
 	font-size: var(--fs-sm);
-	color: var(--cl-soft);
+	color: var(--cl-3);
 }
 .cc-task-notify {
 	display: inline-flex;

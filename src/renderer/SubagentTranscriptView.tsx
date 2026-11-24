@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
+import { useConfirmation } from "./ConfirmationDialog.tsx";
 import { ArrowDownToLine, ArrowLeft, Bot, Send, Square } from "lucide-react";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
 import type { DesktopAPI, DesktopTask, RpcExtensionUIRequest, TaskProgress } from "../shared.ts";
 import { applyEvent, transcript, type Transcript } from "./messages.ts";
 import { TranscriptView } from "./TranscriptView.tsx";
+import { PermissionDialog } from "./PermissionDialog.tsx";
 import { classifySubagentViewSlash, isActiveTaskStatus } from "./subagent-panel-state.ts";
 
 /**
@@ -14,6 +16,7 @@ import { classifySubagentViewSlash, isActiveTaskStatus } from "./subagent-panel-
 export function SubagentTranscriptView({
 	api,
 	task,
+	rootConversationId,
 	progress,
 	onBack,
 	onMainCompact,
@@ -23,6 +26,7 @@ export function SubagentTranscriptView({
 }: {
 	api: DesktopAPI;
 	task: DesktopTask;
+	rootConversationId: string;
 	progress?: TaskProgress;
 	onBack: () => void;
 	onMainCompact: (customInstructions?: string) => void;
@@ -30,6 +34,7 @@ export function SubagentTranscriptView({
 	onNotice: (message: string) => void;
 	fail: (error: unknown) => void;
 }) {
+	const { confirm, confirmation } = useConfirmation();
 	const [history, setHistory] = useState<Transcript>(() => transcript([]));
 	const [pendingUI, setPendingUI] = useState<RpcExtensionUIRequest[]>([]);
 	const [loading, setLoading] = useState(true);
@@ -103,8 +108,8 @@ export function SubagentTranscriptView({
 			return;
 		}
 		if (decision.action === "confirm_main") {
-			const label = decision.command === "compact" ? "压缩主会话上下文 (/compact)" : "清空并新建主会话 (/clear)";
-			if (!window.confirm(`当前处于子 Agent 视图，是否确认对主会话执行：${label}？`)) return;
+			const label = decision.command === "compact" ? "压缩主会话上下文" : "新建主会话";
+			if (!await confirm({ title: label, message: "此命令会在主会话中执行。", confirmLabel: label })) return;
 			setInput("");
 			if (decision.command === "compact") onMainCompact(decision.args);
 			else onMainClear();
@@ -174,36 +179,27 @@ export function SubagentTranscriptView({
 				</div>
 			</div>
 
-			{pendingUI.length > 0 && pendingUI[0].method === "confirm" && (
-				<div className="cc-task-approval cc-subagent-view-approval">
-					<span>待审批：{pendingUI[0].title}</span>
-					<div>
-						<button
-							type="button"
-							className="secondary-button"
-							onClick={() =>
-								void api.tasks
-									.respond(task.id, { type: "extension_ui_response", id: pendingUI[0].id, confirmed: false })
-									.then(() => setPendingUI((prev) => prev.slice(1)))
-									.catch(fail)
-							}
-						>
-							拒绝
-						</button>
-						<button
-							type="button"
-							className="primary-button"
-							onClick={() =>
-								void api.tasks
-									.respond(task.id, { type: "extension_ui_response", id: pendingUI[0].id, confirmed: true })
-									.then(() => setPendingUI((prev) => prev.slice(1)))
-									.catch(fail)
-							}
-						>
-							允许
-						</button>
-					</div>
-				</div>
+			{pendingUI[0] && task.parentConversationId && (
+				<PermissionDialog
+					key={pendingUI[0].id}
+					inline
+					request={pendingUI[0]}
+					conversationId={task.conversationId}
+					project={task.project}
+					subagentSource={{
+						taskId: task.id,
+						name: task.name,
+						description: task.title,
+						subagentType: task.subagentType,
+						depth: task.delegationDepth ?? 1,
+						rootConversationId,
+					}}
+					respond={async (response) => {
+						await api.tasks.respond(task.id, response);
+						setPendingUI((prev) => prev.filter((request) => request.id !== response.id));
+					}}
+					fail={fail}
+				/>
 			)}
 
 			<div
@@ -250,6 +246,7 @@ export function SubagentTranscriptView({
 					</button>
 				</form>
 			)}
+			{confirmation}
 		</div>
 	);
 }

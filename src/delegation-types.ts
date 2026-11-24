@@ -25,6 +25,8 @@ export interface DelegationMetadata {
 	notifySuppressed?: boolean;
 	/** Owning workflow ID when spawned by WorkflowService. */
 	workflowId?: string;
+	/** Stable worktree scope within the owning workflow and parallel branch. */
+	workflowWorkspace?: string;
 }
 export interface DelegationContext {
 	conversationId: string;

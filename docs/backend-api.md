@@ -30,6 +30,12 @@
 
 原有前台接口继续工作。后端切换项目或会话会保留正在运行的旧会话；前端不得再假设“只有当前会话会产生事件”。前台切换时传入目标会话的 ID 调用 `pi.command(command, id)` 和 `pi.respond(response, id)`，并用 `Snapshot.activity` 显示其他会话的运行与审批状态。不同会话的写任务需要不同项目目录或 Worktree。修改全局模型连接、权限等设置前，需要停止全部运行中或排队中的任务。
 
+切换会话时，运行中的 Bash 或 Monitor 会保留其所属的运行时。未显示且近期无任务的运行时可在后台回收。定时任务可以唤醒原会话，前台选择保持独立。同一目录存在其他写任务时，定时任务继续遵守互斥。
+
+`BashOutput` 的普通读取继续返回自上次读取以来的新输出。传入 `filter` 可从已保留的输出中查找，传入 `cursor=0` 可回读，使用返回的 `next_cursor` 继续翻页。这两种读取保留普通读进度。
+
+同一工作区和语言服务器共用进程，空闲后自动退出。调用取消后，桌面宿主取消相应的 LSP 请求。`diagnosticsComplete=false` 表示等待期间未收到诊断报告。
+
 流式恢复使用 `Snapshot.liveTranscript / eventSequence` 和 `DesktopEvent.sequence`。`messages` 是 Pi 已结束的消息，`liveTranscript` 补充当前生成中的 assistant 与未完成工具进度；页面重载时应一起恢复。事件序号在本次桌面宿主进程内递增，前端只重放同一 `conversationId`、且晚于快照序号的事件，避免漏接或重复追加。正式界面通过共享的 `src/transcript.ts` 和有界事件窗口处理这一过程；完整会话历史仍由 Pi 持久化。
 
 ## 项目信任
@@ -54,6 +60,8 @@ if (snapshot.trust?.required && !snapshot.trust.decision) {
 启动 Pi RPC 时，存在受保护资源则显式传 `--approve`（信任）或 `--no-approve`（未信任/未决定）。这避免 RPC 模式无法弹 trust 提示时静默跳过项目配置，也避免把“未决定”误当成信任。
 
 `setProjectTrust` 要求项目已打开、路径为绝对路径、决定为 `trusted / untrusted`；该项目存在运行中任务、直接命令或待审批时拒绝。决定变化会停止并重建该项目的运行时，使 Pi 重新读取项目资源；决定持久化在 `desktop.json` 的 `projectTrust`。信任只控制 Pi 是否加载项目配置，不是 OS 沙箱，也不限制已加载扩展/命令的系统权限。
+
+外部 Claude 会在每次启动或恢复会话时读取所属项目的信任决定。未决定及不信任的项目只启用 Claude 用户配置。项目已有活动 Claude 外部任务时，须先结束任务才能修改信任，因为 SDK 在创建会话时加载配置。
 
 ## 自定义 Agent
 
@@ -173,6 +181,8 @@ const snapshot = await window.pi.tasks.snapshot(task.id);
 后台 Bash 接受 `timeout`（秒）。省略时使用 24 小时上限。启动回执提供作业 ID 和运行状态，验收等到同一作业的最终退出结果。手动停止的结果写入会话记录，无需额外调用模型。界面使用 `pi.monitors.list` 和 `pi.monitors.onEvent` 刷新本机后台命令和检查状态。
 
 「全部放行」模式下，客户端可识别的前台 Kaggle 写操作遵循显式权限规则，无匹配的确认或拒绝规则时直接执行。默认询问模式下，这类写操作需要单次确认，内置命令栏使用原生确认窗口。纯状态查询和受控后台 Bash 或命令监听中会拒绝这类写操作。识别覆盖支持的命令形态，任意脚本仍由原有工具规则和沙箱约束。
+
+启用命令沙箱时，内置文件工具也会在权限规则之前检查工作区边界和敏感凭据路径。文件工具只能写入当前工作区及通过 `/add-dir` 附加的目录。搜索结果会隐藏受保护的凭据文件。Bash 与 Monitor 继续由 Seatbelt 执行命令级隔离。
 
 同一工作目录或相互包含的目录不会并发执行写任务。`isolation: "shared"` 直接使用原目录，同目录后台任务按顺序运行；前台在该目录有写任务时，新提示会被拒绝。普通非 Git 项目可显式使用 `shared`。
 
@@ -297,6 +307,12 @@ await window.pi.terminals.close(terminal.id);
 
 回放只在本次应用进程内保留，页面重载可恢复，应用退出不会维持终端进程。本轮已验收 macOS；Linux 源码可构建但未实机验收，Windows ConPTY 尚未实现。
 
+## 工作流的任务目录
+
+模型同步调用 `WorkflowRun` 时，等待中的父会话让出当前目录，供可写的 `shared` 步骤使用。取消这次调用会停止关联的工作流。通过界面启动的工作流和显式后台调用仍遵循共享目录的任务互斥。
+
+Git 项目中的默认可写步骤在同一串行流程中复用 Worktree，后续步骤可以读取上一步的未提交修改。`phase` 和 `pipeline` 保持当前目录作用域，`parallel` 的回调分支各有独立作用域。显式指定 `shared` 的步骤使用父会话目录。`agent()` 返回 `workingDirectory`，使用 Worktree 时也返回 `worktreeId`。
+
 ## Worktree 审核、合并和清理
 
 ```ts
@@ -305,13 +321,13 @@ const result = await window.pi.worktrees.merge(task.worktreeId!);
 if (result.status === "blocked") {
   // 显示 reason，由用户处理提交、分叉或目标目录状态。
 }
-const removed = await window.pi.worktrees.remove(task.worktreeId!);
+const removed = await window.pi.worktrees.remove(task.worktreeId!, { preserveIgnored: true });
 // removed.branchRetained 为 true 时，提示未合入分支仍保留。
 ```
 
 只管理本应用创建的 Worktree。`merge` 固定合并到创建时记录的源目录／目标分支，仅接受干净的已提交工作树和快进；分叉、目标分支漂移、活动任务、活动终端、忽略文件覆盖风险均会阻止。它不隐式提交或推送。
 
-`remove` 不使用强制删除。脏目录、忽略文件及活动任务／终端都会阻止清理；未合入的已提交分支会保留。只读模式禁止创建、删除和合并。
+`create` 默认基于本地 `HEAD`。需要其他提交时可显式指定 `baseRef`。活动任务、终端及未提交或未跟踪的普通文件会阻止清理。界面确认清理后可用 `preserveIgnored` 将忽略文件移到私有保留目录，位置通过 `retainedIgnoredPath` 返回。模型工具维持默认检查。未合入的已提交分支会保留，只读模式禁止创建、删除和合并。
 
 清理隔离目录后，`tasks.snapshot(id)` 仍可读取持久化消息，返回 `archived: true`；检查点列表与差异也保留。前端应禁用继续执行和文件操作。恢复文件和继续任务要求实际工作目录存在。
 

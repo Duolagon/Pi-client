@@ -34,6 +34,8 @@ export interface TeamMessageRecord {
 	requestId?: string;
 	approve?: boolean;
 	timestamp: number;
+	/** Recipient conversations still awaiting native delivery. Older messages omit this. */
+	pendingConversationIds?: string[];
 }
 
 export interface TeamRecord {

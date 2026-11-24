@@ -116,3 +116,29 @@ test("TeamsService enforces experimental agentTeams toggle, teammate directory l
 		await rm(dir, { recursive: true, force: true });
 	}
 });
+
+test("TeamsService persists deferred recipients and retries with the same native delivery key", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-team-pending-"));
+	try {
+		const keys: string[] = [];
+		const service = new TeamsService({ dataDir: () => dir, isEnabled: () => true, deliver: async (_id, params) => {
+			keys.push(params.key!);
+			return "deferred";
+		} });
+		await service.createTeam({ rootConversationId: "root", leaderConversationId: "root", team_name: "test" });
+		await service.registerMember({ rootConversationId: "root", teamName: "test", memberName: "member", agentId: "task", conversationId: "child" });
+		const pending = await service.sendStructuredMessage({ rootConversationId: "root", senderConversationId: "root", to: "member", message: "Wake up" });
+		assert.equal(pending.delivered, 0);
+		assert.deepEqual((await service.get("root"))?.messages[0].pendingConversationIds, ["child"]);
+
+		const restarted = new TeamsService({ dataDir: () => dir, isEnabled: () => true, deliver: async (_id, params) => {
+			keys.push(params.key!);
+			return "sent";
+		} });
+		await restarted.retryPending("root");
+		await restarted.retryPending("root");
+		assert.equal(keys.length, 2);
+		assert.equal(keys[0], keys[1]);
+		assert.equal((await restarted.get("root"))?.messages[0].pendingConversationIds, undefined);
+	} finally { await rm(dir, { recursive: true, force: true }); }
+});

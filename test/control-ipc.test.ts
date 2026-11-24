@@ -67,7 +67,7 @@ test("control IPC lists real Pi tools, applies scoped overrides, and exposes fin
 		"pi:hooks:list", "pi:hooks:remove", "pi:hooks:save", "pi:hooks:test",
 		"pi:mcp:list", "pi:mcp:remove", "pi:mcp:save",
 		"pi:permissions:check", "pi:permissions:export-claude", "pi:permissions:import-claude",
-		"pi:permissions:list", "pi:permissions:remove", "pi:permissions:upsert",
+		"pi:permissions:list", "pi:permissions:remove", "pi:permissions:set-mode", "pi:permissions:upsert",
 		"pi:skills:list", "pi:skills:remove", "pi:skills:save",
 		"pi:task:result", "pi:tools:list", "pi:tools:set-enabled",
 	]);
@@ -116,6 +116,11 @@ test("control IPC lists real Pi tools, applies scoped overrides, and exposes fin
 	check = await data.invoke<PermissionCheckResult>("pi:permissions:check", { toolName: "read", input: { path: "secrets/credential.txt" } });
 	assert.equal(check.action, "deny");
 	assert.equal(check.ruleId, "deny-secret-path");
+	await data.invoke("pi:permissions:set-mode", data.id, "read");
+	settings = await data.invoke<PermissionSettings>("pi:permissions:list", data.id);
+	assert.equal(settings.effective.mode, "read");
+	check = await data.invoke<PermissionCheckResult>("pi:permissions:check", { conversationId: data.id, toolName: "bash", input: { command: "node --version" } });
+	assert.equal(check.action, "deny");
 	assert.ok(data.events.some((event) => event.type === "tools_changed" && event.conversationIds.includes(data.id)));
 	assert.ok(data.events.some((event) => event.type === "permissions_changed" && event.conversationIds.includes(data.id)));
 	const stored = JSON.parse(await readFile(join(data.fixture.dataDir, "tool-settings.json"), "utf8"));
@@ -162,6 +167,8 @@ test("control IPC rejects malformed objects, scopes, booleans, selectors, payloa
 		["pi:tools:set-enabled", { name: "not-registered", enabled: true }],
 		["pi:tools:set-enabled", { name: "bash", enabled: false, conversationId: "missing-id" }],
 		["pi:permissions:list", "../outside"],
+		["pi:permissions:set-mode", data.id, "anything"],
+		["pi:permissions:set-mode", "missing-id", "ask"],
 		["pi:permissions:upsert", { id: "x", scope: "global", project: data.fixture.project, action: "allow", tool: "read" }],
 		["pi:permissions:upsert", { id: "x", scope: "project", action: "allow", tool: "read" }],
 		["pi:permissions:upsert", { id: "x", scope: "conversation", action: "allow", tool: "read" }],

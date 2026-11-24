@@ -37,7 +37,7 @@ export function assertAcpPolicy(options: ExternalSessionOptions, label: string, 
 	const policy = validateRuntimePolicy(options.policy);
 	if (selfApproves && policy.dontAsk)
 		throw new Error(`${label} ACP runs actions its own rules allow without asking the host, so dontAsk (deny anything not pre-approved) cannot be enforced; no external task was started`);
-	if (policy.mode === "read")
+	if (policy.mode === "read" || policy.mode === "plan")
 		throw new Error(`${label} ACP does not provide an enforceable read-only tool ceiling; use a different executor for Explore/Plan`);
 	if (policy.rules.some((rule) => rule.action !== "allow" && !desktopTools.has(rule.tool)) || policy.disabledTools.some((name) => !desktopTools.has(name)))
 		throw new Error(`${label} ACP cannot enforce the inherited fine-grained tool/path/command policy; no external task was started`);

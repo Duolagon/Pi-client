@@ -135,8 +135,14 @@ export function installWorkspaceHandlers(
 		return service.createWorktree(request);
 	});
 	handle("pi:worktree:list", (project) => service.listWorktrees(optionalText(project, "项目目录")));
-	handle("pi:worktree:remove", (worktreeId) => service.removeWorktree(id(worktreeId)));
+	handle("pi:worktree:remove", (worktreeId, value) => {
+		const options = value === undefined ? {} : object(value);
+		if (options.preserveIgnored !== undefined && typeof options.preserveIgnored !== "boolean")
+			throw new Error("Worktree 清理选项无效。");
+		return service.removeWorktree(id(worktreeId), { preserveIgnored: options.preserveIgnored === true });
+	});
 	handle("pi:worktree:merge", (worktreeId) => service.mergeWorktree(id(worktreeId)));
+	handle("pi:preview:default", (conversationId) => service.defaultPreviewUrl(id(conversationId)));
 	handle("pi:workspace:stage", (paths) => service.gitStage(optionalPathArray(paths)));
 	handle("pi:workspace:unstage", (paths) => service.gitUnstage(optionalPathArray(paths)));
 	handle("pi:workspace:discard:preview", (value) => service.gitDiscardPreview(discardInput(value)));

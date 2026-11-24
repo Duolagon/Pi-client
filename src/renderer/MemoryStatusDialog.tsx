@@ -3,6 +3,15 @@ import { Archive, BookOpen, Info, Layers, Plus, Save, Sparkles, Trash2 } from "l
 import { Modal } from "../prototype/ui.tsx";
 import type { ContextBreakdown, ContextMemorySource, DesktopToolInfo, Snapshot } from "../shared.ts";
 
+const promptStateLabels: Record<NonNullable<ContextMemorySource["promptState"]>, string> = {
+	native: "最近回合由 Pi 原生加载",
+	included: "最近回合已载入",
+	truncated: "最近回合只载入前段，已截断",
+	conditional: "按文件路径规则加载",
+	untrusted: "项目未信任，桌面端跳过",
+	"not-observed": "最近回合未见此来源",
+};
+
 export function MemoryStatusDialog({
 	initialTab = "memory",
 	snapshot,
@@ -241,6 +250,8 @@ export function MemoryStatusDialog({
 						{activeSource?.pathsPattern && (
 							<p className="subtle-note">作用域 paths 匹配：{activeSource.pathsPattern}</p>
 						)}
+						{activeSource?.promptState && <p className="subtle-note">{promptStateLabels[activeSource.promptState]}</p>}
+						{activeSource?.previewTruncated && <p className="subtle-note">此处仅预览文件前 256 KiB。请在编辑器中修改完整文件。</p>}
 						{loading && <p className="subtle-note" role="status">正在加载项目记忆…</p>}
 						<textarea
 							className="cc-memory-editor"

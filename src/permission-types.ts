@@ -34,6 +34,8 @@ export interface RuntimePermissionPolicy {
 	mode: "ask" | "acceptEdits" | "auto" | "read" | "plan";
 	/** Automatically deny any tool that would require an interactive confirmation prompt. */
 	dontAsk?: boolean;
+	/** Apply the workspace write and credential rules to native file tools. */
+	sandbox?: boolean;
 	/** The host resolves global/project/conversation scopes before writing this list. */
 	rules: PermissionRule[];
 	disabledTools: string[];

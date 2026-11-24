@@ -406,6 +406,7 @@ function installHandlers() {
 		if (settings.webSearchEnabled !== undefined && typeof settings.webSearchEnabled !== "boolean")
 			throw new Error("网络搜索开关格式错误。");
 		if (settings.webSearchApiKey !== undefined) string(settings.webSearchApiKey, "WebSearch API Key", 4096);
+		if (settings.useAsDefault !== undefined && typeof settings.useAsDefault !== "boolean") throw new Error("默认连接选项无效。");
 		if (settings.provider !== undefined) connection(settings);
 		if (settings.agentDir !== undefined) string(settings.agentDir, "Pi 配置目录", 16384);
 		return service.saveSettings(settings as Parameters<DesktopAPI["saveSettings"]>[0]);
@@ -575,6 +576,12 @@ void app.whenReady().then(() => {
 	});
 	service.subscribeExternal((event) => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:external:event", event);
+		if (event.event.type === "approval") {
+			updateDock(true);
+			const { request } = event.event;
+			notifyDesktop(request.kind === "question" ? "外部 Agent 需要你回答" : "外部 Agent 需要确认",
+				`${event.executor} · ${service.externalSnapshot(event.taskId).title}`);
+		} else if (event.event.type === "approval_resolved") updateDock();
 	});
 	service.subscribeTodos((event) => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:todos:event", event);

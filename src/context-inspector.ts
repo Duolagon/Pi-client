@@ -1,6 +1,6 @@
-import { privateMemoryLabel, rulePaths, scopedRule } from "./project-memory.ts";
+import { privateMemoryLabel, rulePaths, scopedRule, truncatedInstruction } from "./project-memory.ts";
 import { managedFile, writeManagedFile } from "./managed-path.ts";
-import { readFile, realpath, stat, rm } from "node:fs/promises";
+import { open, realpath, stat, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { DesktopToolInfo } from "./tool-control-types.ts";
@@ -16,6 +16,8 @@ export interface ContextMemorySource {
 	bytes: number;
 	estimatedTokens: number;
 	content: string;
+	previewTruncated?: boolean;
+	promptState?: "native" | "included" | "truncated" | "conditional" | "untrusted" | "not-observed";
 	pathsPattern?: string;
 	imports: { target: string; exists: boolean }[];
 }
@@ -91,17 +93,28 @@ async function readSource(
 		if (!info.isFile()) {
 			return { id, relativePath, path: fullPath, scope, exists: false, editable, bytes: 0, estimatedTokens: 0, content: "", imports: [] };
 		}
-		const content = await readFile(real, "utf8");
+		const maxPreviewBytes = 256 * 1024;
+		let content: string;
+		const handle = await open(real, "r");
+		try {
+			const buffer = Buffer.alloc(Math.min(info.size, maxPreviewBytes));
+			const { bytesRead } = await handle.read(buffer);
+			content = buffer.toString("utf8", 0, bytesRead).replace(/\uFFFD$/, "");
+		} finally {
+			await handle.close();
+		}
+		const previewTruncated = info.size > maxPreviewBytes;
 		return {
 			id,
 			relativePath,
 			path: fullPath,
 			scope,
 			exists: true,
-			editable,
-			bytes: Buffer.byteLength(content, "utf8"),
-			estimatedTokens: estimateTokens(content),
-			content: content.slice(0, 256 * 1024),
+			editable: editable && !previewTruncated,
+			bytes: info.size,
+			estimatedTokens: Math.ceil(info.size / 3.5),
+			content,
+			...(previewTruncated ? { previewTruncated: true } : {}),
 			pathsPattern: scope === "rule" ? scopedRule(content).patterns.join(", ") || undefined : undefined,
 			imports: await resolveImports(content, dirname(real), project),
 		};
@@ -151,6 +164,8 @@ export async function buildContextReport(params: {
 	project: string;
 	privateMemory?: string;
 	agentDir: string;
+	home?: string;
+	projectTrusted?: boolean;
 	stats?: SessionStats;
 	state?: RpcSessionState;
 	tools: DesktopToolInfo[];
@@ -159,7 +174,8 @@ export async function buildContextReport(params: {
 	const { stats, state, tools, messages } = params;
 	const project = await realpath(params.project).catch(() => params.project);
 	const agentDir = await realpath(params.agentDir).catch(() => params.agentDir);
-	const claudeDir = await realpath(join(homedir(), ".claude")).catch(() => join(homedir(), ".claude"));
+	const claudeHome = join(params.home ?? homedir(), ".claude");
+	const claudeDir = await realpath(claudeHome).catch(() => claudeHome);
 	const sources: ContextMemorySource[] = [
 		...(params.privateMemory ? [await readSource(privateMemoryLabel, privateMemoryLabel, params.privateMemory, "desktop", true, dirname(params.privateMemory), project)] : []),
 		await readSource("user-pi-agents", "~/.pi/agent/AGENTS.md", join(agentDir, "AGENTS.md"), "user", false, agentDir, project),
@@ -174,7 +190,33 @@ export async function buildContextReport(params: {
 
 	const activeTools = tools.filter((t) => t.enabled && t.modelVisible);
 	const mcpToolsCount = activeTools.filter((t) => t.source === "mcp").length;
-	const estimatedInstructionsTokens = sources.reduce((sum, item) => sum + item.estimatedTokens, 0);
+	// Pi emits patches to the active prompt. Count the latest effective instruction
+	// sections rather than assuming every file in the editor was included in the request.
+	const sections = new Map<string, string>();
+	for (const message of messages) {
+		if (message.role !== "system") continue;
+		for (const [name, text] of Object.entries(message.sections ?? {})) {
+			if (text === null) sections.delete(name);
+			else sections.set(name, text);
+		}
+	}
+	const nativeInstructions = sections.get("project_context") ?? "";
+	const desktopInstructions = sections.get("desktop_project_memory") ?? "";
+	for (const source of sources) {
+		if (!source.exists) continue;
+		const isUserClaude = source.id === "user-claude";
+		const marker = `\n\n## ${source.relativePath}\n`;
+		const start = isUserClaude ? desktopInstructions.indexOf("# 用户记忆（~/.claude/CLAUDE.md）") : desktopInstructions.indexOf(marker);
+		if (nativeInstructions.includes(`<project_instructions path="${source.path}">`)) source.promptState = "native";
+		else if (params.projectTrusted === false && source.scope !== "user") source.promptState = "untrusted";
+		else if (source.pathsPattern) source.promptState = "conditional";
+		else if (start >= 0) {
+			const body = desktopInstructions.slice(start + (isUserClaude ? 0 : marker.length));
+			const nextSource = body.indexOf("\n\n## ");
+			source.promptState = (nextSource < 0 ? body : body.slice(0, nextSource)).includes(truncatedInstruction) ? "truncated" : "included";
+		} else source.promptState = "not-observed";
+	}
+	const estimatedInstructionsTokens = estimateTokens(nativeInstructions) + estimateTokens(desktopInstructions);
 	const estimatedToolsTokens = activeTools.reduce((sum, t) => sum + estimateTokens(t.description + JSON.stringify(t.parameters ?? {})), 0);
 
 	const ctxUsage = stats?.contextUsage && typeof stats.contextUsage === "object"

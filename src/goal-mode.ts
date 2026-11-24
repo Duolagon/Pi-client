@@ -11,6 +11,7 @@ export interface GoalState {
 	maxTurns: number;
 	turnsUsed: number;
 	maxCostUsd?: number;
+	baselineCostUsd?: number;
 	active: boolean;
 	status: "running" | "achieved" | "stopped" | "max_turns" | "max_cost";
 	startedAt: number;
@@ -62,8 +63,8 @@ export function parseGoalCommand(rawArgs: string): ParsedGoalCommand {
 }
 
 export function isGoalAchieved(assistantText: string): boolean {
-	if (!assistantText) return false;
-	return /(?:<goal-achieved\s*\/?>|<goal-complete\s*\/?>|\[GOAL_ACHIEVED\])/i.test(assistantText);
+	const lastLine = assistantText.trimEnd().split(/\r?\n/).at(-1);
+	return /^ {0,3}(?:<goal-achieved[ \t]*\/?>|<goal-complete[ \t]*\/?>|\[GOAL_ACHIEVED\])$/i.test(lastLine ?? "");
 }
 
 export function buildGoalInitialPrompt(goal: GoalState): string {
@@ -89,13 +90,15 @@ export function buildGoalContinuePrompt(goal: GoalState): string {
 export function evaluateGoalContinuation(
 	goal: GoalState,
 	assistantText: string,
-	spentUsd: number,
+	sessionCostUsd: number,
 	now = Date.now(),
 ): { next: GoalState; shouldContinue: boolean; continuePrompt?: string } {
 	if (!goal.active) {
 		return { next: goal, shouldContinue: false };
 	}
 	const turnsUsed = goal.turnsUsed + 1;
+	const baseline = typeof goal.baselineCostUsd === "number" && Number.isFinite(goal.baselineCostUsd) ? goal.baselineCostUsd : 0;
+	const spentUsd = Math.max(0, sessionCostUsd - baseline);
 	if (isGoalAchieved(assistantText)) {
 		return {
 			next: {

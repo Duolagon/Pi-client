@@ -248,7 +248,7 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 		TodoUpdate: ["id", "subject", "description", "status", "activeForm", "owner", "addBlocks", "addBlockedBy", "metadata", "estimatedSeconds"],
 		TodoList: ["include_completed"],
 		Monitor: ["description", "command", "url", "timeout_ms", "persistent"],
-		BashOutput: ["bash_id", "filter"],
+		BashOutput: ["bash_id", "filter", "cursor"],
 		KillShell: ["shell_id"],
 		BashBackground: ["command", "description", "timeout"],
 		ScheduleWakeup: ["delay_seconds", "reason", "prompt"],
@@ -351,6 +351,8 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 	} else if (tool === "BashOutput") {
 		text(input.bash_id, "bash_id", 200);
 		if (input.filter !== undefined) text(input.filter, "filter", 1000);
+		if (input.cursor !== undefined && (typeof input.cursor !== "number" || !Number.isSafeInteger(input.cursor) || input.cursor < 0))
+			throw new Error("Invalid BashOutput cursor");
 	} else if (tool === "KillShell") {
 		text(input.shell_id, "shell_id", 200);
 	} else if (tool === "BashBackground") {

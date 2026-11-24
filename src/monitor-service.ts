@@ -38,16 +38,18 @@ export interface ShellReadResult {
 	stderr: string;
 	/** Older output was dropped from the ring buffer before this read. */
 	truncated: boolean;
-	/** More buffered output remains; call BashOutput again. */
+	/** More buffered output remains in the current reading mode. */
 	has_more: boolean;
 	filtered_out?: number;
+	/** Next read-only page. Search and replay use a caller-owned cursor. */
+	next_cursor?: number;
 }
 
 interface ShellBuffer {
 	entries: { stream: "stdout" | "stderr"; text: string }[];
 	/** Sequence number of entries[0]. */
 	baseSeq: number;
-	/** Next sequence number BashOutput returns. */
+	/** Next sequence for the incremental, unfiltered reader. */
 	cursor: number;
 	chars: number;
 	partial: { stdout: string; stderr: string };
@@ -235,6 +237,13 @@ export class MonitorService {
 		return this.monitors.has(id);
 	}
 
+	hasActivity(conversationId: string): boolean {
+		return [...this.monitors.values()].some((live) =>
+			live.record.conversationId === conversationId &&
+			(live.record.status === "running" || live.flushing || live.terminationDelivery || live.pendingTermination),
+		);
+	}
+
 	get(id: string): MonitorRecord | undefined {
 		const entry = this.monitors.get(id);
 		return entry ? structuredClone(entry.record) : undefined;
@@ -410,10 +419,9 @@ export class MonitorService {
 	}
 
 	/**
-	 * Output a background shell produced since the previous read. `filter` is a regular
-	 * expression applied per line; lines that do not match are consumed, like Claude Code.
+	 * Read new shell output, or search and replay the retained history with a caller-owned cursor.
 	 */
-	readShell(id: string, filter?: string): ShellReadResult {
+	readShell(id: string, filter?: string, cursor?: number): ShellReadResult {
 		const live = this.monitors.get(id);
 		if (!live?.shell) throw new Error(`Background shell not found: ${id}`);
 		const buffer = live.shell;
@@ -433,8 +441,12 @@ export class MonitorService {
 				this.pushShellLine(live, stream, tail);
 			}
 		}
-		const truncated = buffer.cursor < buffer.baseSeq;
-		const start = Math.max(buffer.cursor, buffer.baseSeq);
+		const replay = pattern !== undefined || cursor !== undefined;
+		const requested = cursor ?? (replay ? 0 : buffer.cursor);
+		if (!Number.isSafeInteger(requested) || requested < 0 || requested > buffer.baseSeq + buffer.entries.length)
+			throw new Error("Invalid background shell output cursor");
+		const truncated = requested < buffer.baseSeq;
+		const start = Math.max(requested, buffer.baseSeq);
 		const selected: { stream: "stdout" | "stderr"; text: string }[] = [];
 		let chars = 0;
 		let index = start - buffer.baseSeq;
@@ -444,9 +456,12 @@ export class MonitorService {
 			selected.push(entry);
 			chars += entry.text.length + 1;
 		}
-		buffer.cursor = buffer.baseSeq + index;
 		const hasMore = index < buffer.entries.length;
-		if (live.record.status !== "running" && !hasMore) buffer.terminalRead = true;
+		const next = buffer.baseSeq + index;
+		if (!replay) {
+			buffer.cursor = next;
+			if (live.record.status !== "running" && !hasMore) buffer.terminalRead = true;
+		}
 		let kept = selected;
 		if (pattern) {
 			const matches = matchLines(pattern, selected.map((entry) => entry.text));
@@ -462,6 +477,7 @@ export class MonitorService {
 			truncated,
 			has_more: hasMore,
 			...(pattern ? { filtered_out: selected.length - kept.length } : {}),
+			...(replay ? { next_cursor: next } : {}),
 		};
 	}
 
@@ -695,23 +711,19 @@ export class MonitorService {
 				deliverAs: "followUp",
 				triggerTurn: true,
 				display: true,
-			});
-			if (disposition === "deferred") {
+			}).catch(() => "unavailable" as const);
+			if (disposition === "deferred" || disposition === "unavailable") {
 				const idx = live.recentSentAt.lastIndexOf(sentAt);
 				if (idx >= 0) live.recentSentAt.splice(idx, 1);
-				// Restore batch to front (within capacity) and retry when idle or after brief delay
-				const combined = [...batch, ...live.pendingLines];
-				live.pendingLines = [];
-				live.pendingChars = 0;
-				for (const item of combined) {
-					if (live.pendingChars + item.length > MAX_PENDING_CHARS && live.pendingLines.length > 0) {
-						live.pendingLines.shift();
-					}
-					live.pendingLines.push(item);
-					live.pendingChars += item.length;
+				// Retry temporary routing failures with the same sequence and bounded buffer.
+				if (!live.terminated) {
+					live.pendingLines.unshift(...batch);
+					for (const item of batch) live.pendingChars += item.length;
+					while (live.pendingChars > MAX_PENDING_CHARS && live.pendingLines.length > 1)
+						live.pendingChars -= live.pendingLines.shift()!.length;
+					live.deliverySeq -= 1;
+					this.scheduleFlush(live, disposition === "deferred" ? 250 : 1000);
 				}
-				live.deliverySeq -= 1;
-				this.scheduleFlush(live, 250);
 			} else if (disposition !== "sent") {
 				const idx = live.recentSentAt.lastIndexOf(sentAt);
 				if (idx >= 0) live.recentSentAt.splice(idx, 1);
@@ -766,10 +778,10 @@ export class MonitorService {
 
 	onConversationSettled(conversationId: string): void {
 		for (const live of this.monitors.values()) {
-			if (live.record.conversationId !== conversationId) continue;
-			if (!live.terminated && live.pendingLines.length > 0) {
+			if (live.record.conversationId === conversationId && !live.terminated && live.pendingLines.length > 0) {
 				this.scheduleFlush(live, 0);
 			}
+			// A different conversation in the same directory may have blocked a final wake-up.
 			void this.redeliverTermination(live);
 		}
 	}
@@ -876,16 +888,8 @@ export class MonitorService {
 			};
 			const key = `${id}:1`;
 			const triggerTurn = opts.notify && !live.shell.terminalRead;
-			const disp = await this.deliver(live.record.conversationId, {
-				customType: SHELL_EVENT_TYPE,
-				key,
-				content,
-				details,
-				deliverAs: "followUp",
-				triggerTurn,
-				display: true,
-			}).catch(() => "unavailable" as const);
-			if (disp === "deferred" && !this.closing) live.pendingTermination = { key, content, details, triggerTurn };
+			live.pendingTermination = { key, content, details, triggerTurn };
+			await this.redeliverTermination(live);
 			return;
 		}
 		if (opts.notify && !live.terminationNotified && !this.closing) {
@@ -911,18 +915,8 @@ export class MonitorService {
 				...(remaining.length ? { count: remaining.length, lines: remaining } : {}),
 			};
 			const key = `${id}:${seq}`;
-			const disp = await this.deliver(live.record.conversationId, {
-				customType: MONITOR_EVENT_TYPE,
-				key,
-				content,
-				details,
-				deliverAs: "followUp",
-				triggerTurn: true,
-				display: true,
-			}).catch(() => "unavailable" as const);
-			if (disp === "deferred" && !this.closing) {
-				live.pendingTermination = { key, content, details };
-			}
+			live.pendingTermination = { key, content, details };
+			await this.redeliverTermination(live);
 		}
 	}
 

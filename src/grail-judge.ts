@@ -112,12 +112,14 @@ export function scanDistortions(lines: DiffLine[]): GrailDistortionHit[] {
 	const hits: GrailDistortionHit[] = [];
 	for (const item of lines) {
 		if (!sourceFile.test(item.file)) continue;
-		const hit = (rule: string) => hits.push({ file: item.file, line: item.line, side: item.side, rule, text: item.text.trim().slice(0, 200) });
+		const hit = (rule: string, review?: true) => hits.push({ file: item.file, line: item.line, side: item.side, rule, text: item.text.trim().slice(0, 200), ...(review ? { review } : {}) });
 		if (item.side === "+") {
 			for (const { rule, pattern } of addedRules) if (pattern.test(item.text)) hit(rule);
 		} else if (testFile.test(item.file) && assertion.test(item.text)) {
-			const replaced = lines.some((other) => other.hunk === item.hunk && other.side === "+" && assertion.test(other.text));
-			hit(replaced ? "测试期望值被修改" : "删除断言");
+			const replacements = lines.filter((other) => other.file === item.file && other.side === "+" && assertion.test(other.text));
+			if (replacements.some((other) => other.text.trim() === item.text.trim())) continue;
+			if (replacements.some((other) => other.hunk === item.hunk)) hit("测试期望值被修改", true);
+			else hit("删除断言");
 		}
 	}
 	return hits;
@@ -156,8 +158,10 @@ export function detectScripts(manifest: unknown): { name: GrailCheckName; script
 	const table = scripts as Record<string, unknown>;
 	const pick = (...names: string[]) => names.find((name) => typeof table[name] === "string" && (table[name] as string).trim());
 	const result: { name: GrailCheckName; script: string }[] = [];
-	const test = pick("test");
-	if (test && !/no test specified/i.test(table[test] as string)) result.push({ name: "test", script: test });
+	const test = ["test", "test:backend", "test:unit"].find((name) =>
+		typeof table[name] === "string" && table[name].trim() && !/no test specified/i.test(table[name]),
+	);
+	if (test) result.push({ name: "test", script: test });
 	const check = pick("check", "typecheck", "type-check");
 	if (check) result.push({ name: "check", script: check });
 	const lint = pick("lint");
@@ -373,8 +377,9 @@ export function gradeVerdict(steps: GrailStepResults): { grade: GrailGrade; reas
 	if (objective.status === "unavailable") return { grade: "unjudgeable", reasons: [objective.reason ?? "没有可执行的测试。"] };
 	if (objective.status === "fail") return { grade: "unfulfilled", reasons: [objective.reason ?? "客观检查失败。"] };
 	if (!distortion) return { grade: "unjudgeable", reasons: ["没有执行扭曲扫描。"] };
-	if (distortion.hits.length)
-		return { grade: "twisted", reasons: distortion.hits.map((hit) => `${hit.rule}：${hit.file}:${hit.line}（${hit.side === "+" ? "新增" : "删除"}）`) };
+	const blockingDistortions = distortion.hits.filter((hit) => !hit.review);
+	if (blockingDistortions.length)
+		return { grade: "twisted", reasons: blockingDistortions.map((hit) => `${hit.rule}：${hit.file}:${hit.line}（${hit.side === "+" ? "新增" : "删除"}）`) };
 	if (!blind || blind.status !== "ok") return { grade: "unjudgeable", reasons: [blind?.reason ?? "评审给不出盲解。"] };
 	if (!comparison || comparison.status !== "ok") return { grade: "unjudgeable", reasons: [comparison?.reason ?? "没有对照结论。"] };
 	const verdicts = new Map<GrailCriterion, { pass: boolean; notes: string[] }>();

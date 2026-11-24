@@ -112,6 +112,12 @@ test("#27 PreviewCheck: tool input validation and permission policy", async () =
 	assert.equal((await evaluatePermission({ ...base, mode: "read" }, { toolName: "PreviewCheck", input: { action: "list_configs" } })).action, "allow");
 	assert.equal((await evaluatePermission({ ...base, mode: "read" }, { toolName: "PreviewCheck", input: { action: "start_server", name: "dev" } })).action, "deny");
 	assert.equal((await evaluatePermission({ ...base, mode: "plan" }, { toolName: "PreviewCheck", input: { action: "start_server", name: "dev" } })).action, "deny");
+	for (const mode of ["read", "plan"] as const) {
+		assert.equal((await evaluatePermission({ ...base, mode }, { toolName: "PreviewCheck", input: { action: "stop_server" } })).action, "deny");
+		assert.equal((await evaluatePermission({ ...base, mode }, {
+			toolName: "PreviewCheck", input: { action: "check", actions: [{ type: "click", selector: "#example" }] },
+		})).action, "deny");
+	}
 	assert.equal((await evaluatePermission({ ...base, mode: "ask" }, { toolName: "PreviewCheck", input: { action: "start_server", name: "dev" } })).action, "ask");
 	assert.equal((await evaluatePermission({ ...base, mode: "auto" }, { toolName: "PreviewCheck", input: { action: "start_server", name: "dev" } })).action, "allow");
 	assert.equal(

@@ -11,6 +11,38 @@ import { WorkflowService } from "../src/workflow-service.ts";
 const here = dirname(fileURLToPath(import.meta.url));
 const workerEntryTs = resolve(here, "../src/workflow-worker-entry.ts");
 
+test("a model caller abort revokes the workflow directory hand-off during approval", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-wf-caller-"));
+	const caller = new AbortController();
+	const service = new WorkflowService({
+		dataDir: () => dir,
+		callbacks: {
+			workerPath: () => workerEntryTs,
+			permissionMode: () => "ask",
+			runAgentStep: async () => { throw new Error("aborted workflow must not start an agent"); },
+		},
+	});
+	try {
+		const workflow = await service.start({
+			conversationId: "parent",
+			rootConversationId: "parent",
+			project: dir,
+			input: { script: 'return agent({ prompt: "test" });' },
+			callerSignal: caller.signal,
+		});
+		assert.equal(service.hasWaitingCaller(workflow.id, "parent"), true);
+		assert.equal(service.hasWaitingCaller(workflow.id, "another-parent"), false);
+		const done = service.wait(workflow.id);
+		caller.abort();
+		assert.equal(service.hasWaitingCaller(workflow.id, "parent"), false);
+		assert.equal((await done).status, "cancelled");
+		assert.equal(service.get(workflow.id)?.pendingApproval, undefined);
+	} finally {
+		await service.close();
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("Workflow isolated worker runs parallel/pipeline/phase/budget and blocks Date.now, Math.random, require, import, eval", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-wf-sandbox-"));
 	try {

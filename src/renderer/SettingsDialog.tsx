@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
 	ConnectionInput,
 	ConnectionMode,
@@ -16,6 +16,7 @@ import type {
 	Snapshot,
 } from "../shared.ts";
 import { Modal } from "../prototype/ui.tsx";
+import { useConfirmation } from "./ConfirmationDialog.tsx";
 import { parseForegroundMinutes } from "./settings-input.ts";
 import { MODEL_ROUTING_ROLES, type ModelRoutingRole } from "../agent-types.ts";
 
@@ -24,6 +25,20 @@ const ROUTING_LABELS: Record<ModelRoutingRole, { title: string; hint: string }> 
 	plan: { title: "Plan（规划）", hint: "只读出方案，适合推理强的模型" },
 	review: { title: "Review（审查）", hint: "只读审改动，选一个和主模型不同的模型做交叉审查" },
 };
+
+interface ConnectionDraft {
+	mode: ConnectionMode;
+	apiKey: string;
+	keyCommand: string;
+	headerText: string;
+	clearHeaders: boolean;
+	baseUrl: string;
+	modelId: string;
+	api: ConnectionProtocol;
+	customModel: boolean;
+	advanced: boolean;
+	makeDefault: boolean;
+}
 
 /** "provider/id" select value for each role; "" means inherit the parent's model. */
 function routingKeys(routing: Settings["modelRouting"]): Record<ModelRoutingRole, string> {
@@ -165,6 +180,10 @@ export function SettingsDialog({
 	const [testing, setTesting] = useState(false);
 	const [error, setError] = useState("");
 	const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
+	const [makeDefault, setMakeDefault] = useState(false);
+	const [savedMessage, setSavedMessage] = useState("");
+	const connectionDrafts = useRef(new Map<Provider, ConnectionDraft>());
+	const { confirm, confirmation } = useConfirmation();
 	useEffect(() => {
 		let mounted = true;
 		void window.pi.sandboxStatus().then((status) => { if (mounted) setSandboxInfo(status); }).catch(() => {});
@@ -181,6 +200,7 @@ export function SettingsDialog({
 	const pending = saving || testing || checkingBalance;
 	const storedKey = settings.configuredProviders.includes(provider);
 	const hasKey = Boolean(apiKey.trim()) || storedKey || Boolean(keyCommand.trim());
+	const isDefaultProvider = settings.defaultModel?.provider === `desktop-${provider}`;
 	const generalSettingsChanged =
 		permission !== settings.permission ||
 		theme !== settings.theme ||
@@ -221,7 +241,8 @@ export function SettingsDialog({
 		mode !== original.mode ||
 		modelId.trim() !== original.modelId ||
 		(mode === "custom" && (baseUrl.trim() !== original.baseUrl || api !== original.api)) ||
-		(hasKey && settings.defaultModel?.provider !== `desktop-${provider}`);
+		(makeDefault && !isDefaultProvider);
+	const useAsDefault = Boolean(connectionOnly || makeDefault || isDefaultProvider || !settings.defaultModel);
 	const parsedHeaders = headerText.trim() ? parseHeaderLines(headerText) : {};
 	const connectionInput: ConnectionInput = {
 		provider,
@@ -238,20 +259,34 @@ export function SettingsDialog({
 		setBalance(null);
 	};
 	const selectProvider = (next: Provider) => {
+		if (connectionChanged) connectionDrafts.current.set(provider, {
+			mode, apiKey, keyCommand, headerText, clearHeaders, baseUrl, modelId, api, customModel, advanced, makeDefault,
+		});
+		else connectionDrafts.current.delete(provider);
 		const nextPreset = presets.find((item) => item.provider === next)!;
 		const values = connectionValues(settings, nextPreset);
+		const draft = connectionDrafts.current.get(next);
+		connectionDrafts.current.delete(next);
 		setProvider(next);
-		setMode(values.mode);
-		setApiKey("");
-		setKeyCommand(values.keyCommand);
-		setHeaderText("");
-		setClearHeaders(false);
-		setBaseUrl(values.baseUrl);
-		setModelId(values.modelId);
-		setApi(values.api);
-		setCustomModel(!nextPreset.models.some((item) => item.id === values.modelId));
-		setAdvanced(values.mode === "custom");
+		setMode(draft?.mode ?? values.mode);
+		setApiKey(draft?.apiKey ?? "");
+		setKeyCommand(draft?.keyCommand ?? values.keyCommand);
+		setHeaderText(draft?.headerText ?? "");
+		setClearHeaders(draft?.clearHeaders ?? false);
+		setBaseUrl(draft?.baseUrl ?? values.baseUrl);
+		setModelId(draft?.modelId ?? values.modelId);
+		setApi(draft?.api ?? values.api);
+		setCustomModel(draft?.customModel ?? !nextPreset.models.some((item) => item.id === values.modelId));
+		setAdvanced(draft?.advanced ?? values.mode === "custom");
+		setMakeDefault(draft?.makeDefault ?? false);
 		clearResult();
+	};
+	const requestClose = async () => {
+		if (pending) return;
+		if ((generalSettingsChanged || connectionChanged || connectionDrafts.current.size > 0) && !await confirm({
+			title: "放弃未保存的设置更改？", confirmLabel: "放弃更改", destructive: true,
+		})) return;
+		close();
 	};
 	const restorePreset = () => {
 		setMode("preset");
@@ -299,7 +334,8 @@ export function SettingsDialog({
 			return;
 		}
 		if (!connectionChanged && !generalSettingsChanged) {
-			close();
+			if (connectionDrafts.current.size) setSavedMessage("其他服务商还有未保存的连接更改。");
+			else close();
 			return;
 		}
 		if (!hasKey && mode === "preset" && connectionChanged) {
@@ -385,10 +421,11 @@ export function SettingsDialog({
 			if (proxy.trim() !== (settings.proxy ?? "")) update.proxy = proxy.trim();
 			if (noProxy.trim() !== (settings.noProxy ?? "")) update.noProxy = noProxy.trim();
 			if (caFile.trim() !== (settings.caFile ?? "")) update.caFile = caFile.trim();
-			if (connectionChanged) Object.assign(update, connectionInput);
+			if (connectionChanged) Object.assign(update, connectionInput, { useAsDefault });
 			const next = await window.pi.saveSettings(update);
 			apply(next);
 			setApiKey("");
+			setMakeDefault(false);
 			setWebSearchApiKey("");
 			setClearWebSearchKey(false);
 			setHeaderText("");
@@ -398,6 +435,10 @@ export function SettingsDialog({
 				return;
 			}
 			onSaved?.();
+			if (connectionDrafts.current.size) {
+				setSavedMessage("已保存。其他服务商还有未保存的连接更改。");
+				return;
+			}
 			close();
 		} catch (error) {
 			setError(error instanceof Error ? error.message : String(error));
@@ -444,13 +485,10 @@ export function SettingsDialog({
 		}
 	};
 	return (
+		<>
 		<Modal
 			title={connectionOnly ? "连接模型" : "设置与模型连接"}
-			close={() => {
-				if (pending) return;
-				if ((generalSettingsChanged || connectionChanged) && !window.confirm("有未保存的设置更改，确定放弃吗？")) return;
-				close();
-			}}
+			close={() => void requestClose()}
 		>
 			<form
 				className="simple-dialog live-settings"
@@ -757,6 +795,7 @@ export function SettingsDialog({
 								<option value="dontAsk">不询问（未放行即拒绝）：不弹审批，规则或安全默认未放行的操作直接拒绝</option>
 								<option value="read">只读：仅允许读取与搜索</option>
 							</select>
+							<small>为未单独设置权限的会话使用。输入框旁的权限选择只影响当前会话。</small>
 						</label>
 						<label className="field-label">
 							外观
@@ -860,7 +899,7 @@ export function SettingsDialog({
 								disabled={pending || busy || (!sandbox && sandboxInfo?.supported === false)}
 								onChange={(event) => setSandbox(event.target.checked)}
 							/>
-							macOS Seatbelt 命令沙箱（将 Bash 写操作隔离至当前项目与临时目录）
+							macOS Seatbelt 命令沙箱与内置文件保护
 						</label>
 						{sandbox && (
 							<div className="live-setting-sub">
@@ -880,6 +919,11 @@ export function SettingsDialog({
 						{sandboxInfo && !sandboxInfo.supported && (
 							<p className="subtle-note">当前运行环境不支持嵌套 Seatbelt 沙箱：{sandboxInfo.reason}</p>
 						)}
+					</div>
+				</details>}
+				{!connectionOnly && <details className="live-settings-section">
+					<summary>预算与通知</summary>
+					<div className="live-settings-section-content">
 						<label className="live-setting-toggle">
 							<input
 								type="checkbox"
@@ -928,6 +972,11 @@ export function SettingsDialog({
 							/>
 							状态栏显示账户余额（支持余额查询的服务商，每分钟最多查询一次）
 						</label>
+					</div>
+				</details>}
+				{!connectionOnly && <details className="live-settings-section">
+					<summary>Agent 与自动化</summary>
+					<div className="live-settings-section-content">
 						<label className="live-setting-toggle">
 							<input
 								type="checkbox"
@@ -1045,8 +1094,13 @@ export function SettingsDialog({
 							/>
 							启用实验性 Agent Teams 多成员协作（TeamCreate / TeamDelete 与结构化团队消息）
 						</label>
+					</div>
+				</details>}
+				{!connectionOnly && <details className="live-settings-section">
+					<summary>模型路由与评审</summary>
+					<div className="live-settings-section-content">
 						<label className="field-label">
-							备用模型（主模型过载或多次重试失败时自动切换）
+							备用模型（主模型过载时仅接手当前回合）
 							<select
 								aria-label="备用模型"
 								value={fallbackModel}
@@ -1148,6 +1202,14 @@ export function SettingsDialog({
 						</fieldset>
 					</div>
 				</details>}
+				{!connectionOnly && !isDefaultProvider && settings.defaultModel && hasKey && (
+					<label className="live-setting-toggle">
+						<input type="checkbox" checked={makeDefault} disabled={pending || busy}
+							onChange={(event) => setMakeDefault(event.target.checked)} />
+						将此连接设为默认模型
+					</label>
+				)}
+				{savedMessage && <p role="status" className="subtle-note">{savedMessage}</p>}
 				{testResult && (
 					<div
 						className={testResult.success ? "live-notice" : "live-error"}
@@ -1168,7 +1230,7 @@ export function SettingsDialog({
 						<span>{balanceText(balance)}</span>
 					</div>
 				)}
-				{busy && <p className="live-error">请先停止当前任务，再修改连接和权限。</p>}
+				{busy && connectionChanged && <p className="subtle-note">连接改动需等当前任务结束后保存。</p>}
 				{error && (
 					<div className="live-error" role="alert">
 						{error}
@@ -1182,7 +1244,7 @@ export function SettingsDialog({
 					<button
 						type="button"
 						className="secondary-button"
-						disabled={pending || busy}
+						disabled={pending}
 						onClick={() => void testConnection()}
 					>
 						{testing ? "正在测试…" : "测试连接"}
@@ -1197,15 +1259,17 @@ export function SettingsDialog({
 					</button>
 					</>}
 					<span />
-					<button type="button" disabled={pending} className="secondary-button" onClick={close}>
+					<button type="button" disabled={pending} className="secondary-button" onClick={() => void requestClose()}>
 						取消
 					</button>
-					<button disabled={pending || busy} className="primary-button">
-						{saving ? "正在保存…" : connectionOnly ? (testing ? "正在测试…" : "测试并连接") : connectionChanged ? "保存并使用" : "保存设置"}
+					<button disabled={pending} className="primary-button">
+						{saving ? "正在保存…" : connectionOnly ? (testing ? "正在测试…" : "测试并连接") : connectionChanged && useAsDefault ? "保存并使用" : "保存设置"}
 					</button>
 				</div>
 			</form>
 		</Modal>
+		{confirmation}
+		</>
 	);
 }
 

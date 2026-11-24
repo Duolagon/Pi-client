@@ -84,17 +84,23 @@ decision 为 allow/deny/cancel。pendingApprovals 给出宿主审批 ID、kind�
 
 回应时再次检查当前宿主策略。撤销、原生超时、取消或进程退出会发 approval_resolved，旧回应被拒绝。审批期间子任务为 waiting_for_input，主 Pi 会话仍可工作。外部审批走 externalAgents.respond，不能传给原 Pi 的 respond 或 tasks.respond。
 
+当前会话的外部请求显示在聊天内，其他会话的请求可从任务抽屉处理。审批数包含在 macOS Dock 角标中，应用失焦时使用系统通知。Claude、Codex 的问题列表和 ACP 支持的字符串或多选表单由客户端填写后按原生字段返回。
+
 取消先走原生协议并等待终止，必要时结束受管进程组。停止父 Pi 会话也取消它的外部任务；不影响其他父会话或独立手动 Pi 后台任务。已完成的文件修改仍保留，取消不等于 Git 撤销。应用重启把活动任务标记 interrupted，不自动付费重跑；显式 send 才恢复会话并处理新指令。
 
 ## 权限边界
 
-保存创建时权限上限，同时继续接收父会话收紧的规则。结构化路径规则映射到对应 Worktree；父任务停用的工具不能通过继续外部会话恢复。
+保存创建时权限上限，同时继续接收父会话收紧的规则。宿主在「接受编辑」模式下会直接允许符合策略的 Worktree 文件编辑，对转发到宿主且未匹配显式规则的 Shell 命令继续要求确认。结构化路径规则映射到对应 Worktree。父任务停用的工具不能通过继续外部会话恢复。
 
-- Claude：每个 PreToolUse 都经过本地与宿主策略，未知工具在只读模式下拒绝；问题单独交互。旧 CLI 不支持原生 onFailure:block 时，helper 使用全面 catch→deny、短于原生 hook timeout 的审批期限、断管清理和进程组退出保护。
-- Codex：强制并校验 untrusted/user 审批以及 read-only/workspace-write 沙箱，拒绝提权；只读任务还要求原生配置没有 MCP。原生安全操作可能无需发出审批，不能宣称和 Pi ask 模式逐次确认一致。
+- Claude：每个 PreToolUse 都经过本地与宿主策略，Plan 与只读任务使用原生只读工具上限。问题单独交互。项目级及本地 Claude 设置仅在所属项目得到明确信任后加载，未决定及不信任时仅加载用户设置。旧 CLI 不支持原生 onFailure:block 时，helper 使用全面 catch→deny、短于原生 hook timeout 的审批期限、断管清理和进程组退出保护。
+- Codex：强制并校验 untrusted/user 审批以及 read-only/workspace-write 沙箱。Plan 与只读任务使用 read-only 沙箱，并要求原生配置没有 MCP。原生安全操作可能无需发出审批，不能宣称和 Pi ask 模式逐次确认一致。
 - Kimi：恢复后设置原生手动模式并验证确认，接收原生权限请求，不宣告客户端文件系统/终端能力。不能以 Plan 模式冒充真正只读。
 - Antigravity：启动时固定开启 `--sandbox`，设置并锁定原生 `default` 手动模式，接收原生权限请求；agy 自身规则已允许的操作不经宿主审批（capabilities.approvalSemantics 为 `agent-rules`），因此拒绝 dontAsk 策略。
 - Codex/Kimi/Antigravity：无法可靠执行的非宿主 deny/ask 规则或原生工具停用，会在启动时明确拒绝，不静默丢弃。仅 allow 规则允许使用原生更保守的审批。运行时修改宿主策略会停止缺少逐工具 hook 的活动任务，需显式继续。
+
+外部进程继承客户端配置的代理、排除地址和 CA 环境变量，具体支持取决于执行器。已配置最低余额时，独立认证的外部账户无法由 Pi 核对，因此任务会明确停止启动。设置美元费用上限后，Claude 使用 SDK 的 USD 上限，其他执行器明确拒绝该组合。可并行子任务从父会话剩余额度分配预算。用量统计计入执行器实际报告的计数，Claude 费用按累计报告差额统计。SDK 费用为估算值，原生执行器没有报告的用量仍无法计入。
+
+可写外部任务在自己的 Worktree 记录每轮恢复点。任务抽屉中的「查看检查点」可预览并按文件恢复。恢复仍检查文件是否在检查点后另有修改，并遵循父会话当前权限。
 
 原生 CLI 的配置、插件、hooks 和 MCP 是各执行器自己的受信代码边界；Pi 的工具钩子不是它们的 OS 沙箱。宿主不会用全局跳过审批参数解决兼容问题。root/管理员进程及恶意本机扩展的任意系统访问不在此工具权限契约的隔离承诺内。
 

@@ -151,21 +151,20 @@ test("DesktopService maps dontAsk, fires PostCompact after compaction_end and Se
 			onEvent(runtime: unknown, event: unknown): void;
 		};
 
-		// Switching permission restarts the runtime: SessionEnd with reason "other".
+		const runtime = internals.runtimes.get(conversationId);
+		assert.ok(runtime);
+		await waitFor(async () => (await readLog(log)).some((entry) => entry.hook_event_name === "SessionStart"));
+
+		// The running session receives the new permission without a restart.
 		snap = await service.saveSettings({ permission: "dontAsk", theme: snap.settings.theme });
 		assert.equal(snap.settings.permission, "dontAsk");
 		const policy = internals.permissionPolicy(conversationId);
 		assert.equal(policy.mode, "ask");
 		assert.equal(policy.dontAsk, true);
-		await waitFor(async () => (await readLog(log)).some((entry) => entry.hook_event_name === "SessionEnd"));
-		const first = (await readLog(log)).find((entry) => entry.hook_event_name === "SessionEnd")!;
-		assert.equal(first.reason, "other");
-		assert.equal(first.session_id, conversationId);
-		assert.equal(first.permission_mode, "ask");
+		assert.equal(internals.runtimes.get(conversationId), runtime);
+		assert.equal((await readLog(log)).filter((entry) => entry.hook_event_name === "SessionEnd").length, 0);
 
 		// Compaction results fire PostCompact; aborted or empty results do not.
-		await waitFor(async () => internals.runtimes.has(conversationId));
-		const runtime = internals.runtimes.get(conversationId);
 		internals.onEvent(runtime, { type: "compaction_end", reason: "manual", result: undefined, aborted: true, willRetry: false });
 		internals.onEvent(runtime, {
 			type: "compaction_end",
@@ -184,19 +183,19 @@ test("DesktopService maps dontAsk, fires PostCompact after compaction_end and Se
 		await service.close();
 		service = undefined;
 		const ends = (await readLog(log)).filter((entry) => entry.hook_event_name === "SessionEnd");
-		assert.equal(ends.length, 2);
-		assert.equal(ends[1]!.reason, "close");
-		assert.equal(ends[1]!.permission_mode, "dontAsk");
-		// SessionStart of the restarted runtime agrees with its SessionEnd.
+		assert.equal(ends.length, 1);
+		assert.equal(ends[0]!.reason, "close");
+		assert.equal(ends[0]!.session_id, conversationId);
+		assert.equal(ends[0]!.permission_mode, "dontAsk");
 		const starts = (await readLog(log)).filter((entry) => entry.hook_event_name === "SessionStart");
-		assert.ok(starts.length >= 2);
-		assert.equal(starts.at(-1)!.permission_mode, "dontAsk");
+		assert.equal(starts.length, 1);
+		assert.equal(starts[0]!.permission_mode, "ask");
 
 		// The stored value survives a reload.
-		const stored = JSON.parse(await readFile(join(fixture.dataDir, "state.json"), "utf8").catch(() => "{}")) as {
-			settings?: { permission?: string };
+		const stored = JSON.parse(await readFile(join(fixture.dataDir, "desktop.json"), "utf8")) as {
+			settings: { permission?: string };
 		};
-		if (stored.settings) assert.equal(stored.settings.permission, "dontAsk");
+		assert.equal(stored.settings.permission, "dontAsk");
 	} finally {
 		await service?.close();
 		restore();

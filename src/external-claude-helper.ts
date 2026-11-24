@@ -12,6 +12,8 @@ export interface ClaudeHelperConfig {
 	cwd: string;
 	resumeSessionId?: string;
 	policy: RuntimePermissionPolicy;
+	projectTrusted?: boolean;
+	maxBudgetUsd?: number;
 }
 export type ClaudeHelperRequest =
 	| { type: "init"; id: string; config: ClaudeHelperConfig }
@@ -93,7 +95,12 @@ export class ClaudeSdkHelper {
 				const config = record(request.config);
 				if (typeof config.executable !== "string" || !isAbsolute(config.executable) || typeof config.cwd !== "string" || !isAbsolute(config.cwd)) throw new Error("Claude executable and project must be absolute paths");
 				if (config.resumeSessionId !== undefined && (typeof config.resumeSessionId !== "string" || !/^[a-zA-Z0-9_-]{1,300}$/.test(config.resumeSessionId))) throw new Error("Invalid Claude resume session");
-				this.config = { executable: config.executable, cwd: config.cwd, policy: validateRuntimePolicy(config.policy), resumeSessionId: config.resumeSessionId as string | undefined };
+				if (config.projectTrusted !== undefined && typeof config.projectTrusted !== "boolean") throw new Error("Invalid Claude project trust");
+				if (config.maxBudgetUsd !== undefined && (typeof config.maxBudgetUsd !== "number" || !Number.isFinite(config.maxBudgetUsd) || config.maxBudgetUsd <= 0))
+					throw new Error("Invalid Claude budget");
+				this.config = { executable: config.executable, cwd: config.cwd, policy: validateRuntimePolicy(config.policy),
+					resumeSessionId: config.resumeSessionId as string | undefined, projectTrusted: config.projectTrusted === true,
+					maxBudgetUsd: config.maxBudgetUsd as number | undefined };
 				this.sessionId = this.config.resumeSessionId;
 				this.start();
 				await this.native!.initializationResult();
@@ -147,14 +154,15 @@ export class ClaudeSdkHelper {
 
 	private start(): void {
 		const config = this.config!;
-		const readonly = config.policy.mode === "read";
+		const readonly = config.policy.mode === "read" || config.policy.mode === "plan";
 		const options: Options = {
 			cwd: config.cwd,
 			pathToClaudeCodeExecutable: config.executable,
 			resume: config.resumeSessionId,
 			includePartialMessages: true,
 			permissionMode: readonly ? "plan" : "default",
-			settingSources: ["user", "project", "local"],
+			settingSources: config.projectTrusted ? ["user", "project", "local"] : ["user"],
+			maxBudgetUsd: config.maxBudgetUsd,
 			...(readonly ? { tools: ["Read", "Grep", "Glob", "LS"] } : {}),
 			// SDK hooks remain in force even when native permission settings would auto-allow.
 			hooks: {
@@ -262,7 +270,8 @@ export class ClaudeSdkHelper {
 		if (item.type === "tool_progress" && typeof item.tool_use_id === "string") this.event({ type: "tool_update", id: item.tool_use_id, text: typeof item.elapsed_time_seconds === "number" ? `${item.elapsed_time_seconds}s` : "Running" });
 		if (item.type === "result" && this.current) {
 			const usage = item.usage && typeof item.usage === "object" ? record(item.usage) : {};
-			this.event({ type: "usage", inputTokens: numeric(usage.input_tokens), outputTokens: numeric(usage.output_tokens) });
+			this.event({ type: "usage", inputTokens: numeric(usage.input_tokens), outputTokens: numeric(usage.output_tokens),
+				sessionCostUsd: numeric(item.total_cost_usd) });
 			if (item.is_error && !this.current.cancelled) {
 				const id = this.current.id;
 				this.current = undefined;

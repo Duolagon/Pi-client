@@ -13,6 +13,7 @@ test("fallbackReason accepts overload, rate limit and server errors only", () =>
 	assert.equal(fallbackReason("529 Overloaded"), "过载");
 	assert.equal(fallbackReason('{"type":"overloaded_error","message":"Overloaded"}'), "过载");
 	assert.equal(fallbackReason("429 Too Many Requests"), "限流");
+	assert.equal(fallbackReason("429 Rate limit exceeded for API key"), "限流");
 	assert.equal(fallbackReason("Rate limit reached for requests"), "限流");
 	assert.equal(fallbackReason("503 Service Unavailable"), "服务端错误");
 	assert.equal(fallbackReason("502 Bad Gateway"), "服务端错误");
@@ -268,7 +269,7 @@ ${marker}`,
 		await service.command({ type: "prompt", message: "FALLBACK_OVERLOAD please" });
 		await settled;
 		const snapshot = await service.snapshot();
-		assert.equal(snapshot.state?.model?.id, "desktop-test-2");
+		assert.equal(snapshot.state?.model?.id, "desktop-test-1");
 		const notice = snapshot.messages.find((m) => m.role === "custom" && m.customType === FALLBACK_MESSAGE_TYPE);
 		assert.ok(notice, "fallback notice is in the transcript");
 		const last = snapshot.messages.findLast((m) => m.role === "assistant") as { content: { type: string; text?: string }[] };

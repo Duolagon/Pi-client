@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Plus, Terminal as TerminalIcon, X } from "lucide-react";
 import { InteractiveTerminal } from "./InteractiveTerminal.tsx";
 import { IconButton } from "../prototype/ui.tsx";
+import { useConfirmation } from "./ConfirmationDialog.tsx";
 import type { PiPackageAction, TerminalInfo } from "../shared.ts";
 
 function stripAnsi(input: string): string {
@@ -37,6 +38,7 @@ export function TerminalPanel({
 	onClose: () => void;
 	fail: (error: unknown) => void;
 }) {
+	const { confirm, confirmation } = useConfirmation();
 	const [mode, setMode] = useState<"bash" | "pty">(focusId && !prefill ? "pty" : "bash");
 	const [packageForm, setPackageForm] = useState(false);
 	const [packageSource, setPackageSource] = useState("");
@@ -195,12 +197,12 @@ export function TerminalPanel({
 			{packageForm && <div className="cc-ssh-form">
 				<button type="button" disabled={creating || readOnly} onClick={() => void managePackage("list")}>列出用户扩展包</button>
 				<input aria-label="npm 扩展包" placeholder="npm:包名@版本" value={packageSource} onChange={(event) => setPackageSource(event.target.value)} />
-				<button type="button" disabled={creating || readOnly || !packageSource.trim()} onClick={() => {
-					if (window.confirm("Pi 扩展包可以在你的账户下运行代码。确认安装此包？")) void managePackage("install");
+				<button type="button" disabled={creating || readOnly || !packageSource.trim()} onClick={async () => {
+					if (await confirm({ title: "安装 Pi 扩展包", message: "Pi 扩展包可以在你的账户下运行代码。", confirmLabel: "安装" })) void managePackage("install");
 				}}>安装</button>
 				<button type="button" disabled={creating || readOnly || !packageSource.trim()} onClick={() => void managePackage("update")}>更新</button>
-				<button type="button" disabled={creating || readOnly || !packageSource.trim()} onClick={() => {
-					if (window.confirm("从 Pi 用户配置中移除此扩展包？")) void managePackage("remove");
+				<button type="button" disabled={creating || readOnly || !packageSource.trim()} onClick={async () => {
+					if (await confirm({ title: "移除 Pi 扩展包", message: "从 Pi 用户配置中移除此扩展包。", confirmLabel: "移除", destructive: true })) void managePackage("remove");
 				}}>移除</button>
 				<small>在新会话中加载变更。</small>
 			</div>}
@@ -276,6 +278,7 @@ export function TerminalPanel({
 					)}
 				</div>
 			)}
+			{confirmation}
 		</section>
 	);
 }

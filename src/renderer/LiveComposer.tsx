@@ -1,17 +1,17 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, Brain, File, Folder, Paperclip, ShieldCheck, Square, X } from "lucide-react";
-import type { Command, FileEntry, FileReferenceAvailability, PermissionMode, Project, SandboxStatus, Snapshot, ThinkingLevel } from "../shared.ts";
+import type { Command, FileEntry, FileReferenceAvailability, Message, PermissionMode, Project, SandboxStatus, Snapshot, ThinkingLevel } from "../shared.ts";
 import { WorkspacePicker } from "./WorkspacePicker.tsx";
 import { SandboxControl } from "./SandboxControl.tsx";
 import { CommandSealIcon } from "./GrailIcons.tsx";
 import { StatusLine } from "./StatusLine.tsx";
-import { fileReferences, insertFileReference, referenceQuery, removeFileReference } from "../file-references.ts";
+import { fileReferences, insertFileReference, isDesktopWorkspaceContext, referenceQuery, removeFileReference, visiblePromptText } from "../file-references.ts";
 import "./composer-controls.css";
 
 import { draftPrompt, maximumImageDataLength, type ComposerAttachment, type ComposerDraft, type Prompt } from "../composer-draft.ts";
 
 const DEFAULT_DESKTOP_KEYBINDINGS = { submit: "Enter" };
-const CYCLABLE_PERMISSIONS: PermissionMode[] = ["ask", "read", "plan", "acceptEdits"];
+const CYCLABLE_PERMISSIONS: PermissionMode[] = ["ask", "acceptEdits", "plan", "read"];
 const REFERENCE_STATUS_LABEL: Record<FileReferenceAvailability, string> = {
 	ready: "发送时可读取",
 	untrusted: "项目尚未授权载入",
@@ -121,13 +121,12 @@ export function LiveComposer({
 	snapshot,
 	activeProject,
 	draft,
+	messages,
 	attachments,
 	updateAttachments,
 	setDraft,
 	running,
 	changing,
-	planMode,
-	onTogglePlanMode,
 	send,
 	stop,
 	stopping,
@@ -152,13 +151,12 @@ export function LiveComposer({
 	snapshot: Snapshot;
 	activeProject?: Project;
 	draft: string;
+	messages: readonly Message[];
 	attachments: ComposerAttachment[];
 	updateAttachments: (update: (items: ComposerAttachment[]) => ComposerAttachment[]) => void;
 	setDraft: (value: string) => void;
 	running: boolean;
 	changing: boolean;
-	planMode?: boolean;
-	onTogglePlanMode?: () => void;
 	send: (prompt: Prompt, input?: ComposerDraft, delivery?: Prompt["streamingBehavior"]) => Promise<unknown>;
 	stop: () => void;
 	stopping?: boolean;
@@ -196,7 +194,19 @@ export function LiveComposer({
 	const [skillsFilter, setSkillsFilter] = useState("");
 	const [skillsIndex, setSkillsIndex] = useState(0);
 	const skillsRef = useRef<HTMLDivElement>(null);
-	const promptHistory = useRef<string[]>([]);
+	const promptHistory = useMemo(() => {
+		const prompts: string[] = [];
+		for (let index = messages.length - 1; index >= 0 && prompts.length < 100; index--) {
+			const message = messages[index];
+			if (message.role !== "user") continue;
+			const text = (typeof message.content === "string"
+				? visiblePromptText(message.content)
+				: message.content.flatMap((block) => block.type === "text" && !isDesktopWorkspaceContext(block.text) ? [block.text] : []).join("\n")).trim();
+			if (text && !text.startsWith("[SYSTEM NOTIFICATION - NOT USER INPUT]") && prompts.at(-1) !== text)
+				prompts.push(text);
+		}
+		return prompts.reverse();
+	}, [messages]);
 	const historyCursor = useRef<number>(-1);
 	const currentDraft = useRef(draft);
 	currentDraft.current = draft;
@@ -236,6 +246,7 @@ export function LiveComposer({
 		input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
 	}, [draft]);
 	const hasModel = snapshot.models.length > 0 && Boolean(snapshot.state?.model);
+	const permissionMode = snapshot.active?.permissionMode ?? snapshot.settings.permission;
 	const disabled = changing || sending || snapshot.engineStatus !== "ready" || !snapshot.active || !hasModel;
 	const attach = async (files: File[]) => {
 		try {
@@ -416,9 +427,6 @@ export function LiveComposer({
 		} catch (error) {
 			fail(error);
 			return;
-		}
-		if (trimmed && promptHistory.current[promptHistory.current.length - 1] !== trimmed) {
-			promptHistory.current.push(trimmed);
 		}
 		historyCursor.current = -1;
 		setSending(true);
@@ -678,7 +686,8 @@ export function LiveComposer({
 						setSlashIndex(0);
 						setAtIndex(0);
 						setSelection({ start: event.currentTarget.selectionStart, end: event.currentTarget.selectionEnd });
-						setDraft(event.target.value);
+							historyCursor.current = -1;
+							setDraft(event.target.value);
 					}}
 					onPaste={(event) => {
 						if (event.clipboardData.files.length) {
@@ -688,9 +697,9 @@ export function LiveComposer({
 					}}
 					onKeyDown={(event) => {
 						if (event.nativeEvent.isComposing) return;
-						if (event.key === "Tab" && event.shiftKey && !changing && !running && !slashOptions.length && !atMatch) {
+						if (event.key === "Tab" && event.shiftKey && !changing && snapshot.active && !slashOptions.length && !atMatch) {
 							event.preventDefault();
-							const current = CYCLABLE_PERMISSIONS.indexOf(snapshot.settings.permission);
+							const current = CYCLABLE_PERMISSIONS.indexOf(permissionMode);
 							const next = CYCLABLE_PERMISSIONS[(current + 1) % CYCLABLE_PERMISSIONS.length];
 							setPermission(next);
 							return;
@@ -757,23 +766,21 @@ export function LiveComposer({
 							event.preventDefault();
 							return;
 						}
-						if (event.key === "ArrowUp" && !draft.includes("\n") && promptHistory.current.length > 0) {
-							const cursor = historyCursor.current === -1 ? promptHistory.current.length - 1 : Math.max(0, historyCursor.current - 1);
-							if (draft === "" || historyCursor.current !== -1) {
-								event.preventDefault();
-								historyCursor.current = cursor;
-								setDraft(promptHistory.current[cursor]);
-								return;
-							}
-						}
-						if (event.key === "ArrowDown" && historyCursor.current !== -1 && !draft.includes("\n")) {
+						if (event.key === "ArrowUp" && promptHistory.length > 0 && (draft === "" || historyCursor.current !== -1)) {
+							const cursor = historyCursor.current === -1 ? promptHistory.length - 1 : Math.max(0, historyCursor.current - 1);
 							event.preventDefault();
-							if (historyCursor.current >= promptHistory.current.length - 1) {
+							historyCursor.current = cursor;
+							setDraft(promptHistory[cursor]);
+							return;
+						}
+						if (event.key === "ArrowDown" && historyCursor.current !== -1) {
+							event.preventDefault();
+							if (historyCursor.current >= promptHistory.length - 1) {
 								historyCursor.current = -1;
 								setDraft("");
 							} else {
 								historyCursor.current += 1;
-								setDraft(promptHistory.current[historyCursor.current]);
+								setDraft(promptHistory[historyCursor.current]);
 							}
 							return;
 						}
@@ -872,14 +879,14 @@ export function LiveComposer({
 			</form>
 			<div className="cl-composer-bar">
 				<div className="cl-pills">
-					<label className={`cl-pill cc-perm-pill cc-perm-${snapshot.settings.permission}`}>
-						<span className={`cc-perm-dot ${snapshot.settings.permission}`} aria-hidden="true" />
+					<label className={`cl-pill cc-perm-pill cc-perm-${permissionMode}`}>
+						<span className={`cc-perm-dot ${permissionMode}`} aria-hidden="true" />
 						<ShieldCheck size={13} />
 						<span className="cl-pill-select">
 							<select
 								aria-label="权限模式"
-								value={snapshot.settings.permission}
-								disabled={changing || running}
+								value={permissionMode}
+								disabled={changing || !snapshot.active}
 								onChange={(event) => setPermission(event.target.value as PermissionMode)}
 							>
 								{(Object.keys(PERMISSION_LABEL) as PermissionMode[]).map((mode) => (
@@ -900,18 +907,6 @@ export function LiveComposer({
 						onOpenChange={setSandboxOpen}
 						onChange={onUpdateSandbox}
 					/>
-					{onTogglePlanMode && (
-						<button
-							type="button"
-							className={`cl-pill cc-plan-pill ${planMode ? "active" : ""}`}
-							aria-pressed={planMode}
-							onClick={onTogglePlanMode}
-							disabled={changing || running}
-							title="切换 Plan 计划模式（先只读调研与出方案，确认后再执行）"
-						>
-							计划
-						</button>
-					)}
 				</div>
 				<div className="cc-bar-right">
 					<StatusLine snapshot={snapshot} running={running} gitBranch={gitBranch} />

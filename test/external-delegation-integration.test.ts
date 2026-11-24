@@ -23,12 +23,12 @@ async function until<T>(read: () => Promise<T> | T, check: (value: T) => boolean
 }
 
 function adapters() {
-	const opened: { executor: ExternalProvider; cwd: string; resume?: string; nativeId: string }[] = [];
+	const opened: { executor: ExternalProvider; cwd: string; resume?: string; nativeId: string; cap?: number; env: NodeJS.ProcessEnv }[] = [];
 	let serial = 0;
 	const create = (executor: ExternalProvider): ExternalAdapter => ({
 		async open(options: ExternalSessionOptions) {
 			const nativeId = options.resumeSessionId ?? `${executor}-native-${++serial}`;
-			opened.push({ executor, cwd: options.cwd, resume: options.resumeSessionId, nativeId });
+			opened.push({ executor, cwd: options.cwd, resume: options.resumeSessionId, nativeId, cap: options.maxBudgetUsd, env: options.env });
 			options.onEvent({ type: "session", sessionId: nativeId });
 			let stopped: (() => void) | undefined;
 			return {
@@ -40,6 +40,10 @@ function adapters() {
 						if (signal?.aborted) stopped();
 					});
 					if (prompt === "SLOW_DONE") await delay(400, undefined, { signal });
+					if (prompt.startsWith("BILL ")) {
+						options.onEvent({ type: "usage", inputTokens: 7, outputTokens: 3, sessionCostUsd: Number(prompt.slice(5)) });
+						return { status: "completed", text: "accounted", sessionId: nativeId };
+					}
 					const path = join(options.cwd, "external-result.txt");
 					options.onEvent({ type: "tool_start", id: "native-write", name: "write", input: { path } });
 					const decision = await options.onPermission({ id: "native-request", kind: "file", toolName: "write", input: { path, content: prompt } }, signal);
@@ -112,13 +116,69 @@ test("native approval waits on the external task, resumes after a response and h
 		const pending = await run(data.service, "EXTERNAL_APPROVAL claude", "EXTERNAL_APPROVAL_RETURNED");
 		const [task] = data.service.listExternal(data.parentId);
 		assert.equal(task.status, "waiting_for_input"); assert.equal(task.pendingApprovals.length, 1);
+		assert.equal(data.service.pendingApprovalCount(), 1);
 		await assert.rejects(access(join(task.workingDirectory, "external-result.txt")));
 		assert.ok(contains(pending, '"pending_approvals":1'));
 		await data.service.respondExternal(task.id, task.pendingApprovals[0].id, { decision: "allow" });
 		await until(() => data.service.externalSnapshot(task.id), (value) => value.status === "completed", "native task complete");
 		const completed = await until(() => data.service.snapshot(), (value) => contains(value, "EXTERNAL_HANDBACK_COMPLETE") && !value.state?.isStreaming, "approval handback");
+		assert.equal(data.service.pendingApprovalCount(), 0);
 		assert.equal(completed.messages.filter((message) => "customType" in message && message.customType === "desktop_task_notification").length, 1);
+		await until(() => data.service.listCheckpoints(data.parentId),
+			(checkpoints) => checkpoints.some((checkpoint) => checkpoint.label === "后台唤醒" && checkpoint.status === "ready"), "async checkpoint sealed");
+		const [checkpoint] = await data.service.listCheckpoints(task.id);
+		assert.deepEqual(checkpoint.changes.map((change) => change.path), ["external-result.txt"]);
+		await assert.rejects(data.service.checkpointDiff(checkpoint.id, data.parentId));
+		assert.equal((await data.service.restoreCheckpoint(checkpoint.id, task.id)).status, "restored");
+		await assert.rejects(access(join(task.workingDirectory, "external-result.txt")));
 		await assert.rejects(data.service.respondExternal(task.id, task.pendingApprovals[0].id, { decision: "allow" }), /失效/);
+	} finally { await data.service.close(); await data.fixture.cleanup(); }
+});
+
+test("external USD budgets reserve sibling shares and account for cumulative native usage", { timeout: 45000 }, async () => {
+	const data = await setup();
+	try {
+		const proxy = "http://127.0.0.1:11784";
+		await data.service.saveSettings({ permission: "auto", theme: "light", maxCostUsd: 2, proxy, noProxy: "localhost" });
+		await assert.rejects(data.service.startExternal({
+			executor: "codex", description: "unsupported budget", prompt: "BLOCK",
+		}), /无法执行.*费用上限/);
+		const first = await data.service.startExternal({ executor: "claude", description: "first budget", prompt: "BLOCK" });
+		const second = await data.service.startExternal({ executor: "claude", description: "second budget", prompt: "BLOCK" });
+		const opened = await until(() => data.native.opened, (items) => items.length === 2, "two budget allocations");
+		assert.ok(opened.every((item) => item.cap && item.cap < 2));
+		assert.ok(opened.reduce((sum, item) => sum + (item.cap ?? 0), 0) < 2);
+		assert.ok(opened.every((item) => item.env.HTTPS_PROXY === proxy && item.env.NO_PROXY === "localhost"));
+		await data.service.cancelExternal(first.id);
+		await data.service.cancelExternal(second.id);
+		const billed = await data.service.startExternal({ executor: "claude", description: "usage", prompt: "BILL 0.25" });
+		await until(() => data.service.externalSnapshot(billed.id), (item) => item.status === "completed", "first usage");
+		await data.service.sendExternal({ taskId: billed.id, message: "BILL 0.42" });
+		await until(() => data.service.externalSnapshot(billed.id), (item) => item.status === "completed" && item.turn === 2, "second usage");
+		const external = (await data.service.usageStats()).models.find((model) => model.key === "external/claude");
+		assert.equal(external?.input, 14);
+		assert.equal(external?.output, 6);
+		assert.equal(external?.cost, 0.42);
+	} finally { await data.service.close(); await data.fixture.cleanup(); }
+});
+
+test("a foreground teammate settles idle and is woken by the next message after its runtime is reaped", { timeout: 45000 }, async () => {
+	const data = await setup();
+	try {
+		await data.service.saveSettings({ permission: "auto", theme: "light", agentTeams: true });
+		await run(data.service, "TEAM_BOOT", "TEAM_BOOT_COMPLETE");
+		const team = await until(() => data.service.getTeam(data.parentId),
+			(value) => value?.members.some((member) => member.name === "reviewer" && member.status === "idle") === true, "foreground teammate idle");
+		const memberId = team?.members.find((member) => member.name === "reviewer")?.conversationId!;
+		assert.ok(memberId);
+		await until(() => data.service.reapIdleChildRuntimes({ idleMs: 0 }), (count) => count === 1, "teammate runtime reaped");
+		await run(data.service, "TEAM_SEND", "TEAM_SEND_COMPLETE");
+		await until(() => data.service.listTasks(),
+			(tasks) => tasks.some((task) => task.id === memberId && task.turn === 2 && task.status === "completed"), "fresh team turn completed");
+		const teammate = await data.service.taskSnapshot(memberId);
+		assert.ok(contains(teammate, "TEAM_MEMBER_WOKE"));
+		assert.equal((await data.service.getTeam(data.parentId))?.messages[0].pendingConversationIds, undefined);
+		assert.equal((await data.service.deleteTeam(data.parentId, "test-team")).deleted, true);
 	} finally { await data.service.close(); await data.fixture.cleanup(); }
 });
 

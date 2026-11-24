@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Plug, Plus, Save, Trash2 } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
+import { useConfirmation } from "./ConfirmationDialog.tsx";
 import type { McpSaveInput, McpServerInfo } from "../shared.ts";
 
 function emptyForm(): McpSaveInput {
@@ -128,9 +129,10 @@ export function McpDialog({
 		}
 	};
 
+	const { confirm, confirmation } = useConfirmation();
 	const remove = async () => {
 		if (!selected) return;
-		if (!window.confirm(`删除 MCP 服务器 ${selected.name}（${selected.scope}）？`)) return;
+		if (!await confirm({ title: "删除 MCP 服务器", message: `移除「${selected.name}」（${selected.scope}）的配置。`, confirmLabel: "删除", destructive: true })) return;
 		setBusy(true);
 		setError("");
 		try {
@@ -322,6 +324,7 @@ export function McpDialog({
 					</div>
 				</form>
 			</div>
+			{confirmation}
 		</Modal>
 	);
 }

@@ -186,6 +186,11 @@ export function validateTask(value: unknown, conversationIds: ReadonlySet<string
 		if (input.workflowId !== undefined) {
 			task.workflowId = id(input.workflowId, "workflowId");
 		}
+		if (input.workflowWorkspace !== undefined) {
+			if (!task.workflowId || typeof input.workflowWorkspace !== "string" || !/^[a-f0-9]{64}$/.test(input.workflowWorkspace))
+				fail("workflowWorkspace");
+			task.workflowWorkspace = input.workflowWorkspace;
+		}
 		if (input.isFork !== undefined) task.isFork = bool(input.isFork, "isFork");
 		if (input.systemPromptFile !== undefined) {
 			// The file is passed to the child's command line; only the host's own path is accepted.
@@ -195,7 +200,8 @@ export function validateTask(value: unknown, conversationIds: ReadonlySet<string
 		}
 	} else if (
 		input.parentToolCallId !== undefined || input.subagentType !== undefined || input.delegationDepth !== undefined ||
-		input.name !== undefined || input.isFork !== undefined || input.systemPromptFile !== undefined
+		input.name !== undefined || input.isFork !== undefined || input.systemPromptFile !== undefined ||
+		input.workflowWorkspace !== undefined
 	) {
 		fail("parentConversationId");
 	}

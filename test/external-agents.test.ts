@@ -40,7 +40,14 @@ class FakeAdapter implements ExternalAdapter {
 				try {
 					if (prompt.startsWith("hold")) await new Promise<void>((resolve) => { release = resolve; this.releases.set(prompt, resolve); if (signal?.aborted) abort(); });
 					if (prompt.startsWith("ask")) {
-						const request: ExternalApprovalRequest = { id: "native-tool-request", kind: prompt.includes("question") ? "question" : "command", toolName: "Bash", input: { command: "npm test" }, options: [{ id: "native-allow", label: "Allow", kind: "allow_once" }, { id: "native-deny", label: "Deny", kind: "reject_once" }] };
+						const write = prompt === "ask write";
+						const request: ExternalApprovalRequest = {
+							id: "native-tool-request",
+							kind: write ? "file" : prompt.includes("question") ? "question" : "command",
+							toolName: write ? "Write" : "Bash",
+							input: write ? { file_path: join(options.cwd, "draft.txt"), content: "sample" } : { command: "npm test" },
+							options: [{ id: "native-allow", label: "Allow", kind: "allow_once" }, { id: "native-deny", label: "Deny", kind: "reject_once" }],
+						};
 						this.permissionCalls.push(request);
 						const decision = await options.onPermission(request);
 						this.decisions.push(decision.decision);
@@ -72,12 +79,14 @@ async function setup(config: { maxConcurrent?: number; capacity?: () => number; 
 	const adapter = new FakeAdapter();
 	const notifications: { owner: string; result: ExternalTaskResult }[] = [];
 	let current: RuntimePermissionPolicy = { version: 1, project, mode: "ask", rules: [], disabledTools: [] };
+	let trusted = false;
 	const trees: WorktreeInfo[] = [];
 	let activity = 0;
 	const options: ExternalAgentOptions = {
 		dataDir, env: { HOME: join(root, "home"), PATH: "/usr/bin:/bin", PI_DESKTOP_KEY_OPENAI: "local-fixture-desktop-secret", PI_DESKTOP_CONNECTIONS: "local-fixture-connections", PI_CODING_AGENT_DIR: "local-fixture-pi-dir", SAFE_FIXTURE: "preserved" },
-		nodeExecutable: process.execPath, claudeHelperPath: join(root, "helper.mjs"), adapters: { codex: adapter, claude: adapter, kimi: adapter },
+		nodeExecutable: process.execPath, claudeHelperPath: join(root, "helper.mjs"), adapters: { codex: adapter, claude: adapter, kimi: adapter, antigravity: adapter },
 		maxConcurrent: config.maxConcurrent, project: (owner) => { if (!["parent-a", "parent-b", "nested-child"].includes(owner)) throw new Error("unknown parent"); return project; },
+		isProjectTrusted: (path) => path === project && trusted,
 		policy: () => structuredClone(current), delegated: (owner) => owner === "nested-child",
 		createWorktree: async (input) => {
 			const id = `tree-${trees.length + 1}`; const path = join(root, id); await mkdir(path);
@@ -99,6 +108,7 @@ async function setup(config: { maxConcurrent?: number; capacity?: () => number; 
 	for (const id of ["codex", "claude", "kimi"] as const) await manager.configure({ id, executable: binary });
 	return { root, project, dataDir, binary, adapter, manager, options, notifications, trees, activity: () => activity,
 		setPolicy: (policy: Partial<RuntimePermissionPolicy>) => { current = { ...current, ...policy }; },
+		setTrusted: (value: boolean) => { trusted = value; },
 		cleanup: async () => { await manager.close(); await rm(root, { recursive: true, force: true }); } };
 }
 
@@ -164,6 +174,59 @@ test("external manager exposes native approvals, preserves option IDs, and reche
 		assert.deepEqual(data.adapter.decisions, ["allow", "deny"]);
 		assert.equal(data.manager.snapshot(task.id).pendingApprovals.length, 0);
 		await assert.rejects(data.manager.respond(task.id, state.pendingApprovals[0].id, { decision: "allow" }), /已失效/);
+	} finally { await data.cleanup(); }
+});
+
+test("external acceptEdits allows Worktree edits and keeps shell approval when the parent later switches to auto", async () => {
+	const data = await setup();
+	try {
+		data.setPolicy({ mode: "acceptEdits" });
+		const task = await data.manager.start({ executor: "claude", description: "Check edit policy", prompt: "ask write" }, "parent-a");
+		await until(() => data.manager.snapshot(task.id), terminal, "worktree write approved");
+		assert.equal(data.adapter.opens[0]?.policy.mode, "acceptEdits");
+		assert.deepEqual(data.adapter.decisions, ["allow"]);
+
+		data.setPolicy({ mode: "auto" });
+		await data.manager.send({ taskId: task.id, message: "ask shell command" }, "parent-a");
+		const pending = await until(() => data.manager.snapshot(task.id), (state) => state.status === "waiting_for_input", "shell command requires approval");
+		assert.equal(data.adapter.opens.at(-1)?.policy.mode, "acceptEdits");
+		await data.manager.respond(task.id, pending.pendingApprovals[0].id, { decision: "deny" });
+		await until(() => data.manager.snapshot(task.id), terminal, "shell command denied");
+		assert.deepEqual(data.adapter.decisions, ["allow", "deny"]);
+	} finally { await data.cleanup(); }
+});
+
+test("external Plan launches on a read-only ceiling and never auto-approves shell commands", async () => {
+	const data = await setup();
+	try {
+		data.setPolicy({ mode: "plan" });
+		const task = await data.manager.start({ executor: "codex", description: "Inspect plan", prompt: "ask shell command" }, "parent-a");
+		const completed = await until(() => data.manager.snapshot(task.id), terminal, "plan command blocked");
+		assert.equal(task.readOnly, true);
+		assert.equal(task.worktreeId, undefined);
+		assert.equal(data.adapter.opens[0]?.policy.mode, "plan");
+		assert.deepEqual(data.adapter.decisions, ["deny"]);
+		assert.equal(completed.pendingApprovals.length, 0);
+	} finally { await data.cleanup(); }
+});
+
+test("Claude Worktree runs reevaluate the original project trust on explicit continuation", async () => {
+	const data = await setup();
+	try {
+		data.setTrusted(true);
+		const task = await data.manager.start({ executor: "claude", description: "Trusted project", prompt: "hold trust" }, "parent-a");
+		await until(() => data.adapter.releases.has("hold trust"), Boolean, "trusted native run");
+		assert.equal(data.manager.activeClaudeInProject(data.project), true);
+		assert.equal(task.workingDirectory, data.trees[0].path);
+		assert.equal(data.adapter.opens[0]?.projectTrusted, true);
+		data.adapter.releases.get("hold trust")!();
+		await until(() => data.manager.activeClaudeInProject(data.project), (running) => !running, "session closed");
+
+		data.setTrusted(false);
+		await data.manager.send({ taskId: task.id, message: "continue without project settings" }, "parent-a");
+		await until(() => data.manager.snapshot(task.id), terminal, "continuation after trust change");
+		assert.equal(data.adapter.opens.at(-1)?.projectTrusted, false);
+		assert.equal(data.adapter.opens.at(-1)?.cwd, task.workingDirectory);
 	} finally { await data.cleanup(); }
 });
 

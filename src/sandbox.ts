@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -10,6 +10,19 @@ let cachedSupport: Promise<{ supported: boolean; reason?: string }> | undefined;
 
 const SENSITIVE_HOME_SUBPATHS = [".ssh", ".aws", ".gnupg", ".kube", ".docker", "Library/Keychains"] as const;
 const SENSITIVE_HOME_LITERALS = [".netrc", ".npmrc", ".pypirc"] as const;
+const ENV_TEMPLATES = new Set([".env.example", ".env.sample", ".env.template"]);
+
+/** Check protected names used by the native file tools, alongside the command sandbox. */
+export function isProtectedFileToolPath(path: string, homeDir: string): boolean {
+	const fileName = basename(path).toLowerCase();
+	if (/^\.env(?:\.|$)/.test(fileName) && !ENV_TEMPLATES.has(fileName)) return true;
+	const fromHome = relative(homeDir, path).split(sep).join("/").toLowerCase();
+	return SENSITIVE_HOME_LITERALS.some((name) => fromHome === name) ||
+		SENSITIVE_HOME_SUBPATHS.some((name) => {
+			const protectedPath = name.toLowerCase();
+			return fromHome === protectedPath || fromHome.startsWith(`${protectedPath}/`);
+		});
+}
 
 export const SANDBOX_PROTECTED_READ_LABELS = [
 	"~/.ssh",
@@ -49,13 +62,15 @@ function isWithinOrSame(target: string, ancestor: string): boolean {
 	return t === a || t.startsWith(`${a}/`);
 }
 
+type WritablePath = string | { literal: string };
+
 /**
  * When `project` is inside a Git worktree (`.git` is a regular pointer file),
- * return the minimal Git metadata paths (`gitdir`, `objects`, `refs`, `logs`)
- * required so `git add` / `git commit` succeed under Seatbelt without exposing
+ * return the minimal Git metadata paths required for index, object and ref writes,
+ * including the packed refs file and its lock, without exposing
  * the main repository working tree, `.git/config`, or `.git/hooks`.
  */
-export async function resolveGitWorktreeWritablePaths(project: string): Promise<string[]> {
+export async function resolveGitWorktreeWritablePaths(project: string): Promise<WritablePath[]> {
 	let current = resolve(project);
 	for (let depth = 0; depth < 32; depth += 1) {
 		const dotGit = join(current, ".git");
@@ -69,15 +84,18 @@ export async function resolveGitWorktreeWritablePaths(project: string): Promise<
 				const gitDir = await realpath(resolve(current, match[1].trim()));
 				const gitDirStat = await lstat(gitDir);
 				if (!gitDirStat.isDirectory()) return [];
-				// Confirm this is a genuine worktree gitdir (has HEAD + commondir).
+				// A linked worktree's administrative directory must also point back to its .git file.
 				await lstat(join(gitDir, "HEAD"));
-				const extras = [gitDir];
+				const link = (await readFile(join(gitDir, "gitdir"), "utf8")).trim();
+				if (!link || await realpath(resolve(gitDir, link)) !== await realpath(dotGit)) return [];
+				const extras: WritablePath[] = [gitDir];
 				try {
 					const commonRaw = (await readFile(join(gitDir, "commondir"), "utf8")).trim();
 					if (commonRaw) {
 						const commonDir = await realpath(resolve(gitDir, commonRaw));
 						if ((await lstat(commonDir)).isDirectory()) {
 							extras.push(join(commonDir, "objects"), join(commonDir, "refs"), join(commonDir, "logs"));
+							extras.push({ literal: join(commonDir, "packed-refs") }, { literal: join(commonDir, "packed-refs.lock") });
 						}
 					}
 				} catch {
@@ -103,15 +121,17 @@ export async function resolveGitWorktreeWritablePaths(project: string): Promise<
  */
 export function buildSeatbeltProfile(
 	project: string,
-	extraWritablePaths: string[] = [],
+	extraWritablePaths: WritablePath[] = [],
 	offline = false,
 	homeDir: string = homedir(),
 ): string {
-	const roots = Array.from(
-		new Set([project, "/tmp", "/private/tmp", "/var/folders", "/private/var/folders", ...extraWritablePaths].filter(Boolean)),
-	)
-		.map((item) => `(subpath "${escapeSeatbeltString(item)}")`)
-		.join("\n    ");
+	const roots = Array.from(new Set(
+		[project, "/tmp", "/private/tmp", "/var/folders", "/private/var/folders", ...extraWritablePaths]
+			.filter(Boolean)
+			.map((item) => typeof item === "string"
+				? `(subpath "${escapeSeatbeltString(item)}")`
+				: `(literal "${escapeSeatbeltString(item.literal)}")`),
+	)).join("\n    ");
 	const deniedReads: string[] = [];
 	if (homeDir) {
 		for (const rel of SENSITIVE_HOME_SUBPATHS) {

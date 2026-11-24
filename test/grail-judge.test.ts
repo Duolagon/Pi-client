@@ -103,6 +103,8 @@ test("script detection reads test, check/typecheck and lint, skipping the npm pl
 	]);
 	assert.deepEqual(detectScripts({ scripts: { test: 'echo "Error: no test specified" && exit 1', check: "tsc" } }), [{ name: "check", script: "check" }]);
 	assert.deepEqual(detectScripts({ scripts: { test: "  " } }), []);
+	assert.deepEqual(detectScripts({ scripts: { test: "echo no test specified", "test:backend": "node --test" } }),
+		[{ name: "test", script: "test:backend" }]);
 	assert.deepEqual(detectScripts(null), []);
 	assert.deepEqual(detectScripts({ scripts: ["test"] }), []);
 	assert.equal(packageManager(["pnpm-lock.yaml"]), "pnpm");
@@ -169,6 +171,12 @@ const passing: GrailStepResults = {
 
 test("grade function covers every grade and stops at the first veto", () => {
 	assert.equal(gradeVerdict(passing).grade, "grail");
+	const assertionChanges = scanDistortions(parseDiffLines([
+		diff("test/x.test.ts", "@@ -1,2 +1,2 @@\n-  assert.equal(x, 1);\n+    assert.equal(x, 1);\n-  expect(y).toBe(2);\n+  expect(y).toBe(3);\n"),
+	]));
+	assert.equal(assertionChanges.length, 1);
+	assert.equal(assertionChanges[0].review, true);
+	assert.equal(gradeVerdict({ ...passing, distortion: { hits: assertionChanges } }).grade, "grail");
 	const granted = gradeVerdict({ ...passing, comparison: comparison({ lessCode: false }) });
 	assert.equal(granted.grade, "granted");
 	assert.match(granted.reasons.join(), /lessCode note/);

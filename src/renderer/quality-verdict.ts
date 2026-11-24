@@ -56,7 +56,7 @@ const SCRIPT_VERIFY_COMMAND = /^(?:npm|pnpm|yarn|bun|deno)\s+(?:run\s+)?(?:tests
 const RUNNER_VERIFY_COMMAND = /^(?:node\s+(?:[^\n]*?\s)?--test\b|python3?\s+-m\s+(?:pytest|unittest)\b)/i;
 const SHELL_CONTROL = /[\n;&|<>`]|\$\(/;
 const MUTATING_CHECK_OPTIONS = /(?:^|\s)--(?:fix|fix-only|write|apply|update-snapshots?)(?:[=\s]|$)/i;
-const READ_ONLY_COMMAND = /^(?:pwd|ls|cat|head|tail|wc|rg|grep|git\s+(?:status|diff|log|show|ls-files|rev-parse))\b/;
+const READ_ONLY_COMMAND = /^(?:pwd|ls|cat|head|tail|wc|rg|grep|find|git\s+(?:status|diff|log|show|ls-files|rev-parse))\b/;
 
 export function isVerifyCommand(command: string): boolean {
 	const text = command.trim();
@@ -66,7 +66,11 @@ export function isVerifyCommand(command: string): boolean {
 }
 
 function mayEditWithShell(command: string): boolean {
-	return SHELL_CONTROL.test(command) || !READ_ONLY_COMMAND.test(command.trim());
+	if (/[<>`]|\$\(/.test(command)) return true;
+	return command.trim().split(/&&|\|\||[;|\n]/).some((segment) =>
+		!READ_ONLY_COMMAND.test(segment.trim()) ||
+		/(?:^|\s)(?:-exec(?:dir)?|-ok(?:dir)?|-delete|-fprint\w*|--pre(?:=|\s)|--ext-diff|--output(?:=|\s))(?:\s|$|=)/.test(segment),
+	);
 }
 
 const USER_DENIAL_TEXT = "用户未批准此操作。";
@@ -87,6 +91,25 @@ function bashCommandOf(call: Extract<Assistant["content"][number], { type: "tool
 	return typeof args.command === "string" ? args.command : null;
 }
 
+type ToolCall = Extract<Assistant["content"][number], { type: "toolCall" }>;
+
+function possibleWrite(call: ToolCall, result: ToolResult | undefined): boolean {
+	if (!result || isUserDenial(result)) return false;
+	if (EDIT_TOOLS.has(toolName(call))) return !result.isError;
+	const command = bashCommandOf(call);
+	return command !== null && !isVerifyCommand(command) && mayEditWithShell(command);
+}
+
+function resultIndex(messages: readonly Message[]): Map<string, ToolResult> {
+	return new Map(messages.flatMap((message) => message.role === "toolResult" ? [[message.toolCallId, message]] : []));
+}
+
+function toolAttemptKey(call: ToolCall): string {
+	const { path, file_path, notebook_path } = (call.arguments ?? {}) as Record<string, unknown>;
+	const target = path ?? file_path ?? notebook_path ?? bashCommandOf(call);
+	return typeof target === "string" ? `${toolName(call)}:${target.trim()}` : call.id;
+}
+
 interface BackgroundCheckExit {
 	status: "exited" | "error" | "stopped" | "timed_out";
 	exitCode?: number;
@@ -103,6 +126,7 @@ interface VerificationEvidence {
 export function collectVerificationEvidence(messages: readonly Message[], monitors: readonly MonitorRecord[] = []): VerificationEvidence {
 	const shellExits = new Map<string, BackgroundCheckExit>();
 	const writeTimes: number[] = [];
+	const results = resultIndex(messages);
 	for (const message of messages) {
 		if (message.role === "custom" && message.customType === "desktop_shell_event") {
 			const details = message.details as {
@@ -120,13 +144,13 @@ export function collectVerificationEvidence(messages: readonly Message[], monito
 				startedAt: typeof details.started_at === "number" ? details.started_at : undefined,
 				finishedAt: typeof details.finished_at === "number" ? details.finished_at : message.timestamp,
 			});
-		} else if (
-			(message.role === "assistant" && message.content.some((call) => {
-				if (call.type !== "toolCall") return false;
-				const command = bashCommandOf(call);
-				return EDIT_TOOLS.has(toolName(call)) || (command !== null && !isVerifyCommand(command) && mayEditWithShell(command));
-			})) || (message.role === "bashExecution" && !isVerifyCommand(message.command) && mayEditWithShell(message.command))
-		) {
+		} else if (message.role === "assistant") {
+			for (const call of message.content) {
+				if (call.type !== "toolCall") continue;
+				const result = results.get(call.id);
+				if (result && possibleWrite(call, result)) writeTimes.push(result.timestamp);
+			}
+		} else if (message.role === "bashExecution" && !isVerifyCommand(message.command) && mayEditWithShell(message.command)) {
 			writeTimes.push(message.timestamp);
 		}
 	}
@@ -156,7 +180,9 @@ export function scoreTurn(
 	evidence: VerificationEvidence = collectVerificationEvidence(turnMessages),
 ): QualityVerdict {
 	let editVersion = 0;
-	let toolErrors = 0;
+	const toolErrors = new Set<string>();
+	const attempts = new Map<string, string>();
+	const outcomes = resultIndex(turnMessages);
 	let modelError = false;
 	let aborted = false;
 	let edited = false;
@@ -170,6 +196,7 @@ export function scoreTurn(
 				aborted ||= message.stopReason === "aborted";
 				for (const call of message.content) {
 					if (call.type !== "toolCall") continue;
+						attempts.set(call.id, toolAttemptKey(call));
 					const command = bashCommandOf(call);
 					if (command && isVerifyCommand(command)) {
 						runningChecks.set(call.id, {
@@ -177,7 +204,7 @@ export function scoreTurn(
 							version: editVersion,
 							background: (call.arguments as { run_in_background?: unknown }).run_in_background === true,
 						});
-					} else if (EDIT_TOOLS.has(toolName(call)) || (command && mayEditWithShell(command))) {
+						} else if (possibleWrite(call, outcomes.get(call.id))) {
 						editVersion++;
 						writes.add(call.id);
 						edited ||= EDIT_TOOLS.has(toolName(call));
@@ -185,9 +212,13 @@ export function scoreTurn(
 				}
 				break;
 			case "toolResult": {
-				if (message.isError && !isUserDenial(message)) toolErrors++;
-				if (writes.has(message.toolCallId) && !isUserDenial(message)) latestWriteEnd = Math.max(latestWriteEnd, message.timestamp);
 				const entry = runningChecks.get(message.toolCallId);
+				if (!entry) {
+					const key = attempts.get(message.toolCallId) ?? message.toolCallId;
+					if (message.isError && !isUserDenial(message)) toolErrors.add(key);
+					else if (!message.isError) toolErrors.delete(key);
+				}
+				if (writes.has(message.toolCallId)) latestWriteEnd = Math.max(latestWriteEnd, message.timestamp);
 				if (entry) {
 					entry.startedAt = message.timestamp - (message.durationMs ?? 0);
 					const details = message.details as { exitCode?: unknown; background?: unknown; shell_id?: unknown } | undefined;
@@ -203,18 +234,21 @@ export function scoreTurn(
 			}
 			case "bashExecution": {
 				if (!isVerifyCommand(message.command)) {
-					if (mayEditWithShell(message.command)) editVersion++;
+						if (mayEditWithShell(message.command)) {
+							editVersion++;
+							latestWriteEnd = Math.max(latestWriteEnd, message.timestamp);
+						}
 					break;
 				}
 				const id = `shell-${message.timestamp}-${runningChecks.size}`;
 				const exitCode = exitCodeOf(message.exitCode);
 				const status = message.cancelled ? "stopped" : exitStatus(exitCode, false);
-				runningChecks.set(id, { check: { id, command: message.command, exitCode, status }, version: editVersion });
+					runningChecks.set(id, { check: { id, command: message.command, exitCode, status }, version: editVersion, startedAt: message.timestamp });
 				break;
 			}
 		}
 	}
-	const checks = [...runningChecks.values()].map(({ check, version, startedAt }) => {
+	const assessed = [...runningChecks.values()].map(({ check, version, startedAt }) => {
 		const shell = check.shellId ? evidence.shellExits.get(check.shellId) : undefined;
 		const started = shell?.startedAt ?? startedAt;
 		if (shell) {
@@ -222,19 +256,27 @@ export function scoreTurn(
 			check.status = shell.status === "timed_out" || shell.status === "stopped" ? shell.status
 				: exitStatus(shell.exitCode, shell.status === "error");
 		}
-		if (check.status !== "passed") return check;
 		const wroteDuringShell = shell && started !== undefined && evidence.writeTimes.some((time) => time > started && time <= shell.finishedAt);
-		if (version !== editVersion || (started !== undefined && latestWriteEnd > started) || wroteDuringShell) {
+		if (check.status !== "pending" && (version !== editVersion || (started !== undefined && latestWriteEnd > started) || wroteDuringShell)) {
 			check.status = "stale";
 		}
+		return { check, started: started ?? -Infinity };
+	});
+	const latestPass = new Map<string, number>();
+	for (const { check, started } of assessed)
+		if (check.status === "passed") latestPass.set(check.command, Math.max(latestPass.get(check.command) ?? -Infinity, started));
+	const checks = assessed.map(({ check, started }) => {
+		if (["failed", "stopped", "timed_out"].includes(check.status) && (latestPass.get(check.command) ?? -Infinity) > started)
+			check.status = "stale";
 		return check;
 	});
 	const verifyPassed = checks.some((check) => check.status === "passed");
-	const signals = { edited, verifyRan: checks.length > 0, verifyPassed, toolErrors, modelError, aborted };
+	const unresolvedErrors = toolErrors.size;
+	const signals = { edited, verifyRan: checks.length > 0, verifyPassed, toolErrors: unresolvedErrors, modelError, aborted };
 	const result = (omen: QualityOmen, label: string, reason: string): QualityVerdict => ({ omen, label, reason, signals, checks });
 	if (aborted) return result("none", "", "本次回复已停止");
 	if (modelError) return result("problem", "有报错", "模型返回错误");
-	if (toolErrors || checks.some((check) => ["failed", "stopped", "timed_out"].includes(check.status)))
+	if (unresolvedErrors || checks.some((check) => ["failed", "stopped", "timed_out"].includes(check.status)))
 		return result("problem", "有检查未通过", "展开查看失败命令和工具记录");
 	if (!signals.edited) return result("none", "", "本轮无代码改动");
 	if (verifyPassed && !checks.some((check) => check.status === "pending"))

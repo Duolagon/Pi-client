@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { test } from "node:test";
-import { cp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -23,7 +23,7 @@ async function setup() {
 	await writeFile(join(project, "src", "add.mjs"), "export function add(a, b) {\n\treturn 0;\n}\n");
 	await writeFile(
 		join(project, "test", "add.test.mjs"),
-		'import assert from "node:assert/strict";\nimport { test } from "node:test";\nimport { add } from "../src/add.mjs";\ntest("add", () => assert.equal(add(1, 2), 3));\n',
+		'import assert from "node:assert/strict";\nimport { writeFileSync } from "node:fs";\nimport { test } from "node:test";\nimport { add } from "../src/add.mjs";\ntest("add", () => { writeFileSync("grail-local-artifact", "test"); assert.equal(add(1, 2), 3); });\n',
 	);
 	await exec("git", ["init", "-q", project]);
 	await exec("git", ["add", "."], { cwd: project });
@@ -87,6 +87,7 @@ test("Grail judgement: grail, 愿望达成, failing test, cancel and seal, never
 		};
 
 		const first = await judge();
+		await assert.rejects(access(join(fixture.project, "grail-local-artifact")), { code: "ENOENT" });
 		assert.equal(first.grade, "grail", JSON.stringify(first.reasons) + (first.steps.objective?.runs[0]?.output ?? ""));
 		assert.equal(first.steps.objective?.status, "pass");
 		assert.ok((first.steps.objective?.runs[0].testCount ?? 0) >= 1);
@@ -102,6 +103,7 @@ test("Grail judgement: grail, 愿望达成, failing test, cancel and seal, never
 		assert.doesNotMatch(blind.prompt, /a \+ b/);
 		assert.notEqual(resolve(blind.cwd), resolve(fixture.project));
 		assert.match(calls.find((call) => call.step === "comparison")!.prompt, /a \+ b/);
+		assert.notEqual(resolve(calls.find((call) => call.step === "comparison")!.cwd), resolve(fixture.project));
 
 		await writeFile(control, "granted");
 		const second = await judge();

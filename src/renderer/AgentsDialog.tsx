@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Bot, Plus, Save, Trash2 } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
+import { useConfirmation } from "./ConfirmationDialog.tsx";
 import type {
 	AgentDefinition,
 	AgentMemoryScope,
@@ -182,9 +183,10 @@ export function AgentsDialog({
 		}
 	};
 
+	const { confirm, confirmation } = useConfirmation();
 	const remove = async () => {
 		if (!selected || builtin || !selected.removable) return;
-		if (!window.confirm(`删除 Agent ${selected.name}？`)) return;
+		if (!await confirm({ title: "删除 Agent", message: `移除「${selected.name}」的自定义定义。`, confirmLabel: "删除", destructive: true })) return;
 		setBusy(true);
 		setError("");
 		try {
@@ -462,6 +464,7 @@ export function AgentsDialog({
 					</div>
 				</form>
 			</div>
+			{confirmation}
 		</Modal>
 	);
 }

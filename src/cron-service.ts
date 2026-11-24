@@ -289,6 +289,7 @@ export type CronDeliverFn = (
 		display?: boolean;
 		idleOnly?: boolean;
 	},
+	project?: string,
 ) => Promise<NotificationDisposition | "unavailable">;
 
 export class CronService {
@@ -361,12 +362,12 @@ export class CronService {
 			this.loadedProjects.add(project);
 			const file = await managedFile(project, [".pi"], "scheduled_tasks.json", false).catch(() => undefined);
 			if (!file) return;
-			await this.readFileIntoMemory(file);
+			await this.readFileIntoMemory(file, project);
 			this.scheduleNextTick();
 		});
 	}
 
-	private async readFileIntoMemory(file: string): Promise<void> {
+	private async readFileIntoMemory(file: string, project?: string): Promise<void> {
 		try {
 			const parsed = JSON.parse(await readFile(file, "utf8")) as unknown;
 			const obj = assertObject(parsed, "scheduled_tasks.json");
@@ -374,7 +375,7 @@ export class CronService {
 			const now = Date.now();
 			for (const raw of obj.jobs) {
 				const job = validateStoredJob(raw);
-				if (!job || now >= job.expiresAt) continue;
+				if (!job || !job.durable || job.project !== project || this.jobs.has(job.id) || now >= job.expiresAt) continue;
 				this.jobs.set(job.id, job);
 			}
 		} catch {
@@ -435,7 +436,7 @@ export class CronService {
 			if (params.project && this.isProjectTrusted(params.project) && !this.loadedProjects.has(params.project)) {
 				this.loadedProjects.add(params.project);
 				const file = await managedFile(params.project, [".pi"], "scheduled_tasks.json", false).catch(() => undefined);
-				if (file) await this.readFileIntoMemory(file);
+				if (file) await this.readFileIntoMemory(file, params.project);
 			}
 			if (!this.globalLoaded) {
 				this.globalLoaded = true;
@@ -593,7 +594,7 @@ export class CronService {
 		if (this.closed || !this.jobs.size || !this.isEnabled()) return;
 		let earliest = Infinity;
 		for (const job of this.jobs.values()) {
-			if (!job.enabled) continue;
+			if (!job.enabled || (job.durable && job.project && !this.isProjectTrusted(job.project))) continue;
 			if (this.pendingOneShotRetries.has(job.id)) continue;
 			const dueAt = Math.max(job.nextRunAt, this.unavailableUntil.get(job.id) ?? 0);
 			if (dueAt < earliest) earliest = dueAt;
@@ -622,7 +623,7 @@ export class CronService {
 					changed = true;
 					continue;
 				}
-				if (!this.isEnabled() || !job.enabled) continue;
+				if (!this.isEnabled() || !job.enabled || (job.durable && job.project && !this.isProjectTrusted(job.project))) continue;
 				const retryBackoff = this.unavailableUntil.get(job.id) ?? 0;
 				if (retryBackoff > now && !settledConversationId) continue;
 				const isRetryMatch = settledConversationId && this.pendingOneShotRetries.has(job.id) && job.conversationId === settledConversationId;
@@ -646,7 +647,7 @@ export class CronService {
 					triggerTurn: true,
 					display: true,
 					idleOnly: true,
-				}).catch(() => "unavailable" as const);
+				}, job.project).catch(() => "unavailable" as const);
 
 				if (disposition === "deferred") {
 					if (!job.recurring) {

@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import vm from "node:vm";
 
 type Transport = {
@@ -105,7 +106,8 @@ async function main() {
 		});
 	};
 
-	const scopeStorage = new AsyncLocalStorage<{ prefix: string; counter: { value: number } }>();
+	const scopeStorage = new AsyncLocalStorage<{ prefix: string; counter: { value: number }; workspace: string }>();
+	const workspaceKey = (prefix: string) => createHash("sha256").update(prefix).digest("hex");
 	const nextStepKey = (explicitKey?: string): string => {
 		const scope = scopeStorage.getStore();
 		const prefix = scope?.prefix ?? "root";
@@ -114,7 +116,7 @@ async function main() {
 		return `${prefix}#${index}`;
 	};
 
-	const rootScope = { prefix: "root", counter: { value: 0 } };
+	const rootScope = { prefix: "root", counter: { value: 0 }, workspace: workspaceKey("root") };
 
 	const executeScript = async (script: string) => {
 		const sandbox: Record<string, unknown> = {
@@ -125,7 +127,7 @@ async function main() {
 				const opts = input as Record<string, unknown>;
 				const explicitKey = typeof opts.key === "string" && opts.key.trim() ? opts.key.trim() : undefined;
 				const stepKey = nextStepKey(explicitKey);
-				return rpc("agent", { stepKey, options: opts });
+				return rpc("agent", { stepKey, workspaceKey: (scopeStorage.getStore() ?? rootScope).workspace, options: opts });
 			},
 			parallel: async (items: unknown[]) => {
 				if (!Array.isArray(items)) throw new Error("parallel(tasks) requires an array");
@@ -134,7 +136,8 @@ async function main() {
 				return Promise.all(
 					items.map((item, idx) => {
 						if (typeof item === "function") {
-							return scopeStorage.run({ prefix: `${base}[${idx}]`, counter: { value: 0 } }, () =>
+							const prefix = `${base}[${idx}]`;
+							return scopeStorage.run({ prefix, counter: { value: 0 }, workspace: workspaceKey(prefix) }, () =>
 								Promise.resolve((item as () => unknown)()),
 							);
 						}
@@ -167,7 +170,7 @@ async function main() {
 				await rpc("phase_start", { name: cleanName });
 				try {
 					const result = await scopeStorage.run(
-						{ prefix: `${parent.prefix}/phase:${cleanName}#${seq}`, counter: { value: 0 } },
+						{ prefix: `${parent.prefix}/phase:${cleanName}#${seq}`, counter: { value: 0 }, workspace: parent.workspace },
 						() => Promise.resolve((fn as () => unknown)()),
 					);
 					await rpc("phase_end", { name: cleanName, status: "completed" });

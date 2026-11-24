@@ -10,7 +10,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { GitCheckpoint, GitCheckpointDiff, GitRestoreResult } from "./git-types.ts";
 import type { TerminalCreateInput, TerminalEvent, TerminalInfo, TerminalReplay } from "./terminal-types.ts";
-import type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRemoveResult } from "./worktree-types.ts";
+import type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRemoveOptions, WorktreeRemoveResult } from "./worktree-types.ts";
 import type { ChildApprovalRequest, DesktopTask, TaskEvent, TaskPendingApproval, TaskProgress, TaskProgressActivity, TaskSendInput, TaskSendResult, TaskStartInput } from "./task-types.ts";
 import type { DesktopSessionAPI } from "./session-types.ts";
 import type { LiveTranscript } from "./transcript.ts";
@@ -54,7 +54,7 @@ export type * from "./session-history-types.ts";
 
 export type { GitCheckpoint, GitCheckpointDiff, GitRestoreResult } from "./git-types.ts";
 export type { TerminalCreateInput, TerminalEvent, TerminalInfo, TerminalReplay } from "./terminal-types.ts";
-export type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRemoveResult } from "./worktree-types.ts";
+export type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRemoveOptions, WorktreeRemoveResult } from "./worktree-types.ts";
 export type { ChildApprovalRequest, DesktopTask, TaskEvent, TaskPendingApproval, TaskProgress, TaskProgressActivity, TaskSendInput, TaskSendResult, TaskStartInput, TaskStatus } from "./task-types.ts";
 
 export interface CheckpointInput {
@@ -132,7 +132,7 @@ export interface DesktopTaskAPI {
 export interface DesktopWorktreeAPI {
 	create(input: WorktreeCreateInput): Promise<WorktreeInfo>;
 	list(project?: string): Promise<WorktreeInfo[]>;
-	remove(id: string): Promise<WorktreeRemoveResult>;
+	remove(id: string, options?: WorktreeRemoveOptions): Promise<WorktreeRemoveResult>;
 	merge(id: string): Promise<WorktreeMergeResult>;
 }
 
@@ -228,6 +228,8 @@ export interface Conversation {
 	group?: string;
 	/** Additional workspace directories attached via /add-dir (read/write allowed + synced to Seatbelt sandbox). */
 	additionalDirs?: string[];
+	/** Conversation override for the default permission mode. */
+	permissionMode?: PermissionMode;
 	/** Active or last-run /goal autonomous continuation state. */
 	goal?: GoalState;
 	updatedAt: number;
@@ -440,6 +442,8 @@ export interface GrailDistortionHit {
 	side: "+" | "-";
 	rule: string;
 	text: string;
+	/** A changed assertion needs review and does not determine the verdict on its own. */
+	review?: true;
 }
 export interface GrailDistortionResult {
 	hits: GrailDistortionHit[];
@@ -757,6 +761,7 @@ export interface DesktopAPI {
 	checkPreview(url: string, mobile: boolean): Promise<PreviewCheck>;
 	/** True when something answers on the local preview address. */
 	probePreview(url: string): Promise<boolean>;
+	defaultPreviewUrl(conversationId: string): Promise<string>;
 	inspectCode(conversationId: string, path: string, at?: CodePosition): Promise<CodeIntelligence>;
 	sandboxStatus(): Promise<SandboxStatus>;
 	/** Local environment diagnosis (/doctor); no network or model requests. */
@@ -813,6 +818,7 @@ export interface DesktopAPI {
 		apiKey?: string;
 		keyCommand?: string;
 		headers?: Record<string, string>;
+		useAsDefault?: boolean;
 		baseUrl?: string;
 		modelId?: string;
 		api?: ConnectionProtocol;

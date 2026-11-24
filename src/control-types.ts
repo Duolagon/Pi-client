@@ -1,5 +1,6 @@
 import type { DesktopToolInfo } from "./tool-control-types.ts";
 import type { PermissionRule, RuntimePermissionPolicy } from "./permission-types.ts";
+import type { PermissionMode, Snapshot } from "./shared.ts";
 
 export interface ControlScope {
 	scope?: "global" | "project" | "conversation";
@@ -36,6 +37,7 @@ export interface DesktopToolsAPI {
 	onEvent(listener: (event: ControlEvent) => void): () => void;
 }
 export interface DesktopPermissionsAPI {
+	setMode(conversationId: string, mode: PermissionMode): Promise<Snapshot>;
 	list(conversationId?: string): Promise<PermissionSettings>;
 	upsert(rule: PermissionRule): Promise<PermissionSettings>;
 	remove(id: string): Promise<PermissionSettings>;

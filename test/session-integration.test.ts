@@ -263,7 +263,7 @@ test(
 				join(data.fixture.agentDir, "extensions", "cancel-fork.js"),
 				'export default function (pi) { pi.on("session_before_fork", async () => ({ cancel: true })); }\n',
 			);
-			await data.service.saveSettings({ permission: "auto", theme: "light" });
+			await data.service.saveSettings({ permission: "auto", theme: "light", agentDir: data.fixture.agentDir });
 			const parent = structuredClone(await data.service.snapshot());
 			assert.ok(parent.active?.sessionFile);
 			const bytes = await readFile(parent.active.sessionFile);

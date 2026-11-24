@@ -24,6 +24,7 @@ export interface WorkflowAgentStepRequest {
 	conversationId: string;
 	rootConversationId: string;
 	stepKey: string;
+	workspaceKey: string;
 	prompt: string;
 	description: string;
 	subagentType?: string;
@@ -34,6 +35,8 @@ export interface WorkflowAgentStepRequest {
 
 export interface WorkflowAgentStepResult {
 	taskId: string;
+	worktreeId?: string;
+	workingDirectory?: string;
 	output: string;
 	structuredOutput?: unknown;
 	usage?: { totalTokens: number; cost: number };
@@ -70,6 +73,12 @@ interface WorkerHandle {
 	onMessage(fn: (msg: unknown) => void): void;
 	onExit(fn: (code: number | null) => void): void;
 	kill(): void;
+}
+
+interface ActiveWorkflow {
+	worker?: WorkerHandle;
+	abort: AbortController;
+	callerSignal?: AbortSignal;
 }
 
 async function spawnWorker(workerPath: string): Promise<WorkerHandle> {
@@ -128,7 +137,7 @@ export class WorkflowService {
 	private callbacks: WorkflowCallbacks;
 	private workflows = new Map<string, WorkflowRecord>();
 	private alwaysApprovedRoots = new Set<string>();
-	private activeWorkers = new Map<string, { worker: WorkerHandle; abort: AbortController }>();
+	private activeRuns = new Map<string, ActiveWorkflow>();
 	private approvalWaiters = new Map<string, { resolve: (decision: WorkflowApprovalDecision) => void }>();
 	private runWaiters = new Map<string, Set<() => void>>();
 	private listeners = new Set<(event: WorkflowEvent) => void>();
@@ -228,8 +237,10 @@ export class WorkflowService {
 		rootConversationId: string;
 		project: string;
 		input: WorkflowRunInput;
+		callerSignal?: AbortSignal;
 	}): Promise<WorkflowRecord> {
 		if (this.closed) throw new Error("Workflow service is closed");
+		params.callerSignal?.throwIfAborted();
 		const script = typeof params.input.script === "string" ? params.input.script : "";
 		if (!script.trim() || script.length > 256 * 1024 || script.includes("\0")) {
 			throw new Error("Invalid workflow script");
@@ -265,15 +276,22 @@ export class WorkflowService {
 		this.workflows.set(id, record);
 		await this.serialize(id, () => this.saveWorkflow(record));
 		this.emit(record);
-		void this.executeWorkflow(id, false);
+		void this.executeWorkflow(id, false, params.callerSignal);
 		return structuredClone(record);
+	}
+
+	/** A shared child may use the parent's directory only while its tool invocation waits. */
+	hasWaitingCaller(id: string, conversationId: string): boolean {
+		const run = this.activeRuns.get(id);
+		return Boolean(run?.callerSignal && !run.callerSignal.aborted && !run.abort.signal.aborted &&
+			this.workflows.get(id)?.conversationId === conversationId);
 	}
 
 	async resume(id: string): Promise<WorkflowRecord> {
 		if (this.closed) throw new Error("Workflow service is closed");
 		const record = this.workflows.get(id);
 		if (!record) throw new Error(`Workflow not found: ${id}`);
-		if (this.activeWorkers.has(id)) throw new Error("Workflow is already running");
+		if (this.activeRuns.has(id)) throw new Error("Workflow is already running");
 		if (record.status === "completed") return structuredClone(record);
 
 		record.status = "running";
@@ -287,6 +305,7 @@ export class WorkflowService {
 	}
 
 	async wait(id: string, signal?: AbortSignal): Promise<WorkflowRecord> {
+		signal?.throwIfAborted();
 		const existing = this.workflows.get(id);
 		if (!existing) throw new Error(`Workflow not found: ${id}`);
 		if (["completed", "failed", "cancelled"].includes(existing.status)) {
@@ -358,11 +377,14 @@ export class WorkflowService {
 	async stop(id: string): Promise<WorkflowRecord> {
 		const record = this.workflows.get(id);
 		if (!record) throw new Error(`Workflow not found: ${id}`);
-		const active = this.activeWorkers.get(id);
-		if (active) {
-			active.abort.abort();
-			active.worker.kill();
-			this.activeWorkers.delete(id);
+		const active = this.activeRuns.get(id);
+		active?.abort.abort();
+		active?.worker?.kill();
+		const stopping = !["completed", "failed", "cancelled"].includes(record.status);
+		if (stopping) {
+			record.status = "cancelled";
+			record.error = "工作流已停止。";
+			record.updatedAt = Date.now();
 		}
 		if (record.pendingApproval) {
 			const reqId = record.pendingApproval.id;
@@ -374,10 +396,7 @@ export class WorkflowService {
 			}
 		}
 		await this.callbacks.cancelWorkflowTasks?.(id).catch(() => {});
-		if (!["completed", "failed", "cancelled"].includes(record.status)) {
-			record.status = "cancelled";
-			record.error = "工作流已停止。";
-			record.updatedAt = Date.now();
+		if (stopping) {
 			await this.serialize(id, () => this.saveWorkflow(record));
 			this.emit(record);
 			this.notifyWaiters(id);
@@ -441,6 +460,7 @@ export class WorkflowService {
 		record: WorkflowRecord,
 		opts: Record<string, unknown>,
 		stepKey: string,
+		workspaceKey: string,
 		signal: AbortSignal,
 	): Promise<WorkflowJournalEntry> {
 		const prompt = typeof opts.prompt === "string" && opts.prompt.trim() ? opts.prompt.trim() : "";
@@ -473,6 +493,7 @@ export class WorkflowService {
 				conversationId: record.conversationId,
 				rootConversationId: record.rootConversationId,
 				stepKey,
+				workspaceKey,
 				prompt,
 				description,
 				subagentType,
@@ -521,6 +542,8 @@ export class WorkflowService {
 			stepKey,
 			status: "completed",
 			taskId: stepResult.taskId,
+			...(stepResult.worktreeId ? { worktreeId: stepResult.worktreeId } : {}),
+			...(stepResult.workingDirectory ? { workingDirectory: stepResult.workingDirectory } : {}),
 			output: stepResult.output,
 			...(validatedStructured !== undefined ? { structuredOutput: validatedStructured } : {}),
 			usage: { totalTokens, cost: totalCost },
@@ -528,12 +551,21 @@ export class WorkflowService {
 		};
 	}
 
-	private async executeWorkflow(id: string, isResume: boolean): Promise<void> {
+	private async executeWorkflow(id: string, isResume: boolean, callerSignal?: AbortSignal): Promise<void> {
 		const record = this.workflows.get(id);
-		if (!record) return;
+		if (!record || record.status !== "running" || this.closed) return;
 		const abort = new AbortController();
+		const cancelled = () => abort.signal.aborted || record.status === "cancelled";
+		const active: ActiveWorkflow = { abort, callerSignal };
+		this.activeRuns.set(id, active);
+		const stopWhenCallerAborts = () => { void this.stop(id).catch(() => {}); };
+		callerSignal?.addEventListener("abort", stopWhenCallerAborts, { once: true });
 
 		try {
+			if (callerSignal?.aborted) {
+				await this.stop(id);
+				return;
+			}
 			await this.requireApproval(
 				record,
 				"start_workflow",
@@ -543,8 +575,10 @@ export class WorkflowService {
 				abort.signal,
 			);
 
+			abort.signal.throwIfAborted();
 			const worker = await spawnWorker(this.callbacks.workerPath());
-			this.activeWorkers.set(id, { worker, abort });
+			active.worker = worker;
+			abort.signal.throwIfAborted();
 
 			const done = await new Promise<{ ok: boolean; result?: unknown; error?: string }>((resolve) => {
 				let finished = false;
@@ -559,7 +593,7 @@ export class WorkflowService {
 				});
 
 				worker.onMessage((raw) => {
-					if (!raw || typeof raw !== "object") return;
+					if (abort.signal.aborted || !raw || typeof raw !== "object") return;
 					const msg = raw as Record<string, unknown>;
 					if (msg.type === "ready") {
 						worker.send({ type: "start", script: record.script });
@@ -578,23 +612,22 @@ export class WorkflowService {
 						const method = String(msg.method ?? "");
 						const payload = (msg.payload ?? {}) as Record<string, unknown>;
 						void this.handleWorkerRpc(record, method, payload, abort.signal)
-							.then((result) => worker.send({ type: "rpc_result", id: rpcId, ok: true, result }))
-							.catch((err) =>
-								worker.send({
+							.then((result) => {
+								if (!abort.signal.aborted) worker.send({ type: "rpc_result", id: rpcId, ok: true, result });
+							})
+							.catch((err) => {
+								if (!abort.signal.aborted) worker.send({
 									type: "rpc_result",
 									id: rpcId,
 									ok: false,
 									error: err instanceof Error ? err.message : String(err),
-								}),
-							);
+								});
+							});
 					}
 				});
 			});
 
-			this.activeWorkers.delete(id);
-			worker.kill();
-
-			if (abort.signal.aborted || record.status === "cancelled") {
+			if (cancelled()) {
 				return;
 			}
 			if (done.ok) {
@@ -626,8 +659,7 @@ export class WorkflowService {
 					.catch(() => {});
 			}
 		} catch (err) {
-			this.activeWorkers.delete(id);
-			if (record.status !== "cancelled") {
+			if (!cancelled()) {
 				record.status = "failed";
 				record.error = err instanceof Error ? err.message : String(err);
 				record.updatedAt = Date.now();
@@ -635,6 +667,10 @@ export class WorkflowService {
 				this.emit(record);
 			}
 			this.notifyWaiters(id);
+		} finally {
+			active.worker?.kill();
+			this.activeRuns.delete(id);
+			callerSignal?.removeEventListener("abort", stopWhenCallerAborts);
 		}
 	}
 
@@ -681,14 +717,18 @@ export class WorkflowService {
 		}
 		if (method === "agent") {
 			const stepKey = String(payload.stepKey ?? "");
+			const workspaceKey = String(payload.workspaceKey ?? "");
 			const opts = (payload.options ?? {}) as Record<string, unknown>;
 			if (!stepKey) throw new Error("Missing workflow agent stepKey");
+			if (!/^[a-f0-9]{64}$/.test(workspaceKey)) throw new Error("Invalid workflow agent workspace key");
 
 			// Deterministic journal replay: already-completed steps return cached outcome without re-spawning
 			const cached = record.journal[stepKey];
 			if (cached && cached.status === "completed") {
 				return {
 					taskId: cached.taskId ?? "",
+					...(cached.worktreeId ? { worktreeId: cached.worktreeId } : {}),
+					...(cached.workingDirectory ? { workingDirectory: cached.workingDirectory } : {}),
 					output: cached.output ?? "",
 					...(cached.structuredOutput !== undefined ? { structuredOutput: cached.structuredOutput } : {}),
 					...(cached.usage ? { usage: cached.usage } : {}),
@@ -696,7 +736,7 @@ export class WorkflowService {
 				};
 			}
 
-			const entry = await this.executeAgentWithSchemaRetries(record, opts, stepKey, signal);
+			const entry = await this.executeAgentWithSchemaRetries(record, opts, stepKey, workspaceKey, signal);
 			await this.serialize(record.id, async () => {
 				record.journal[stepKey] = entry;
 				record.updatedAt = Date.now();
@@ -705,6 +745,8 @@ export class WorkflowService {
 			this.emit(record);
 			return {
 				taskId: entry.taskId ?? "",
+				...(entry.worktreeId ? { worktreeId: entry.worktreeId } : {}),
+				...(entry.workingDirectory ? { workingDirectory: entry.workingDirectory } : {}),
 				output: entry.output ?? "",
 				...(entry.structuredOutput !== undefined ? { structuredOutput: entry.structuredOutput } : {}),
 				...(entry.usage ? { usage: entry.usage } : {}),
@@ -716,11 +758,11 @@ export class WorkflowService {
 
 	async close(): Promise<void> {
 		this.closed = true;
-		for (const [, active] of this.activeWorkers) {
+		for (const [, active] of this.activeRuns) {
 			active.abort.abort();
-			active.worker.kill();
+			active.worker?.kill();
 		}
-		this.activeWorkers.clear();
+		this.activeRuns.clear();
 		for (const [reqId, waiter] of this.approvalWaiters) {
 			this.approvalWaiters.delete(reqId);
 			waiter.resolve("deny");

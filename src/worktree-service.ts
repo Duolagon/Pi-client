@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
-import type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRemoveResult } from "./worktree-types.ts";
+import { managedDirectory } from "./managed-path.ts";
+import type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRemoveOptions, WorktreeRemoveResult } from "./worktree-types.ts";
 
 const exec = promisify(execFile);
 const idPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -62,21 +63,12 @@ export class WorktreeService {
 				throw new Error("Git 基准引用无效。");
 			const resolveCommit = async (ref: string): Promise<string> =>
 				(await this.git(repository, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`])).trim();
-			let baseRef = explicitBaseRef || "origin/HEAD";
+			const baseRef = explicitBaseRef || "HEAD";
 			let baseCommit: string;
 			try {
 				baseCommit = await resolveCommit(baseRef);
 			} catch {
-				if (!explicitBaseRef) {
-					baseRef = "HEAD";
-					try {
-						baseCommit = await resolveCommit(baseRef);
-					} catch {
-						throw new Error("找不到 Git 基准提交。请先为仓库创建提交，或选择有效引用。");
-					}
-				} else {
-					throw new Error("找不到 Git 基准提交。请先为仓库创建提交，或选择有效引用。");
-				}
+				throw new Error("找不到 Git 基准提交。请先为仓库创建提交，或选择有效引用。");
 			}
 			const id = randomUUID();
 			const branch = `pi-desktop/${id}`;
@@ -135,22 +127,58 @@ export class WorktreeService {
 		});
 	}
 
-	remove(id: string): Promise<WorktreeRemoveResult> {
+	remove(id: string, options?: WorktreeRemoveOptions): Promise<WorktreeRemoveResult> {
 		return this.serialize(async () => {
 			await this.load();
 			const record = this.requireRecord(id);
 			await this.verify(record);
 			if (await this.options.isActive?.(await this.info(record)))
 				throw new Error("Worktree 中仍有活动任务或终端，请先停止。");
-			// Ignored files can contain local secrets or build output; normal status would hide them before deletion.
-			if (await this.status(record.path, ["--ignored=matching"]))
-				throw new Error("Worktree 中有未提交、未跟踪或被忽略的文件，未删除任何内容。");
-			await this.git(record.repository, ["worktree", "remove", record.path]);
+			if (await this.status(record.path))
+				throw new Error("Worktree 中有未提交或未跟踪的文件，请先处理。");
+			let retainedIgnoredPath: string | undefined;
+			if (await this.status(record.path, ["--ignored=matching"])) {
+				if (!options?.preserveIgnored) throw new Error("Worktree 中有被忽略的文件，请先移出这些文件或在客户端选择保留后清理。");
+				retainedIgnoredPath = await this.retainIgnoredFiles(record);
+			}
+			try {
+				// Avoid Git's force removal. Recheck after moving ignored entries to catch intervening writes.
+				if (await this.status(record.path, ["--ignored=matching"]))
+					throw new Error("Worktree 在清理期间产生了新文件，请检查后重试。");
+				await this.git(record.repository, ["worktree", "remove", record.path]);
+			} catch (error) {
+				if (retainedIgnoredPath) {
+					throw new Error(`Worktree 未清理。已移出的文件保留在：${retainedIgnoredPath}`, { cause: error });
+				}
+				throw error;
+			}
 			const branchRetained = !(await this.deleteMergedBranch(record));
 			this.records = this.records.filter((item) => item.id !== id);
 			await this.persist();
-			return { worktreeId: id, branch: record.branch, branchRetained };
+			return { worktreeId: id, branch: record.branch, branchRetained, ...(retainedIgnoredPath ? { retainedIgnoredPath } : {}) };
 		});
+	}
+
+	private async retainIgnoredFiles(record: StoredWorktree): Promise<string | undefined> {
+		const files = (await this.git(record.path, ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]))
+			.split("\0").filter(Boolean);
+		if (!files.length) return undefined;
+		const root = (await managedDirectory(this.options.dataDir, ["worktree-retained"], true))!;
+		const retained = await mkdtemp(join(root, `${record.id}-`));
+		try {
+			for (const file of files) {
+				const source = resolve(record.path, file);
+				const parent = dirname(source);
+				if (!source.startsWith(record.path + sep) || await realpath(parent) !== parent)
+					throw new Error("Worktree 文件路径无效。");
+				const destination = join(retained, file);
+				await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+				await rename(source, destination);
+			}
+		} catch (error) {
+			throw new Error(`未完成 Worktree 清理。已移出的文件保留在：${retained}`, { cause: error });
+		}
+		return retained;
 	}
 
 	merge(id: string): Promise<WorktreeMergeResult> {

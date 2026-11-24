@@ -171,7 +171,7 @@ async function executePreviewAction(contents: Electron.WebContents, action: Prev
  * loads a loopback URL in an isolated sandboxed Electron BrowserWindow,
  * runs optional UI actions (click, fill, wait, wait_for, scroll), reads DOM
  * text/HTML/interactive elements, captures console & network errors, and
- * optionally saves a PNG screenshot.
+ * optionally saves a bounded JPEG screenshot.
  */
 export async function runPreviewCheck(input: PreviewInspectInput): Promise<PreviewInspectResult> {
 	const url = localPreviewUrl(input.url);
@@ -288,13 +288,22 @@ export async function runPreviewCheck(input: PreviewInspectInput): Promise<Previ
 		let screenshotPath: string | undefined;
 		let screenshotBase64: string | undefined;
 		if (input.screenshot) {
-			const image = await contents.capturePage();
-			const png = image.toPNG();
-			screenshotBase64 = png.toString("base64");
+			const captured = await contents.capturePage();
+			let image = captured;
+			const size = captured.getSize();
+			if (Math.max(size.width, size.height) > 1280) {
+				image = captured.resize(size.width > size.height ? { width: 1280 } : { height: 1280 });
+			}
+			let jpeg = image.toJPEG(76);
+			if (jpeg.byteLength > 350 * 1024) {
+				jpeg = image.resize({ width: Math.max(1, Math.round(image.getSize().width * 0.65)) }).toJPEG(60);
+			}
+			if (jpeg.byteLength > 350 * 1024) throw new Error("预览截图超出 350 KB 的大小限制。");
+			screenshotBase64 = jpeg.toString("base64");
 			if (input.screenshotDir) {
 				await mkdir(input.screenshotDir, { recursive: true, mode: 0o700 });
-				screenshotPath = join(input.screenshotDir, `preview-${Date.now()}.png`);
-				await writeFile(screenshotPath, png, { mode: 0o600 });
+				screenshotPath = join(input.screenshotDir, `preview-${Date.now()}.jpg`);
+				await writeFile(screenshotPath, jpeg, { mode: 0o600 });
 			}
 		}
 
@@ -309,7 +318,7 @@ export async function runPreviewCheck(input: PreviewInspectInput): Promise<Previ
 			...(domHtml !== undefined ? { domHtml } : {}),
 			...(interactiveElements ? { interactiveElements } : {}),
 			...(screenshotPath ? { screenshotPath } : {}),
-			...(screenshotBase64 ? { screenshotBase64 } : {}),
+			...(screenshotBase64 ? { screenshotBase64, screenshotMimeType: "image/jpeg" } : {}),
 		};
 	} finally {
 		clearTimeout(timer);

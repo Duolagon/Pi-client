@@ -108,12 +108,15 @@ test("Codex refuses unenforceable native policies and read-only MCP or sandbox d
 		assert.doesNotThrow(() => assertCodexPolicy({ policy: { ...data.options.policy, rules: [{ id: "allow-tests", scope: "global", action: "allow", tool: "bash", command: { type: "exact", value: "npm test" } }] } }));
 		assert.throws(() => assertCodexPolicy({ policy: { ...data.options.policy, disabledTools: ["read"] } }), /unsupported_policy/);
 		assert.throws(() => assertCodexPolicy({ policy: { ...data.options.policy, rules: [{ id: "secret", scope: "global", action: "deny", tool: "read", path: ".env" }] } }), /unsupported_policy/);
-		data.options.policy.mode = "read";
-		data.options.env.CODEX_FIXTURE_MCP = "1";
-		await assert.rejects(new CodexAdapter().open(data.options), /without MCP/);
-		delete data.options.env.CODEX_FIXTURE_MCP;
-		data.options.env.CODEX_FIXTURE_BAD_SANDBOX = "1";
-		await assert.rejects(new CodexAdapter().open(data.options), /sandbox/);
+		for (const mode of ["read", "plan"] as const) {
+			data.options.policy.mode = mode;
+			data.options.env.CODEX_FIXTURE_MCP = "1";
+			await assert.rejects(new CodexAdapter().open(data.options), /without MCP/);
+			delete data.options.env.CODEX_FIXTURE_MCP;
+			data.options.env.CODEX_FIXTURE_BAD_SANDBOX = "1";
+			await assert.rejects(new CodexAdapter().open(data.options), /sandbox/);
+			delete data.options.env.CODEX_FIXTURE_BAD_SANDBOX;
+		}
 	} finally { await data.cleanup(); }
 });
 

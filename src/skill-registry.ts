@@ -209,7 +209,15 @@ function parseFrontmatter(raw: string): { data: Record<string, string>; body: st
 	const data: Record<string, string> = {};
 	for (const line of norm.slice(4, end).split("\n")) {
 		const m = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
-		if (m) data[m[1]] = m[2].trim().replace(/^["']|["']$/g, "");
+		if (!m) continue;
+		const value = m[2].trim();
+		if (value.startsWith('"') && value.endsWith('"')) {
+			try {
+				const parsed = JSON.parse(value) as unknown;
+				if (typeof parsed === "string") { data[m[1]] = parsed; continue; }
+			} catch { /* An imported YAML scalar may use a different escape convention. */ }
+		}
+		data[m[1]] = value.replace(/^["']|["']$/g, "");
 	}
 	return { data, body: norm.slice(end + 4).replace(/^\n+/, "").trim() };
 }
@@ -334,11 +342,7 @@ export class SkillRegistry {
 	}
 
 	async list(project?: string, projectTrusted = true): Promise<SkillDefinitionEntry[]> {
-		const out: SkillDefinitionEntry[] = [
-			...(await scanSkillDirectory(join(this.agentDir(), "skills"), "user", true)),
-			...(await scanSkillDirectory(join(homedir(), ".claude", "skills"), "user", false)),
-			...(await scanCommandsDirectory(join(homedir(), ".claude", "commands"), "user")),
-		];
+		const out: SkillDefinitionEntry[] = [];
 		if (project && isAbsolute(project) && projectTrusted) {
 			out.push(
 				...(await scanSkillDirectory(join(project, ".pi", "skills"), "project", true)),
@@ -346,8 +350,13 @@ export class SkillRegistry {
 				...(await scanCommandsDirectory(join(project, ".claude", "commands"), "project")),
 			);
 		}
+		out.push(
+			...(await scanSkillDirectory(join(this.agentDir(), "skills"), "user", true)),
+			...(await scanSkillDirectory(join(homedir(), ".claude", "skills"), "user", false)),
+			...(await scanCommandsDirectory(join(homedir(), ".claude", "commands"), "user")),
+		);
 		for (const bundled of BUNDLED_SKILLS) {
-			if (!out.some((entry) => entry.name === bundled.name)) out.push(bundled);
+			if (!out.some((entry) => entry.name.toLowerCase() === bundled.name)) out.push(bundled);
 		}
 		return out;
 	}
@@ -364,9 +373,9 @@ export class SkillRegistry {
 		const frontmatter = [
 			"---",
 			`name: ${name}`,
-			`description: ${input.description.trim().replace(/\r?\n/g, " ")}`,
+			`description: ${JSON.stringify(input.description.trim().replace(/\r?\n/g, " "))}`,
 			...(input.context === "fork" ? ["context: fork"] : []),
-			...(input.agent?.trim() ? [`agent: ${input.agent.trim().replace(/\r?\n/g, " ")}`] : []),
+			...(input.agent?.trim() ? [`agent: ${JSON.stringify(input.agent.trim().replace(/\r?\n/g, " "))}`] : []),
 			"---",
 			"",
 			input.body.trim(),

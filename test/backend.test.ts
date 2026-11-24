@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { access, readFile, writeFile, symlink, rm, realpath } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile, symlink, rm, realpath } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { dirname, join, resolve } from "node:path";
@@ -96,6 +96,11 @@ test(
 		const { fixture, options, service, events } = await setup();
 		let current = service;
 		try {
+			const additionalDir = join(fixture.root, "shared-lib");
+			await mkdir(additionalDir);
+			const activeId = (await service.snapshot()).active!.id;
+			const attached = await service.addDir(activeId, additionalDir);
+			assert.deepEqual(attached.snapshot.active?.additionalDirs, [await realpath(additionalDir)]);
 			service.subscribe(({ event }) => {
 				if (event.type === "extension_ui_request" && event.method === "confirm")
 					void service.respond({
@@ -151,6 +156,7 @@ test(
 			snapshot = await current.initialize();
 			assert.equal(snapshot.active?.id, originalId);
 			assert.equal(snapshot.active?.title, "Real desktop session");
+			assert.deepEqual(snapshot.active?.additionalDirs, [await realpath(additionalDir)]);
 			assert.ok(snapshot.messages.some((message) => message.role === "assistant"));
 		} finally {
 			await current.close();
@@ -208,10 +214,9 @@ test(
 			await update;
 			const selected = await service.newConversation();
 			assert.notEqual(selected.active?.id, runningId);
-			await assert.rejects(
-				service.saveSettings({ permission: "auto", theme: "dark" }),
-				/执行|运行|完成|进行|停止|busy/,
-			);
+			const changed = await service.saveSettings({ permission: "ask", theme: "dark" });
+			assert.equal(changed.settings.theme, "dark");
+			assert.equal(changed.settings.permission, "ask");
 			await service.command({ type: "abort" }, runningId);
 			assert.equal((await settled).aborted, true);
 			await service.newConversation();

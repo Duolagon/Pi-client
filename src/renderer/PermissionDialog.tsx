@@ -84,6 +84,9 @@ export function PermissionDialog({
 		}
 	}, [isAskQuestions, request]);
 	const title = isAskQuestions ? "请回答以下确认问题" : "title" in request ? request.title : "Pi 需要你的输入";
+	const answersComplete = parsedQuestions?.every((_, index) =>
+		Boolean(questionAnswers[String(index)]?.length || questionCustom[String(index)]?.trim()),
+	);
 	const toolMatch = /^允许执行\s+([^\s？?（]+)(（远端写入，仅本次）)?[？?]?$/.exec(title);
 	const inferredTool = toolMatch?.[1];
 	const singleRemoteUse = Boolean(toolMatch?.[2]);
@@ -294,6 +297,7 @@ export function PermissionDialog({
 						className="cc-ask-form"
 						onSubmit={(event) => {
 							event.preventDefault();
+						if (pending || !answersComplete) return;
 							const formatted: Record<string, string | string[]> = {};
 							parsedQuestions.forEach((q, idx) => {
 								const key = q.header || `Q${idx + 1}`;
@@ -354,7 +358,7 @@ export function PermissionDialog({
 							<button disabled={pending} type="button" className="secondary-button" onClick={cancel}>
 								取消
 							</button>
-							<button disabled={pending} className="primary-button">
+							<button disabled={pending || !answersComplete} className="primary-button">
 								提交回答
 							</button>
 						</div>
@@ -369,7 +373,7 @@ export function PermissionDialog({
 						<label className="field-label">
 							{request.method === "editor" ? (
 								<textarea
-									autoFocus data-autofocus
+									autoFocus={!inline} data-autofocus={!inline || undefined}
 									rows={9}
 									aria-label="扩展编辑器"
 									value={value}
@@ -377,7 +381,7 @@ export function PermissionDialog({
 								/>
 							) : (
 								<input
-									autoFocus data-autofocus
+									autoFocus={!inline} data-autofocus={!inline || undefined}
 									aria-label="扩展输入"
 									placeholder={request.placeholder}
 									value={value}

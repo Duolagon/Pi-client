@@ -1,0 +1,100 @@
+import { useState, type FormEvent } from "react";
+import type { ExternalApprovalRequest, ExternalApprovalResponse, ExternalTask } from "../external-types.ts";
+import { externalQuestionFields } from "./external-questions.ts";
+import "./external-approval.css";
+
+export function ExternalApprovalCard({
+	task,
+	request,
+	onRespond,
+	fail,
+}: {
+	task: ExternalTask;
+	request: ExternalApprovalRequest;
+	onRespond: (response: ExternalApprovalResponse) => Promise<void>;
+	fail: (error: unknown) => void;
+}) {
+	const [answers, setAnswers] = useState<NonNullable<ExternalApprovalResponse["answers"]>>({});
+	const [pending, setPending] = useState(false);
+	const question = request.kind === "question";
+	const fields = question ? externalQuestionFields(request, task.executor) : undefined;
+	const usable = fields?.every((field) => {
+		const answer = Object.hasOwn(answers, field.id) ? answers[field.id] : undefined;
+		if (Array.isArray(answer)) return answer.length >= field.min && answer.length <= field.max;
+		return typeof answer === "string" && answer.trim() ? true : !field.required;
+	});
+	const respond = async (response: ExternalApprovalResponse) => {
+		if (pending) return;
+		setPending(true);
+		try { await onRespond(response); } catch (error) { fail(error); setPending(false); }
+	};
+	const submitAnswers = (event: FormEvent) => {
+		event.preventDefault();
+		if (!usable) return;
+		const filled = Object.entries(answers).filter(([, answer]) => Array.isArray(answer) ? answer.length > 0 : Boolean(answer.trim()));
+		void respond({ decision: "allow", answers: Object.fromEntries(filled) });
+	};
+	const selectMultiple = (id: string, value: string, checked: boolean) => {
+		setAnswers((previous) => {
+			const existing = Object.hasOwn(previous, id) ? previous[id] : undefined;
+			const selected = Array.isArray(existing) ? existing : [];
+			return { ...previous, [id]: checked ? [...selected, value] : selected.filter((item) => item !== value) };
+		});
+	};
+	const choices = request.options?.filter((option) => !option.kind || option.kind === "allow_once" || option.kind === "reject_once");
+	const details = request.input.command ?? request.input.path ?? request.input.file_path ?? (question ? undefined : request.input);
+	const detailText = details === undefined ? undefined : typeof details === "string" ? details : JSON.stringify(details, null, 2);
+	const decline = <button type="button" className="secondary-button" disabled={pending}
+		onClick={() => void respond({ decision: question ? "cancel" : "deny" })}>{question ? "取消回答" : "拒绝"}</button>;
+	return (
+		<section className="cc-inline-approval cc-external-approval" aria-label={question ? "外部 Agent 提问" : "外部 Agent 审批"}>
+			<h3>{task.executor} · {task.title} · {question ? "需要回答" : request.toolName}</h3>
+			{request.description && <p className="subtle-note">{request.description}</p>}
+			{detailText && <pre className="permission-detail cc-bash-out">{detailText}</pre>}
+			{fields ? (
+				<form onSubmit={submitAnswers}>
+					{fields.map((field) => {
+						const answer = Object.hasOwn(answers, field.id) ? answers[field.id] : undefined;
+						return (
+							<fieldset key={field.id} disabled={pending} className="cc-external-field">
+								<legend>{field.label}</legend>
+								{field.description && <p className="subtle-note">{field.description}</p>}
+								{field.multiple ? field.options.map((option) => (
+									<label key={option.value}>
+										<input type="checkbox" checked={Array.isArray(answer) && answer.includes(option.value)}
+											onChange={(event) => selectMultiple(field.id, option.value, event.target.checked)} /> {option.label}
+									</label>
+								)) : field.options.length ? (
+									<select aria-label={field.label} value={typeof answer === "string" ? answer : ""}
+										onChange={(event) => setAnswers({ ...answers, [field.id]: event.target.value })}>
+										<option value="">请选择</option>
+										{field.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+									</select>
+								) : (
+									<input type="text" aria-label={field.label} value={typeof answer === "string" ? answer : ""} maxLength={32768}
+										onChange={(event) => setAnswers({ ...answers, [field.id]: event.target.value })} />
+								)}
+							</fieldset>
+						);
+					})}
+					<div className="dialog-actions">{decline}<button className="primary-button" disabled={pending || !usable}>提交回答</button></div>
+				</form>
+			) : (
+				<>
+					{question && !choices?.length && <p className="subtle-note">当前问题的格式无法在客户端作答。</p>}
+					<div className="dialog-actions">
+						{decline}
+						{choices?.map((choice) => (
+							<button key={choice.id} type="button" className="secondary-button" disabled={pending}
+								onClick={() => void respond({ decision: choice.kind === "reject_once" ? "deny" : "allow", optionId: choice.id })}>{choice.label}</button>
+						))}
+						{!question && request.kind !== "permissions" && !request.options?.length && (
+							<button type="button" className="primary-button" disabled={pending}
+								onClick={() => void respond({ decision: "allow" })}>仅本次允许</button>
+						)}
+					</div>
+				</>
+			)}
+		</section>
+	);
+}

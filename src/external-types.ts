@@ -23,7 +23,7 @@ export type ExternalAdapterEvent =
 	| { type: "tool_update"; id: string; text: string }
 	| { type: "tool_end"; id: string; isError: boolean; output?: string }
 	| { type: "diagnostic"; message: string }
-	| { type: "usage"; inputTokens?: number; outputTokens?: number };
+	| { type: "usage"; inputTokens?: number; outputTokens?: number; sessionCostUsd?: number };
 export interface ExternalTurnResult {
 	status: "completed" | "cancelled";
 	text: string;
@@ -35,6 +35,10 @@ export interface ExternalSessionOptions {
 	env: NodeJS.ProcessEnv;
 	resumeSessionId?: string;
 	policy: RuntimePermissionPolicy;
+	/** The host resolved trust for the original project, including runs in its Worktree. */
+	projectTrusted?: boolean;
+	/** A native USD cap for this turn, where the executor exposes one. */
+	maxBudgetUsd?: number;
 	/** SDK helper is shipped with the desktop host; never model supplied. */
 	helperPath?: string;
 	nodeExecutable?: string;

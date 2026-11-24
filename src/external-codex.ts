@@ -40,6 +40,7 @@ export function assertCodexPolicy(options: Pick<ExternalSessionOptions, "policy"
 
 class CodexSession implements ExternalSession {
 	private options: ExternalSessionOptions;
+	private readOnly: boolean;
 	private rpc: JsonLineProcess;
 	private nativeId?: string;
 	private active?: Turn;
@@ -52,6 +53,7 @@ class CodexSession implements ExternalSession {
 
 	constructor(options: ExternalSessionOptions) {
 		this.options = options;
+		this.readOnly = options.policy.mode === "read" || options.policy.mode === "plan";
 		this.rpc = new JsonLineProcess({
 			executable: options.executable,
 			args: ["app-server", "--listen", "stdio://", "--disable", "multi_agent", "--strict-config"],
@@ -67,7 +69,7 @@ class CodexSession implements ExternalSession {
 		await this.rpc.notify("initialized", {});
 		const parameters = {
 			cwd: this.options.cwd, approvalPolicy: "untrusted", approvalsReviewer: "user",
-			sandbox: this.options.policy.mode === "read" ? "read-only" : "workspace-write",
+			sandbox: this.readOnly ? "read-only" : "workspace-write",
 			config: { "features.multi_agent": false },
 		};
 		const response = await this.rpc.request<RecordValue>(this.options.resumeSessionId ? "thread/resume" : "thread/start", {
@@ -77,13 +79,13 @@ class CodexSession implements ExternalSession {
 		const id = text(thread.id);
 		if (this.options.resumeSessionId && id !== this.options.resumeSessionId) throw new Error("Codex resumed a different native thread");
 		const sandbox = object(response.sandbox);
-		if (this.options.policy.mode === "read" ? sandbox.type !== "readOnly" : !["workspaceWrite", "readOnly"].includes(String(sandbox.type)))
+		if (this.readOnly ? sandbox.type !== "readOnly" : !["workspaceWrite", "readOnly"].includes(String(sandbox.type)))
 			throw new Error("unsupported_policy: Codex did not confirm the requested sandbox");
 		if (response.approvalPolicy !== "untrusted" || (response.approvalsReviewer !== undefined && response.approvalsReviewer !== "user"))
 			throw new Error("unsupported_policy: Codex did not confirm user-routed untrusted approvals");
 		this.nativeId = id;
 		this.options.onEvent({ type: "session", sessionId: id });
-		if (this.options.policy.mode === "read") {
+		if (this.readOnly) {
 			const servers = await this.rpc.request<RecordValue>("mcpServerStatus/list", { threadId: id, limit: 100 });
 			if (!Array.isArray(servers.data) || servers.data.length || servers.nextCursor)
 				throw new Error("unsupported_policy: read-only Codex tasks require a native configuration without MCP servers");
@@ -111,7 +113,7 @@ class CodexSession implements ExternalSession {
 			const response = await this.rpc.request<RecordValue>("turn/start", {
 				threadId: this.nativeId, cwd: this.options.cwd,
 				input: [{ type: "text", text: prompt }], approvalPolicy: "untrusted", approvalsReviewer: "user",
-				sandboxPolicy: this.options.policy.mode === "read" ? { type: "readOnly", networkAccess: false }
+				sandboxPolicy: this.readOnly ? { type: "readOnly", networkAccess: false }
 					: { type: "workspaceWrite", writableRoots: [this.options.cwd], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true },
 			});
 			const result = object(response.turn);
@@ -226,7 +228,7 @@ class CodexSession implements ExternalSession {
 			throw new Error("Codex request does not belong to the active task");
 		const requestId = String(id);
 		if (method === "item/commandExecution/requestApproval") {
-			if (this.options.policy.mode === "read") return { decision: "decline" };
+			if (this.readOnly) return { decision: "decline" };
 			if (params.kind !== undefined && !["command", "writeStdin"].includes(String(params.kind))) return { decision: "decline" };
 			const item = this.items.get(String(params.itemId));
 			// A cached shell's original launch command cannot authorize later terminal input.
@@ -236,7 +238,7 @@ class CodexSession implements ExternalSession {
 			return { decision: decision(response) };
 		}
 		if (method === "item/fileChange/requestApproval") {
-			if (this.options.policy.mode === "read") return { decision: "decline" };
+			if (this.readOnly) return { decision: "decline" };
 			const item = this.items.get(String(params.itemId));
 			const changes = item?.changes;
 			if (!Array.isArray(changes) || !changes.length) return { decision: "decline" };

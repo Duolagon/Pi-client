@@ -181,6 +181,10 @@ test("configured policy is loaded afresh and malformed or missing files fail clo
 		assert.equal((await loadRuntimePermissionPolicy(env, f.project)).mode, "auto");
 		await writeFile(file, JSON.stringify(f.policy({ disabledTools: ["write"] })));
 		assert.deepEqual((await loadRuntimePermissionPolicy(env, f.project)).disabledTools, ["write"]);
+		await writeFile(file, JSON.stringify(f.policy({ additionalDirs: [f.outside] })));
+		const attached = await loadRuntimePermissionPolicy(env, f.project);
+		assert.deepEqual(attached.additionalDirs, [f.outside]);
+		assert.equal((await evaluatePermission(attached, { toolName: "write", input: { path: join(f.outside, "new.txt") } })).action, "allow");
 		await writeFile(file, "{}");
 		await assert.rejects(loadRuntimePermissionPolicy(env, f.project));
 		await writeFile(file, "invalid JSON");
@@ -203,6 +207,8 @@ test("validators reject unknown fields, malformed scopes and unsafe command sele
 		assert.throws(() => validatePermissionRule(f.rule({ command: { type: "exact", value: "sh -c 'touch x'" } })));
 		assert.throws(() => validateRuntimePolicy(f.policy({ rules: [f.rule(), f.rule()] })));
 		assert.throws(() => validateRuntimePolicy({ ...f.policy(), disabledTools: ["*"] }));
+		for (const additionalDirs of [f.outside, [""], ["relative"], [42], [f.outside + "\0"]])
+			assert.throws(() => validateRuntimePolicy({ ...f.policy(), additionalDirs }), /附加目录/);
 		assert.deepEqual(validatePermissionRule(f.rule({ scope: "project", project: f.project })), f.rule({ scope: "project", project: f.project }));
 	} finally { await f.cleanup(); }
 });

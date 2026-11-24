@@ -9,7 +9,7 @@ import { createInterface } from "node:readline";
 import type { UsageBucket, UsageStatsReport } from "./shared.ts";
 
 /** One assistant message's usage, keyed for de-duplication across forked copies. */
-interface UsageRecord {
+export interface UsageRecord {
 	key: string;
 	day: string;
 	model: string;
@@ -18,6 +18,7 @@ interface UsageRecord {
 	cacheRead: number;
 	cacheWrite: number;
 	cost: number;
+	samples?: number;
 }
 
 interface CachedFile {
@@ -113,7 +114,7 @@ function add(target: Omit<UsageBucket, "key">, record: UsageRecord): void {
 	target.cacheWrite += record.cacheWrite;
 	target.tokens += record.input + record.output + record.cacheRead + record.cacheWrite;
 	target.cost += record.cost;
-	target.messages += 1;
+	target.messages += record.samples ?? 1;
 }
 
 export class UsageStatsCollector {
@@ -125,7 +126,7 @@ export class UsageStatsCollector {
 	 * Aggregates usage of the given session files over the last `days` local days,
 	 * today included. Unreadable or vanished files are skipped.
 	 */
-	async collect(files: string[], options: { days?: number; now?: number } = {}): Promise<UsageStatsReport> {
+	async collect(files: string[], options: { days?: number; now?: number } = {}, extraRecords: UsageRecord[] = []): Promise<UsageStatsReport> {
 		const days = Math.min(MAX_USAGE_DAYS, Math.max(1, Math.floor(options.days ?? DEFAULT_USAGE_DAYS)));
 		const now = options.now ?? Date.now();
 		const start = new Date(now);
@@ -159,7 +160,7 @@ export class UsageStatsCollector {
 		const byDay = new Map<string, Omit<UsageBucket, "key">>();
 		const byModel = new Map<string, Omit<UsageBucket, "key">>();
 		const totals = emptyBucket();
-		for (const records of perFile) {
+		for (const records of [...perFile, extraRecords]) {
 			for (const record of records) {
 				if (record.day < since || seen.has(record.key)) continue;
 				seen.add(record.key);

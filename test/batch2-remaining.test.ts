@@ -294,7 +294,7 @@ test("#23 Skill context: fork frontmatter parsing, save round-trip, and prompt f
 		const registry = new SkillRegistry({ agentDir: () => agentDir });
 		await registry.save({
 			name: "deep-check",
-			description: "Run check in subagent",
+			description: 'Run check: "subagent" #literal \\ path',
 			body: "Inspect $ARGUMENTS carefully.",
 			scope: "user",
 			context: "fork",
@@ -305,6 +305,11 @@ test("#23 Skill context: fork frontmatter parsing, save round-trip, and prompt f
 		const saved = list.find((s) => s.name === "deep-check");
 		assert.equal(saved?.context, "fork");
 		assert.equal(saved?.agent, "Review");
+		assert.equal(saved?.description, 'Run check: "subagent" #literal \\ path');
+
+		await registry.save({ name: "deep-check", description: "Project override", body: "Project prompt", scope: "project", project: projectDir });
+		assert.equal((await registry.list(projectDir, true)).find((entry) => entry.name === "deep-check")?.body, "Project prompt");
+		assert.equal((await registry.list(projectDir, false)).find((entry) => entry.name === "deep-check")?.scope, "user");
 
 		const cmd = list.find((s) => s.name === "audit");
 		assert.equal(cmd?.context, "fork");
@@ -332,6 +337,9 @@ test("#24 /goal: command parser, completion marker, and turn/cost caps", () => {
 
 	assert.equal(isGoalAchieved("Done!\n<goal-achieved/>"), true);
 	assert.equal(isGoalAchieved("Still working on step 2."), false);
+	assert.equal(isGoalAchieved("还没完成，所以暂不输出 \`<goal-achieved/>\`"), false);
+	assert.equal(isGoalAchieved("<goal-achieved/>\nOnly an example."), false);
+	assert.equal(isGoalAchieved("    <goal-achieved/>"), false);
 
 	const initial: GoalState = {
 		objective: "Ship feature X",
@@ -356,6 +364,9 @@ test("#24 /goal: command parser, completion marker, and turn/cost caps", () => {
 	const overCost = evaluateGoalContinuation(turn1.next, "Still working", 2.1, 3000);
 	assert.equal(overCost.shouldContinue, false);
 	assert.equal(overCost.next.status, "max_cost");
+	const sameGoalWithHistory = { ...initial, baselineCostUsd: 12 };
+	assert.equal(evaluateGoalContinuation(sameGoalWithHistory, "Still working", 12.5).shouldContinue, true);
+	assert.equal(evaluateGoalContinuation(sameGoalWithHistory, "Still working", 14.1).next.status, "max_cost");
 
 	const turn2 = evaluateGoalContinuation(turn1.next, "Still working", 0.9, 3000);
 	const overTurns = evaluateGoalContinuation(turn2.next, "Still working", 1.0, 4000);

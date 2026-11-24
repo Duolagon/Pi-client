@@ -36,9 +36,14 @@ export default function uiProvider(pi) {
 			if (prompt.includes("模型上下文验证")) {
 				const system = [context.systemPrompt, ...context.messages.filter((message) => message.role === "system")
 					.flatMap((message) => [message.content, ...Object.values(message.sections ?? {})])].join("\n");
-				response = fauxAssistantMessage(["PI_PRIVATE_MEMORY_FIXTURE", "PI_RULE_FIXTURE", "PI_REFERENCE_FIXTURE"].every((marker) => system.includes(marker))
+				response = fauxAssistantMessage(["PI_PRIVATE_MEMORY_FIXTURE", "PI_RULE_FIXTURE"].every((marker) => system.includes(marker)) &&
+					!system.includes("PI_REFERENCE_FIXTURE") && prompt.includes("PI_REFERENCE_FIXTURE")
 					? "收到项目记忆、规则和文件引用。"
 					: "项目上下文缺失。");
+			} else if (prompt === "文件引用续问验证") {
+				const preserved = context.messages.some((message) => message.role === "user" &&
+					(typeof message.content === "string" ? message.content : message.content.map((part) => part.text ?? "").join("\n")).includes("PI_REFERENCE_FIXTURE"));
+				response = fauxAssistantMessage(preserved ? "仍能看到前一轮的文件引用。" : "上一轮文件引用缺失。");
 			} else if (prompt.includes("实现问候函数")) {
 				const steps = [
 					fauxAssistantMessage([

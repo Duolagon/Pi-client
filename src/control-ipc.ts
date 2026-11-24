@@ -24,6 +24,7 @@ export function installControlHandlers(handle: Handle, service: DesktopService):
 		return service.setToolEnabled(request);
 	});
 	handle("pi:permissions:list", (id) => service.permissionSettings(optionalId(id)));
+	handle("pi:permissions:set-mode", (id, mode) => service.setConversationPermission(text(id, 200), mode));
 	handle("pi:permissions:upsert", (value) => service.upsertPermission(validatePermissionRule(value)));
 	handle("pi:permissions:remove", (id) => service.removePermission(text(id, 200)));
 	handle("pi:permissions:check", (value) => {

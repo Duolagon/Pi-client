@@ -19,6 +19,7 @@ import { TASK_NOTIFICATION_TYPE, formatTaskProgressSummary } from "./delegation-
 import { postLoopbackJson, postLoopbackNdjson } from "./loopback-request.ts";
 import { isLspSupportedFile } from "./language-service.ts";
 import { createGuardedBashOperations } from "./host-guard-bash.ts";
+import { loadRuntimePermissionPolicy } from "./permission-policy.ts";
 import type { TaskProgress } from "./task-types.ts";
 
 const NOTIFICATION_ACK = "desktop_notification_ack";
@@ -30,6 +31,7 @@ const safeChildTools = new Set(["read", "grep", "find", "ls", "AgentExecutors", 
 const worktreeMutationTools = new Set(["WorktreeCreate", "WorktreeMerge", "WorktreeRemove"]);
 const cronChildBlockedTools = new Set<string>(cronToolNames);
 const teamTools = new Set<string>(teamToolNames);
+const sharedChecklistTools = ["TodoCreate", "TodoGet", "TodoUpdate", "TodoList"];
 /**
  * Calls that never change the parent's working directory. Other Agent calls are checked by
  * the host itself (a second shared writer finds the directory busy; external agents and
@@ -111,7 +113,8 @@ export const toolSchemas: Record<DesktopModelToolName, JsonSchema> = {
 	}),
 	BashOutput: schema({
 		bash_id: { ...boundedText(200), description: "The shell_id returned by Bash with run_in_background: true" },
-		filter: { ...boundedText(1000), description: "Optional regular expression; only output lines matching it are returned (non-matching lines are consumed)" },
+		filter: { ...boundedText(1000), description: "Optional line regexp that searches retained output without consuming any lines" },
+		cursor: { type: "integer", minimum: 0, description: "Read-only replay position, or next_cursor from the preceding search page; 0 starts at the oldest retained line" },
 	}, ["bash_id"]),
 	KillShell: schema({
 		shell_id: { ...boundedText(200), description: "The shell_id of the background shell to stop" },
@@ -221,7 +224,7 @@ const descriptions: Record<DesktopModelToolName, string> = {
 	TodoUpdate: "Update a task item on the shared checklist (status: pending | in_progress | completed | deleted, owner, activeForm, dependency edges, or merged metadata).",
 	TodoList: "List persistent tasks on the shared checklist for this root conversation, showing statuses, owners, and dependency blockers.",
 	Monitor: "Start a background command or WebSocket (wss:// or loopback ws://) monitor. Output is coalesced and delivered asynchronously via <monitor-event> follow-ups; stop it anytime with TaskStop.",
-	BashOutput: "Read output a background shell (started by Bash with run_in_background: true) produced since your last read, plus its status (running, completed, killed or failed) and exit code. filter is an optional regular expression applied per line. Only shells of this conversation can be read.",
+	BashOutput: "Read new output and exit status for a background shell in this conversation. filter searches retained output line by line without consuming it. Pass cursor=0 to replay or pass next_cursor to continue reading search or replay pages.",
 	KillShell: "Stop a background shell started by Bash with run_in_background: true, addressed by its shell_id. Only shells of this conversation can be stopped.",
 	ScheduleWakeup: "Schedule a one-shot reminder wakeup after delay_seconds (only fires when parent session is idle, consumes quota, max 7 days, unavailable to subagents).",
 	CronCreate: "Create a recurring or one-shot scheduled task with jitter and 7-day lifetime (fires only when session is idle, consumes quota, unavailable to subagents).",
@@ -232,7 +235,7 @@ const descriptions: Record<DesktopModelToolName, string> = {
 	WorkflowRun: "Execute a deterministic multi-step workflow script in an isolated utilityProcess/VM sandbox using allowlisted agent(), parallel(), pipeline(), phase(), log(), and budget() primitives with durable journal recovery.",
 	StructuredOutput: "Submit the structured JSON result matching the workflow step's schema.",
 	LSP: "Query a locally installed Language Server (TypeScript/JS, Python/pyright, Go/gopls, Rust/rust-analyzer) for diagnostics, document symbols, or go-to-definition. Requires the project to be trusted and the language server installed on PATH.",
-	PreviewCheck: "Verify local web apps end-to-end: read .claude/launch.json (list_configs), start/stop/inspect dev servers (start_server, stop_server, server_logs), and load localhost URLs in an isolated headless browser (check) to click, fill inputs, scroll, read DOM text/HTML/interactive elements, check console/network errors, and capture PNG screenshots.",
+	PreviewCheck: "Verify local web apps end-to-end: read .claude/launch.json (list_configs), start/stop/inspect dev servers (start_server, stop_server, server_logs), and load localhost URLs in an isolated headless browser (check) to click, fill inputs, scroll, read DOM text/HTML/interactive elements, check console/network errors, and capture bounded JPEG screenshots.",
 };
 
 function hostConfig(): { url: string; token: string } | undefined {
@@ -263,6 +266,12 @@ export default function toolControl(pi: ExtensionAPI): void {
 	const child = process.env.PI_DESKTOP_CHILD === "1" || readOnlyChild || forkChild || delegationDepth > 0;
 	const agentTeams = process.env.PI_DESKTOP_AGENT_TEAMS === "1";
 	const teamMember = process.env.PI_DESKTOP_TEAM_MEMBER === "1";
+	const hiddenChecklists = (overrides: Record<string, boolean>) => {
+		const shared = sharedChecklistTools.some((name) => overrides[name] === true) ||
+			(overrides.TodoWrite !== true && (agentTeams || (child && !forkChild)));
+		return (shared ? ["TodoWrite"] : sharedChecklistTools).filter((name) => overrides[name] !== true);
+	};
+	let hiddenChecklistDeclarations = hiddenChecklists({});
 	const structuredOutputEnabled = process.env.PI_DESKTOP_STRUCTURED_OUTPUT === "1";
 	const canDelegate = !forkChild && delegationDepth < maxDepth;
 	const host = hostConfig();
@@ -344,7 +353,8 @@ export default function toolControl(pi: ExtensionAPI): void {
 				),
 				executionMode: [...delegatingToolNames, "TaskOutput"].includes(name) ? "parallel" : "sequential",
 				// AgentSend stays callable for older prompts, but SendMessage is the declared tool.
-				...(name === "AgentSend" ? { prepareLoadout: () => ({ hiddenDeclarations: ["AgentSend"] }) } : {}),
+				...(name === "AgentSend" ? { prepareLoadout: () => ({ hiddenDeclarations: ["AgentSend"] }) }
+					: sharedChecklistTools.includes(name) ? { prepareLoadout: () => ({ hiddenDeclarations: hiddenChecklistDeclarations }) } : {}),
 				prepareArguments: (input) => validateDesktopToolInput(name, input),
 				async execute(toolCallId, input, signal, onUpdate) {
 					const params = validateDesktopToolInput(name, input);
@@ -392,13 +402,13 @@ export default function toolControl(pi: ExtensionAPI): void {
 					const shaped = asModelToolResult(record.data);
 					if (shaped) return { content: [{ type: "text", text: shaped.text }], details: shaped.details, ...(shaped.usage ? { usage: shaped.usage } : {}) };
 					if (name === "PreviewCheck" && record.data && typeof record.data === "object") {
-						const data = record.data as { text?: unknown; screenshotBase64?: unknown };
+						const data = record.data as { text?: unknown; screenshotBase64?: unknown; screenshotMimeType?: unknown };
 						if (typeof data.text === "string") {
 							const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [
 								{ type: "text", text: data.text },
 							];
 							if (typeof data.screenshotBase64 === "string" && data.screenshotBase64.length > 0) {
-								content.push({ type: "image", data: data.screenshotBase64, mimeType: "image/png" });
+								content.push({ type: "image", data: data.screenshotBase64, mimeType: data.screenshotMimeType === "image/jpeg" ? "image/jpeg" : "image/png" });
 							}
 							const { screenshotBase64: _omit, ...details } = data as Record<string, unknown>;
 							return { content, details };
@@ -412,6 +422,8 @@ export default function toolControl(pi: ExtensionAPI): void {
 	}
 	const config = async (): Promise<ToolOverrides> => validateToolOverrides(JSON.parse(await readFile(toolsFile, "utf8")));
 	let previousOverrides: Record<string, boolean> = {};
+	const dynamicPermission = process.env.PI_DESKTOP_DYNAMIC_PERMISSION === "1";
+	const hiddenByMode = new Set<string>();
 	const baseline = new Map<string, boolean>();
 	let loadedBaseline = false;
 	let application: Promise<void> = Promise.resolve();
@@ -431,8 +443,10 @@ export default function toolControl(pi: ExtensionAPI): void {
 		}
 		loadedBaseline = true;
 		const settings = await config();
+		hiddenChecklistDeclarations = hiddenChecklists(settings.overrides);
 		const all = pi.getAllTools();
-		const active = new Set(pi.getActiveTools());
+		const active = new Set([...pi.getActiveTools(), ...hiddenByMode]);
+		hiddenByMode.clear();
 		for (const name of new Set([...Object.keys(previousOverrides), ...baseline.keys()])) {
 			if (!(name in settings.overrides)) {
 				if (baseline.get(name)) active.add(name); else active.delete(name);
@@ -458,6 +472,20 @@ export default function toolControl(pi: ExtensionAPI): void {
 		if (!structuredOutputEnabled) active.delete("StructuredOutput");
 		if (child && !forkChild) for (const name of worktreeMutationTools) active.delete(name);
 		if (readOnlyChild) for (const name of active) if (!safeChildTools.has(name) && !(canDelegate && delegating(name)) && !(name === "StructuredOutput" && structuredOutputEnabled)) active.delete(name);
+		if (dynamicPermission) {
+			const policy = await loadRuntimePermissionPolicy();
+			active.delete("ExitPlanMode");
+			if (policy.mode === "read" || policy.mode === "plan") {
+				for (const name of active) {
+					if (safeChildTools.has(name) || (canDelegate && delegating(name)) ||
+						(policy.mode === "plan" && ["write", "edit"].includes(name))) continue;
+					hiddenByMode.add(name);
+					active.delete(name);
+				}
+				if (policy.mode === "plan" && settings.overrides.ExitPlanMode !== false &&
+					all.some((tool) => tool.name === "ExitPlanMode")) active.add("ExitPlanMode");
+			}
+		}
 		previousOverrides = settings.overrides;
 		pi.setActiveTools([...active]);
 		if (baselineFile) {
@@ -468,7 +496,10 @@ export default function toolControl(pi: ExtensionAPI): void {
 	}
 	function inventory(settings: ToolOverrides): DesktopToolInfo[] {
 		const active = new Set(pi.getActiveTools());
-		return pi.getAllTools().map((tool) => describeTool(tool, active, settings.overrides, child, canDelegate, readOnlyChild, agentTeams, teamMember, structuredOutputEnabled));
+		return pi.getAllTools().map((tool) => {
+			const details = describeTool(tool, active, settings.overrides, child, canDelegate, readOnlyChild, agentTeams, teamMember, structuredOutputEnabled);
+			return hiddenChecklistDeclarations.includes(tool.name) ? { ...details, modelVisible: false } : details;
+		});
 	}
 	// Results queued as `nextTurn` in this process; Pi consumes them when the next run starts.
 	const queuedNotifications = new Map<string, NotificationUsage | undefined>();

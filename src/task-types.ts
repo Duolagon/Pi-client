@@ -64,6 +64,8 @@ export interface DesktopTask {
 	teamName?: string;
 	/** Owning workflow ID when spawned by WorkflowService. */
 	workflowId?: string;
+	/** Stable worktree scope within the owning workflow and parallel branch. */
+	workflowWorkspace?: string;
 	/** JSON Schema enforced via StructuredOutput for workflow agent steps. */
 	structuredOutputSchema?: unknown;
 	/** Validated StructuredOutput payload captured from this child task. */

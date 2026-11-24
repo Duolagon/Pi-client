@@ -53,6 +53,7 @@ test("conversation-only turn yields no omen", () => {
 test("edit + passing verify (agent Bash) = verified", () => {
 	const msgs: Message[] = [
 		assistant(null, { tools: [edit(), bash("b1", "npm run test:backend")] }),
+		toolResult("e1", false),
 		toolResult("b1", false),
 	];
 	const v = scoreTurn(msgs);
@@ -61,7 +62,7 @@ test("edit + passing verify (agent Bash) = verified", () => {
 });
 
 test("a successful tool response without a recorded exit code cannot certify the check", () => {
-	const msgs = [assistant(null, { tools: [edit(), bash("b1", "npm test")] }), toolResult("b1", false, {})];
+	const msgs = [assistant(null, { tools: [edit(), bash("b1", "npm test")] }), toolResult("e1", false), toolResult("b1", false, {})];
 	const verdict = scoreTurn(msgs);
 	assert.equal(verdict.omen, "unverified");
 	assert.equal(verdict.checks[0].status, "pending");
@@ -72,6 +73,7 @@ const checkShellId = "shell_0123456789ab";
 function backgroundTestLaunch(): Message[] {
 	return [
 		assistant(null, { tools: [edit(), { id: "bg-test", name: "bash", arguments: { command: "npm test", run_in_background: true } }] }),
+		toolResult("e1", false),
 		// Previous clients populated exitCode on the launch acknowledgement. Existing sessions must stay accurate.
 		toolResult("bg-test", false, { background: true, shell_id: checkShellId, status: "running", exitCode: 0 }),
 	];
@@ -128,20 +130,20 @@ test("a live shell record shows a silent stop immediately", () => {
 
 test("edits in a later turn while a background check is running invalidate its result", () => {
 	const turn = backgroundTestLaunch();
-	const laterEdit = assistant(null, { tools: [edit("e2")] });
+	const laterEdit = [assistant(null, { tools: [edit("e2")] }), toolResult("e2", false)];
 	const completion = shellEvent({ status: "completed", exit_code: 0, started_at: turn[1].timestamp });
-	const afterCompletion = assistant(null, { tools: [edit("e3")] });
-	assert.equal(scoreTurn(turn, collectVerificationEvidence([...turn, laterEdit, completion])).checks[0].status, "stale");
-	assert.equal(scoreTurn(turn, collectVerificationEvidence([...turn, completion, afterCompletion])).checks[0].status, "passed");
+	const afterCompletion = [assistant(null, { tools: [edit("e3")] }), toolResult("e3", false)];
+	assert.equal(scoreTurn(turn, collectVerificationEvidence([...turn, ...laterEdit, completion])).checks[0].status, "stale");
+	assert.equal(scoreTurn(turn, collectVerificationEvidence([...turn, completion, ...afterCompletion])).checks[0].status, "passed");
 });
 
 test("edit + passing verify via ! bashExecution exit 0 = verified", () => {
-	const msgs: Message[] = [assistant(null, { tools: [edit()] }), bashExec("node --test test/foo.test.ts", 0)];
+	const msgs: Message[] = [assistant(null, { tools: [edit()] }), toolResult("e1", false), bashExec("node --test test/foo.test.ts", 0)];
 	assert.equal(scoreTurn(msgs).omen, "verified");
 });
 
 test("edit with no verification = unverified (never a fake pass)", () => {
-	const v = scoreTurn([assistant(null, { tools: [edit()] })]);
+	const v = scoreTurn([assistant(null, { tools: [edit()] }), toolResult("e1", false)]);
 	assert.equal(v.omen, "unverified");
 	assert.equal(v.signals.verifyRan, false);
 });
@@ -170,12 +172,12 @@ test("model error = problem", () => {
 });
 
 test("aborted by the user = no omen", () => {
-	assert.equal(scoreTurn([assistant(null, { tools: [edit()] }, )]).omen, "unverified");
+	assert.equal(scoreTurn([assistant(null, { tools: [edit()] })]).omen, "none");
 	assert.equal(scoreTurn([assistant(null, { stopReason: "aborted", tools: [edit()] })]).omen, "none");
 });
 
 test("non-verify bash command does not count as verification", () => {
-	const msgs: Message[] = [assistant(null, { tools: [edit(), bash("b1", "git status")] }), toolResult("b1", false)];
+	const msgs: Message[] = [assistant(null, { tools: [edit(), bash("b1", "git status")] }), toolResult("e1", false), toolResult("b1", false)];
 	assert.equal(scoreTurn(msgs).omen, "unverified");
 });
 
@@ -238,7 +240,7 @@ test("a write the user denied is not a tool error", () => {
 		isError: true,
 		timestamp: at(),
 	} as unknown as Message;
-	assert.equal(scoreTurn([assistant(null, { tools: [edit()] }), denied]).omen, "unverified");
+	assert.equal(scoreTurn([assistant(null, { tools: [edit()] }), denied]).omen, "none");
 });
 
 test("a passing check becomes stale after a later edit", () => {
@@ -255,6 +257,7 @@ test("a passing check becomes stale after a later edit", () => {
 test("echo and compound shell lines cannot certify changes", () => {
 	const result = scoreTurn([
 		assistant(null, { tools: [edit()] }),
+		toolResult("e1", false),
 		bashExec('echo "npm test"', 0),
 		bashExec("npm test || true", 0),
 	]);
@@ -263,10 +266,36 @@ test("echo and compound shell lines cannot certify changes", () => {
 });
 
 test("later shell writes make checks stale while Git diff does not", () => {
-	const checked = [assistant(null, { tools: [edit(), bash("test", "npm test")] }), toolResult("test", false)];
+	const checked = [assistant(null, { tools: [edit(), bash("test", "npm test")] }), toolResult("e1", false), toolResult("test", false)];
 	assert.equal(scoreTurn([...checked, bashExec("git diff --stat", 0)]).checks[0].status, "passed");
+	assert.equal(scoreTurn([...checked, bashExec("git status && git diff --stat", 0)]).checks[0].status, "passed");
+	assert.equal(scoreTurn([...checked, bashExec('find src -name "*.ts"', 0)]).checks[0].status, "passed");
 	assert.equal(scoreTurn([...checked, bashExec("printf x > src/a.ts", 0)]).checks[0].status, "stale");
 	assert.equal(scoreTurn([...checked, bashExec("npx prettier --write src/a.ts", 0)]).checks[0].status, "stale");
+});
+
+test("a successful retry and verification supersede earlier failures", () => {
+	const result = scoreTurn([
+		assistant(null, { tools: [edit("failed-edit")] }), toolResult("failed-edit", true),
+		bashExec("npm test", 1),
+		assistant(null, { tools: [edit("fixed-edit")] }), toolResult("fixed-edit", false),
+		bashExec("npm test", 0),
+	]);
+	assert.equal(result.omen, "verified");
+	assert.deepEqual(result.checks.map((check) => check.status), ["stale", "passed"]);
+	assert.equal(result.signals.toolErrors, 0);
+});
+
+test("a passing check does not resolve a failed operation on an unrelated path", () => {
+	const result = scoreTurn([
+		assistant(null, { tools: [{ id: "missing", name: "edit", arguments: { path: "different.ts" } }] }),
+		toolResult("missing", true),
+		assistant(null, { tools: [edit("ok")] }),
+		toolResult("ok", false),
+		bashExec("npm test", 0),
+	]);
+	assert.equal(result.omen, "problem");
+	assert.equal(result.signals.toolErrors, 1);
 });
 
 test("an edit still running when a check starts invalidates the result", () => {

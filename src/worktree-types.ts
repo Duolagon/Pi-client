@@ -21,6 +21,12 @@ export interface WorktreeRemoveResult {
 	worktreeId: string;
 	branch: string;
 	branchRetained: boolean;
+	retainedIgnoredPath?: string;
+}
+
+export interface WorktreeRemoveOptions {
+	/** Move ignored files to a private recovery directory before removing the clean Worktree. */
+	preserveIgnored?: boolean;
 }
 
 export type WorktreeMergeResult =

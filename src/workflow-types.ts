@@ -31,6 +31,8 @@ export interface WorkflowJournalEntry {
 	stepKey: string;
 	status: "completed" | "failed";
 	taskId?: string;
+	worktreeId?: string;
+	workingDirectory?: string;
 	output?: string;
 	structuredOutput?: unknown;
 	error?: string;

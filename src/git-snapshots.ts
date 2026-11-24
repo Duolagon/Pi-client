@@ -117,6 +117,16 @@ export class GitSnapshots {
 		});
 	}
 
+	/** A queued wakeup may be deferred or already delivered and never start a turn. */
+	async abandonPending(project: string, id: string, conversationId: string): Promise<void> {
+		const root = await this.queryRoot(project);
+		await this.serialize(root, async () => {
+			const manifest = await this.load(root, id, conversationId);
+			if (!manifest.after && manifest.checkpoint.kind === undefined)
+				await unlink(join(this.directory(root), `${id}.json`));
+		});
+	}
+
 	/** List durable checkpoints for this project, newest first. */
 	async list(project: string, conversationId?: string): Promise<GitCheckpoint[]> {
 		const root = await this.queryRoot(project);
@@ -164,13 +174,14 @@ export class GitSnapshots {
 	}
 
 	/** Differences from a checkpoint's before-state to the current worktree (spanning later checkpoints). */
-	async diffToWorktree(project: string, id: string): Promise<GitCheckpointDiff> {
+	async diffToWorktree(project: string, id: string, reviewDirectory?: string): Promise<GitCheckpointDiff> {
 		const root = await this.projectRoot(project);
 		return this.serialize(root, async () => {
 			const manifest = await this.load(root, id);
 			const current = await this.capture(root, Object.keys(manifest.before));
 			const files: GitCheckpointDiff["files"] = [];
 			const excluded = excludedPaths(manifest.before, current);
+			if (reviewDirectory && !excluded.size) await this.materializeEntries(root, reviewDirectory, current);
 			for (const change of changes(manifest.before, current, excluded)) {
 				if (change.beforeKind === "directory" || change.afterKind === "directory") continue;
 				const result = await this.fileDiff(change.path, manifest.before[change.path] ?? missing, current[change.path] ?? missing);
@@ -186,18 +197,26 @@ export class GitSnapshots {
 		if (inside(root, resolve(target))) throw new Error("快照副本必须位于项目目录之外。");
 		return this.serialize(root, async () => {
 			const manifest = await this.load(root, id);
-			for (const [path, entry] of Object.entries(manifest.before).sort(([a], [b]) => a.localeCompare(b))) {
-				const destination = join(target, path);
-				if (entry.kind === "directory") await mkdir(destination, { recursive: true, mode: 0o700 });
-				else if (entry.kind === "file") {
-					await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
-					await writeFile(destination, await this.bytes(entry), { flag: "wx", mode: 0o600 });
-				} else if (entry.kind === "symlink") {
-					await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
-					await symlink((await this.bytes(entry)).toString(), destination);
-				}
-			}
+			await this.materializeEntries(root, target, manifest.before);
 		});
+	}
+
+	private async materializeEntries(root: string, target: string, entries: Record<string, Entry>): Promise<void> {
+		if (inside(root, resolve(target))) throw new Error("快照副本必须位于项目目录之外。");
+		for (const [path, entry] of Object.entries(entries).sort(([a], [b]) => a.localeCompare(b))) {
+			const destination = join(target, path);
+			if (entry.kind === "directory") await mkdir(destination, { recursive: true, mode: 0o700 });
+			else if (entry.kind === "file") {
+				await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+				await writeFile(destination, await this.bytes(entry), { flag: "wx", mode: 0o600 | (entry.mode & 0o100) });
+			} else if (entry.kind === "symlink") {
+				const link = (await this.bytes(entry)).toString();
+				const linked = resolve(root, dirname(path), link);
+				if (!inside(root, linked)) continue;
+				await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+				await symlink(relative(dirname(destination), join(target, relative(root, linked))) || ".", destination);
+			}
+		}
 	}
 
 	/** Restore selected changed paths only if their current state still matches this checkpoint. */

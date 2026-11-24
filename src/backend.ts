@@ -2,12 +2,12 @@ import { draftPrompt, mergeDrafts, type ComposerDraft, type Prompt } from "./com
 import { QueuedPrompts, type NativeQueue } from "./queued-prompts.ts";
 import type { DesktopPromptResult, FileReferenceAvailability, QueueActionResult, QueuedPromptGroups } from "./shared.ts";
 import { searchWorkspaceFiles } from "./workspace-file-search.ts";
-import { isReferenceablePath } from "./file-references.ts";
+import { isReferenceablePath, visiblePromptText } from "./file-references.ts";
 import { createDraftPullRequest, readPullRequest, readPullRequestComments, setPullRequestAutoMerge, type DraftPullRequest } from "./review-service.ts";
 import { managedFile, writeManagedFile } from "./managed-path.ts";
 import { execFile } from "node:child_process";
 import { randomBytes, randomUUID, createHash } from "node:crypto";
-import { access, lstat, mkdir, mkdtemp, readFile, writeFile, rename, realpath, stat, readdir, rm } from "node:fs/promises";
+import { access, cp, lstat, mkdir, mkdtemp, readFile, writeFile, rename, realpath, stat, readdir, rm } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { summarizeEngineError, tildify } from "./desktop-log.ts";
 import { homedir, tmpdir } from "node:os";
@@ -53,7 +53,7 @@ import type {
 } from "./session-navigation-extension.ts";
 import type { GitCheckpoint, GitCheckpointDiff, GitRestoreResult } from "./git-types.ts";
 import type { TerminalCreateInput, TerminalEvent, TerminalInfo, TerminalReplay } from "./terminal-types.ts";
-import type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRemoveResult } from "./worktree-types.ts";
+import type { WorktreeCreateInput, WorktreeInfo, WorktreeMergeResult, WorktreeRemoveOptions, WorktreeRemoveResult } from "./worktree-types.ts";
 import type { ChildApprovalRequest, DesktopTask, TaskEvent, TaskPendingApproval, TaskProgress, TaskProgressActivity, TaskSendInput, TaskSendResult, TaskStartInput, TaskStopReason } from "./task-types.ts";
 import { sanitizeStoredTasks } from "./task-validation.ts";
 import {
@@ -125,10 +125,11 @@ import type {
 import { connectionMode, validateEndpoint } from "./model-connections.ts";
 import { providerModels, providerPresets } from "./provider-presets.ts";
 import { memoryLimit, memoryName, privateMemoryLabel, readProjectText } from "./project-memory.ts";
-import { codeIntelligence, formatCodeIntelligence, formatLspDiagnostics, isLspSupportedFile, type CodePosition } from "./language-service.ts";
-import { buildGoalInitialPrompt, DEFAULT_GOAL_MAX_TURNS, evaluateGoalContinuation, MAX_GOAL_TURNS } from "./goal-mode.ts";
+import { LanguageService, formatCodeIntelligence, formatLspDiagnostics, isLspSupportedFile, type CodeIntelligenceOperation, type CodePosition } from "./language-service.ts";
+import { buildGoalInitialPrompt, DEFAULT_GOAL_MAX_TURNS, evaluateGoalContinuation, MAX_GOAL_TURNS, type GoalState } from "./goal-mode.ts";
+import { planRelativePath } from "./plan-path.ts";
 import { buildLaunchShellCommand, launchConfigUrl, readLaunchConfigurations, validateLocalPreviewUrl } from "./launch-config.ts";
-import { formatPreviewInspectSummary, type PreviewInspectInput, type PreviewInspectResult, type PreviewInteraction } from "./preview-check-types.ts";
+import { DEFAULT_LOCAL_PREVIEW_URL, formatPreviewInspectSummary, type PreviewInspectInput, type PreviewInspectResult, type PreviewInteraction } from "./preview-check-types.ts";
 import { detectProjectTrustResources } from "./project-trust.ts";
 import { DEFAULT_OUTPUT_STYLE, discoverOutputStyles, findOutputStyle, outputStylePromptSection, validOutputStyleName } from "./output-styles.ts";
 import { EDITOR_CHOICES, type EditorChoice } from "./editor-open.ts";
@@ -186,6 +187,7 @@ import type { SlashCommand } from "./shared.ts";
 const exec = promisify(execFile);
 const DOCTOR_CHECK_TIMEOUT_MS = 4000;
 const providers: Provider[] = ["anthropic", "openai", "google", "openrouter", "deepseek"];
+const permissionModes = new Set<unknown>(["ask", "acceptEdits", "read", "auto", "plan", "dontAsk"]);
 const piBuiltinTools = new Set(["read", "write", "edit", "bash", "grep", "find", "ls", "powershell"]);
 
 /** An explicit empty result means deny all built-in tools, not "unset". */
@@ -217,6 +219,11 @@ export function piToolArgs(
 }
 function finiteCount(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+function stopActiveGoal(conversation: Conversation, reason: string): boolean {
+	if (!conversation.goal?.active) return false;
+	conversation.goal = { ...conversation.goal, active: false, status: "stopped", finishedAt: Date.now(), stopReason: reason };
+	return true;
 }
 function statTokens(value: Partial<SessionStats["tokens"]> | undefined): SessionStats["tokens"] {
 	return {
@@ -272,6 +279,9 @@ interface SessionRuntime {
 	/** Recently answered UI request ids in this runtime, so duplicate replies are idempotent. */
 	answeredUI: Set<string>;
 	checkpointId?: string;
+	checkpointStarting?: Promise<void>;
+	costLimitFile?: string;
+	releaseCostReservation?: () => Promise<void>;
 	checkpointUserAnchor?: { previousEntryId: string | null; observedPrompt: boolean };
 	settling?: Promise<void>;
 	userQueue?: QueuedPrompts;
@@ -282,7 +292,7 @@ interface SessionRuntime {
 	stopHookRanThisTurn?: boolean;
 	/** Set once SessionStart fired, so only a started runtime reports SessionEnd. */
 	sessionStarted?: boolean;
-	/** Permission mode the session started with, reported again by SessionEnd. */
+	/** Last policy written to the runtime, reported by its lifecycle hooks. */
 	sessionPermissionMode?: string;
 	navigation?: { directory: string; token: string; command: string };
 	controls?: { directory: string; token: string; command: string; hostToken: string; operation: Promise<void> };
@@ -404,6 +414,7 @@ export class DesktopService {
 	private historyAvailable = false;
 	private readonly usage = new UsageStatsCollector();
 	private connectionCheck?: { agent: AgentProcess; cancel: (error: Error) => void };
+	private connectionTestOperation: Promise<void> = Promise.resolve();
 	private grailListeners = new Set<(event: GrailEvent) => void>();
 	private grailRuns = new Map<string, { id: string; controller: AbortController; step: GrailStep; startedAt: number }>();
 	private grailWrites = new Map<string, Promise<void>>();
@@ -425,6 +436,7 @@ export class DesktopService {
 	private toolHost: ToolHostServer;
 	private delegation: ModelDelegation;
 	private agents: AgentRegistry;
+	private languages: LanguageService;
 	private agentWatcher?: { key: string; stop: () => void };
 	private mcp: McpRegistry;
 	private hooks: HooksService;
@@ -457,6 +469,7 @@ export class DesktopService {
 
 	constructor(options: ServiceOptions) {
 		this.options = options;
+		this.languages = new LanguageService(options.env);
 		this.toolSettings = new ToolSettingsStore(options.dataDir);
 		this.agents = new AgentRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
 		this.mcp = new McpRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
@@ -469,13 +482,13 @@ export class DesktopService {
 		this.monitors = new MonitorService({ deliver: (id, params) => this.deliverToConversation(id, params) });
 		this.cron = new CronService({
 			dataDir: () => this.options.dataDir,
-			deliver: (id, params) => this.deliverToConversation(id, params),
+			deliver: (id, params, project) => this.deliverCronWakeup(id, params, project),
 			isEnabled: () => this.store.settings.cronEnabled !== false,
 			isProjectTrusted: (project) => this.isProjectTrusted(project),
 		});
 		this.teams = new TeamsService({
 			dataDir: () => this.options.dataDir,
-			deliver: (id, params) => this.deliverToConversation(id, params),
+			deliver: (id, params) => this.deliverTeamWakeup(id, params),
 			isEnabled: () => this.store.settings.agentTeams === true,
 		});
 		this.toolHost = new ToolHostServer({
@@ -548,7 +561,7 @@ export class DesktopService {
 				});
 			},
 			handlePlanExit: async (request, context) => {
-				const conv = this.conversation(context.conversationId);
+				if (this.permissionPolicy(context.conversationId).mode !== "plan") throw new Error("请先进入计划模式，再提交计划。");
 				if (typeof request.plan === "string" && request.plan.trim()) {
 					const saved = await this.writePlan(
 						request.title ? `# ${request.title}\n\n${request.plan}` : request.plan,
@@ -557,7 +570,9 @@ export class DesktopService {
 					return { saved: true, planFile: saved.relativePath, content: saved.content };
 				}
 				const current = await this.readPlan(context.conversationId);
-				return { saved: current.exists, planFile: current.relativePath, content: current.content };
+				if (!current.content.trim())
+					throw new Error(`计划正文为空。请将正文传入 ExitPlanMode 的 plan 参数，或先写入 ${current.relativePath}。`);
+				return { saved: true, planFile: current.relativePath, content: current.content };
 			},
 		});
 		this.delegation = new ModelDelegation({
@@ -620,6 +635,7 @@ export class DesktopService {
 				permissionMode: (conversationId) => this.hookPermissionMode(conversationId),
 				deliver: (id, params) => this.deliverToConversation(id, params),
 				cancelWorkflowTasks: async (workflowId) => {
+					await this.operation;
 					const matching = this.store.tasks.filter(
 						(item) => item.workflowId === workflowId && ["queued", "running", "waiting_for_input"].includes(item.status),
 					);
@@ -658,6 +674,7 @@ export class DesktopService {
 						? `You MUST return valid JSON conforming to this schema by calling the StructuredOutput tool with {"data": <JSON>}:\n${JSON.stringify(req.schema)}`
 						: undefined;
 					const combinedSystem = [definition?.prompt?.trim(), schemaHint].filter(Boolean).join("\n\n---\n\n");
+					signal.throwIfAborted();
 					const task = await this.startTask(
 						{
 							project: conv.project,
@@ -680,7 +697,9 @@ export class DesktopService {
 							runInBackground: true,
 							notifySuppressed: true,
 							workflowId: req.workflowId,
+							...(req.isolation !== "shared" ? { workflowWorkspace: req.workspaceKey } : {}),
 						},
+						signal,
 					);
 					// The task is now in the store and counts toward the cap by its own status.
 					releaseSlot();
@@ -696,6 +715,8 @@ export class DesktopService {
 					const output = finished.result?.text ?? "";
 					return {
 						taskId: finished.id,
+						worktreeId: finished.worktreeId,
+						workingDirectory: finished.workingDirectory,
 						output,
 						...(finished.structuredOutput !== undefined ? { structuredOutput: finished.structuredOutput } : {}),
 						...(finished.stats ? { usage: { totalTokens: finished.stats.tokens.total, cost: finished.stats.cost } } : {}),
@@ -705,6 +726,7 @@ export class DesktopService {
 					}
 				},
 				resumeStructuredStep: async (taskId, feedback, signal) => {
+					signal.throwIfAborted();
 					const existing = this.task(taskId);
 					delete existing.structuredOutput;
 					const expectedTurn = (existing.turn ?? 1) + 1;
@@ -717,6 +739,8 @@ export class DesktopService {
 					if (!finished) throw new Error(`Workflow task ${taskId} disappeared`);
 					return {
 						taskId: finished.id,
+						worktreeId: finished.worktreeId,
+						workingDirectory: finished.workingDirectory,
 						output: finished.result?.text ?? "",
 						...(finished.structuredOutput !== undefined ? { structuredOutput: finished.structuredOutput } : {}),
 						...(finished.stats ? { usage: { totalTokens: finished.stats.tokens.total, cost: finished.stats.cost } } : {}),
@@ -745,10 +769,12 @@ export class DesktopService {
 		});
 		this.external = new ExternalAgents({
 			dataDir: options.dataDir, env: { ...process.env, ...options.env }, nodeExecutable: options.executable,
+			networkEnv: () => networkEnvironment(this.store.settings),
 			claudeHelperPath: options.claudeHelperPath ?? join(runtimeDir, "external-claude-helper.mjs"),
 			adapters: options.externalAdapters ?? { codex: new CodexAdapter(), claude: new ClaudeAdapter(), kimi: new KimiAdapter(), antigravity: new AntigravityAdapter() },
 			maxConcurrent: options.maxConcurrentTasks ?? 4,
 			project: (id) => this.conversation(id).project,
+			isProjectTrusted: (project) => this.isProjectTrusted(project),
 			policy: (id) => this.permissionPolicy(id),
 			delegated: (id) => this.store.tasks.some((task) => task.conversationId === id && task.parentConversationId),
 			createWorktree: (input) => this.createWorktree(input), listWorktrees: () => this.listWorktrees(),
@@ -757,6 +783,17 @@ export class DesktopService {
 				if (task.readOnly) return true;
 				try { this.assertPathAvailable(task.workingDirectory, undefined, task.id); return true; } catch { return false; }
 			},
+			beginCheckpoint: async (task) => {
+				const checkpoint = await this.git.begin(task.workingDirectory, task.id, `${task.title} · 第 ${task.turn} 轮`);
+				return async () => { await this.git.finish(task.workingDirectory, checkpoint.id, { conversationId: task.id }); };
+			},
+			checkBudget: (executor) => {
+				if (this.store.settings.minBalance)
+					throw new Error("外部执行器使用独立账号，无法核对 Pi 设置的最低余额。");
+				if (this.store.settings.maxCostUsd && executor !== "claude")
+					throw new Error("此外部执行器无法执行其账号的美元费用上限。");
+			},
+			reserveBudget: (task) => this.reserveChildCost(task.parentConversationId, task.id),
 			flushNotifications: (owner) => { void this.flushNotifications(owner, "auto"); },
 			onActivityChange: () => { void this.scheduleTasks(); },
 		});
@@ -784,6 +821,8 @@ export class DesktopService {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT")
 				this.engineError = `无法读取桌面配置：${error instanceof Error ? error.message : String(error)}`;
 		}
+		for (const conversation of this.store.conversations)
+			stopActiveGoal(conversation, "应用已重启，目标模式已停止。");
 		const interrupted: DesktopTask[] = [];
 		for (const task of this.store.tasks) {
 			if (["queued", "running", "waiting_for_input"].includes(task.status)) {
@@ -814,7 +853,7 @@ export class DesktopService {
 		await this.persist();
 		const reapInterval = this.options.childRuntimeReapIntervalMs ?? CHILD_RUNTIME_REAP_INTERVAL_MS;
 		if (reapInterval > 0 && !this.reapTimer) {
-			this.reapTimer = setInterval(() => { void this.reapIdleChildRuntimes().catch(() => {}); }, reapInterval);
+			this.reapTimer = setInterval(() => { void this.reapIdleRuntimes().catch(() => {}); }, reapInterval);
 			this.reapTimer.unref?.();
 		}
 		if (this.options.initialProject) return this.selectProject(this.options.initialProject);
@@ -828,24 +867,55 @@ export class DesktopService {
 		return () => this.listeners.delete(listener);
 	}
 
-	/**
-	 * Spend limit for a session process. A delegated child gets what the root
-	 * conversation has left, so subagents cannot run past the cap on their own.
-	 * A fork copies the parent's history, and its own entries already include
-	 * the parent's spend, so it gets the whole cap.
-	 */
-	private async costCapFor(conversationId: string, delegated?: DesktopTask): Promise<number | undefined> {
-		const cap = this.store.settings.maxCostUsd;
-		if (!cap) return undefined;
-		if (!delegated || delegated.isFork) return cap;
-		const rootId = this.rootConversationId(conversationId);
-		const root = rootId === conversationId ? undefined : this.runtimes.get(rootId);
-		const stats = await root?.agent
-			?.request<SessionStats>({ type: "get_session_stats" })
-			.catch(() => undefined);
-		const spent = finiteCount(stats?.cost);
-		// A small positive remainder keeps the child's limit active instead of unlimited.
-		return Math.max(0.0001, cap - spent);
+	private costReservations = new Map<string, { owner: string; amount: number }>();
+	private costOperation: Promise<unknown> = Promise.resolve();
+
+	private serializeCost<T>(action: () => Promise<T>): Promise<T> {
+		const result = this.costOperation.catch(() => {}).then(action);
+		this.costOperation = result;
+		return result;
+	}
+
+	/** The root's Pi session already includes usage from subagents that reported back. */
+	private rootCostLimit(owner: string): number {
+		const cap = this.store.settings.maxCostUsd ?? 0;
+		const reserved = [...this.costReservations.values()]
+			.filter((reservation) => reservation.owner === owner)
+			.reduce((sum, reservation) => sum + reservation.amount, 0);
+		const undelivered = this.store.tasks.filter((task) => task.parentConversationId && task.runInBackground &&
+			this.rootConversationId(task.conversationId) === owner && !this.costReservations.has(task.id) &&
+			!["queued", "running", "waiting_for_input"].includes(task.status) && task.notifiedTurn !== (task.turn ?? 1))
+			.reduce((sum, task) => sum + finiteCount(task.stats?.cost), 0);
+		return Math.max(0, cap - reserved - undelivered - this.external.measuredCostUsd(owner));
+	}
+
+	private async refreshRootCostLimit(owner: string): Promise<void> {
+		const file = this.runtimes.get(owner)?.costLimitFile;
+		if (file) await this.atomicFile(file, String(this.rootCostLimit(owner)));
+	}
+
+	private reserveChildCost(parent: string, taskId: string): Promise<{ maxBudgetUsd: number; release(): Promise<void> } | undefined> {
+		if (!this.store.settings.maxCostUsd) return Promise.resolve(undefined);
+		const owner = this.rootConversationId(parent);
+		return this.serializeCost(async () => {
+			if (!this.store.settings.maxCostUsd) return undefined;
+			const root = this.runtimes.get(owner) ?? await this.ensureRuntime(this.conversation(owner));
+			const spent = finiteCount((await this.requireAgent(root).request<SessionStats>({ type: "get_session_stats" })).cost);
+			const remaining = this.rootCostLimit(owner) - spent;
+			if (remaining <= 0) throw new Error("父会话的费用额度已用完或被运行中的任务预留。");
+			const usedSlots = [...this.costReservations.values()].filter((reservation) => reservation.owner === owner).length;
+			const slots = Math.max(2, (this.options.maxConcurrentTasks ?? 4) + 1 - usedSlots);
+			const amount = remaining / slots;
+			const reservation = { owner, amount };
+			this.costReservations.set(taskId, reservation);
+			try { await this.refreshRootCostLimit(owner); }
+			catch (error) { this.costReservations.delete(taskId); throw error; }
+			return { maxBudgetUsd: amount, release: () => this.serializeCost(async () => {
+				if (this.costReservations.get(taskId) !== reservation) return;
+				this.costReservations.delete(taskId);
+				await this.refreshRootCostLimit(owner);
+			}) };
+		});
 	}
 
 	private providerAuthenticated(provider: Provider): boolean {
@@ -987,7 +1057,7 @@ export class DesktopService {
 
 	/** Approval and question prompts waiting across every running conversation. */
 	pendingApprovalCount(): number {
-		let count = 0;
+		let count = this.external.pendingApprovalCount();
 		for (const runtime of this.runtimes.values()) count += runtime.pendingUI.size;
 		return count;
 	}
@@ -1028,10 +1098,15 @@ export class DesktopService {
 					throw new Error("请先停止该项目的任务与审批，再更改项目信任。");
 			}
 			const changed = (this.store.projectTrust?.[project] ?? undefined) !== input.decision;
+			if (changed && this.external.activeClaudeInProject(project))
+				throw new Error("请先停止该项目的 Claude 外部任务，再更改项目信任。");
 			this.store.projectTrust = { ...(this.store.projectTrust ?? {}), [project]: input.decision };
 			await this.persist();
 			if (input.decision === "trusted") await this.cron.loadProject(project);
 			if (changed) {
+				for (const conversation of this.store.conversations) {
+					if (this.trustProjectFor(conversation.project) === project) this.languages.closeProject(conversation.project);
+				}
 				// Pi reads project resources once at startup, so an explicit decision
 				// only takes effect after the affected runtimes are recreated.
 				for (const runtime of runtimes) await this.stopRuntime(runtime);
@@ -1040,6 +1115,7 @@ export class DesktopService {
 					this.ensureAgentWatcher(active.project);
 					if (await this.projectAvailable(active)) await this.ensureRuntime(active);
 				}
+				this.cron.onEnabledChanged();
 			}
 			return this.buildSnapshot();
 		});
@@ -1222,12 +1298,14 @@ export class DesktopService {
 	}
 
 	private isReadRestricted(conversationId?: string): boolean {
-		const mode = conversationId ? this.permissionPolicy(conversationId).mode : this.store.settings.permission;
+		const id = conversationId ?? this.store.activeId;
+		const mode = id ? this.permissionPolicy(id).mode : this.store.settings.permission;
 		return mode === "read" || mode === "plan";
 	}
 
 	private assertWritableMode(actionLabel: string, conversationId?: string): void {
-		const mode = conversationId ? this.permissionPolicy(conversationId).mode : this.store.settings.permission;
+		const id = conversationId ?? this.store.activeId;
+		const mode = id ? this.permissionPolicy(id).mode : this.store.settings.permission;
 		if (mode === "read") throw new Error(`只读模式下不可${actionLabel}。`);
 		if (mode === "plan") throw new Error(`Plan 模式下不可${actionLabel}。`);
 	}
@@ -1501,6 +1579,8 @@ export class DesktopService {
 			project: conv.project,
 			privateMemory: this.privateMemoryPath(this.trustProjectFor(conv.project)),
 			agentDir: this.store.settings.agentDir ?? this.defaultAgentDir(),
+			home: this.options.env?.HOME,
+			projectTrusted: this.projectTrusted(this.trustProjectFor(conv.project)),
 			stats: snapshot.stats,
 			state: snapshot.state ? ({ ...snapshot.state, autoRetryEnabled } as typeof snapshot.state) : snapshot.state,
 			tools,
@@ -1549,15 +1629,10 @@ export class DesktopService {
 		return this.contextReport(conv.id);
 	}
 
-	private planRelativePath(conversationId: string): string {
-		if (!/^[a-zA-Z0-9._-]+$/.test(conversationId)) throw new Error("会话标识无效。");
-		return join(".pi", "plans", `${conversationId}.md`).replaceAll("\\", "/");
-	}
-
 	async readPlan(conversationId?: string): Promise<PlanFileState> {
 		await this.operation;
 		const conv = this.conversation(conversationId);
-		const relativePath = this.planRelativePath(conv.id);
+		const relativePath = planRelativePath(conv.id);
 		const fullPath = resolve(conv.project, relativePath);
 		if (!inside(conv.project, fullPath)) throw new Error("计划文件路径超出项目目录。");
 		try {
@@ -1577,7 +1652,7 @@ export class DesktopService {
 		await this.operation;
 		const conv = this.conversation(conversationId);
 		if (this.permissionPolicy(conv.id).mode === "read") throw new Error("只读模式下不可写入计划文件。");
-		const relativePath = this.planRelativePath(conv.id);
+		const relativePath = planRelativePath(conv.id);
 		const fullPath = (await managedFile(conv.project, [".pi", "plans"], `${conv.id}.md`, true))!;
 		await writeManagedFile(fullPath, content);
 		return { path: fullPath, relativePath, content, exists: true };
@@ -1601,7 +1676,7 @@ export class DesktopService {
 		if (this.closed) throw new Error("桌面服务已关闭。");
 		const sessionDir = join(this.options.dataDir, "sessions");
 		const canonicalDir = await realpath(sessionDir).catch(() => undefined);
-		if (!canonicalDir) return this.usage.collect([], input);
+		if (!canonicalDir) return this.usage.collect([], input, this.external.usageRecords());
 		const byId = new Map<string, string>();
 		const names = await readdir(canonicalDir, { withFileTypes: true }).catch(() => []);
 		for (const entry of names) {
@@ -1622,7 +1697,7 @@ export class DesktopService {
 			const actual = await realpath(absolute).catch(() => undefined);
 			if (actual && inside(canonicalDir, actual) && actual.endsWith(".jsonl")) files.push(actual);
 		}
-		return this.usage.collect(files, input);
+		return this.usage.collect(files, input, this.external.usageRecords());
 	}
 
 	/** Local environment checks for /doctor. Reads only local state; no network or model requests. */
@@ -1878,9 +1953,7 @@ export class DesktopService {
 		conversationId: string,
 		input: { objective: string; maxTurns?: number; maxCostUsd?: number },
 	): Promise<Snapshot> {
-		let initialPrompt = "";
-		let targetId = "";
-		const snapshot = await this.serialize(async () => {
+		const { goal, snapshot } = await this.serialize(async () => {
 			const conversation = this.conversation(conversationId);
 			const objective = input.objective.trim().slice(0, 4000);
 			if (!objective) throw new Error("目标描述不能为空。");
@@ -1892,22 +1965,41 @@ export class DesktopService {
 			if (maxCostUsd !== undefined && (!Number.isFinite(maxCostUsd) || maxCostUsd < 0.01)) {
 				throw new Error("目标费用上限无效。");
 			}
-			conversation.goal = {
+			const runtime = await this.ensureRuntime(conversation);
+			this.assertRuntimeIdle(runtime);
+			if (runtime.settling) throw new Error("本轮任务正在结算，请稍候再启动目标。");
+			let baselineCostUsd: number | undefined;
+			if (maxCostUsd !== undefined) {
+				const stats = await this.requireAgent(runtime).request<SessionStats>({ type: "get_session_stats" });
+				if (!Number.isFinite(stats.cost)) throw new Error("无法读取会话费用，目标模式尚未启动。");
+				baselineCostUsd = finiteCount(stats.cost);
+				this.assertRuntimeIdle(runtime);
+			}
+			const goal: GoalState = {
 				objective,
 				maxTurns,
 				turnsUsed: 0,
-				...(maxCostUsd !== undefined ? { maxCostUsd } : {}),
+				maxCostUsd,
+				baselineCostUsd,
 				active: true,
 				status: "running",
-				startedAt: Date.now(),
+				startedAt: Math.max(Date.now(), (conversation.goal?.startedAt ?? 0) + 1),
 			};
-			initialPrompt = buildGoalInitialPrompt(conversation.goal);
-			targetId = conversation.id;
+			conversation.goal = goal;
 			await this.persist();
-			return this.buildSnapshot();
+			return { goal, snapshot: await this.buildSnapshot() };
 		});
 		// Kick off the first turn outside the serialize lock so normal prompt streaming runs cleanly.
-		await this.command({ type: "prompt", message: initialPrompt }, targetId);
+		try {
+			const current = this.conversation(conversationId).goal;
+			if (current?.active && current.startedAt === goal.startedAt)
+				await this.command({ type: "prompt", message: buildGoalInitialPrompt(goal) }, conversationId);
+		} catch (error) {
+			const conversation = this.conversation(conversationId);
+			if (conversation.goal?.startedAt === goal.startedAt && stopActiveGoal(conversation, error instanceof Error ? error.message : String(error)))
+				await this.persist();
+			throw error;
+		}
 		return snapshot;
 	}
 
@@ -1915,16 +2007,8 @@ export class DesktopService {
 	stopGoal(conversationId: string): Promise<Snapshot> {
 		return this.serialize(async () => {
 			const conversation = this.conversation(conversationId);
-			if (conversation.goal?.active) {
-				conversation.goal = {
-					...conversation.goal,
-					active: false,
-					status: "stopped",
-					finishedAt: Date.now(),
-					stopReason: "用户已手动停止目标模式。",
-				};
-				await this.persist();
-			}
+			if (!stopActiveGoal(conversation, "用户已手动停止目标模式。")) return this.buildSnapshot();
+			await this.persist();
 			const runtime = this.runtimes.get(conversation.id);
 			if (runtime?.agent && (runtime.busy || runtime.state?.isStreaming)) {
 				await runtime.agent.request({ type: "abort" }).catch(() => {});
@@ -2040,7 +2124,10 @@ export class DesktopService {
 		await this.operation;
 		const conversation = this.conversation(conversationId);
 		const runtime = this.runtimes.get(conversation.id);
-		if (runtime?.agent) return runtime.agent.request({ type: "get_fork_messages" });
+		if (runtime?.agent) {
+			const { messages } = await runtime.agent.request<{ messages: { entryId: string; text: string }[] }>({ type: "get_fork_messages" });
+			return { messages: messages.map((message) => ({ ...message, text: visiblePromptText(message.text) })) };
+		}
 		if (!conversation.sessionFile) return { messages: [] };
 		const { forkMessages } = await this.history.inspect({
 			sessionFile: conversation.sessionFile,
@@ -2182,13 +2269,15 @@ export class DesktopService {
 			runtime.busy = state.isStreaming;
 			await agent.request({ type: "set_session_name", name: child.title });
 			await this.saveSessionLeaf(runtime);
+			await this.writeRuntimeControls(runtime);
+			if (runtime.controls) await this.controlRequest(runtime, "apply");
 			if (input.activate !== false) await this.activate(child);
 			else if (this.store.activeId === parent.id) await this.ensureRuntime(parent);
 			await this.persist();
 			return {
 				cancelled: false,
 				conversation: structuredClone(child),
-				selectedText: result.text,
+				selectedText: result.text === undefined ? undefined : visiblePromptText(result.text),
 				snapshot: await this.buildSnapshot(child.id),
 			};
 		} catch (error) {
@@ -2336,13 +2425,13 @@ export class DesktopService {
 		return this.workflows.respondApproval(workflowId, requestId, decision);
 	}
 
-	private rootConversationId(conversationId: string): string {
+	private rootConversationId(conversationId: string, followCopies = true): string {
 		let cursor = conversationId;
 		const visited = new Set<string>();
 		while (cursor && !visited.has(cursor)) {
 			visited.add(cursor);
 			const parent =
-				this.store.conversations.find((item) => item.id === cursor)?.parentConversationId ??
+				(followCopies ? this.store.conversations.find((item) => item.id === cursor)?.parentConversationId : undefined) ??
 				this.store.tasks.find((item) => item.conversationId === cursor && item.parentConversationId)?.parentConversationId;
 			if (!parent) break;
 			cursor = parent;
@@ -2385,6 +2474,24 @@ export class DesktopService {
 		} finally {
 			clearTimeout(timer);
 		}
+	}
+
+	async defaultPreviewUrl(conversationId: string): Promise<string> {
+		await this.operation;
+		const conversation = this.conversation(conversationId);
+		const root = this.rootConversationId(conversationId);
+		const embeddable = (url: string | undefined): url is string => Boolean(url && validateLocalPreviewUrl(url).hostname !== "[::1]");
+		for (const server of this.previewServers.values()) {
+			if (server.rootConversationId === root && this.monitors.get(server.serverId)?.status === "running" && embeddable(server.url))
+				return server.url;
+		}
+		const path = await realpath(join(conversation.project, ".claude", "launch.json")).catch(() => undefined);
+		if (path && inside(conversation.project, path)) {
+			const config = await readLaunchConfigurations(conversation.project).catch(() => undefined);
+			const first = config?.configurations.map(launchConfigUrl).find(embeddable);
+			if (first) return first;
+		}
+		return DEFAULT_LOCAL_PREVIEW_URL;
 	}
 
 	private async handlePreviewCheckTool(input: Record<string, unknown>, context: ToolHostContext): Promise<unknown> {
@@ -2578,7 +2685,7 @@ export class DesktopService {
 		}
 		if (request.tool === "LSP") {
 			const conv = this.conversation(context.conversationId);
-			const operation = String(input.operation) as "diagnostics" | "documentSymbol" | "goToDefinition" | "inspect";
+			const operation = String(input.operation) as CodeIntelligenceOperation;
 			const filePath = String(input.filePath);
 			const silent = input.silent === true;
 			const trusted = this.store.projectTrust?.[this.trustProjectFor(conv.project)] === "trusted";
@@ -2595,7 +2702,7 @@ export class DesktopService {
 					? { line: input.line, column: input.character }
 					: undefined;
 			try {
-				const intel = await codeIntelligence(conv.project, filePath, this.options.env, at);
+				const intel = await this.languages.inspect(conv.project, filePath, at, operation, context.signal);
 				const formatted = silent
 					? formatLspDiagnostics(filePath, intel)
 					: formatCodeIntelligence(filePath, intel, operation);
@@ -2604,6 +2711,7 @@ export class DesktopService {
 					filePath,
 					operation,
 					diagnostics: intel.diagnostics,
+					diagnosticsComplete: intel.diagnosticsComplete,
 					symbols: operation === "diagnostics" ? [] : intel.symbols,
 					definitions: intel.definitions,
 					formatted,
@@ -2708,6 +2816,7 @@ export class DesktopService {
 				conversationId: conv.id,
 				rootConversationId: this.rootConversationId(conv.id),
 				project: conv.project,
+				callerSignal: input.run_in_background === true ? undefined : context.signal,
 				input: {
 					title: typeof input.title === "string" ? input.title : undefined,
 					script: String(input.script),
@@ -2811,7 +2920,8 @@ export class DesktopService {
 			// Shells are shared within one root conversation (its subagents included), never across roots.
 			if (!record || record.kind !== "shell" || record.rootConversationId !== this.rootConversationId(context.conversationId))
 				throw new Error(`Background shell not found: ${id}`);
-			if (request.tool === "BashOutput") return this.monitors.readShell(id, typeof input.filter === "string" ? input.filter : undefined);
+			if (request.tool === "BashOutput")
+				return this.monitors.readShell(id, typeof input.filter === "string" ? input.filter : undefined, typeof input.cursor === "number" ? input.cursor : undefined);
 			if (record.status === "running") await this.monitors.stop(id, undefined, "model_stop");
 			const stopped = this.monitors.get(id)!;
 			return { shell_id: id, status: shellStatus(stopped), exit_code: stopped.exitCode ?? null, message: record.status === "running" ? "Background shell stopped" : "Background shell had already finished" };
@@ -2886,19 +2996,7 @@ export class DesktopService {
 				}
 				const memberName =
 					typeof cleanInput.name === "string" ? cleanInput.name : `member-${randomBytes(3).toString("hex")}`;
-				const result = await this.delegation.handle(context, request.tool, { ...cleanInput, name: memberName });
-				const details = (result as { details?: { task_id?: string; conversation_id?: string; subagent_type?: string } })?.details;
-				if (details?.task_id && details.conversation_id) {
-					await this.teams.registerMember({
-						rootConversationId: rootId,
-						teamName: cleanInput.team_name,
-						memberName,
-						agentId: details.task_id,
-						conversationId: details.conversation_id,
-						subagentType: details.subagent_type,
-					});
-				}
-				return result;
+				return this.delegation.handle(context, request.tool, { ...cleanInput, name: memberName });
 			}
 			return this.delegation.handle(context, request.tool, cleanInput);
 		}
@@ -3310,9 +3408,12 @@ export class DesktopService {
 		const task = this.store.tasks.find((item) => item.conversationId === conversationId);
 		if (trustDecision !== "trusted") return paths.map(() => "untrusted");
 		if (task?.omitClaudeMd) return paths.map(() => "unavailable");
+		const policy = this.permissionPolicy(conversationId);
 		return Promise.all(paths.map(async (candidate): Promise<FileReferenceAvailability> => {
 			const path = candidate.replace(/^\.\//, "");
 			if (!isReferenceablePath(path)) return "unavailable";
+			const permission = await evaluatePermission(policy, { toolName: "read", input: { path } }).catch(() => undefined);
+			if (permission?.action !== "allow") return "unavailable";
 			const content = await readProjectText(project, path);
 			return content?.trim() ? "ready" : "unavailable";
 		}));
@@ -3323,7 +3424,7 @@ export class DesktopService {
 		const { project } = this.conversation(conversationId);
 		if (this.store.projectTrust?.[this.trustProjectFor(project)] !== "trusted")
 			throw new Error("请先在项目菜单中信任此项目，再启动语言服务器。");
-		return codeIntelligence(project, path, this.options.env, at);
+		return this.languages.inspect(project, path, at);
 	}
 
 	async readFile(path: string, conversationId?: string): Promise<{ path: string; content: string }> {
@@ -3623,6 +3724,7 @@ export class DesktopService {
 		apiKey?: string;
 		keyCommand?: string;
 		headers?: Record<string, string>;
+		useAsDefault?: boolean;
 		baseUrl?: string;
 		modelId?: string;
 		agentDir?: string;
@@ -3630,7 +3732,6 @@ export class DesktopService {
 		mode?: ConnectionMode;
 	}): Promise<Snapshot> {
 		return this.serialize(async () => {
-			this.assertIdle();
 			const next: StoredState = structuredClone(this.store);
 			next.settings.permission = settings.permission;
 			next.settings.theme = settings.theme;
@@ -3845,11 +3946,11 @@ export class DesktopService {
 				if (authenticated && !connection.modelId)
 					throw new Error("请填写此连接的模型 ID；留空密钥会保留已保存的认证。");
 				next.settings.connections[provider] = connection;
-				if (connection.modelId && authenticated)
+				if (connection.modelId && authenticated && settings.useAsDefault !== false)
 					next.settings.defaultModel = { provider: `desktop-${provider}`, id: connection.modelId };
 			}
+			const permissionChanged = next.settings.permission !== this.store.settings.permission;
 			const needsRestart =
-				next.settings.permission !== this.store.settings.permission ||
 				Boolean(next.settings.sandbox) !== Boolean(this.store.settings.sandbox) ||
 				Boolean(next.settings.sandboxOffline) !== Boolean(this.store.settings.sandboxOffline) ||
 				(next.settings.webSearchEnabled !== false) !== (this.store.settings.webSearchEnabled !== false) ||
@@ -3863,23 +3964,22 @@ export class DesktopService {
 				next.settings.minBalance !== this.store.settings.minBalance ||
 				fallbackKey(next.settings.fallbackModel) !== fallbackKey(this.store.settings.fallbackModel) ||
 				Boolean(settings.provider);
+			if (needsRestart) this.assertIdle();
 			const styleChanged = next.settings.outputStyle !== this.store.settings.outputStyle;
 			this.store = next;
 			await this.persist();
+			if (permissionChanged) await this.closeReadRestrictedTerminals();
 			if (settings.cronEnabled !== undefined) this.cron.onEnabledChanged();
 			// Running main conversations pick up the new style on their next turn.
 			if (styleChanged && !needsRestart)
 				for (const runtime of this.runtimes.values()) await this.writeOutputStyle(runtime).catch(() => {});
 			if (needsRestart) {
 				for (const runtime of [...this.runtimes.values()]) await this.stopRuntime(runtime);
-				if (next.settings.permission === "read" || next.settings.permission === "plan") {
-					for (const terminal of this.terminals.list()) await this.terminals.close(terminal.id);
-				}
 				const active = this.active();
 				if (active) await this.activate(active);
 				const connection = settings.provider && this.store.settings.connections[settings.provider];
 				const runtime = active && this.runtimes.get(active.id);
-				if (settings.provider && connection?.modelId && this.providerAuthenticated(settings.provider) && runtime?.agent) {
+				if (settings.provider && settings.useAsDefault !== false && connection?.modelId && this.providerAuthenticated(settings.provider) && runtime?.agent) {
 					await runtime.agent.request({
 						type: "set_model",
 						provider: `desktop-${settings.provider}`,
@@ -3887,15 +3987,15 @@ export class DesktopService {
 					});
 					await this.syncState(runtime);
 				}
-			}
+			} else if (permissionChanged) await this.refreshControls("permissions_changed");
 			return this.buildSnapshot();
 		});
 	}
 
 	testConnection(input: ConnectionInput): Promise<ConnectionTestResult> {
-		return this.serialize(async () => {
+		const test = this.connectionTestOperation.then(async () => {
+			await this.operation;
 			if (this.closed) throw new Error("桌面服务已关闭。");
-			this.assertIdle();
 			const stored = this.store.settings.connections[input.provider];
 			const mode = connectionMode(input, stored);
 			const preset = providerPresets.find((item) => item.provider === input.provider)!;
@@ -4014,6 +4114,8 @@ export class DesktopService {
 				await rm(temporary, { recursive: true, force: true });
 			}
 		});
+		this.connectionTestOperation = test.then(() => {}, () => {});
+		return test;
 	}
 
 	async exportConversation(outputPath: string): Promise<string> {
@@ -4140,6 +4242,19 @@ export class DesktopService {
 	}
 
 	private async runGrail(conversation: Conversation, run: { id: string; controller: AbortController; step: GrailStep; startedAt: number }): Promise<GrailVerdict> {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-grail-review-"));
+		try {
+			return await this.reviewGrailSnapshot(conversation, run, workspace);
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+		}
+	}
+
+	private async reviewGrailSnapshot(
+		conversation: Conversation,
+		run: { id: string; controller: AbortController; step: GrailStep; startedAt: number },
+		workspace: string,
+	): Promise<GrailVerdict> {
 		const signal = run.controller.signal;
 		const settings = this.store.settings;
 		const deadline = run.startedAt + (settings.grailTimeoutSec ?? DEFAULT_GRAIL_TIMEOUT_SEC) * 1000;
@@ -4178,21 +4293,22 @@ export class DesktopService {
 		const unjudgeable = (reason: string): GrailVerdict => ({ ...finish(), grade: "unjudgeable", reasons: [reason] });
 		if (!checkpoint) return unjudgeable("这个愿望没有 Git 快照（不是 Git 项目或还没有改动），无法取得 diff。");
 		if (!requirement.length) return unjudgeable("这个愿望里没有用户需求消息。");
-		const diff = await this.git.diffToWorktree(conversation.project, checkpoint.id);
+		const diff = await this.git.diffToWorktree(conversation.project, checkpoint.id, workspace);
 		if (diff.excludedFiles) return unjudgeable("有文件超出 Git 快照容量，无法完整鉴定改动。");
 		files = diff.files.map((file) => ({ path: file.path, status: file.status }));
 		if (!diff.files.length) return unjudgeable("这个愿望没有代码改动。");
 		const lines = parseDiffLines(diff.files);
+		const prefix = (await exec("git", ["rev-parse", "--show-prefix"], { cwd: conversation.project, timeout: 10000 })).stdout.replace(/\r?\n$/, "");
 
 		step("objective");
 		if (this.store.projectTrust?.[this.trustProjectFor(conversation.project)] === "untrusted")
 			steps.objective = { status: "unavailable", reason: "项目被标记为不信任，不执行项目脚本。", runs: [] };
-		else steps.objective = await this.grailObjective(conversation, deadline, signal);
+		else steps.objective = await this.grailObjective(conversation.project, workspace, prefix, deadline, signal);
 		if (steps.objective.status !== "pass") return finish();
 
 		step("distortion");
 		steps.distortion = { hits: scanDistortions(lines) };
-		if (steps.distortion.hits.length) return finish();
+		if (steps.distortion.hits.some((hit) => !hit.review)) return finish();
 
 		if (!model?.provider || !model.id) {
 			steps.blind = { status: "unavailable", reason: "没有可用的评审模型。" };
@@ -4203,7 +4319,7 @@ export class DesktopService {
 		const before = await mkdtemp(join(tmpdir(), "pi-grail-blind-"));
 		try {
 			await this.git.materializeBefore(conversation.project, checkpoint.id, before);
-			const output = await this.grailModelRun(before, model, buildBlindPrompt(requirement), true, budget, deadline, signal);
+			const output = await this.grailModelRun(join(before, prefix), model, buildBlindPrompt(requirement), budget, deadline, signal);
 			steps.blind = parseBlindSolution(output);
 		} catch (error) {
 			if (signal.aborted) throw error;
@@ -4217,7 +4333,7 @@ export class DesktopService {
 		const annotated = annotateDiff(diff.files);
 		try {
 			const prompt = buildComparisonPrompt(requirement, steps.blind.solution!, annotated.text);
-			steps.comparison = parseComparison(await this.grailModelRun(conversation.project, model, prompt, false, budget, deadline, signal), lines);
+			steps.comparison = parseComparison(await this.grailModelRun(join(workspace, prefix), model, prompt, budget, deadline, signal), lines);
 		} catch (error) {
 			if (signal.aborted) throw error;
 			steps.comparison = { status: "unavailable", reason: error instanceof Error ? error.message : String(error), findings: [], dropped: 0 };
@@ -4225,26 +4341,38 @@ export class DesktopService {
 		return finish();
 	}
 
-	private async grailObjective(conversation: Conversation, deadline: number, signal: AbortSignal): Promise<GrailObjectiveResult> {
+	private async grailObjective(project: string, workspace: string, prefix: string, deadline: number, signal: AbortSignal): Promise<GrailObjectiveResult> {
 		let manifest: unknown;
 		try {
-			manifest = JSON.parse(await readFile(join(conversation.project, "package.json"), "utf8"));
+			manifest = JSON.parse(await readFile(join(workspace, prefix, "package.json"), "utf8"));
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT")
 				return { status: "unavailable", reason: "package.json 无法解析。", runs: [] };
 		}
 		const scratch = await mkdtemp(join(tmpdir(), "pi-grail-"));
 		try {
+			const objectiveRoot = join(scratch, "workspace");
+			const objectiveProject = join(objectiveRoot, prefix);
+			const copy = { recursive: true, verbatimSymlinks: true, mode: fsConstants.COPYFILE_FICLONE };
+			await cp(workspace, objectiveRoot, copy);
+			const sourceRoot = resolve(project, ...prefix.split("/").filter(Boolean).map(() => ".."));
+			for (const subdir of new Set(["", prefix])) {
+				signal.throwIfAborted();
+				const modules = join(sourceRoot, subdir, "node_modules");
+				if (await lstat(modules).then((entry) => entry.isDirectory(), () => false)) {
+					const destination = join(objectiveRoot, subdir, "node_modules");
+					if (!(await access(destination).then(() => true, () => false))) await cp(modules, destination, copy);
+				}
+			}
 			let sandboxProfile: string | undefined;
 			if (this.store.settings.sandbox && (await probeSeatbeltSupport()).supported) {
 				sandboxProfile = join(scratch, "grail.sb");
-				const extra = await resolveGitWorktreeWritablePaths(conversation.project);
-				await writeFile(sandboxProfile, buildSeatbeltProfile(conversation.project, extra, true), { mode: 0o600 });
+				await writeFile(sandboxProfile, buildSeatbeltProfile(objectiveRoot, [], true), { mode: 0o600 });
 			}
 			return await runObjectiveChecks({
-				project: conversation.project,
+				project: objectiveProject,
 				manifest,
-				files: await readdir(conversation.project),
+				files: [...new Set([...await readdir(objectiveRoot), ...await readdir(objectiveProject)])],
 				env: scriptEnvironment({ ...process.env, ...this.options.env }, join(scratch, "npm-cache")),
 				sandboxProfile,
 				deadline,
@@ -4260,7 +4388,6 @@ export class DesktopService {
 		cwd: string,
 		model: { provider: string; id: string },
 		prompt: string,
-		readOnlyTools: boolean,
 		budget: { spent: number; max: number },
 		deadline: number,
 		signal: AbortSignal,
@@ -4269,7 +4396,8 @@ export class DesktopService {
 			...process.env,
 			...this.options.env,
 			PI_SKIP_VERSION_CHECK: "1",
-			PI_DESKTOP_CONNECTION_TEST: "1",
+			PI_DESKTOP_CONNECTION_TEST: "0",
+			PI_DESKTOP_GRAIL_REVIEW: "1",
 			PI_DESKTOP_PERMISSION_MODE: "read",
 			...networkEnvironment(this.store.settings),
 		};
@@ -4281,7 +4409,12 @@ export class DesktopService {
 		let agent: AgentProcess | undefined;
 		let timer: NodeJS.Timeout | undefined;
 		let onAbort: (() => void) | undefined;
+		const controls = await mkdtemp(join(tmpdir(), "pi-grail-controls-"));
 		try {
+			env.PI_DESKTOP_POLICY_FILE = join(controls, "permission.json");
+			await this.atomicJson(env.PI_DESKTOP_POLICY_FILE, {
+				version: 1, mode: "read", sandbox: true, rules: [], disabledTools: [], project: await realpath(cwd),
+			} satisfies RuntimePermissionPolicy);
 			let last: Extract<Message, { role: "assistant" }> | undefined;
 			let settle!: () => void;
 			let fail!: (error: Error) => void;
@@ -4295,7 +4428,7 @@ export class DesktopService {
 				cwd,
 				args: [
 					"--no-session",
-					...(readOnlyTools ? ["--tools", "read,grep,find,ls"] : ["--no-tools"]),
+					"--tools", "read,grep,find,ls",
 					"--no-skills",
 					"--no-prompt-templates",
 					"--no-context-files",
@@ -4333,6 +4466,7 @@ export class DesktopService {
 			clearTimeout(timer);
 			if (onAbort) signal.removeEventListener("abort", onAbort);
 			await agent?.stop();
+			await rm(controls, { recursive: true, force: true });
 		}
 	}
 
@@ -4599,8 +4733,9 @@ export class DesktopService {
 			for (const name of ["WorktreeCreate", "WorktreeMerge", "WorktreeRemove"]) disabledTools.add(name);
 		}
 		// Global "dontAsk" is the ask policy with every remaining prompt turned into a denial.
-		const globalDontAsk = this.store.settings.permission === "dontAsk";
-		const globalMode: RuntimePermissionPolicy["mode"] = globalDontAsk ? "ask" : (this.store.settings.permission as RuntimePermissionPolicy["mode"]);
+		const requested = conversation.permissionMode ?? parent?.mode ?? this.store.settings.permission;
+		const globalDontAsk = requested === "dontAsk";
+		const globalMode: RuntimePermissionPolicy["mode"] = globalDontAsk ? "ask" : (requested as RuntimePermissionPolicy["mode"]);
 		const dontAsk = Boolean(globalDontAsk || inherited?.dontAsk || parent?.dontAsk);
 		const parentCeiling = parent?.mode ?? globalMode;
 		let mode: RuntimePermissionPolicy["mode"];
@@ -4629,6 +4764,9 @@ export class DesktopService {
 			version: 1,
 			mode,
 			...(dontAsk ? { dontAsk: true } : {}),
+			...(this.store.settings.sandbox || inherited?.sandbox || parent?.sandbox || this.runtimes.get(conversationId)?.sandboxProfileFile
+				? { sandbox: true }
+				: {}),
 			rules,
 			disabledTools: [...disabledTools],
 			...(allowedMcpServers !== undefined ? { allowedMcpServers } : {}),
@@ -4666,6 +4804,7 @@ export class DesktopService {
 		const write = (runtime.controlWrites ?? Promise.resolve()).catch(() => {}).then(async () => {
 			const policy = this.permissionPolicy(runtime.conversationId);
 			if (runtime.policyFile) await this.atomicJson(runtime.policyFile, policy);
+			runtime.sessionPermissionMode = policy.dontAsk ? "dontAsk" : policy.mode;
 			if (runtime.sandboxProfileFile) {
 				const conversation = this.store.conversations.find((item) => item.id === runtime.conversationId);
 				if (conversation) {
@@ -4732,6 +4871,30 @@ export class DesktopService {
 		if (failed?.status === "rejected") throw new Error(`设置已保存，工具声明刷新失败，请重开会话：${String(failed.reason)}`);
 	}
 
+	setConversationPermission(conversationId: string, input: unknown): Promise<Snapshot> {
+		return this.serialize(async () => {
+			if (!permissionModes.has(input)) throw new Error("无效的会话权限模式。");
+			const conversation = this.conversation(conversationId);
+			// Fork and clone lineage tracks history, while only delegated tasks inherit permissions.
+			if (this.rootConversationId(conversationId, false) !== conversationId) throw new Error("请在主会话调整权限。");
+			conversation.permissionMode = input as PermissionMode;
+			await this.persist();
+			await this.closeReadRestrictedTerminals(conversationId);
+			const runtimes = [...this.runtimes.values()].filter((runtime) =>
+				!runtime.stopping && this.rootConversationId(runtime.conversationId, false) === conversationId,
+			);
+			for (const runtime of runtimes) await this.writeRuntimeControls(runtime);
+			await this.external.invalidatePolicies();
+			for (const runtime of runtimes) {
+				if (runtime.controls && runtime.engineStatus === "ready" && !runtime.busy && !runtime.pendingUI.size)
+					await this.controlRequest(runtime, "apply");
+			}
+			for (const listener of this.controlListeners)
+				listener({ type: "permissions_changed", conversationIds: runtimes.map((runtime) => runtime.conversationId) });
+			return this.buildSnapshot();
+		});
+	}
+
 	private async controlRequest(runtime: SessionRuntime, operation: "list" | "apply"): Promise<DesktopToolInfo[]> {
 		const data = await this.controlCall(runtime, { operation });
 		if (!Array.isArray(data.tools)) throw new Error("工具清单格式错误。");
@@ -4776,18 +4939,50 @@ export class DesktopService {
 			usage?: NotificationUsage;
 		},
 	): Promise<NotificationDisposition | undefined> {
-		const data = await this.controlCall(runtime, {
-			operation: "deliver",
-			customType: params.customType,
-			...(params.key ? { key: params.key } : {}),
-			content: params.content,
-			details: params.details,
-			deliverAs: params.deliverAs,
-			triggerTurn: params.triggerTurn,
-			...(params.display !== undefined ? { display: params.display } : {}),
-			...(params.usage ? { usage: params.usage } : {}),
-		});
-		return data.delivery as NotificationDisposition | undefined;
+		const deliver = async () => {
+			const data = await this.controlCall(runtime, {
+				operation: "deliver",
+				customType: params.customType,
+				...(params.key ? { key: params.key } : {}),
+				content: params.content,
+				details: params.details,
+				deliverAs: params.deliverAs,
+				triggerTurn: params.triggerTurn,
+				...(params.display !== undefined ? { display: params.display } : {}),
+				...(params.usage ? { usage: params.usage } : {}),
+			});
+			return data.delivery as NotificationDisposition | undefined;
+		};
+		return params.triggerTurn && params.deliverAs === "followUp"
+			? this.checkpointWakeup(runtime, deliver)
+			: deliver();
+	}
+
+	private async checkpointWakeup(
+		runtime: SessionRuntime,
+		send: () => Promise<NotificationDisposition | undefined>,
+	): Promise<NotificationDisposition | undefined> {
+		if (runtime.busy || runtime.bashBusy || runtime.state?.isStreaming || runtime.state?.isCompacting) return "deferred";
+		const conversation = this.conversation(runtime.conversationId);
+		if (!this.isReadRestricted(conversation.id)) {
+			try { this.assertPathAvailable(conversation.project, conversation.id); } catch { return "deferred"; }
+		}
+		const existing = Boolean(runtime.checkpointId || runtime.checkpointStarting);
+		await this.startCheckpoint(runtime, "后台唤醒");
+		const prepared = existing ? undefined : runtime.checkpointId;
+		let delivery: NotificationDisposition | undefined;
+		try {
+			delivery = await send();
+			return delivery;
+		} finally {
+			if (prepared && delivery !== "sent" && runtime.checkpointId === prepared && !runtime.busy && !runtime.state?.isStreaming) {
+				runtime.checkpointId = undefined;
+				runtime.checkpointUserAnchor = undefined;
+				const task = this.store.tasks.find((item) => item.conversationId === conversation.id);
+				if (task?.checkpointId === prepared) delete task.checkpointId;
+				await this.git.abandonPending(conversation.project, prepared, conversation.id).catch(() => {});
+			}
+		}
 	}
 
 	async deliverToConversation(
@@ -4814,6 +5009,15 @@ export class DesktopService {
 		if (params.idleOnly && (runtime.busy || runtime.state?.isStreaming)) return "deferred";
 		const deliverAs = params.deliverAs ?? "followUp";
 		const triggerTurn = params.triggerTurn ?? (deliverAs === "followUp");
+		if (triggerTurn && !runtime.busy && !runtime.state?.isStreaming) {
+			const conversation = this.store.conversations.find((item) => item.id === conversationId);
+			if (!conversation) return "unavailable";
+			try {
+				this.assertPathAvailable(conversation.project, conversation.id);
+			} catch {
+				return "deferred";
+			}
+		}
 		const disposition = await this.deliverOnRuntime(runtime, {
 			customType: params.customType,
 			key: params.key,
@@ -4827,6 +5031,60 @@ export class DesktopService {
 		return disposition ?? "sent";
 	}
 
+	private async deliverCronWakeup(
+		conversationId: string,
+		params: Parameters<DesktopService["deliverToConversation"]>[1],
+		project?: string,
+	): Promise<NotificationDisposition | "unavailable"> {
+		if (this.closed) return "unavailable";
+		const conversation = this.store.conversations.find((item) => item.id === conversationId);
+		if (!conversation || this.isDelegatedChild(conversationId)) return "unavailable";
+		if (project && conversation.project !== project) return "unavailable";
+		try {
+			this.assertPathAvailable(conversation.project, conversation.id);
+		} catch {
+			// Busy with another session: retry as temporarily unavailable for a one-shot
+			// job, since the target session itself has no settling event to wake the job.
+			return "unavailable";
+		}
+		const runtime = await this.ensureRuntime(conversation).catch(() => undefined);
+		if (!runtime) return "unavailable";
+		return this.deliverToConversation(conversationId, params);
+	}
+
+	private async deliverTeamWakeup(
+		conversationId: string,
+		params: Parameters<DesktopService["deliverToConversation"]>[1],
+	): Promise<NotificationDisposition | "unavailable"> {
+		if (this.closed || this.store.settings.agentTeams !== true) return "unavailable";
+		const conversation = this.store.conversations.find((item) => item.id === conversationId);
+		if (!conversation || !(await this.projectAvailable(conversation))) return "unavailable";
+		const task = this.store.tasks.find((item) => item.conversationId === conversationId && item.parentConversationId);
+		if (task && (task.quarantined || ["cancelled", "failed", "interrupted"].includes(task.status))) return "unavailable";
+		if (task && (["queued", "running", "waiting_for_input"].includes(task.status) || this.piOutboxItem(task))) return "deferred";
+		try { this.assertPathAvailable(conversation.project, conversation.id); } catch { return "deferred"; }
+		const runtime = await this.ensureRuntime(conversation).catch(() => undefined);
+		if (!runtime) return "unavailable";
+		if (runtime.busy || runtime.state?.isStreaming || runtime.stopping) return "deferred";
+		const prior = task ? { turn: task.turn, stats: task.stats, baseline: task.statsAtTurnStart } : undefined;
+		let disposition: NotificationDisposition | "unavailable" = "unavailable";
+		try {
+			if (task) {
+				await this.prepareTaskUsage(runtime, task);
+				task.turn = (task.turn ?? 1) + 1;
+			}
+			disposition = await this.deliverToConversation(conversationId, { ...params, idleOnly: true });
+			return disposition;
+		} finally {
+			if (task && prior && disposition !== "sent" && !runtime.busy && !runtime.state?.isStreaming) {
+				task.turn = prior.turn;
+				task.stats = prior.stats;
+				task.statsAtTurnStart = prior.baseline;
+				await this.releaseRuntimeCost(runtime);
+			}
+		}
+	}
+
 	subscribeTerminals(listener: (event: TerminalEvent) => void): () => void {
 		return this.terminals.subscribe(listener);
 	}
@@ -4836,9 +5094,10 @@ export class DesktopService {
 		return structuredClone(this.store.tasks);
 	}
 
-	startTask(input: TaskStartInput, delegation?: DelegationMetadata): Promise<DesktopTask> {
+	startTask(input: TaskStartInput, delegation?: DelegationMetadata, signal?: AbortSignal): Promise<DesktopTask> {
 		return this.serialize(async () => {
 			if (this.closed) throw new Error("桌面服务已关闭。");
+			signal?.throwIfAborted();
 			if (!input.message.trim()) throw new Error("请输入任务内容。");
 			if (input.message.length > MAX_TASK_MESSAGE) throw new Error("任务内容过长。");
 			const validateToolNames = (list: string[] | undefined, label: string) => {
@@ -4861,10 +5120,18 @@ export class DesktopService {
 					typeof input.model.id !== "string" || !input.model.id || input.model.id.length > MAX_MODEL_ID)
 			)
 				throw new Error("任务模型无效。");
-			const existing = input.worktreeId
-				? (await this.worktrees.list()).find((item) => item.id === input.worktreeId)
+			// Resolve reuse under the task creation lock so simultaneous requests in one workflow
+			// scope see the same worktree, including when a previous attempt failed after editing it.
+			const previousWorkflowTask = delegation?.workflowId && delegation.workflowWorkspace
+				? this.store.tasks.find((task) =>
+					task.workflowId === delegation.workflowId && task.workflowWorkspace === delegation.workflowWorkspace &&
+					task.parentConversationId === delegation.parentConversationId && task.worktreeId && !task.quarantined)
 				: undefined;
-			if (input.worktreeId && (!existing || existing.status !== "ready")) throw new Error("指定的 Worktree 不可用。");
+			const worktreeId = input.worktreeId ?? previousWorkflowTask?.worktreeId;
+			const existing = worktreeId
+				? (await this.worktrees.list()).find((item) => item.id === worktreeId)
+				: undefined;
+			if (worktreeId && (!existing || existing.status !== "ready")) throw new Error("指定的 Worktree 不可用。");
 			if (existing && input.baseRef !== undefined) throw new Error("已有 Worktree 不能重新指定 Git 基准。");
 			const project = await realpath(input.project ?? existing?.repository ?? this.requireActive().project);
 			if (!(await stat(project)).isDirectory()) throw new Error("项目目录不存在。");
@@ -4892,8 +5159,9 @@ export class DesktopService {
 					hookAdditionalContext = truncateText(startHook.additionalContext.trim(), MAX_HOOK_ADDITIONAL_CONTEXT);
 				}
 			}
+			signal?.throwIfAborted();
 			const isolated = input.isolation !== "shared";
-			if (isolated && !existing && this.store.settings.permission === "read")
+			if (isolated && !existing && this.isReadRestricted(delegation?.parentConversationId))
 				throw new Error("只读模式请使用 shared 隔离方式，不能创建 Worktree。");
 			const worktree =
 				existing ?? (isolated ? await this.worktrees.create({ project, baseRef: input.baseRef }) : undefined);
@@ -4901,6 +5169,7 @@ export class DesktopService {
 			let directory = project;
 			try {
 				if (worktree) directory = await realpath(join(worktree.path, relative(worktree.repository, project)));
+				signal?.throwIfAborted();
 			} catch (error) {
 				if (worktree && !existing) await this.worktrees.remove(worktree.id).catch(() => {});
 				throw error;
@@ -4997,6 +5266,24 @@ export class DesktopService {
 					delegation.readOnly,
 					input.mcpServers,
 				);
+			}
+			if (task.teamName && task.parentConversationId && task.name) {
+				try {
+					await this.teams.registerMember({
+						rootConversationId: this.rootConversationId(task.parentConversationId),
+						teamName: task.teamName,
+						memberName: task.name,
+						agentId: task.id,
+						conversationId: task.conversationId,
+						subagentType: task.subagentType,
+					});
+				} catch (error) {
+					this.store.conversations = this.store.conversations.filter((item) => item.id !== conversation.id);
+					if (this.store.taskPolicies) delete this.store.taskPolicies[task.id];
+					if (systemPromptFile) await rm(systemPromptFile, { force: true }).catch(() => {});
+					if (worktree && !existing) await this.worktrees.remove(worktree.id).catch(() => {});
+					throw error;
+				}
 			}
 			this.store.tasks.unshift(task);
 			if (delegation && conversation.sessionFile) {
@@ -5175,6 +5462,7 @@ export class DesktopService {
 		task.revision = (task.revision ?? 0) + 1;
 		for (const listener of this.taskListeners) listener({ type: "task_updated", task: structuredClone(task) });
 		await this.persist();
+		if (this.store.settings.maxCostUsd) await this.serializeCost(() => this.refreshRootCostLimit(this.rootConversationId(task.conversationId)));
 	}
 	/**
 	 * Deliver a parent's pending background results through its Pi extension.
@@ -5247,7 +5535,10 @@ export class DesktopService {
 				consumers.add(done);
 			});
 			if (!started && !runtime.busy && !runtime.state?.isStreaming)
-				await this.controlCall(runtime, { operation: "wake", count: queued.size }).catch(() => {});
+				await this.checkpointWakeup(runtime, async () => {
+					const reply = await this.controlCall(runtime, { operation: "wake", count: queued.size });
+					return reply.delivery as NotificationDisposition | undefined;
+				}).catch(() => {});
 			// Report the count after the run has taken them, not while the run is starting.
 			if (started || !runtime.busy) await consumed;
 		}
@@ -5438,18 +5729,24 @@ export class DesktopService {
 	 * leaf is saved; a later message restarts the child with `--session` transparently.
 	 */
 	reapIdleChildRuntimes(options: { idleMs?: number } = {}): Promise<number> {
+		return this.reapIdleRuntimes(options.idleMs, "child");
+	}
+
+	private reapIdleRuntimes(
+		idleMs = this.options.childRuntimeIdleMs ?? CHILD_RUNTIME_IDLE_MS,
+		scope: "all" | "child" = "all",
+	): Promise<number> {
 		if (this.closed) return Promise.resolve(0);
 		return this.serialize(async () => {
-			const idleMs = options.idleMs ?? this.options.childRuntimeIdleMs ?? CHILD_RUNTIME_IDLE_MS;
 			const now = Date.now();
-			const candidates = [...this.runtimes.values()].filter((runtime) => this.reapable(runtime)).sort((left, right) => left.lastActivity - right.lastActivity);
+			const candidates = [...this.runtimes.values()].filter((runtime) => this.reapable(runtime, scope)).sort((left, right) => left.lastActivity - right.lastActivity);
 			const excess = Math.max(0, candidates.length - MAX_IDLE_CHILD_RUNTIMES);
 			let reaped = 0;
 			for (const [index, runtime] of candidates.entries()) {
 				if (index >= excess && now - runtime.lastActivity < idleMs) continue;
 				// Stop hooks run while the run settles; wait for them before stopping.
 				if (runtime.settling) await runtime.settling.catch(() => {});
-				if (this.closed || !this.reapable(runtime)) continue;
+				if (this.closed || !this.reapable(runtime, scope)) continue;
 				await this.stopRuntime(runtime, "capture");
 				reaped++;
 			}
@@ -5467,19 +5764,26 @@ export class DesktopService {
 		return false;
 	}
 
-	private reapable(runtime: SessionRuntime): boolean {
+	private reapable(runtime: SessionRuntime, scope: "all" | "child" | "switch"): boolean {
 		const id = runtime.conversationId;
-		const task = this.store.tasks.find((item) => item.conversationId === id && item.parentConversationId);
+		const task = this.store.tasks.find((item) => item.conversationId === id);
 		const active = (status: string) => ["queued", "running", "waiting_for_input"].includes(status);
-		if (!task || active(task.status) || this.runtimes.get(id) !== runtime) return false;
-		const delivered = !task.runInBackground || task.notifySuppressed || task.notifiedTurn === (task.turn ?? 1);
+		if ((scope === "child" && !task?.parentConversationId) || this.runtimes.get(id) !== runtime) return false;
+		// A main turn can finish streaming moments before its host cleanup updates the
+		// task row. Navigation can park it immediately; stopRuntime waits for the cleanup.
+		const parkingSettledTurn = scope === "switch" && !task?.parentConversationId && Boolean(runtime.settling);
+		if (task && ((active(task.status) && !parkingSettledTurn) || (task.runInBackground && !task.notifySuppressed && task.notifiedTurn !== (task.turn ?? 1))))
+			return false;
 		return (
-			delivered &&
-			!runtime.stopping && !runtime.busy && !runtime.bashBusy && !runtime.settling &&
+			!runtime.stopping && !runtime.busy && !runtime.bashBusy && (!runtime.settling || parkingSettledTurn) &&
 			runtime.engineStatus !== "starting" && !runtime.pendingUI.size &&
 			!runtime.state?.isStreaming && !runtime.state?.isCompacting &&
 			id !== this.store.activeId && !this.viewing.has(id) &&
-			!this.hasActiveDescendant(id) &&
+			!this.store.conversations.find((conversation) => conversation.id === id)?.goal?.active &&
+			!this.monitors.hasActivity(id) &&
+			// Switching can park an idle parent. Its independent children report their
+			// results in the outbox when the parent is reopened.
+			(scope === "switch" || !this.hasActiveDescendant(id)) &&
 			!this.external.list(id).some((item) => active(item.status)) &&
 			!this.terminals.list().some((terminal) => terminal.conversationId === id && terminal.status !== "exited")
 		);
@@ -5573,9 +5877,18 @@ export class DesktopService {
 		return this.terminals.list(conversationId);
 	}
 
+	private async closeReadRestrictedTerminals(permissionRoot?: string): Promise<void> {
+		const restricted = this.terminals.list().filter((terminal) =>
+			terminal.status !== "exited" &&
+			(!permissionRoot || this.rootConversationId(terminal.conversationId, false) === permissionRoot) &&
+			this.isReadRestricted(terminal.conversationId),
+		);
+		await Promise.all(restricted.map((terminal) => this.terminals.close(terminal.id)));
+	}
+
 	async writeTerminal(id: string, data: string): Promise<void> {
 		const terminal = this.terminals.list().find((item) => item.id === id);
-		if (this.closed || this.isReadRestricted() || (terminal && this.isReadRestricted(terminal.conversationId))) throw new Error("当前不可向终端输入。");
+		if (this.closed || !terminal || this.isReadRestricted(terminal.conversationId)) throw new Error("当前不可向终端输入。");
 		await this.terminals.write(id, data);
 	}
 
@@ -5609,29 +5922,37 @@ export class DesktopService {
 
 	async listCheckpoints(conversationId?: string): Promise<GitCheckpoint[]> {
 		await this.operation;
-		const conversation = this.conversation(conversationId);
-		return this.git.list(conversation.project, conversation.id);
+		const scope = this.checkpointScope(conversationId);
+		return this.git.list(scope.project, scope.id);
 	}
 
 	async checkpointDiff(id: string, conversationId?: string, path?: string): Promise<GitCheckpointDiff> {
 		await this.operation;
-		const conversation = this.conversation(conversationId);
-		return this.git.diff(conversation.project, id, path, conversation.id);
+		const scope = this.checkpointScope(conversationId);
+		return this.git.diff(scope.project, id, path, scope.id);
 	}
 
 	async restoreCheckpoint(id: string, conversationId?: string, paths?: string[]): Promise<GitRestoreResult> {
 		return this.serialize(async () => {
-			if (this.isReadRestricted(conversationId)) throw new Error("只读或 Plan 模式禁止恢复文件。");
-			const conversation = this.conversation(conversationId);
-			this.assertProjectIdle(conversation.project);
+			const scope = this.checkpointScope(conversationId);
+			if (this.isReadRestricted(scope.parentId ?? scope.id)) throw new Error("只读或 Plan 模式禁止恢复文件。");
+			this.assertProjectIdle(scope.project);
 			if (
 				this.terminals
 					.list()
-					.some((terminal) => terminal.status !== "exited" && overlaps(terminal.project, conversation.project))
+					.some((terminal) => terminal.status !== "exited" && overlaps(terminal.project, scope.project))
 			)
 				throw new Error("请先关闭此项目的交互终端，再恢复文件。");
-			return this.git.restore(conversation.project, id, paths, conversation.id);
+			return this.git.restore(scope.project, id, paths, scope.id);
 		});
+	}
+
+	private checkpointScope(conversationId?: string): { project: string; id: string; parentId?: string } {
+		if (conversationId && this.external.has(conversationId)) {
+			const task = this.external.snapshot(conversationId);
+			return { id: task.id, project: task.workingDirectory, parentId: task.parentConversationId };
+		}
+		return this.conversation(conversationId);
 	}
 
 	async listWorktrees(project?: string): Promise<WorktreeInfo[]> {
@@ -5647,11 +5968,13 @@ export class DesktopService {
 		});
 	}
 
-	removeWorktree(id: string): Promise<WorktreeRemoveResult> {
+	removeWorktree(id: string, options?: WorktreeRemoveOptions): Promise<WorktreeRemoveResult> {
 		return this.serialize(async () => {
 			if (this.isReadRestricted()) throw new Error("只读或 Plan 模式禁止删除 Worktree。");
 			const item = (await this.worktrees.list()).find((tree) => tree.id === id);
 			if (!item) throw new Error("Worktree 不存在。");
+			if (this.store.conversations.some((conversation) => overlaps(item.path, conversation.project) && this.monitors.hasActivity(conversation.id)))
+				throw new Error("Worktree 中仍有活动的后台命令或监听，请先停止。");
 			if (item.conversationId) {
 				const runtime = this.runtimes.get(item.conversationId);
 				if (runtime) {
@@ -5659,7 +5982,7 @@ export class DesktopService {
 					await this.stopRuntime(runtime);
 				}
 			}
-			return this.worktrees.remove(id);
+			return this.worktrees.remove(id, options);
 		});
 	}
 
@@ -5696,6 +6019,7 @@ export class DesktopService {
 
 	async close(): Promise<void> {
 		this.closed = true;
+		this.languages.close();
 		this.agentWatcher?.stop();
 		this.agentWatcher = undefined;
 		if (this.reapTimer) clearInterval(this.reapTimer);
@@ -5789,6 +6113,11 @@ export class DesktopService {
 		// The parent model already knows about its own TaskStop, and a stopped parent must
 		// not be woken by the children its abort cancelled.
 		if (status === "cancelled" && (stopReason === "model_stop" || stopReason === "parent_abort")) task.notifySuppressed = true;
+		if (task.teamName && this.store.settings.agentTeams === true) {
+			const memberStatus = status === "completed" ? "idle" :
+				["cancelled", "failed", "interrupted"].includes(status) ? "shutdown" : "active";
+			void this.teams.setMemberStatus(this.rootConversationId(task.conversationId), task.conversationId, memberStatus).catch(() => {});
+		}
 		task.updatedAt = Date.now();
 		task.revision = (task.revision ?? 0) + 1;
 		for (const listener of this.taskListeners) listener({ type: "task_updated", task: structuredClone(task) });
@@ -5819,12 +6148,19 @@ export class DesktopService {
 	}
 	/**
 	 * The parent a foreground shared writer yields to: while the parent waits on the Agent
-	 * call it does not write, so its busy runtime must not block the child it waits for.
+	 * or WorkflowRun call it does not write, so its busy runtime must not block the child it waits for.
 	 */
 	private yieldingParent(conversationId?: string): string | undefined {
 		const task = conversationId ? this.store.tasks.find((item) => item.conversationId === conversationId) : undefined;
-		if (!task?.parentConversationId || task.readOnly || task.quarantined || task.runInBackground || task.worktreeId) return undefined;
+		if (!task?.parentConversationId || task.readOnly || task.quarantined || task.worktreeId || !this.hasWaitingParent(task)) return undefined;
 		return ["queued", "running", "waiting_for_input"].includes(task.status) ? task.parentConversationId : undefined;
+	}
+
+	private hasWaitingParent(task: DesktopTask): boolean {
+		if (!task.parentConversationId) return false;
+		return task.workflowId
+			? this.workflows.hasWaitingCaller(task.workflowId, task.parentConversationId)
+			: !task.runInBackground;
 	}
 	private assertPathAvailable(project: string, exceptId?: string, externalExceptId?: string): void {
 		// Explore/Plan have a host-enforced read-only ceiling and never write checkpoints.
@@ -5859,6 +6195,12 @@ export class DesktopService {
 	private async startCheckpoint(runtime: SessionRuntime, label: string, trackPrompt = false): Promise<void> {
 		if (this.isReadRestricted(runtime.conversationId) || this.store.tasks.some((task) => task.conversationId === runtime.conversationId && task.readOnly)) return;
 		if (runtime.checkpointId) return;
+		if (runtime.checkpointStarting) return runtime.checkpointStarting;
+		const starting = this.captureCheckpoint(runtime, label, trackPrompt);
+		runtime.checkpointStarting = starting;
+		try { await starting; } finally { delete runtime.checkpointStarting; }
+	}
+	private async captureCheckpoint(runtime: SessionRuntime, label: string, trackPrompt: boolean): Promise<void> {
 		const workspace = await this.workspace(runtime.conversationId);
 		if (!workspace.isGit) return;
 		const conversation = this.conversation(runtime.conversationId);
@@ -5872,6 +6214,56 @@ export class DesktopService {
 		const task = this.store.tasks.find((item) => item.conversationId === conversation.id);
 		if (task) task.checkpointId = checkpoint.id;
 	}
+	private goalWaitsForChildren(runtime: SessionRuntime, goal: GoalState): boolean {
+		const owner = runtime.conversationId;
+		return this.store.tasks.some((task) => task.parentConversationId === owner && task.runInBackground && !task.notifySuppressed &&
+			task.createdAt >= goal.startedAt && ["queued", "running", "waiting_for_input"].includes(task.status)) ||
+			this.external.hasActiveBackgroundChildren(owner, goal.startedAt) ||
+			this.outbox(owner).some((item) => item.updatedAt >= goal.startedAt && !runtime.queuedNotifications?.has(item.key));
+	}
+
+	private async settleGoal(runtime: SessionRuntime, aborted: boolean, error?: string): Promise<void> {
+		const conversation = this.store.conversations.find((item) => item.id === runtime.conversationId);
+		if (!conversation) return;
+		const goal = conversation.goal;
+		if (!goal?.active) return;
+		if (aborted || error || runtime.stopping || this.closed) {
+			stopActiveGoal(conversation, error ? `发生错误：${error}` : "目标模式已停止。");
+			await this.persist();
+			return;
+		}
+		const latestText = (await this.childFinalText(runtime).catch(() => "")) ?? "";
+		const stats = goal.maxCostUsd !== undefined && runtime.agent && runtime.engineStatus === "ready"
+			? await runtime.agent.request<SessionStats>({ type: "get_session_stats" }).catch(() => undefined)
+			: undefined;
+		const live = this.store.conversations.find((item) => item.id === runtime.conversationId);
+		if (!live) return;
+		const current = live.goal;
+		if (!current?.active || current.startedAt !== goal.startedAt || this.closed || runtime.stopping) return;
+		if (current.maxCostUsd !== undefined && !Number.isFinite(stats?.cost)) {
+			stopActiveGoal(live, "无法读取本轮费用，已停止自动继续。");
+			await this.persist();
+			return;
+		}
+		const evaluation = evaluateGoalContinuation(current, latestText, finiteCount(stats?.cost));
+		live.goal = evaluation.next;
+		await this.persist();
+		const nextPrompt = evaluation.continuePrompt;
+		// Active children will wake the parent through their ordinary result delivery.
+		if (!evaluation.shouldContinue || !nextPrompt || this.goalWaitsForChildren(runtime, current)) return;
+		setImmediate(() => {
+			const owner = this.store.conversations.find((item) => item.id === runtime.conversationId);
+			if (this.closed || !owner?.goal?.active || owner.goal.startedAt !== current.startedAt ||
+				owner.goal.turnsUsed !== evaluation.next.turnsUsed || runtime.stopping || runtime.busy ||
+				this.goalWaitsForChildren(runtime, current)) return;
+			void this.command({ type: "prompt", message: nextPrompt }, owner.id).catch((cause) => {
+				const latest = this.store.conversations.find((item) => item.id === owner.id);
+				if (latest?.goal?.startedAt === current.startedAt && stopActiveGoal(latest, cause instanceof Error ? cause.message : String(cause)))
+					void this.persist().catch(() => {});
+			});
+		});
+	}
+
 	private async finishRuntime(runtime: SessionRuntime, aborted: boolean, error?: string): Promise<void> {
 		this.clearTaskProgressTimer(runtime);
 		try {
@@ -5927,51 +6319,7 @@ export class DesktopService {
 				else this.updateTask(task, "completed");
 			}
 			await this.persist();
-			if (!task?.parentConversationId) {
-				const conv = this.store.conversations.find((item) => item.id === runtime.conversationId);
-				if (conv?.goal?.active) {
-					if (aborted || error || runtime.stopping || this.closed) {
-						conv.goal = {
-							...conv.goal,
-							active: false,
-							status: "stopped",
-							finishedAt: Date.now(),
-							stopReason: error ? `发生错误：${error}` : "目标模式已停止。",
-						};
-						await this.persist();
-					} else {
-						const latestText = (await this.childFinalText(runtime).catch(() => "")) ?? "";
-						const stats = runtime.agent && runtime.engineStatus === "ready"
-							? await runtime.agent.request<SessionStats>({ type: "get_session_stats" }).catch(() => undefined)
-							: undefined;
-						const spentUsd = typeof stats?.cost === "number" && Number.isFinite(stats.cost) ? stats.cost : 0;
-						const evaluation = evaluateGoalContinuation(conv.goal, latestText, spentUsd);
-						conv.goal = evaluation.next;
-						await this.persist();
-						if (evaluation.shouldContinue && evaluation.continuePrompt) {
-							const nextPrompt = evaluation.continuePrompt;
-							const convId = conv.id;
-							setImmediate(() => {
-								const liveConv = this.store.conversations.find((item) => item.id === convId);
-								if (!this.closed && liveConv?.goal?.active) {
-									void this.command({ type: "prompt", message: nextPrompt }, convId).catch((cause) => {
-										if (liveConv.goal?.active) {
-											liveConv.goal = {
-												...liveConv.goal,
-												active: false,
-												status: "stopped",
-												finishedAt: Date.now(),
-												stopReason: cause instanceof Error ? cause.message : String(cause),
-											};
-											void this.persist().catch(() => {});
-										}
-									});
-								}
-							});
-						}
-					}
-				}
-			}
+			if (!task?.parentConversationId) await this.settleGoal(runtime, aborted, error);
 			if (!runtime.stopping && !this.closed && !runtime.stopHookRanThisTurn) {
 				if (task?.parentConversationId) {
 					const meta = await this.hookContextFor(runtime.conversationId);
@@ -5994,18 +6342,17 @@ export class DesktopService {
 				this.updateTask(task, "failed", message, "error");
 			this.emit({ conversationId: runtime.conversationId, event: { type: "desktop_error", message } });
 		} finally {
+			await this.releaseRuntimeCost(runtime);
 			runtime.settling = undefined;
 			// A stopped child's partial output is recorded now; its parent may receive it.
 			const task = this.store.tasks.find((item) => item.conversationId === runtime.conversationId);
 			if (task?.parentConversationId && !["queued", "running", "waiting_for_input"].includes(task.status)) {
 				void this.monitors.stopForConversation([runtime.conversationId], "child_finished");
-				if (task.teamName) {
-					const teamStatus = task.status === "cancelled" || task.status === "failed" || task.status === "interrupted" ? "shutdown" : "idle";
-					void this.teams.setMemberStatus(this.rootConversationId(runtime.conversationId), runtime.conversationId, teamStatus);
-				}
 			}
 			if (task?.parentConversationId && task.runInBackground && !["queued", "running", "waiting_for_input"].includes(task.status))
 				void this.flushNotifications(task.parentConversationId, "auto");
+			if (this.store.settings.agentTeams === true && !this.closed)
+				void this.teams.retryPending(this.rootConversationId(runtime.conversationId)).catch(() => {});
 			void this.scheduleTasks();
 			this.external?.pump();
 		}
@@ -6054,6 +6401,7 @@ export class DesktopService {
 		runtime.agent = undefined;
 		// Background shells end with the runtime that started them (they use its sandbox profile).
 		await this.monitors.stopShellsForConversation(runtime.conversationId, "runtime_stop");
+		await this.monitors.stopForConversation([runtime.conversationId], "runtime_stop");
 		runtime.shellEnv = undefined;
 		if (runtime.settling) await runtime.settling;
 		if (runtime.checkpointId) await this.finishRuntime(runtime, true);
@@ -6068,6 +6416,8 @@ export class DesktopService {
 		if (runtime.policyFile) await rm(runtime.policyFile, { force: true });
 		if (runtime.sandboxProfileFile) await rm(runtime.sandboxProfileFile, { force: true });
 		if (runtime.outputStyleFile) await rm(runtime.outputStyleFile, { force: true });
+		await this.releaseRuntimeCost(runtime);
+		if (runtime.costLimitFile) await this.serializeCost(() => rm(runtime.costLimitFile!, { force: true }));
 		if (this.runtimes.get(runtime.conversationId) === runtime) this.runtimes.delete(runtime.conversationId);
 		if (endContext) this.fireSessionEnd(endContext);
 	}
@@ -6124,7 +6474,7 @@ export class DesktopService {
 	}
 
 	private isSlotBorrower(task: DesktopTask): boolean {
-		if (!task.parentConversationId || task.runInBackground) return false;
+		if (!this.hasWaitingParent(task)) return false;
 		const active = new Set(["running", "waiting_for_input"]);
 		const seen = new Set<string>([task.conversationId]);
 		let cursor: string | undefined = task.parentConversationId;
@@ -6191,15 +6541,11 @@ export class DesktopService {
 			if (this.closed || this.launches.get(task.conversationId) !== launch) return;
 			if (!resumed && task.thinkingLevel) await agent.request({ type: "set_thinking_level", level: task.thinkingLevel });
 			if (this.closed || this.launches.get(task.conversationId) !== launch) return;
-			// A forked child starts with the parent's history; usage is measured from here.
-			const baseline = await agent.request<SessionStats>({ type: "get_session_stats" }).catch(() => undefined);
-			task.statsAtTurnStart = {
-				tokens: statTokens(baseline?.tokens),
-				cost: finiteCount(baseline?.cost),
-				toolCalls: finiteCount(baseline?.toolCalls),
-				startedAt: Date.now(),
-			};
-			delete task.stats;
+			await this.prepareTaskUsage(runtime, task);
+			if (this.closed || this.launches.get(task.conversationId) !== launch) {
+				await this.releaseRuntimeCost(runtime);
+				return;
+			}
 			await this.command({ type: "prompt", message }, task.conversationId, launch);
 			// Pi accepted the message; it is part of the child's session now.
 			if (resumed && task.pendingMessage === message) {
@@ -6207,10 +6553,38 @@ export class DesktopService {
 				await this.persist();
 			}
 		} catch (error) {
+			const runtime = this.runtimes.get(task.conversationId);
+			if (runtime) await this.releaseRuntimeCost(runtime);
 			if (!this.closed && task.status !== "cancelled" && task.status !== "interrupted")
 				this.updateTask(task, "failed", error instanceof Error ? error.message : String(error), "error");
 			void this.scheduleTasks();
 		}
+	}
+
+	private async prepareTaskUsage(runtime: SessionRuntime, task: DesktopTask): Promise<void> {
+		// A forked child starts with its parent's history. Each run measures usage from its own baseline.
+		const baseline = await this.requireAgent(runtime).request<SessionStats>({ type: "get_session_stats" }).catch(() => undefined);
+		if (task.parentConversationId && runtime.costLimitFile) {
+			if (!baseline) throw new Error("无法读取子任务费用基线。");
+			const reservation = await this.reserveChildCost(task.parentConversationId, task.id);
+			if (!reservation) throw new Error("任务费用设置已更改，请重新发起任务。");
+			runtime.releaseCostReservation = reservation.release;
+			await this.atomicFile(runtime.costLimitFile, String(finiteCount(baseline.cost) + reservation.maxBudgetUsd));
+		}
+		task.statsAtTurnStart = {
+			tokens: statTokens(baseline?.tokens),
+			cost: finiteCount(baseline?.cost),
+			toolCalls: finiteCount(baseline?.toolCalls),
+			startedAt: Date.now(),
+		};
+		delete task.stats;
+	}
+
+	private async releaseRuntimeCost(runtime: SessionRuntime): Promise<void> {
+		const release = runtime.releaseCostReservation;
+		delete runtime.releaseCostReservation;
+		if (release && runtime.costLimitFile) await this.atomicFile(runtime.costLimitFile, "0").catch(() => {});
+		await release?.().catch(() => {});
 	}
 	private createConversation(project: string): Conversation {
 		const conversation = { id: randomUUID(), title: "新会话", project, updatedAt: Date.now() };
@@ -6236,9 +6610,7 @@ export class DesktopService {
 		if (
 			previous &&
 			previous.conversationId !== conversation.id &&
-			!previous.busy &&
-			!previous.bashBusy &&
-			!previous.pendingUI.size
+			this.reapable(previous, "switch")
 		) {
 			await this.stopRuntime(previous);
 		}
@@ -6356,8 +6728,13 @@ export class DesktopService {
 				await this.writeOutputStyle(runtime);
 				env.PI_DESKTOP_OUTPUT_STYLE_FILE = runtime.outputStyleFile;
 			}
-			const costCap = await this.costCapFor(conversation.id, delegated);
-			if (costCap !== undefined) env.PI_DESKTOP_MAX_COST = String(costCap);
+			delete env.PI_DESKTOP_MAX_COST;
+			delete env.PI_DESKTOP_MAX_COST_FILE;
+			if (this.store.settings.maxCostUsd) {
+				runtime.costLimitFile = join(this.options.dataDir, `cost-${conversation.id}-${randomBytes(8).toString("hex")}.txt`);
+				await this.atomicFile(runtime.costLimitFile, String(delegated ? 0 : this.rootCostLimit(conversation.id)));
+				env.PI_DESKTOP_MAX_COST_FILE = runtime.costLimitFile;
+			}
 			env.PI_DESKTOP_READ_ONLY_CHILD = delegated?.readOnly ? "1" : "0";
 			env.PI_DESKTOP_FORK_CHILD = delegated?.isFork ? "1" : "0";
 			env.PI_DESKTOP_DELEGATION_DEPTH = String(delegated ? (delegated.delegationDepth ?? 1) : 0);
@@ -6441,7 +6818,10 @@ export class DesktopService {
 			}
 			const policy = this.permissionPolicy(conversation.id);
 			const policyMode = policy.mode;
-			args.push(...piToolArgs(task, policyMode, { canDelegate: this.canDelegateFurther(conversation.id) }));
+			const dynamicPermissions = toolsInstalled && !delegated;
+			if (dynamicPermissions) env.PI_DESKTOP_DYNAMIC_PERMISSION = "1";
+			else delete env.PI_DESKTOP_DYNAMIC_PERMISSION;
+			args.push(...piToolArgs(task, dynamicPermissions ? "ask" : policyMode, { canDelegate: this.canDelegateFurther(conversation.id) }));
 			if (task?.parentConversationId && task.systemPromptFile && !task.quarantined) {
 				// An explicit --append-system-prompt replaces Pi's APPEND_SYSTEM.md discovery;
 				// pass the file Pi would have found first so the child keeps it.
@@ -6475,7 +6855,6 @@ export class DesktopService {
 			}));
 			runtime.engineStatus = "ready";
 			runtime.sessionStarted = true;
-			runtime.sessionPermissionMode = this.hookPermissionMode(conversation.id);
 			void this.hooks.run("SessionStart", {
 				project: this.trustProjectFor(conversation.project),
 				projectTrusted: this.isProjectTrusted(conversation.project),
@@ -7168,7 +7547,10 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 	);
 	const state: StoredState = {
 		projects: value.projects,
-		conversations: value.conversations,
+		conversations: value.conversations.map((conversation) => ({
+			...conversation,
+			permissionMode: permissionModes.has(conversation.permissionMode) ? conversation.permissionMode : undefined,
+		})),
 		activeId: value.activeId,
 		settings: {
 			permission: value.settings.permission,
@@ -7225,6 +7607,7 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 			})(),
 			editor: EDITOR_CHOICES.includes(value.settings.editor as EditorChoice) ? value.settings.editor : undefined,
 			statusBalance: value.settings.statusBalance === false ? false : undefined,
+			webSearchEnabled: value.settings.webSearchEnabled === false ? false : undefined,
 			proxy: storedText(value.settings.proxy, 2048),
 			noProxy: storedText(value.settings.noProxy, 4096),
 			caFile: storedText(value.settings.caFile, 4096, true),
@@ -7233,6 +7616,7 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 			agentDir: value.settings.agentDir,
 		},
 		keys: value.keys,
+		webSearchApiKey: typeof value.webSearchApiKey === "string" && value.webSearchApiKey ? value.webSearchApiKey : undefined,
 		headerKeys:
 			value.headerKeys && typeof value.headerKeys === "object" && !Array.isArray(value.headerKeys)
 				? Object.fromEntries(
