@@ -162,6 +162,7 @@ export function LiveComposer({
 	onFocusSubagentPanel,
 	inputRef,
 	gitBranch,
+	dockStatus,
 	fail,
 }: {
 	snapshot: Snapshot;
@@ -194,9 +195,30 @@ export function LiveComposer({
 	inputRef?: React.MutableRefObject<HTMLTextAreaElement | null>;
 	/** Workspace git branch; absent when the project is not a git repository. */
 	gitBranch?: string;
+	/** Live top-strip status fused inside the top rim of the unified composer card. */
+	dockStatus?: {
+		active: boolean;
+		stepBadge?: string;
+		label: string;
+		detail?: string;
+	};
 	fail: (error: unknown) => void;
 }) {
 	const [sending, setSending] = useState(false);
+	const [launching, setLaunching] = useState(false);
+	const [runElapsedSec, setRunElapsedSec] = useState(0);
+	useEffect(() => {
+		if (!running) {
+			setRunElapsedSec(0);
+			return;
+		}
+		const startedAt = Date.now();
+		setRunElapsedSec(0);
+		const timer = window.setInterval(() => {
+			setRunElapsedSec(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+		}, 1000);
+		return () => window.clearInterval(timer);
+	}, [running]);
 	const [slashIndex, setSlashIndex] = useState(0);
 	const [slashDismissed, setSlashDismissed] = useState(false);
 	const [atIndex, setAtIndex] = useState(0);
@@ -446,6 +468,8 @@ export function LiveComposer({
 		}
 		historyCursor.current = -1;
 		setSending(true);
+		setLaunching(true);
+		window.setTimeout(() => setLaunching(false), 320);
 		try {
 			await send(input, { text: draft, attachments }, running ? delivery : undefined);
 		} catch {
@@ -628,6 +652,26 @@ export function LiveComposer({
 					void attach(Array.from(event.dataTransfer.files));
 				}}
 			>
+				{snapshot.active && (dockStatus || snapshot.stats || snapshot.state?.model) && (
+					<div className={`cc-dock-header ${dockStatus?.active ? "is-live" : ""}`}>
+						<div className="cc-dock-header-left">
+							<span className={`cc-dock-orb ${dockStatus?.active ? "live" : "idle"}`} aria-hidden="true" />
+							{dockStatus?.stepBadge && <span className="cc-dock-step">{dockStatus.stepBadge}</span>}
+							<span className={`cc-dock-state-label ${dockStatus?.active ? "cc-shimmer-text" : ""}`}>
+								{dockStatus?.label ?? "就绪"}
+							</span>
+							{dockStatus?.detail && <span className="cc-dock-state-detail">· {dockStatus.detail}</span>}
+							{running && (
+								<span className="cc-dock-timer" aria-hidden="true">
+									{`${String(Math.floor(runElapsedSec / 60)).padStart(2, "0")}:${String(runElapsedSec % 60).padStart(2, "0")}`}
+								</span>
+							)}
+						</div>
+						<div className="cc-dock-header-right">
+							<StatusLine snapshot={snapshot} running={running} />
+						</div>
+					</div>
+				)}
 				{attachments.length > 0 && (
 					<div className="cl-attachments">
 						{attachments.map((item, index) => (
@@ -869,7 +913,6 @@ export function LiveComposer({
 						/>
 					</div>
 					<div className="cc-dock-right">
-						<StatusLine snapshot={snapshot} running={running} />
 						{snapshot.commands.length > 0 && (
 							<div className="cl-skills" ref={skillsRef}>
 								<button
@@ -952,18 +995,20 @@ export function LiveComposer({
 									onChange={(val) => setDelivery(val as NonNullable<Prompt["streamingBehavior"]>)}
 								/>
 								<button type="button" className="cl-send stop" aria-label="停止任务" title="停止本轮回复和本机后台命令（Esc）" onClick={stop} disabled={stopping}>
-									<Square size={12} fill="currentColor" />
+									<Square size={11} fill="currentColor" />
+									<span>停止</span>
 								</button>
 							</>
 						)}
 						<button
 							type="submit"
-							className="cl-send"
+							className={`cl-send ${launching ? "is-launching" : ""}`.trim()}
 							aria-label={running ? "追加指令" : "发送任务"}
 							title={running ? "追加指令（Enter）" : "发送任务（Enter）"}
 							disabled={disabled || (!draft.trim() && !attachments.length)}
 						>
-							{snapshot.settings.theme === "grail" ? <CommandSealIcon width={17} height={17} /> : <ArrowUp size={17} />}
+							{snapshot.settings.theme === "grail" ? <CommandSealIcon width={15} height={15} /> : <ArrowUp size={15} />}
+							<span>{running ? "追加" : "发送"}</span>
 						</button>
 					</div>
 				</div>

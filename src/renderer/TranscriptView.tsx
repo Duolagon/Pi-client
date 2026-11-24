@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { copyText } from "./clipboard.ts";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ArrowDownToLine, Bot, Check, Circle, CircleAlert, ChevronRight, Copy, ExternalLink, Eye, FilePen, FileText, GitFork, Globe, ListChecks, LoaderCircle, RotateCcw, Search, Sparkles, Square, Terminal as TerminalIcon } from "lucide-react";
 import { SmoothCollapse } from "./SmoothCollapse.tsx";
@@ -100,7 +100,12 @@ function CodeBlock({ className, children }: { className?: string; children?: Rea
 		<div className="cc-codeblock">
 			<div className="cc-codeblock-head">
 				<span className="cc-codeblock-lang">{lang}</span>
-				<button type="button" className="cc-codeblock-copy" onClick={copy} aria-label="复制代码">
+				<button
+					type="button"
+					className={`cc-codeblock-copy ${copied === "done" ? "is-copied" : ""}`}
+					onClick={copy}
+					aria-label="复制代码"
+				>
 					{copied === "done" ? <Check size={12} /> : <Copy size={12} />}
 					<span role={copied === "failed" ? "alert" : undefined}>{copyLabel[copied]}</span>
 				</button>
@@ -112,53 +117,60 @@ function CodeBlock({ className, children }: { className?: string; children?: Rea
 	);
 }
 
+const REMARK_PLUGINS = [remarkGfm];
+
 function MarkdownContent({ text, onOpenPreview }: { text: string; onOpenPreview?: (url: string) => void }) {
+	const components = useMemo<Components>(
+		() => ({
+			pre({ children }) {
+				return <>{children}</>;
+			},
+			table({ node: _node, ...props }) {
+				return (
+					<div className="cl-table-scroll">
+						<table {...props} />
+					</div>
+				);
+			},
+			a({ href, children, node: _node, ...props }) {
+				const isLocal = typeof href === "string" && /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?/i.test(href);
+				if (isLocal && onOpenPreview && href) {
+					return (
+						<a
+							href={href}
+							onClick={(event) => {
+								event.preventDefault();
+								onOpenPreview(href);
+							}}
+							{...props}
+						>
+							{children}
+						</a>
+					);
+				}
+				return (
+					<a href={href} target="_blank" rel="noreferrer" {...props}>
+						{children}
+					</a>
+				);
+			},
+			code({ className, children, node: _node, ...props }) {
+				const isBlock = Boolean(className) || String(children).includes("\n");
+				if (isBlock) {
+					return <CodeBlock className={className}>{children}</CodeBlock>;
+				}
+				return (
+					<code className={className} {...props}>
+						{children}
+					</code>
+				);
+			},
+		}),
+		[onOpenPreview],
+	);
 	return (
 		<div className="cl-markdown">
-			<ReactMarkdown
-				remarkPlugins={[remarkGfm]}
-				components={{
-					pre({ children }) {
-						return <>{children}</>;
-					},
-					table({ node: _node, ...props }) {
-						return <div className="cl-table-scroll"><table {...props} /></div>;
-					},
-					a({ href, children, ...props }) {
-						const isLocal = typeof href === "string" && /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?/i.test(href);
-						if (isLocal && onOpenPreview && href) {
-							return (
-								<a
-									href={href}
-									onClick={(event) => {
-										event.preventDefault();
-										onOpenPreview(href);
-									}}
-									{...props}
-								>
-									{children}
-								</a>
-							);
-						}
-						return (
-							<a href={href} target="_blank" rel="noreferrer" {...props}>
-								{children}
-							</a>
-						);
-					},
-					code({ className, children, node: _node, ...props }) {
-						const isBlock = Boolean(className) || String(children).includes("\n");
-						if (isBlock) {
-							return <CodeBlock className={className}>{children}</CodeBlock>;
-						}
-						return (
-							<code className={className} {...props}>
-								{children}
-							</code>
-						);
-					},
-				}}
-			>
+			<ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={components}>
 				{text}
 			</ReactMarkdown>
 		</div>
@@ -171,7 +183,7 @@ function CopyTurnButton({ text }: { text: string }) {
 	return (
 		<button
 			type="button"
-			className="cc-meta-action"
+			className={`cc-meta-action ${copied === "done" ? "is-copied" : ""}`}
 			onClick={() => {
 				void copyText(text).then((ok) => {
 					setCopied(ok ? "done" : "failed");
@@ -597,6 +609,16 @@ const GROUP_KIND: Record<string, "bash" | "read" | "search" | "edit" | "web"> = 
 	WebSearch: "web",
 };
 
+interface EditSpotlight {
+	id: string;
+	verb: string;
+	target: string;
+	additions: number;
+	removals: number;
+	editPairs?: { oldText: string; newText: string }[];
+	lineContent?: { content: string; startLine?: number };
+}
+
 /** Folds every run of work steps (tool calls plus the thinking between them) in a turn into one ToolGroup. */
 function groupTurnItems(items: TurnItem[], state: Transcript): ReactNode[] {
 	const out: ReactNode[] = [];
@@ -612,6 +634,7 @@ function groupTurnItems(items: TurnItem[], state: Transcript): ReactNode[] {
 		let running = false;
 		let failed = false;
 		const live: ReactNode[] = [];
+		const editSpotlights: EditSpotlight[] = [];
 		for (const item of run) {
 			const b = item.block;
 			if (b.type !== "toolCall") {
@@ -622,11 +645,41 @@ function groupTurnItems(items: TurnItem[], state: Transcript): ReactNode[] {
 			const res = state.messages.find(
 				(m): m is Extract<Message, { role: "toolResult" }> => m.role === "toolResult" && m.toolCallId === b.id,
 			);
+			const isRunning = !res && (state.tools[b.id]?.status ?? "running") === "running";
 			if (res) {
 				if (res.isError) failed = true;
-			} else if ((state.tools[b.id]?.status ?? "running") === "running") {
+			} else if (isRunning) {
 				running = true;
 				live.push(item.node);
+			}
+			if (!isRunning && !res?.isError && (b.name === "edit" || b.name === "write")) {
+				const a = asRecord(b.arguments);
+				const path = typeof a.path === "string" ? a.path : typeof a.file_path === "string" ? a.file_path : "文件";
+				if (b.name === "edit") {
+					const editPairs = extractEditPairs(a);
+					if (editPairs.length) {
+						let additions = 0;
+						let removals = 0;
+						for (const pair of editPairs) {
+							const d = computeLineDiff(pair.oldText, pair.newText);
+							additions += d.additions;
+							removals += d.removals;
+						}
+						editSpotlights.push({ id: b.id, verb: "已更新", target: path, additions, removals, editPairs });
+					}
+				} else if (b.name === "write") {
+					const content = typeof a.content === "string" ? a.content : "";
+					if (content) {
+						editSpotlights.push({
+							id: b.id,
+							verb: "已写入",
+							target: path,
+							additions: countLines(content),
+							removals: 0,
+							lineContent: { content, startLine: 1 },
+						});
+					}
+				}
 			}
 		}
 		const only = tools.length === 1 ? tools[0].block : undefined;
@@ -640,7 +693,14 @@ function groupTurnItems(items: TurnItem[], state: Transcript): ReactNode[] {
 		if (counts.web) parts.push(`查阅 ${counts.web} 个网页`);
 		const summary = typeof description === "string" && description.trim() ? description.trim() : parts.join("，");
 		out.push(
-			<ToolGroup key={`group-${run[0].key}`} summary={summary} running={running} failed={failed} live={live}>
+			<ToolGroup
+				key={`group-${run[0].key}`}
+				summary={summary}
+				running={running}
+				failed={failed}
+				live={live}
+				editSpotlights={editSpotlights}
+			>
 				{run.map((item) => item.node)}
 			</ToolGroup>,
 		);
@@ -659,21 +719,66 @@ function groupTurnItems(items: TurnItem[], state: Transcript): ReactNode[] {
 	return out;
 }
 
-/** One summary row for a run of work steps. Collapsed by default; only the step running right now shows underneath. */
+function EditSpotlightRow({ item }: { item: EditSpotlight }) {
+	const [open, setOpen] = useState(false);
+	const baseName = item.target.split("/").pop() || item.target;
+	const dirPrefix = item.target.includes("/") ? item.target.slice(0, item.target.lastIndexOf("/") + 1) : "";
+	return (
+		<div className={`cc-edit-spotlight ${open ? "is-open" : ""}`}>
+			<button type="button" className="cc-edit-spotlight-row" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+				<span className="cc-edit-spotlight-icon" aria-hidden="true">
+					<FilePen size={11.5} />
+				</span>
+				<span className="cc-edit-spotlight-verb">{item.verb}</span>
+				<span className="cc-edit-spotlight-path" title={item.target}>
+					{dirPrefix && <em className="cc-file-dir">{dirPrefix}</em>}
+					<strong>{baseName}</strong>
+				</span>
+				<span className="cc-tool-diff-stat" aria-label={`新增 ${item.additions} 行，移除 ${item.removals} 行`}>
+					{item.additions > 0 && <span className="add">+{item.additions}</span>}
+					{item.removals > 0 && <span className="del">-{item.removals}</span>}
+				</span>
+				<ChevronRight size={13} className="cl-tool-chevron" />
+			</button>
+			<SmoothCollapse open={open}>
+				<div className="cc-edit-spotlight-diff">
+					{item.editPairs?.length ? (
+						item.editPairs.map((pair, idx) => (
+							<div key={idx} className={idx > 0 ? "cc-edit-hunk-sep" : undefined}>
+								<InlineEditDiff oldText={pair.oldText} newText={pair.newText} />
+							</div>
+						))
+					) : item.lineContent ? (
+						<CodeLines
+							content={item.lineContent.content.split("\n").slice(0, 40).join("\n")}
+							startLine={item.lineContent.startLine}
+						/>
+					) : null}
+				</div>
+			</SmoothCollapse>
+		</div>
+	);
+}
+
+/** One summary row for a run of work steps. Collapsed by default; live steps and file-edit spotlights surface cleanly underneath. */
 function ToolGroup({
 	summary,
 	running,
 	failed,
 	live,
+	editSpotlights,
 	children,
 }: {
 	summary: string;
 	running: boolean;
 	failed: boolean;
 	live: ReactNode[];
+	editSpotlights: EditSpotlight[];
 	children: ReactNode;
 }) {
 	const [open, setOpen] = useState(false);
+	const totalAdd = editSpotlights.reduce((sum, item) => sum + item.additions, 0);
+	const totalDel = editSpotlights.reduce((sum, item) => sum + item.removals, 0);
 	return (
 		<div className={`cl-tool-group ${running ? "running" : failed ? "error" : "done"} ${open ? "is-open" : ""}`}>
 			<button type="button" className="cc-tool-row cc-tool-group-head" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
@@ -681,12 +786,25 @@ function ToolGroup({
 				<span className="cc-tool-head">
 					<span className="cc-tool-verb cc-tool-group-summary">{summary}{failed && <span className="cc-tool-error-label"> · 有失败步骤</span>}</span>
 				</span>
+				{!open && (totalAdd > 0 || totalDel > 0) && (
+					<span className="cc-tool-diff-stat">
+						{totalAdd > 0 && <span className="add">+{totalAdd}</span>}
+						{totalDel > 0 && <span className="del">-{totalDel}</span>}
+					</span>
+				)}
 				<ChevronRight size={13} className="cl-tool-chevron" />
 			</button>
 			<SmoothCollapse open={open}>
 				<div className="cc-tool-group-body">{children}</div>
 			</SmoothCollapse>
-			{!open && live.length > 0 && <div className="cc-tool-group-body">{live}</div>}
+			{!open && (live.length > 0 || editSpotlights.length > 0) && (
+				<div className="cc-tool-group-body">
+					{editSpotlights.map((item) => (
+						<EditSpotlightRow key={item.id} item={item} />
+					))}
+					{live}
+				</div>
+			)}
 		</div>
 	);
 }

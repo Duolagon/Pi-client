@@ -96,6 +96,7 @@ import { ProjectTrustDialog } from "./ProjectTrustDialog.tsx";
 import { AgentsDialog } from "./AgentsDialog.tsx";
 import { McpDialog } from "./McpDialog.tsx";
 import { resolveEditorPath } from "../editor-path.ts";
+import { InteractiveEffects } from "./InteractiveEffects.tsx";
 import { SmoothCollapse } from "./SmoothCollapse.tsx";
 import { Presence, prefersReducedMotion } from "./Presence.tsx";
 import "./grail-theme.css";
@@ -1847,6 +1848,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				</aside>
 			</Presence>
 			<main className="cl-main">
+				<InteractiveEffects />
 				{flash && (
 					<div className="cc-flash" role="status" aria-live="polite">
 						<Check size={14} />
@@ -2866,6 +2868,43 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							onFocusSubagentPanel={() => subagentPanelRef.current?.focusFirst() ?? false}
 							inputRef={composerInputRef}
 							gitBranch={gitSummary?.isGit && gitSummary.branch ? gitSummary.branch : undefined}
+							dockStatus={(() => {
+								const doneTodos = latestTodos.filter((t) => t.status === "completed").length;
+								const activeTodo = latestTodos.find((t) => t.status === "in_progress");
+								const activeChildren = taskList.filter(
+									(t) => t.parentConversationId === snapshot.active?.id && (t.status === "running" || t.status === "queued"),
+								).length;
+								const childSuffix = activeChildren > 0 ? `${activeChildren} 个子任务运行中` : undefined;
+								if (activeTodo && latestTodos.length > 0) {
+									return {
+										active: running || activeChildren > 0,
+										stepBadge: `步骤 ${Math.min(doneTodos + 1, latestTodos.length)}/${latestTodos.length}`,
+										label: activeTodo.content,
+										detail: childSuffix,
+									};
+								}
+								if (running) {
+									return {
+										active: true,
+										label: waitingForInput
+											? "等待你处理审批"
+											: activePhase && activePhase !== "completed"
+												? runLabels[activePhase]
+												: "正在处理任务",
+										detail: childSuffix,
+									};
+								}
+								if (activeChildren > 0) {
+									return {
+										active: true,
+										label: `${activeChildren} 个子任务运行中`,
+									};
+								}
+								return {
+									active: false,
+									label: ready ? "就绪 · 可直接输入或按 / 唤出命令" : "引擎连接中…",
+								};
+							})()}
 							fail={app.fail}
 						/>
 						</div>

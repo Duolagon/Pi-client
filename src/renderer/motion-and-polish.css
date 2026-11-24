@@ -112,14 +112,18 @@
 @keyframes cc-orb-breathe {
 	0%,
 	100% {
-		transform: scale(0.88);
-		opacity: 0.6;
-		box-shadow: 0 0 0 0 color-mix(in srgb, var(--cl-clay) 28%, transparent);
+		transform: scale(0.9);
+		opacity: 0.72;
+		box-shadow:
+			0 0 0 0 color-mix(in srgb, var(--cl-clay) 38%, transparent),
+			0 0 4px color-mix(in srgb, var(--cl-clay) 25%, transparent);
 	}
 	50% {
-		transform: scale(1.08);
+		transform: scale(1.12);
 		opacity: 1;
-		box-shadow: 0 0 0 4px color-mix(in srgb, var(--cl-clay) 14%, transparent);
+		box-shadow:
+			0 0 0 6px color-mix(in srgb, var(--cl-clay) 18%, transparent),
+			0 0 12px color-mix(in srgb, var(--cl-clay) 50%, transparent);
 	}
 }
 
@@ -145,17 +149,37 @@
 .cc-shimmer-text {
 	background: linear-gradient(
 		90deg,
-		var(--cl-2) 0%,
-		var(--cl-2) 36%,
-		var(--cl-clay) 50%,
-		var(--cl-2) 64%,
-		var(--cl-2) 100%
+		#475569 0%,
+		#475569 28%,
+		#2563eb 45%,
+		#60a5fa 50%,
+		#2563eb 55%,
+		#475569 72%,
+		#475569 100%
 	);
-	background-size: 220% 100%;
+	background-size: 240% 100%;
 	-webkit-background-clip: text;
 	background-clip: text;
 	color: transparent;
-	animation: cc-shimmer-sweep 2.2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+	animation: cc-shimmer-sweep 1.85s linear infinite;
+}
+
+:root[data-theme="dark"] .cc-shimmer-text,
+:root[data-theme="grail"] .cc-shimmer-text {
+	background: linear-gradient(
+		90deg,
+		#94a3b8 0%,
+		#94a3b8 28%,
+		#60a5fa 45%,
+		#f8fafc 50%,
+		#60a5fa 55%,
+		#94a3b8 72%,
+		#94a3b8 100%
+	);
+	background-size: 240% 100%;
+	-webkit-background-clip: text;
+	background-clip: text;
+	color: transparent;
 }
 
 /* ── 2. Architectural Canvas, Sidebar & Panel Choreography ── */
@@ -880,11 +904,18 @@ button:not(:disabled):active {
 	border-color: var(--cl-line);
 }
 
-/* Send & Stop buttons: crisp rounded-lg tactile action */
+/* Send & Stop buttons: crisp labeled primary pill action */
 .cl-send {
-	width: 30px;
+	width: auto !important;
+	min-width: 66px;
 	height: 30px;
+	padding: 0 12px;
+	gap: 5px;
 	border-radius: 9px;
+	font-size: 12.5px;
+	font-weight: 560;
+	white-space: nowrap;
+	flex-shrink: 0;
 	transition:
 		background var(--dur-fast) ease,
 		transform var(--dur-micro) var(--ease-spring),
@@ -892,13 +923,175 @@ button:not(:disabled):active {
 		opacity var(--dur-fast) ease;
 }
 
+.cl-send:not(:disabled) {
+	box-shadow: 0 2px 8px -2px color-mix(in srgb, var(--cl-clay) 42%, transparent);
+}
+
 .cl-send:not(:disabled):hover {
 	transform: translateY(-1px);
-	box-shadow: 0 3px 10px -2px color-mix(in srgb, var(--cl-clay) 45%, transparent);
+	box-shadow: 0 4px 12px -2px color-mix(in srgb, var(--cl-clay) 52%, transparent);
+}
+
+.cl-send.stop {
+	background: var(--cl-red);
+	color: #ffffff;
 }
 
 .cl-send.stop:not(:disabled):hover {
-	box-shadow: 0 3px 10px -2px color-mix(in srgb, var(--cl-red) 40%, transparent);
+	box-shadow: 0 4px 12px -2px color-mix(in srgb, var(--cl-red) 45%, transparent);
+}
+
+/* Integrated single-card top status strip inside .cl-composer-box */
+.cc-dock-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	margin: -12px -14px 2px;
+	padding: 7px 14px;
+	border-bottom: 1px solid var(--cl-line-soft);
+	border-radius: 14px 14px 0 0;
+	background: color-mix(in srgb, var(--cl-soft) 72%, var(--cl-surface));
+	font-size: 12px;
+	line-height: 1.3;
+	min-width: 0;
+}
+
+.cc-dock-header.is-live {
+	background: color-mix(in srgb, var(--cl-clay-soft) 55%, var(--cl-surface));
+	border-bottom-color: color-mix(in srgb, var(--cl-clay) 14%, var(--cl-line-soft));
+}
+
+.cc-dock-header-left {
+	display: flex;
+	align-items: center;
+	gap: 7px;
+	min-width: 0;
+	overflow: hidden;
+}
+
+.cc-dock-orb {
+	width: 7.5px;
+	height: 7.5px;
+	border-radius: 50%;
+	flex-shrink: 0;
+}
+
+.cc-dock-orb.live {
+	background: var(--cl-clay);
+	animation: cc-orb-breathe 1.65s ease-in-out infinite;
+}
+
+.cc-dock-orb.idle {
+	background: var(--cl-green);
+	opacity: 0.72;
+}
+
+.cc-dock-step {
+	font-weight: 620;
+	color: var(--cl-clay);
+	flex-shrink: 0;
+}
+
+.cc-dock-state-label {
+	color: var(--cl-2);
+	font-weight: 500;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.cc-dock-state-detail {
+	color: var(--cl-3);
+	font-size: 11.5px;
+	white-space: nowrap;
+	flex-shrink: 0;
+}
+
+.cc-dock-header-right {
+	display: flex;
+	align-items: center;
+	flex-shrink: 0;
+	font-family: var(--mono);
+	font-variant-numeric: tabular-nums;
+}
+
+/* Surface file edit/write steps directly on the timeline with inline Diff card */
+.cc-edit-spotlight {
+	margin: 2px 0;
+}
+
+.cc-edit-spotlight-row {
+	width: 100%;
+	display: flex;
+	align-items: center;
+	gap: 7px;
+	min-height: 29px;
+	padding: 3px 8px;
+	margin-inline: -6px;
+	width: calc(100% + 12px);
+	border-radius: 8px;
+	font-size: 12.5px;
+	color: var(--cl-2);
+	text-align: left;
+	transition: background 140ms ease;
+}
+
+.cc-edit-spotlight-row:hover {
+	background: var(--cl-hover);
+	color: var(--cl-1);
+}
+
+.cc-edit-spotlight-icon {
+	width: 18px;
+	height: 18px;
+	border-radius: 5px;
+	background: var(--cl-green-soft);
+	color: var(--cl-green);
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+}
+
+.cc-edit-spotlight-verb {
+	font-weight: 560;
+	color: var(--cl-1);
+	flex-shrink: 0;
+}
+
+.cc-edit-spotlight-path {
+	flex: 1;
+	min-width: 0;
+	font-family: var(--mono);
+	font-size: 12px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.cc-edit-spotlight-path strong {
+	font-weight: 560;
+	color: var(--cl-1);
+}
+
+.cc-edit-spotlight.is-open > .cc-edit-spotlight-row .cl-tool-chevron {
+	transform: rotate(90deg);
+}
+
+.cc-edit-spotlight-diff {
+	margin: 5px 0 6px 24px;
+	border-radius: 10px;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-soft);
+	box-shadow: var(--elev-1);
+	overflow: hidden;
+}
+
+.cc-edit-spotlight-diff .cc-diff {
+	border: 0;
+	border-radius: 0;
+	margin: 0;
 }
 
 @container composer (max-width: 695px) {
@@ -2085,6 +2278,318 @@ button:not(:disabled):active {
 	color: var(--cl-2);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   12. Flagship Interactive Effects: Pointer Spotlight, Dynamic Island Beam,
+       Spring Physics, Tactile Micro-Motion & Raycast Launcher Polish
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+:root[data-resizing="true"] .live-app {
+	transition: none !important;
+}
+
+@keyframes cc-beam-sweep {
+	0% {
+		transform: translateX(-110%);
+	}
+	100% {
+		transform: translateX(210%);
+	}
+}
+
+@keyframes cc-send-launch {
+	0% {
+		transform: scale(1);
+	}
+	38% {
+		transform: translateY(-3px) scale(1.05);
+	}
+	100% {
+		transform: translateY(0) scale(1);
+	}
+}
+
+@keyframes cc-copy-pop {
+	0% {
+		transform: scale(0.88);
+	}
+	55% {
+		transform: scale(1.07);
+	}
+	100% {
+		transform: scale(1);
+	}
+}
+
+@keyframes cc-arrow-bob {
+	0%,
+	100% {
+		transform: translateY(0);
+	}
+	50% {
+		transform: translateY(2.5px);
+	}
+}
+
+@keyframes cc-accent-bar-in {
+	from {
+		opacity: 0;
+		transform: scaleY(0.35);
+	}
+	to {
+		opacity: 1;
+		transform: scaleY(1);
+	}
+}
+
+/* 12.1 Pointer-Tracking Specular Spotlight on Cards & Composer Dock (no overflow clip!) */
+:is(.cc-starter-card, .cl-composer-box, .cc-completion-card, .cc-inline-approval, .cc-status-card, .cc-tool-ctrl-row)[data-spot="true"] {
+	background-image: radial-gradient(
+		320px circle at var(--mx, 50%) var(--my, 50%),
+		color-mix(in srgb, var(--cl-clay) 7.5%, transparent) 0%,
+		transparent 72%
+	);
+}
+
+:root[data-theme="dark"] :is(.cc-starter-card, .cl-composer-box, .cc-completion-card, .cc-inline-approval, .cc-status-card, .cc-tool-ctrl-row)[data-spot="true"],
+:root[data-theme="grail"] :is(.cc-starter-card, .cl-composer-box, .cc-completion-card, .cc-inline-approval, .cc-status-card, .cc-tool-ctrl-row)[data-spot="true"] {
+	background-image: radial-gradient(
+		340px circle at var(--mx, 50%) var(--my, 50%),
+		color-mix(in srgb, var(--cl-clay) 13%, transparent) 0%,
+		transparent 72%
+	);
+}
+
+/* 12.2 Dynamic Island Energy Beam & Live Elapsed Timer inside .cc-dock-header */
+.cc-dock-header {
+	position: relative;
+	overflow: hidden;
+	transition: background 240ms ease, border-color 240ms ease;
+}
+
+.cc-dock-header.is-live::before {
+	content: "";
+	position: absolute;
+	top: 0;
+	left: 0;
+	width: 48%;
+	height: 2px;
+	background: linear-gradient(
+		90deg,
+		transparent 0%,
+		color-mix(in srgb, var(--cl-clay) 45%, transparent) 30%,
+		var(--cl-clay) 55%,
+		#60a5fa 75%,
+		transparent 100%
+	);
+	animation: cc-beam-sweep 2.1s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+	pointer-events: none;
+}
+
+.cc-dock-timer {
+	display: inline-flex;
+	align-items: center;
+	padding: 1px 6px;
+	margin-left: 2px;
+	border-radius: 999px;
+	background: color-mix(in srgb, var(--cl-clay) 12%, transparent);
+	color: var(--cl-clay);
+	font-family: var(--mono);
+	font-size: 11px;
+	font-weight: 600;
+	font-variant-numeric: tabular-nums;
+	flex-shrink: 0;
+}
+
+.cl-composer.is-running .cl-composer-box {
+	border-color: color-mix(in srgb, var(--cl-clay) 34%, var(--cl-line));
+	box-shadow:
+		var(--elev-2),
+		0 0 0 1px color-mix(in srgb, var(--cl-clay) 10%, transparent),
+		0 10px 30px -12px color-mix(in srgb, var(--cl-clay) 22%, transparent);
+}
+
+.cl-send.is-launching svg {
+	animation: cc-send-launch 300ms var(--ease-pop) both;
+}
+
+/* 12.3 Tactile Diff Stat Pills, Code Copy Pop & Completion Celebration Card */
+.cc-tool-diff-stat .add,
+.cc-tool-diff-stat .del {
+	padding: 1px 5px;
+	border-radius: 5px;
+	line-height: 1.35;
+}
+
+.cc-tool-diff-stat .add {
+	background: var(--cl-green-soft);
+}
+
+.cc-tool-diff-stat .del {
+	background: var(--cl-remove);
+}
+
+.cc-edit-spotlight-row {
+	transition:
+		background 150ms ease,
+		transform 160ms var(--ease-spring);
+}
+
+.cc-edit-spotlight-row:hover {
+	transform: translateX(2px);
+}
+
+.cc-codeblock {
+	border-radius: 11px;
+	border: 1px solid var(--cl-line);
+	box-shadow: var(--elev-1);
+	transition: border-color 180ms ease, box-shadow 180ms ease;
+}
+
+.cc-codeblock:hover {
+	border-color: color-mix(in srgb, var(--cl-clay) 28%, var(--cl-line));
+	box-shadow: var(--elev-2);
+}
+
+.cc-codeblock-copy.is-copied,
+.cc-meta-action.is-copied {
+	color: var(--cl-green) !important;
+	background: var(--cl-green-soft) !important;
+	border-radius: 6px;
+	animation: cc-copy-pop 260ms var(--ease-pop) both;
+}
+
+.cc-omen-verified {
+	padding: 1px 7px;
+	border-radius: 999px;
+	background: var(--cl-green-soft);
+	font-weight: 550;
+}
+
+.cc-completion-card {
+	position: relative;
+	border-left: 3px solid var(--cl-clay);
+	transition:
+		transform 190ms var(--ease-spring),
+		box-shadow 190ms ease,
+		border-color 190ms ease;
+}
+
+.cc-completion-card:hover {
+	transform: translateY(-1px);
+	box-shadow: var(--elev-2);
+}
+
+/* 12.4 Lively Micro-Icon Choreography & Navigation Glides */
+.cl-side-new svg {
+	transition: transform 220ms var(--ease-pop);
+}
+
+.cl-side-new:hover:not(:disabled) svg {
+	transform: rotate(90deg) scale(1.08);
+}
+
+.cc-top-btn svg,
+.cc-theme-pill svg {
+	transition: transform 200ms var(--ease-pop);
+}
+
+.cc-top-btn:hover:not(:disabled) svg,
+.cc-theme-pill:hover:not(:disabled) svg {
+	transform: translateY(-1px) scale(1.08);
+}
+
+.cl-conv.selected::before {
+	animation: cc-accent-bar-in 220ms var(--ease-pop) both;
+}
+
+.cc-starter-card .cc-starter-icon {
+	transition: transform 220ms var(--ease-pop), box-shadow 200ms ease;
+}
+
+.cc-starter-card:hover .cc-starter-icon {
+	transform: scale(1.08) rotate(-3deg);
+	box-shadow: 0 4px 12px -3px color-mix(in srgb, currentColor 28%, transparent);
+}
+
+/* Floating frosted glass Jump-to-Latest pill with bobbing arrow */
+.cc-jump-latest {
+	backdrop-filter: blur(12px) saturate(150%);
+	background: color-mix(in srgb, var(--cl-surface) 86%, transparent);
+	border: 1px solid color-mix(in srgb, var(--cl-clay) 28%, var(--cl-line));
+	box-shadow: var(--elev-2);
+	transition: transform 180ms var(--ease-spring), box-shadow 180ms ease, border-color 180ms ease;
+}
+
+.cc-jump-latest:hover {
+	transform: translateY(-2px);
+	border-color: var(--cl-clay);
+	box-shadow: var(--elev-3);
+}
+
+.cc-jump-latest svg {
+	color: var(--cl-clay);
+	animation: cc-arrow-bob 1.6s ease-in-out infinite;
+}
+
+/* 12.5 Raycast-Grade Slash `/` & `@` Launcher Popover & Frosted Menus */
+.cc-slash-menu,
+.cc-select-menu,
+.cc-more-menu,
+.cc-ws-menu {
+	backdrop-filter: blur(18px) saturate(160%);
+	background: color-mix(in srgb, var(--cl-surface) 92%, transparent);
+}
+
+.cc-slash-item {
+	position: relative;
+	border-radius: 8px;
+	transition: background 120ms ease, transform 140ms var(--ease-spring);
+}
+
+.cc-slash-item.active {
+	background: var(--cl-clay-soft);
+	transform: translateX(2px);
+}
+
+.cc-slash-item.active::before {
+	content: "";
+	position: absolute;
+	left: 3px;
+	top: 6px;
+	bottom: 6px;
+	width: 2.5px;
+	border-radius: 99px;
+	background: var(--cl-clay);
+}
+
+.cc-slash-name {
+	font-family: var(--mono);
+	font-weight: 600;
+	color: var(--cl-clay);
+}
+
+/* 12.6 Spring Overshoot Glider & iOS Switch Thumb-Stretch Physics */
+.cc-seg-glider.is-animated {
+	transition:
+		transform 250ms cubic-bezier(0.22, 1.12, 0.36, 1),
+		width 250ms cubic-bezier(0.22, 1.12, 0.36, 1),
+		height 200ms var(--ease-spring);
+}
+
+.live-setting-toggle:not(.cc-external-check) > input[type="checkbox"]::after {
+	transition:
+		transform 220ms cubic-bezier(0.22, 1.15, 0.36, 1),
+		width 140ms var(--ease-spring);
+}
+
+.live-setting-toggle:not(.cc-external-check):active > input[type="checkbox"]:not(:disabled)::after {
+	width: 19px;
+}
+
+.live-setting-toggle:not(.cc-external-check):active > input[type="checkbox"]:checked:not(:disabled)::after {
+	transform: translateX(11px);
+}
+
 @media (prefers-reduced-motion: reduce) {
 	.live-app,
 	.cc-terminal-track,
@@ -2097,6 +2602,8 @@ button:not(:disabled):active {
 	.cc-shimmer-text,
 	.cl-think.thinking-active summary .cc-think-label,
 	.cl-tool-group.running .cc-tool-group-summary,
+	.cc-dock-header.is-live::before,
+	.cc-jump-latest svg,
 	.cc-conv-menu,
 	.cl-transcript,
 	.cc-tab-panel,
