@@ -382,7 +382,7 @@ export function TranscriptView({
 	const waitingToolId = approvals.length === 1 ? approvals[0][0] : undefined;
 	return (
 		<div className="cl-transcript">
-			{units(state.messages).map((unit, index) => {
+			{units(state.messages).map((unit, index, allUnits) => {
 				if (unit.kind === "user") {
 					const message = unit.message;
 					if (message.role === "custom" && message.customType === "desktop_task_notification") {
@@ -532,6 +532,7 @@ export function TranscriptView({
 					.filter((b): b is Extract<typeof b, { type: "text" }> => b.type === "text")
 					.map((b) => b.text)
 					.join("\n\n");
+				const isLatestTurn = index === allUnits.findLastIndex((u) => u.kind === "turn");
 				return (
 					<article className="cl-msg cl-msg-ai" key={`turn-${last.timestamp}-${index}`}>
 						{groupTurnItems(
@@ -553,6 +554,7 @@ export function TranscriptView({
 								}),
 							),
 							state,
+							isLatestTurn,
 						)}
 						{errorMessage && !aborted && (
 							<div className="cl-msg-error" role="alert">
@@ -756,13 +758,25 @@ interface EditSpotlight {
 }
 
 /** Folds every run of work steps (tool calls plus the thinking between them) in a turn into one ToolGroup. */
-function groupTurnItems(items: TurnItem[], state: Transcript): ReactNode[] {
-	const out: ReactNode[] = [];
+function groupTurnItems(items: TurnItem[], state: Transcript, isLatestTurn = false): ReactNode[] {
+	const entries: Array<
+		| { kind: "node"; node: ReactNode }
+		| {
+				kind: "group";
+				key: string;
+				summary: string;
+				running: boolean;
+				failed: boolean;
+				live: ReactNode[];
+				editSpotlights: EditSpotlight[];
+				children: ReactNode[];
+		  }
+	> = [];
 	let run: TurnItem[] = [];
 	const flush = () => {
 		const tools = run.filter((item) => item.block.type === "toolCall");
 		if (!tools.length) {
-			for (const item of run) out.push(item.node);
+			for (const item of run) entries.push({ kind: "node", node: item.node });
 			run = [];
 			return;
 		}
@@ -828,18 +842,16 @@ function groupTurnItems(items: TurnItem[], state: Transcript): ReactNode[] {
 		if (counts.edit) parts.push(`编辑 ${counts.edit} 个文件`);
 		if (counts.web) parts.push(`查阅 ${counts.web} 个网页`);
 		const summary = typeof description === "string" && description.trim() ? description.trim() : parts.join("，");
-		out.push(
-			<ToolGroup
-				key={`group-${run[0].key}`}
-				summary={summary}
-				running={running}
-				failed={failed}
-				live={live}
-				editSpotlights={editSpotlights}
-			>
-				{run.map((item) => item.node)}
-			</ToolGroup>,
-		);
+		entries.push({
+			kind: "group",
+			key: `group-${run[0].key}`,
+			summary,
+			running,
+			failed,
+			live,
+			editSpotlights,
+			children: run.map((item) => item.node),
+		});
 		run = [];
 	};
 	for (const item of items) {
@@ -848,15 +860,34 @@ function groupTurnItems(items: TurnItem[], state: Transcript): ReactNode[] {
 			run.push(item);
 		} else {
 			flush();
-			out.push(item.node);
+			entries.push({ kind: "node", node: item.node });
 		}
 	}
 	flush();
-	return out;
+	const lastEditGroupIdx = isLatestTurn
+		? entries.findLastIndex((e) => e.kind === "group" && e.editSpotlights.length > 0)
+		: -1;
+	return entries.map((entry, idx) =>
+		entry.kind === "node" ? (
+			entry.node
+		) : (
+			<ToolGroup
+				key={entry.key}
+				summary={entry.summary}
+				running={entry.running}
+				failed={entry.failed}
+				live={entry.live}
+				editSpotlights={entry.editSpotlights}
+				autoExpandLastEdit={idx === lastEditGroupIdx}
+			>
+				{entry.children}
+			</ToolGroup>
+		),
+	);
 }
 
-function EditSpotlightRow({ item }: { item: EditSpotlight }) {
-	const [open, setOpen] = useState(false);
+function EditSpotlightRow({ item, defaultOpen = false }: { item: EditSpotlight; defaultOpen?: boolean }) {
+	const [open, setOpen] = useState(defaultOpen);
 	const baseName = item.target.split("/").pop() || item.target;
 	const dirPrefix = item.target.includes("/") ? item.target.slice(0, item.target.lastIndexOf("/") + 1) : "";
 	return (
@@ -903,6 +934,7 @@ function ToolGroup({
 	failed,
 	live,
 	editSpotlights,
+	autoExpandLastEdit = false,
 	children,
 }: {
 	summary: string;
@@ -910,6 +942,7 @@ function ToolGroup({
 	failed: boolean;
 	live: ReactNode[];
 	editSpotlights: EditSpotlight[];
+	autoExpandLastEdit?: boolean;
 	children: ReactNode;
 }) {
 	const [open, setOpen] = useState(false);
@@ -935,8 +968,12 @@ function ToolGroup({
 			</SmoothCollapse>
 			{!open && (live.length > 0 || editSpotlights.length > 0) && (
 				<div className="cc-tool-group-body">
-					{editSpotlights.map((item) => (
-						<EditSpotlightRow key={item.id} item={item} />
+					{editSpotlights.map((item, idx) => (
+						<EditSpotlightRow
+							key={item.id}
+							item={item}
+							defaultOpen={autoExpandLastEdit && idx === editSpotlights.length - 1}
+						/>
 					))}
 					{live}
 				</div>

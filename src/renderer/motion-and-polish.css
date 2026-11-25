@@ -555,12 +555,31 @@ button:not(:disabled):active {
 	box-shadow: var(--elev-1);
 }
 
-/* Breathing Working Indicator with Shimmer */
+/* Breathing Working Indicator with Shimmer & Continuous Vertical Timeline Rail */
 .cl-working {
 	padding: 10px 0;
 	gap: 9px;
 	font-size: 13px;
 	animation: cc-fade-up 200ms var(--ease-out-expo) both;
+}
+
+.cl-transcript:has(> .cl-msg-ai:last-child > .cl-tool-group:last-child):has(+ .cl-working) {
+	padding-bottom: 2px;
+}
+
+.cl-transcript:has(> .cl-msg-ai:last-child > .cl-tool-group:last-child) + .cl-working {
+	position: relative;
+	padding: 4px 0 12px 20px;
+}
+
+.cl-transcript:has(> .cl-msg-ai:last-child > .cl-tool-group:last-child) + .cl-working::before {
+	content: "";
+	position: absolute;
+	left: 7px;
+	top: -4px;
+	bottom: 10px;
+	width: 1.5px;
+	background: var(--cl-line);
 }
 
 .cl-spinner {
@@ -1075,13 +1094,18 @@ button:not(:disabled):active {
 	color: var(--cl-1);
 }
 
+.cc-edit-spotlight-row .cl-tool-chevron {
+	margin-left: 2px;
+	transition: transform 200ms var(--ease-spring);
+}
+
 .cc-edit-spotlight.is-open > .cc-edit-spotlight-row .cl-tool-chevron {
 	transform: rotate(90deg);
 }
 
 .cc-edit-spotlight-diff {
-	margin: 5px 0 6px 24px;
-	border-radius: 10px;
+	margin: 5px 0 8px 4px;
+	border-radius: 11px;
 	border: 1px solid var(--cl-line);
 	background: var(--cl-soft);
 	box-shadow: var(--elev-1);
@@ -1092,6 +1116,8 @@ button:not(:disabled):active {
 	border: 0;
 	border-radius: 0;
 	margin: 0;
+	max-height: 220px;
+	overflow: auto;
 }
 
 @container composer (max-width: 695px) {
@@ -1209,7 +1235,7 @@ button:not(:disabled):active {
 	transition: transform 180ms var(--ease-spring);
 }
 
-.cc-conversation-status[open] > summary::before {
+.cc-conversation-status.is-open > summary::before {
 	transform: rotate(90deg);
 }
 
@@ -2332,29 +2358,40 @@ button:not(:disabled):active {
 /* 12.1 Pointer-Tracking Specular Spotlight on Cards & Composer Dock (no overflow clip!) */
 :is(.cc-starter-card, .cl-composer-box, .cc-completion-card, .cc-inline-approval, .cc-status-card, .cc-tool-ctrl-row, .cc-agent-item, .cc-rewind-item, .cc-doctor-row, .cc-subagent-row, .cc-pr-card)[data-spot="true"] {
 	background-image: radial-gradient(
-		320px circle at var(--mx, 50%) var(--my, 50%),
-		color-mix(in srgb, var(--cl-clay) 7.5%, transparent) 0%,
-		transparent 72%
+		250px circle at var(--mx, 50%) var(--my, 50%),
+		color-mix(in srgb, var(--cl-clay) 13.5%, transparent) 0%,
+		color-mix(in srgb, var(--cl-clay) 4.5%, transparent) 44%,
+		transparent 74%
 	);
 }
 
 :root[data-theme="dark"] :is(.cc-starter-card, .cl-composer-box, .cc-completion-card, .cc-inline-approval, .cc-status-card, .cc-tool-ctrl-row, .cc-agent-item, .cc-rewind-item, .cc-doctor-row, .cc-subagent-row, .cc-pr-card)[data-spot="true"],
 :root[data-theme="grail"] :is(.cc-starter-card, .cl-composer-box, .cc-completion-card, .cc-inline-approval, .cc-status-card, .cc-tool-ctrl-row, .cc-agent-item, .cc-rewind-item, .cc-doctor-row, .cc-subagent-row, .cc-pr-card)[data-spot="true"] {
 	background-image: radial-gradient(
-		340px circle at var(--mx, 50%) var(--my, 50%),
-		color-mix(in srgb, var(--cl-clay) 13%, transparent) 0%,
-		transparent 72%
+		280px circle at var(--mx, 50%) var(--my, 50%),
+		color-mix(in srgb, var(--cl-clay) 16.5%, transparent) 0%,
+		color-mix(in srgb, var(--cl-clay) 5.5%, transparent) 44%,
+		transparent 74%
 	);
 }
 
 /* 12.2 Dynamic Island Energy Beam & Live Elapsed Timer inside .cc-dock-header */
+/* IMPORTANT: Never put overflow: hidden on .cc-dock-header itself so .cc-telemetry-hud can pop upward freely! */
 .cc-dock-header {
 	position: relative;
-	overflow: hidden;
+	overflow: visible;
 	transition: background 240ms ease, border-color 240ms ease;
 }
 
-.cc-dock-header.is-live::before {
+.cc-dock-beam {
+	position: absolute;
+	inset: 0;
+	border-radius: inherit;
+	overflow: hidden;
+	pointer-events: none;
+}
+
+.cc-dock-beam::before {
 	content: "";
 	position: absolute;
 	top: 0;
@@ -2856,8 +2893,12 @@ details.cl-think.is-open .cc-think-preview {
 	display: none;
 }
 
-/* 13.3 Streaming Caret, User Bubble Hover Actions & Image Lightbox */
-.cc-ai-text.is-streaming .cl-markdown > :last-child::after {
+/* 13.3 Streaming Caret (inline leaf targets only — never drops onto a new block row!), User Bubble Actions & Lightbox */
+.cc-ai-text.is-streaming .cl-markdown > :is(p, h1, h2, h3, h4, h5, h6):last-child::after,
+.cc-ai-text.is-streaming .cl-markdown > :is(ul, ol):last-child > li:last-child:not(:has(> p, > ul, > ol))::after,
+.cc-ai-text.is-streaming .cl-markdown > :is(ul, ol):last-child > li:last-child > p:last-child::after,
+.cc-ai-text.is-streaming .cl-markdown > blockquote:last-child > p:last-child::after,
+.cc-ai-text.is-streaming .cl-markdown > .cc-codeblock:last-child pre > code::after {
 	content: "";
 	display: inline-block;
 	width: 2.5px;
@@ -3017,18 +3058,34 @@ details.cl-think.is-open .cc-think-preview {
 /* Interactive StatusLine Context Ring & Telemetry HUD */
 .cc-status-line {
 	position: relative;
+	overflow: visible !important;
+}
+
+.cc-status-line > * + *::before {
+	content: none !important;
+	display: none !important;
 }
 
 .cc-status-hud-trigger {
 	display: inline-flex;
 	align-items: center;
 	gap: 6px;
+	min-width: 0;
+	max-width: 100%;
+	overflow: hidden;
 	padding: 2px 6px;
 	margin: -2px -4px;
 	border-radius: 6px;
 	color: inherit;
 	font-size: inherit;
 	transition: background 140ms ease, color 140ms ease;
+}
+
+.cc-status-hud-trigger > * + *::before {
+	content: "·";
+	margin-right: 6px;
+	color: var(--cl-3);
+	opacity: 0.55;
 }
 
 .cc-status-hud-trigger:hover,
@@ -3343,34 +3400,44 @@ details.cl-think.is-open .cc-think-preview {
 	animation: cc-hunk-flash 900ms ease-out both;
 }
 
-.cc-review-line {
+button.cc-review-line {
 	position: relative;
-	transition: color 130ms ease, background 130ms ease;
+	text-decoration: none;
+	transition: color 120ms ease, background 120ms ease;
 }
 
-.cc-diff-line:hover .cc-review-line,
-.cc-diff-split-cell:hover .cc-review-line {
-	color: var(--cl-clay);
-	font-weight: 600;
+.cc-diff-line:hover button.cc-review-line,
+.cc-diff-split-cell:hover button.cc-review-line {
+	color: transparent !important;
+	text-decoration: none !important;
 }
 
-.cc-diff-line:hover .cc-review-line::after,
-.cc-diff-split-cell:hover .cc-review-line::after {
+button.cc-review-line::after {
 	content: "+";
 	position: absolute;
-	right: 1px;
+	left: 50%;
 	top: 50%;
-	transform: translateY(-50%);
-	width: 13px;
-	height: 13px;
-	border-radius: 4px;
+	transform: translate(-50%, -50%) scale(0.72);
+	opacity: 0;
+	width: 15px;
+	height: 15px;
+	border-radius: 4.5px;
 	background: var(--cl-clay);
 	color: #ffffff;
-	font-size: 10px;
-	line-height: 13px;
+	font-size: 11px;
+	line-height: 15px;
 	text-align: center;
 	font-weight: 700;
-	box-shadow: 0 1px 3px rgba(37, 99, 235, 0.35);
+	box-shadow: 0 1px 4px rgba(37, 99, 235, 0.36);
+	transition: opacity 130ms ease, transform 180ms var(--ease-pop);
+	pointer-events: none;
+}
+
+.cc-diff-line:hover button.cc-review-line::after,
+.cc-diff-split-cell:hover button.cc-review-line::after,
+button.cc-review-line:focus-visible::after {
+	opacity: 1;
+	transform: translate(-50%, -50%) scale(1);
 }
 
 .cc-inspector-resize::before {
@@ -3574,7 +3641,7 @@ body.cc-resizing .cc-inspector-resize::after {
 	color: var(--cl-2);
 }
 
-/* PreviewPanel Scan Beam & Spring Viewport Morph */
+/* PreviewPanel Scan Beam & True Spring Viewport Morph (100cqi -> 375px computed px interpolation!) */
 .cc-preview-bar {
 	position: relative;
 	overflow: hidden;
@@ -3591,15 +3658,22 @@ body.cc-resizing .cc-inspector-resize::after {
 	animation: cc-beam-sweep 1.5s linear infinite;
 }
 
+.cc-preview-stage {
+	container-type: inline-size;
+}
+
 .cc-preview-stage > iframe {
+	width: 100cqi;
 	transition:
-		width 280ms var(--ease-spring),
+		width 300ms var(--ease-spring),
 		height 280ms var(--ease-spring),
 		border-radius 280ms var(--ease-spring),
+		border-color 220ms ease,
 		box-shadow 280ms ease;
 }
 
 .cc-preview-stage > iframe.mobile {
+	width: min(340px, calc(100cqi - 28px));
 	border-radius: 22px;
 	border: 4px solid var(--cl-line);
 	box-shadow: var(--elev-3);
@@ -3807,13 +3881,13 @@ body.cc-resizing .cc-inspector-resize::after {
 	.cc-shimmer-text,
 	.cl-think.thinking-active summary .cc-think-label,
 	.cl-tool-group.running .cc-tool-group-summary,
-	.cc-dock-header.is-live::before,
+	.cc-dock-beam::before,
 	.cc-jump-latest svg,
 	.cc-conv-menu,
 	.cl-transcript,
 	.cc-tab-panel,
 	.cc-settings-pane,
-	.cc-ai-text.is-streaming .cl-markdown > :last-child::after,
+	.cc-ai-text.is-streaming .cl-markdown ::after,
 	.cc-skeleton-card,
 	.cc-usage-bar,
 	.cc-usage-table tbody tr,

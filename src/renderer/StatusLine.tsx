@@ -114,12 +114,14 @@ export function StatusLine({
 	snapshot,
 	running,
 	gitBranch,
+	hideModel = false,
 	onOpenContext,
 	onOpenStats,
 }: {
 	snapshot: Snapshot;
 	running: boolean;
 	gitBranch?: string;
+	hideModel?: boolean;
 	onOpenContext?: () => void;
 	onOpenStats?: () => void;
 }) {
@@ -154,11 +156,14 @@ export function StatusLine({
 		snapshot.settings.statusBalance !== false && Boolean(provider && snapshot.settings.configuredProviders.includes(provider));
 	const balance = balanceLabel(useProviderBalance(provider, balanceEnabled, running));
 	const modelName = model ? model.name || model.id : undefined;
+	const visibleModelName = hideModel ? undefined : modelName;
 	const tokens = stats?.tokens;
 	const showUsage = Boolean(stats && (stats.tokens.total > 0 || contextPct !== undefined));
-	if (!modelName && !showUsage && !gitBranch && !balance) return null;
-
 	const interactive = Boolean(onOpenContext || onOpenStats || tokens || balance);
+	const showIdleCtxRing = hideModel && !showUsage && Boolean(snapshot.active && interactive);
+	if (!visibleModelName && !showUsage && !gitBranch && !balance && !showIdleCtxRing) return null;
+
+	const displayCtxPct = contextPct ?? (showIdleCtxRing ? 0 : undefined);
 
 	return (
 		<span ref={rootRef} className={`cc-stats-pill cc-status-line ${hudOpen ? "is-open" : ""}`.trim()} role="status" aria-label="状态栏">
@@ -171,15 +176,15 @@ export function StatusLine({
 					if (interactive) setHudOpen((v) => !v);
 				}}
 			>
-				{modelName && (
+				{visibleModelName && (
 					<span className="cc-status-model">
-						{modelName}
+						{visibleModelName}
 					</span>
 				)}
-				{showUsage && contextPct !== undefined && (
+				{displayCtxPct !== undefined && (
 					<span className="cc-status-item cc-status-ctx">
-						<ContextRing pct={contextPct} />
-						<span>Ctx {Math.round(contextPct)}%</span>
+						<ContextRing pct={displayCtxPct} />
+						<span>Ctx {Math.round(displayCtxPct)}%</span>
 					</span>
 				)}
 				{showUsage && contextPct === undefined && tokens && (
@@ -211,43 +216,39 @@ export function StatusLine({
 							<strong>会话用量与遥测</strong>
 							{modelName && <span className="cc-source-tag">{modelName}</span>}
 						</div>
-						{contextPct !== undefined && (
-							<div className="cc-telemetry-meter">
-								<div className="cc-telemetry-meter-row">
-									<span>上下文窗口</span>
-									<strong>
-										{contextPct.toFixed(1)}%
-										{contextUsageObj?.contextWindow ? ` · ${Math.round(contextUsageObj.contextWindow / 1000)}k` : ""}
-									</strong>
-								</div>
-								<div className="cc-telemetry-bar">
-									<div
-										className={`cc-telemetry-bar-fill ${contextPct >= 85 ? "danger" : contextPct >= 65 ? "warn" : ""}`}
-										style={{ width: `${Math.max(2, Math.min(100, contextPct))}%` }}
-									/>
-								</div>
+						<div className="cc-telemetry-meter">
+							<div className="cc-telemetry-meter-row">
+								<span>上下文窗口</span>
+								<strong>
+									{(contextPct ?? 0).toFixed(1)}%
+									{contextUsageObj?.contextWindow ? ` · ${Math.round(contextUsageObj.contextWindow / 1000)}k` : ""}
+								</strong>
 							</div>
-						)}
-						{tokens && (
-							<div className="cc-telemetry-grid">
-								<div>
-									<span>输入 Token</span>
-									<strong>{tokens.input.toLocaleString()}</strong>
-								</div>
-								<div>
-									<span>输出 Token</span>
-									<strong>{tokens.output.toLocaleString()}</strong>
-								</div>
-								<div>
-									<span>缓存读取</span>
-									<strong>{(tokens.cacheRead ?? 0).toLocaleString()}</strong>
-								</div>
-								<div>
-									<span>本会话费用</span>
-									<strong>${(stats?.cost ?? 0).toFixed(4)}</strong>
-								</div>
+							<div className="cc-telemetry-bar">
+								<div
+									className={`cc-telemetry-bar-fill ${(contextPct ?? 0) >= 85 ? "danger" : (contextPct ?? 0) >= 65 ? "warn" : ""}`}
+									style={{ width: `${Math.max(2, Math.min(100, contextPct ?? 0))}%` }}
+								/>
 							</div>
-						)}
+						</div>
+						<div className="cc-telemetry-grid">
+							<div>
+								<span>输入 Token</span>
+								<strong>{(tokens?.input ?? 0).toLocaleString()}</strong>
+							</div>
+							<div>
+								<span>输出 Token</span>
+								<strong>{(tokens?.output ?? 0).toLocaleString()}</strong>
+							</div>
+							<div>
+								<span>缓存读取</span>
+								<strong>{(tokens?.cacheRead ?? 0).toLocaleString()}</strong>
+							</div>
+							<div>
+								<span>本会话费用</span>
+								<strong>${(stats?.cost ?? 0).toFixed(4)}</strong>
+							</div>
+						</div>
 						{balance && <p className="cc-telemetry-balance">{balance.title.replace(/^账户余额（[^）]+）\n?/, "")}</p>}
 						{(onOpenContext || onOpenStats) && (
 							<div className="cc-telemetry-actions">

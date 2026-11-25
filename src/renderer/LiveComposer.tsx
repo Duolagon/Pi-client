@@ -692,6 +692,7 @@ export function LiveComposer({
 				</SurfacePresence>
 				{snapshot.active && (dockStatus || snapshot.stats || snapshot.state?.model) && (
 					<div className={`cc-dock-header ${dockStatus?.active ? "is-live" : ""}`}>
+						{dockStatus?.active && <span className="cc-dock-beam" aria-hidden="true" />}
 						<div className="cc-dock-header-left">
 							<span className={`cc-dock-orb ${dockStatus?.active ? "live" : "idle"}`} aria-hidden="true" />
 							{dockStatus?.stepBadge && <span className="cc-dock-step">{dockStatus.stepBadge}</span>}
@@ -709,6 +710,7 @@ export function LiveComposer({
 							<StatusLine
 								snapshot={snapshot}
 								running={running}
+								hideModel
 								onOpenContext={() => onBuiltinSlash("context")}
 								onOpenStats={() => onBuiltinSlash("stats")}
 							/>
