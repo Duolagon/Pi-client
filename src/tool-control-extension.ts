@@ -5,7 +5,7 @@ import { isAbsolute, join } from "node:path";
 import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition, ToolInfo } from "@earendil-works/pi-coding-agent";
 import {
-	agentIsolationValues, agentModelValues, asModelToolResult, batchedToolNames, delegatingToolNames, desktopModelToolNames, validateControlRequest,
+	agentIsolationValues, agentModelValues, asModelToolResult, batchedToolNames, deferredSpecialistTools, delegatingToolNames, desktopModelToolNames, validateControlRequest,
 	validateDesktopToolInput, validateToolOverrides,
 	type DesktopModelToolName, type DesktopToolInfo, type NotificationUsage, type ToolCallBatch, type ToolControlRequest,
 	type ToolControlResponse, type ToolOverrides,
@@ -158,8 +158,8 @@ export const toolSchemas: Record<DesktopModelToolName, JsonSchema> = {
 		data: { description: "JSON value matching the required StructuredOutput JSON Schema" },
 	}, ["data"]),
 	LSP: schema({
-		operation: { type: "string", enum: ["diagnostics", "documentSymbol", "goToDefinition", "inspect"], description: "LSP operation to run on the file" },
-		filePath: { ...boundedText(4096), description: "Project-relative or absolute path to a JS, TS, Python, Go, or Rust file" },
+		operation: { type: "string", enum: ["diagnostics", "documentSymbol", "goToDefinition", "inspect", "workspaceOutline"], description: "LSP operation: diagnostics, documentSymbol, goToDefinition, inspect, or workspaceOutline (fast multi-file directory symbol map without requiring an LSP server)" },
+		filePath: { ...boundedText(4096), description: "Project-relative or absolute path to a file (or directory when operation is workspaceOutline)" },
 		line: { type: "integer", minimum: 1, description: "1-based line number (used for goToDefinition)" },
 		character: { type: "integer", minimum: 1, description: "1-based column number (used for goToDefinition)" },
 	}, ["operation", "filePath"]),
@@ -196,6 +196,13 @@ export const toolSchemas: Record<DesktopModelToolName, JsonSchema> = {
 		screenshot: { type: "boolean", description: "Capture and return a PNG screenshot of the rendered page" },
 		wait_ms: { type: "integer", minimum: 500, maximum: 60000, description: "Max time to wait for start_server to become reachable (default 15000)" },
 	}),
+	ToolSearch: schema({
+		query: {
+			...boundedText(500),
+			description: 'Keyword query (e.g. "worktree", "cron", "preview", "workflow", "monitor", "executors") or exact selection "select:WorktreeCreate,WorktreeMerge"',
+		},
+		max_results: { type: "integer", minimum: 1, maximum: 30, description: "Maximum matching tool schemas to load (default 8)" },
+	}, ["query"]),
 };
 const descriptions: Record<DesktopModelToolName, string> = {
 	Agent: [
@@ -234,8 +241,9 @@ const descriptions: Record<DesktopModelToolName, string> = {
 	TeamDelete: "Delete the active Agent Team directory after active teammates have stopped or shut down.",
 	WorkflowRun: "Execute a deterministic multi-step workflow script in an isolated utilityProcess/VM sandbox using allowlisted agent(), parallel(), pipeline(), phase(), log(), and budget() primitives with durable journal recovery.",
 	StructuredOutput: "Submit the structured JSON result matching the workflow step's schema.",
-	LSP: "Query a locally installed Language Server (TypeScript/JS, Python/pyright, Go/gopls, Rust/rust-analyzer) for diagnostics, document symbols, or go-to-definition. Requires the project to be trusted and the language server installed on PATH.",
+	LSP: "Query code intelligence: use operation='workspaceOutline' on a directory (e.g. 'src' or '.') for an instant multi-file exported symbol map without needing an external server; or query an installed Language Server (TS/JS, Python/pyright, Go/gopls, Rust/rust-analyzer) on a file for diagnostics, documentSymbol, goToDefinition, or inspect.",
 	PreviewCheck: "Verify local web apps end-to-end: read .claude/launch.json (list_configs), start/stop/inspect dev servers (start_server, stop_server, server_logs), and load localhost URLs in an isolated headless browser (check) to click, fill inputs, scroll, read DOM text/HTML/interactive elements, check console/network errors, and capture bounded JPEG screenshots.",
+	ToolSearch: "Load full parameter schemas for deferred specialist tools on demand. Available specialist groups: worktree (WorktreeCreate, WorktreeList, WorktreeMerge, WorktreeRemove), cron (ScheduleWakeup, CronCreate, CronList, CronDelete), workflow (WorkflowRun), preview (PreviewCheck for localhost UI/DOM verification), monitor (Monitor for live command/WS streams), executors (AgentExecutors for Codex/Claude/Kimi/Antigravity discovery).",
 };
 
 function hostConfig(): { url: string; token: string } | undefined {
@@ -272,6 +280,25 @@ export default function toolControl(pi: ExtensionAPI): void {
 		return (shared ? ["TodoWrite"] : sharedChecklistTools).filter((name) => overrides[name] !== true);
 	};
 	let hiddenChecklistDeclarations = hiddenChecklists({});
+	const unlockedSpecialistTools = new Set<string>();
+	const hiddenSpecialists = (overrides: Record<string, boolean>): string[] =>
+		deferredSpecialistTools.filter((name) => overrides[name] !== true && !unlockedSpecialistTools.has(name));
+	let hiddenSpecialistDeclarations = hiddenSpecialists({});
+	const autoUnlockFromPrompt = (promptText: string): boolean => {
+		if (!promptText.trim()) return false;
+		const before = unlockedSpecialistTools.size;
+		if (/worktree|工作树|分支隔离/i.test(promptText)) {
+			for (const t of ["WorktreeCreate", "WorktreeList", "WorktreeMerge", "WorktreeRemove"]) unlockedSpecialistTools.add(t);
+		}
+		if (/\/loop\b|\bcron\b|schedule|wakeup|定时|唤醒|每隔/i.test(promptText)) {
+			for (const t of ["ScheduleWakeup", "CronCreate", "CronList", "CronDelete"]) unlockedSpecialistTools.add(t);
+		}
+		if (/\bworkflow\b|工作流|pipeline/i.test(promptText)) unlockedSpecialistTools.add("WorkflowRun");
+		if (/\/preview\b|localhost|127\.0\.0\.1|浏览器|预览|页面检查|截图/i.test(promptText)) unlockedSpecialistTools.add("PreviewCheck");
+		if (/\bmonitor\b|监听日志|websocket|\bwss?:\/\//i.test(promptText)) unlockedSpecialistTools.add("Monitor");
+		if (/\bcodex\b|\bkimi\b|\bantigravity\b|claude\s*code|外部.*agent|\bexecutor/i.test(promptText)) unlockedSpecialistTools.add("AgentExecutors");
+		return unlockedSpecialistTools.size !== before;
+	};
 	const structuredOutputEnabled = process.env.PI_DESKTOP_STRUCTURED_OUTPUT === "1";
 	const canDelegate = !forkChild && delegationDepth < maxDepth;
 	const host = hostConfig();
@@ -343,21 +370,85 @@ export default function toolControl(pi: ExtensionAPI): void {
 				) : (
 					name === "StructuredOutput"
 						? structuredOutputEnabled
-						: name === "WorkflowRun"
-							? !child
-							: teamTools.has(name)
-								? (agentTeams && !child)
-								: delegating(name)
-									? (canDelegate || (name === "SendMessage" && teamMember && agentTeams))
-									: !(child && (worktreeMutationTools.has(name) || cronChildBlockedTools.has(name)))
+						: name === "ToolSearch"
+							? !readOnlyChild
+							: name === "WorkflowRun"
+								? !child
+								: teamTools.has(name)
+									? (agentTeams && !child)
+									: delegating(name)
+										? (canDelegate || (name === "SendMessage" && teamMember && agentTeams))
+										: !(child && (worktreeMutationTools.has(name) || cronChildBlockedTools.has(name)))
 				),
-				executionMode: [...delegatingToolNames, "TaskOutput"].includes(name) ? "parallel" : "sequential",
+				executionMode: [...delegatingToolNames, "TaskOutput", "ToolSearch"].includes(name) ? "parallel" : "sequential",
 				// AgentSend stays callable for older prompts, but SendMessage is the declared tool.
+				// Specialist tools stay callable while ToolSearch defers their heavy schemas until needed.
 				...(name === "AgentSend" ? { prepareLoadout: () => ({ hiddenDeclarations: ["AgentSend"] }) }
+					: name === "ToolSearch" ? { prepareLoadout: () => ({ hiddenDeclarations: hiddenSpecialistDeclarations }) }
 					: sharedChecklistTools.includes(name) ? { prepareLoadout: () => ({ hiddenDeclarations: hiddenChecklistDeclarations }) } : {}),
 				prepareArguments: (input) => validateDesktopToolInput(name, input),
 				async execute(toolCallId, input, signal, onUpdate) {
 					const params = validateDesktopToolInput(name, input);
+					if (name === "ToolSearch") {
+						const rawQuery = String(params.query ?? "").trim();
+						const maxResults = typeof params.max_results === "number" ? params.max_results : 8;
+						const activeSet = new Set(pi.getActiveTools());
+						const candidates = desktopModelToolNames.filter(
+							(candidate) => candidate !== "ToolSearch" && candidate !== "AgentSend" && activeSet.has(candidate),
+						);
+						let matched: DesktopModelToolName[] = [];
+						if (/^select:/i.test(rawQuery)) {
+							const wanted = new Set(
+								rawQuery
+									.slice(7)
+									.split(",")
+									.map((s) => s.trim().toLowerCase())
+									.filter(Boolean),
+							);
+							matched = candidates.filter((c) => wanted.has(c.toLowerCase()));
+						} else {
+							const terms = rawQuery.toLowerCase().split(/[\s,]+/).filter(Boolean);
+							const scored = candidates
+								.map((c) => {
+									const hayName = c.toLowerCase();
+									const hayDesc = descriptions[c].toLowerCase();
+									let score = 0;
+									for (const term of terms) {
+										if (hayName === term) score += 10;
+										else if (hayName.includes(term)) score += 5;
+										else if (hayDesc.includes(term)) score += 2;
+									}
+									return { name: c, score };
+								})
+								.filter((entry) => entry.score > 0)
+								.sort((a, b) => b.score - a.score);
+							matched = scored.slice(0, maxResults).map((entry) => entry.name);
+						}
+						if (!matched.length) {
+							return {
+								content: [{ type: "text", text: `No matching active specialist tools for "${rawQuery}". Available deferred tools: ${deferredSpecialistTools.filter((c) => activeSet.has(c)).join(", ")}.` }],
+								details: { query: rawQuery, matched: [] },
+							};
+						}
+						let newlyUnlocked = false;
+						for (const item of matched) {
+							if ((deferredSpecialistTools as readonly string[]).includes(item) && !unlockedSpecialistTools.has(item)) {
+								unlockedSpecialistTools.add(item);
+								newlyUnlocked = true;
+							}
+						}
+						if (newlyUnlocked) {
+							hiddenSpecialistDeclarations = hiddenSpecialists(previousOverrides);
+							pi.setActiveTools(pi.getActiveTools());
+						}
+						const schemaBlocks = matched.map((item) =>
+							`### ${item}\n${descriptions[item]}\nParameters JSON Schema:\n${JSON.stringify(toolSchemas[item])}`,
+						);
+						return {
+							content: [{ type: "text", text: `Loaded ${matched.length} tool schema(s):\n\n${schemaBlocks.join("\n\n")}` }],
+							details: { query: rawQuery, matched },
+						};
+					}
 					const canTeamMessage = name === "SendMessage" && teamMember && agentTeams && !forkChild;
 					if (forkChild && delegating(name)) throw new Error("Forked agents cannot fork or spawn agents");
 					if (!canDelegate && delegating(name) && !canTeamMessage) throw new Error(`Subagent nesting limit reached (depth ${delegationDepth}). Complete this task directly; subagents cannot delegate, and cannot spawn nested agents.`);
@@ -444,6 +535,7 @@ export default function toolControl(pi: ExtensionAPI): void {
 		loadedBaseline = true;
 		const settings = await config();
 		hiddenChecklistDeclarations = hiddenChecklists(settings.overrides);
+		hiddenSpecialistDeclarations = hiddenSpecialists(settings.overrides);
 		const all = pi.getAllTools();
 		const active = new Set([...pi.getActiveTools(), ...hiddenByMode]);
 		hiddenByMode.clear();
@@ -496,9 +588,11 @@ export default function toolControl(pi: ExtensionAPI): void {
 	}
 	function inventory(settings: ToolOverrides): DesktopToolInfo[] {
 		const active = new Set(pi.getActiveTools());
+		const deferring = active.has("ToolSearch");
 		return pi.getAllTools().map((tool) => {
 			const details = describeTool(tool, active, settings.overrides, child, canDelegate, readOnlyChild, agentTeams, teamMember, structuredOutputEnabled);
-			return hiddenChecklistDeclarations.includes(tool.name) ? { ...details, modelVisible: false } : details;
+			const hidden = hiddenChecklistDeclarations.includes(tool.name) || (deferring && hiddenSpecialistDeclarations.includes(tool.name));
+			return hidden ? { ...details, modelVisible: false } : details;
 		});
 	}
 	// Results queued as `nextTurn` in this process; Pi consumes them when the next run starts.
@@ -517,6 +611,16 @@ export default function toolControl(pi: ExtensionAPI): void {
 		// This run takes every queued result; acknowledge them so a later replay is a duplicate.
 		for (const [key, usage] of queuedNotifications) acknowledge(key, usage, ctx);
 		queuedNotifications.clear();
+		const lastUser = ctx?.sessionManager?.getBranch?.().findLast((entry) => entry.type === "message" && entry.message.role === "user");
+		if (lastUser?.type === "message" && lastUser.message.role === "user") {
+			const raw = lastUser.message.content;
+			const promptText = typeof raw === "string"
+				? raw
+				: Array.isArray(raw)
+					? raw.filter((item): item is { type: "text"; text: string } => item?.type === "text" && typeof item.text === "string").map((item) => item.text).join("\n")
+					: "";
+			autoUnlockFromPrompt(promptText);
+		}
 		await apply();
 		// List the agent types the model can delegate to as a named prompt section. Returning
 		// `systemPrompt` would force an opaque prompt that drops the other extensions'

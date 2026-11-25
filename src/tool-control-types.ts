@@ -17,9 +17,22 @@ export const desktopModelToolNames = [
 	"Monitor", "BashOutput", "KillShell",
 	"ScheduleWakeup", "CronCreate", "CronList", "CronDelete",
 	"TeamCreate", "TeamDelete",
-	"WorkflowRun", "StructuredOutput", "LSP", "PreviewCheck",
+	"WorkflowRun", "StructuredOutput", "LSP", "PreviewCheck", "ToolSearch",
 ] as const;
 export type DesktopModelToolName = (typeof desktopModelToolNames)[number];
+
+/**
+ * Specialist desktop tools whose full JSON schemas are omitted from initial model requests
+ * to cut prompt-token overhead and tool dilution, while staying 100% callable and loadable via `ToolSearch`.
+ */
+export const deferredSpecialistTools = [
+	"AgentExecutors",
+	"WorktreeCreate", "WorktreeList", "WorktreeMerge", "WorktreeRemove",
+	"Monitor",
+	"ScheduleWakeup", "CronCreate", "CronList", "CronDelete",
+	"WorkflowRun",
+	"PreviewCheck",
+] as const satisfies readonly DesktopModelToolName[];
 /**
  * Host calls that are not separate model tools. `BashBackground` is the `bash` tool's
  * `run_in_background: true` path; Pi has already run the bash permission checks for it.
@@ -261,6 +274,7 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 		StructuredOutput: ["data"],
 		LSP: ["operation", "filePath", "line", "character", "silent"],
 		PreviewCheck: ["action", "name", "server_id", "url", "mobile", "actions", "selector", "read_dom", "screenshot", "wait_ms"],
+		ToolSearch: ["query", "max_results"],
 	};
 	if (Object.keys(input).some((key) => !allowed[tool].includes(key))) throw new Error("Unknown tool input field");
 	if (tool === "Agent") {
@@ -398,9 +412,9 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 	} else if (tool === "StructuredOutput") {
 		if (!("data" in input)) throw new Error("StructuredOutput requires 'data'");
 	} else if (tool === "LSP") {
-		const validOps = ["diagnostics", "documentSymbol", "goToDefinition", "inspect"];
+		const validOps = ["diagnostics", "documentSymbol", "goToDefinition", "inspect", "workspaceOutline"];
 		if (typeof input.operation !== "string" || !validOps.includes(input.operation)) {
-			throw new Error("LSP operation must be diagnostics, documentSymbol, goToDefinition, or inspect");
+			throw new Error("LSP operation must be diagnostics, documentSymbol, goToDefinition, inspect, or workspaceOutline");
 		}
 		text(input.filePath, "filePath", 4096);
 		if (input.line !== undefined && (!Number.isSafeInteger(input.line) || Number(input.line) < 1)) {
@@ -410,6 +424,11 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 			throw new Error("LSP character must be a positive integer");
 		}
 		optionalBoolean(input.silent, "silent");
+	} else if (tool === "ToolSearch") {
+		text(input.query, "query", 500);
+		if (input.max_results !== undefined && (!Number.isSafeInteger(input.max_results) || Number(input.max_results) < 1 || Number(input.max_results) > 30)) {
+			throw new Error("ToolSearch max_results must be an integer between 1 and 30");
+		}
 	} else if (tool === "PreviewCheck") {
 		const validActions = ["list_configs", "start_server", "stop_server", "server_logs", "check"];
 		if (input.action !== undefined && (typeof input.action !== "string" || !validActions.includes(input.action))) {

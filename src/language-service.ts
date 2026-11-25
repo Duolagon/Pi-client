@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { readFile, realpath, stat } from "node:fs/promises";
-import { extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export interface CodePosition { line: number; column: number }
@@ -14,7 +14,18 @@ export interface CodeIntelligence {
 	diagnosticsComplete?: boolean;
 }
 
-export type CodeIntelligenceOperation = "diagnostics" | "documentSymbol" | "goToDefinition" | "inspect";
+export type CodeIntelligenceOperation = "diagnostics" | "documentSymbol" | "goToDefinition" | "inspect" | "workspaceOutline";
+
+export interface WorkspaceOutlineSymbol {
+	line: number;
+	kind: string;
+	name: string;
+}
+
+export interface WorkspaceFileOutline {
+	path: string;
+	symbols: WorkspaceOutlineSymbol[];
+}
 
 const servers: Record<string, [string, string[], string]> = {
 	".ts": ["typescript-language-server", ["--stdio"], "typescript"],
@@ -399,4 +410,129 @@ export async function codeIntelligence(project: string, path: string, env?: Node
 	} finally {
 		service.close();
 	}
+}
+
+const OUTLINE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs"]);
+const IGNORED_OUTLINE_DIRS = new Set([
+	".git", "node_modules", "dist", "build", "release", "out", ".next", ".turbo",
+	"target", "vendor", "__pycache__", ".venv", "venv", "coverage", ".cache",
+]);
+
+function extractOutlineSymbols(text: string, ext: string): WorkspaceOutlineSymbol[] {
+	const symbols: WorkspaceOutlineSymbol[] = [];
+	const seen = new Set<string>();
+	const lines = text.split(/\r?\n/);
+	for (let i = 0; i < lines.length && symbols.length < 40; i++) {
+		const raw = lines[i]!;
+		if (raw.length > 400) continue;
+		let match: RegExpExecArray | null = null;
+		let kind = "";
+		let name = "";
+		if (ext === ".py") {
+			match = /^(?:async\s+)?(class|def)\s+([A-Za-z_]\w*)/.exec(raw);
+			if (match) { kind = match[1]!; name = match[2]!; }
+		} else if (ext === ".go") {
+			match = /^(func|type)\s+(?:\([^)]+\)\s*)?([A-Za-z_]\w*)/.exec(raw);
+			if (match) { kind = match[1]!; name = match[2]!; }
+		} else if (ext === ".rs") {
+			match = /^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(fn|struct|enum|trait|mod|type)\s+([A-Za-z_]\w*)/.exec(raw);
+			if (match) { kind = match[1]!; name = match[2]!; }
+		} else {
+			match = /^export\s+(?:default\s+)?(?:async\s+)?(function|class|interface|type|const|let|enum)\s+([A-Za-z_$][\w$]*)/.exec(raw)
+				?? /^(?:async\s+)?(function|class|interface)\s+([A-Za-z_$][\w$]*)/.exec(raw);
+			if (match) { kind = match[1]!; name = match[2]!; }
+		}
+		if (name && !seen.has(`${kind}:${name}`)) {
+			seen.add(`${kind}:${name}`);
+			symbols.push({ line: i + 1, kind, name });
+		}
+	}
+	return symbols;
+}
+
+/**
+ * Fast, zero-dependency RepoMap / directory symbol skeleton builder.
+ * Maps up to `maxFiles` source files inside `targetPath` without spawning an external LSP process,
+ * gated per-file by `allowFile` so read permissions and sandbox rules are strictly enforced.
+ */
+export async function buildWorkspaceOutline(
+	project: string,
+	targetPath: string,
+	allowFile?: (relativePath: string) => Promise<boolean>,
+	signal?: AbortSignal,
+	maxFiles = 60,
+): Promise<{ files: WorkspaceFileOutline[]; scannedFiles: number; truncated: boolean; formatted: string }> {
+	signal?.throwIfAborted();
+	const root = await realpath(project);
+	const resolvedTarget = await realpath(resolve(root, targetPath || "."));
+	if (resolvedTarget !== root && !within(root, resolvedTarget)) {
+		throw new Error("路径超出项目目录。");
+	}
+	const targetStat = await stat(resolvedTarget);
+	const candidateFiles: string[] = [];
+	let truncated = false;
+
+	if (targetStat.isFile()) {
+		candidateFiles.push(resolvedTarget);
+	} else if (targetStat.isDirectory()) {
+		const queue: string[] = [resolvedTarget];
+		for (let qIdx = 0; qIdx < queue.length && candidateFiles.length < maxFiles; qIdx++) {
+			signal?.throwIfAborted();
+			const dir = queue[qIdx]!;
+			const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+			entries.sort((a, b) => a.name.localeCompare(b.name));
+			for (const entry of entries) {
+				if (entry.name.startsWith(".") || IGNORED_OUTLINE_DIRS.has(entry.name)) continue;
+				const full = join(dir, entry.name);
+				if (entry.isDirectory()) {
+					if (queue.length < 200) queue.push(full);
+				} else if (entry.isFile() && OUTLINE_EXTENSIONS.has(extname(entry.name).toLowerCase())) {
+					if (candidateFiles.length >= maxFiles) {
+						truncated = true;
+						break;
+					}
+					candidateFiles.push(full);
+				}
+			}
+		}
+	}
+
+	const outlines: WorkspaceFileOutline[] = [];
+	for (const file of candidateFiles) {
+		signal?.throwIfAborted();
+		const realFile = await realpath(file).catch(() => undefined);
+		if (!realFile || (realFile !== root && !within(root, realFile))) continue;
+		const rel = within(root, realFile);
+		if (!rel) continue;
+		if (allowFile && !(await allowFile(rel))) continue;
+		const info = await stat(realFile).catch(() => undefined);
+		if (!info?.isFile() || info.size > 256 * 1024) continue;
+		const content = await readFile(realFile, { encoding: "utf8", signal }).catch(() => "");
+		if (!content) continue;
+		const symbols = extractOutlineSymbols(content, extname(realFile).toLowerCase());
+		outlines.push({ path: rel, symbols });
+	}
+
+	const label = within(root, resolvedTarget) ?? ".";
+	const lines: string[] = [`[Workspace Symbol Outline (${label}) — ${outlines.length} file(s)${truncated ? ", truncated" : ""}]:`];
+	let charBudget = 20_000;
+	for (const item of outlines) {
+		const symSummary = item.symbols.length
+			? item.symbols.map((s) => `${s.kind} ${s.name}:L${s.line}`).join(", ")
+			: "(no top-level symbols)";
+		const row = `- ${item.path}: ${symSummary}`;
+		if (charBudget - row.length < 0) {
+			lines.push("…(output budget reached)");
+			truncated = true;
+			break;
+		}
+		lines.push(row);
+		charBudget -= row.length + 1;
+	}
+	return {
+		files: outlines,
+		scannedFiles: outlines.length,
+		truncated,
+		formatted: lines.join("\n"),
+	};
 }

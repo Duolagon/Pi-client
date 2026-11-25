@@ -2,14 +2,15 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { copyText } from "./clipboard.ts";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ArrowDownToLine, Bot, Check, Circle, CircleAlert, ChevronRight, Copy, ExternalLink, Eye, FilePen, FileText, GitFork, Globe, ListChecks, LoaderCircle, RotateCcw, Search, Sparkles, Square, Terminal as TerminalIcon, X, ZoomIn } from "lucide-react";
+import { ArrowDownToLine, Bot, Check, Circle, CircleAlert, ChevronRight, Copy, ExternalLink, Eye, FilePen, FileText, GitFork, Globe, ListChecks, LoaderCircle, RotateCcw, Search, Sparkles, Square, Terminal as TerminalIcon } from "lucide-react";
+import { Modal } from "../prototype/ui.tsx";
 import { AnimatedDetails, SmoothCollapse } from "./SmoothCollapse.tsx";
-import { SurfacePresence } from "./Presence.tsx";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
 import { formatRunningToolTimer } from "../task-eta.ts";
 import type { DesktopTask, ExternalTask, Message, MonitorRecord, TaskProgress } from "../shared.ts";
 import type { Transcript, ToolProgress } from "./messages.ts";
-import { CodeLines, InlineEditDiff, computeLineDiff } from "./DiffView.tsx";
+import { CodeLines, InlineEditDiff } from "./DiffView.tsx";
+import { summarizeLineChanges, type LineChangeCounts } from "./diff-lines.ts";
 import { highlightCode } from "./highlight.tsx";
 import { collectVerificationEvidence, scoreTurn, type QualityVerdict, type VerificationCheck } from "./quality-verdict.ts";
 import { OmenGlyph } from "./GrailIcons.tsx";
@@ -26,6 +27,33 @@ export interface TodoItem {
 
 type Assistant = Extract<Message, { role: "assistant" }>;
 type AnyMessage = Transcript["messages"][number];
+type ImagePreview = { src: string; alt: string };
+
+function ImageThumbnail({
+	src,
+	alt,
+	previewLabel,
+	className,
+	onZoom,
+}: ImagePreview & { previewLabel: string; className?: string; onZoom?: (image: ImagePreview) => void }) {
+	const image = <img className={className} src={src} alt={alt} />;
+	if (!onZoom) return image;
+	return (
+		<button
+			type="button"
+			className="cc-zoomable-img"
+			aria-label={`放大预览：${previewLabel}`}
+			title="放大预览"
+			onClick={(event) => {
+				event.currentTarget.focus({ preventScroll: true });
+				onZoom({ src, alt: previewLabel });
+			}}
+		>
+			{image}
+		</button>
+	);
+}
+
 type Unit =
 	| { kind: "user"; message: Extract<Message, { role: "user" } | { role: "custom" }> }
 	| { kind: "bash"; message: Extract<Message, { role: "bashExecution" }> }
@@ -362,19 +390,7 @@ export function TranscriptView({
 	/** Opens a tool's file path in the configured external editor. */
 	onOpenFile?: OpenFileHandler;
 }) {
-	const [lightbox, setLightbox] = useState<{ src: string; alt: string } | null>(null);
-	useEffect(() => {
-		if (!lightbox) return;
-		const onKey = (event: KeyboardEvent) => {
-			if (event.key === "Escape") {
-				event.preventDefault();
-				event.stopPropagation();
-				setLightbox(null);
-			}
-		};
-		window.addEventListener("keydown", onKey, true);
-		return () => window.removeEventListener("keydown", onKey, true);
-	}, [lightbox]);
+	const [lightbox, setLightbox] = useState<ImagePreview | null>(null);
 	const verificationEvidence = useMemo(() => collectVerificationEvidence(state.messages, backgroundMonitors), [state.messages, backgroundMonitors]);
 	const messageIndices = new Map(state.messages.map((message, index) => [message, index]));
 	const approvals = approvalTool ? Object.entries(state.tools)
@@ -396,6 +412,7 @@ export function TranscriptView({
 						desktop_team_message: { verb: "Team", label: "(团队协作消息)" },
 						desktop_workflow_event: { verb: "Workflow", label: "(工作流事件)" },
 						desktop_model_fallback: { verb: "Model", label: "(已切换到备用模型)" },
+						desktop_model_escalation: { verb: "Escalate", label: "(验证受阻，已临时升档强模型诊断)" },
 					};
 					const cardMeta = message.role === "custom" ? customCardMeta[message.customType] : undefined;
 					if (message.role === "custom" && cardMeta) {
@@ -453,13 +470,12 @@ export function TranscriptView({
 											block.type === "text" ? (
 												message.role === "user" && part > 0 && isDesktopWorkspaceContext(block.text) ? null : <p key={part}>{block.text}</p>
 											) : (
-												<img
+												<ImageThumbnail
 													key={part}
-													className="cc-zoomable-img"
 													alt="用户附件"
-													title="点击放大预览"
+													previewLabel="用户附件预览"
 													src={`data:${block.mimeType};base64,${block.data}`}
-													onClick={() => setLightbox({ src: `data:${block.mimeType};base64,${block.data}`, alt: "用户附件预览" })}
+													onZoom={setLightbox}
 												/>
 											),
 										)
@@ -606,32 +622,13 @@ export function TranscriptView({
 					</article>
 				);
 			})}
-			<SurfacePresence show={Boolean(lightbox)} direction="pill" group="lightbox">
-				{(boxRef) =>
-					lightbox ? (
-						<div
-							ref={boxRef}
-							className="cc-lightbox-backdrop"
-							role="dialog"
-							aria-modal="true"
-							aria-label={lightbox.alt}
-							onClick={() => setLightbox(null)}
-						>
-							<div className="cc-lightbox-stage" onClick={(e) => e.stopPropagation()}>
-								<img src={lightbox.src} alt={lightbox.alt} />
-								<div className="cc-lightbox-bar">
-									<span>
-										<ZoomIn size={13} /> {lightbox.alt}
-									</span>
-									<button type="button" className="cc-lightbox-close" aria-label="关闭图片预览" onClick={() => setLightbox(null)}>
-										<X size={15} />
-									</button>
-								</div>
-							</div>
-						</div>
-					) : null
-				}
-			</SurfacePresence>
+			{lightbox && (
+				<Modal title={lightbox.alt} className="cc-image-preview-modal" close={() => setLightbox(null)}>
+					<div className="cc-image-preview-stage">
+						<img src={lightbox.src} alt={lightbox.alt} />
+					</div>
+				</Modal>
+			)}
 		</div>
 	);
 }
@@ -667,7 +664,7 @@ function turnItems({
 	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
 	onOpenPreview?: (url: string) => void;
 	onOpenFile?: OpenFileHandler;
-	onZoomImage?: (img: { src: string; alt: string }) => void;
+	onZoomImage?: (image: ImagePreview) => void;
 }): TurnItem[] {
 	const items: TurnItem[] = [];
 	message.content.forEach((block, part) => {
@@ -747,15 +744,13 @@ const GROUP_KIND: Record<string, "bash" | "read" | "search" | "edit" | "web"> = 
 	WebSearch: "web",
 };
 
-interface EditSpotlight {
+type EditSpotlight = {
 	id: string;
-	verb: string;
 	target: string;
-	additions: number;
-	removals: number;
-	editPairs?: { oldText: string; newText: string }[];
-	lineContent?: { content: string; startLine?: number };
-}
+} & (
+	| { kind: "edit"; diffStat?: LineChangeCounts; editPairs: { oldText: string; newText: string }[] }
+	| { kind: "write"; content: string; writtenLines: number }
+);
 
 /** Folds every run of work steps (tool calls plus the thinking between them) in a turn into one ToolGroup. */
 function groupTurnItems(items: TurnItem[], state: Transcript, isLatestTurn = false): ReactNode[] {
@@ -802,33 +797,29 @@ function groupTurnItems(items: TurnItem[], state: Transcript, isLatestTurn = fal
 				running = true;
 				live.push(item.node);
 			}
-			if (!isRunning && !res?.isError && (b.name === "edit" || b.name === "write")) {
+			const succeeded = res ? !res.isError : state.tools[b.id]?.status === "done";
+			if (succeeded && (b.name === "edit" || b.name === "write")) {
 				const a = asRecord(b.arguments);
 				const path = typeof a.path === "string" ? a.path : typeof a.file_path === "string" ? a.file_path : "文件";
 				if (b.name === "edit") {
 					const editPairs = extractEditPairs(a);
 					if (editPairs.length) {
-						let additions = 0;
-						let removals = 0;
-						for (const pair of editPairs) {
-							const d = computeLineDiff(pair.oldText, pair.newText);
-							additions += d.additions;
-							removals += d.removals;
-						}
-						editSpotlights.push({ id: b.id, verb: "已更新", target: path, additions, removals, editPairs });
-					}
-				} else if (b.name === "write") {
-					const content = typeof a.content === "string" ? a.content : "";
-					if (content) {
 						editSpotlights.push({
+							kind: "edit",
 							id: b.id,
-							verb: "已写入",
 							target: path,
-							additions: countLines(content),
-							removals: 0,
-							lineContent: { content, startLine: 1 },
+							diffStat: summarizeLineChanges(editPairs),
+							editPairs,
 						});
 					}
+				} else if (typeof a.content === "string") {
+					editSpotlights.push({
+						kind: "write",
+						id: b.id,
+						target: path,
+						content: a.content,
+						writtenLines: a.content ? countLines(a.content) : 0,
+					});
 				}
 			}
 		}
@@ -896,31 +887,36 @@ function EditSpotlightRow({ item, defaultOpen = false }: { item: EditSpotlight; 
 				<span className="cc-edit-spotlight-icon" aria-hidden="true">
 					<FilePen size={11.5} />
 				</span>
-				<span className="cc-edit-spotlight-verb">{item.verb}</span>
+				<span className="cc-edit-spotlight-verb">{item.kind === "write" ? "已写入" : "已更新"}</span>
 				<span className="cc-edit-spotlight-path" title={item.target}>
 					{dirPrefix && <em className="cc-file-dir">{dirPrefix}</em>}
 					<strong>{baseName}</strong>
 				</span>
-				<span className="cc-tool-diff-stat" aria-label={`新增 ${item.additions} 行，移除 ${item.removals} 行`}>
-					{item.additions > 0 && <span className="add">+{item.additions}</span>}
-					{item.removals > 0 && <span className="del">-{item.removals}</span>}
-				</span>
+				{item.kind === "write" ? (
+					<span className="cc-tool-badge">{item.writtenLines} 行</span>
+				) : item.diffStat ? (
+					<span className="cc-tool-diff-stat" aria-label={`新增 ${item.diffStat.additions} 行，移除 ${item.diffStat.removals} 行`}>
+						{item.diffStat.additions > 0 && <span className="add">+{item.diffStat.additions}</span>}
+						{item.diffStat.removals > 0 && <span className="del">-{item.diffStat.removals}</span>}
+					</span>
+				) : (
+					<span className="cc-tool-badge">差异预览</span>
+				)}
 				<ChevronRight size={13} className="cl-tool-chevron" />
 			</button>
 			<SmoothCollapse open={open}>
 				<div className="cc-edit-spotlight-diff">
-					{item.editPairs?.length ? (
+					{item.kind === "edit" ? (
 						item.editPairs.map((pair, idx) => (
 							<div key={idx} className={idx > 0 ? "cc-edit-hunk-sep" : undefined}>
 								<InlineEditDiff oldText={pair.oldText} newText={pair.newText} />
 							</div>
 						))
-					) : item.lineContent ? (
-						<CodeLines
-							content={item.lineContent.content.split("\n").slice(0, 40).join("\n")}
-							startLine={item.lineContent.startLine}
-						/>
-					) : null}
+					) : item.content ? (
+						<CodeLines content={item.content.split("\n").slice(0, 40).join("\n")} />
+					) : (
+						<span className="cc-tool-badge">空文件</span>
+					)}
 				</div>
 			</SmoothCollapse>
 		</div>
@@ -946,8 +942,9 @@ function ToolGroup({
 	children: ReactNode;
 }) {
 	const [open, setOpen] = useState(false);
-	const totalAdd = editSpotlights.reduce((sum, item) => sum + item.additions, 0);
-	const totalDel = editSpotlights.reduce((sum, item) => sum + item.removals, 0);
+	const completeCounts = editSpotlights.every((item) => item.kind === "edit" && item.diffStat !== undefined);
+	const totalAdd = editSpotlights.reduce((sum, item) => sum + (item.kind === "edit" ? item.diffStat?.additions ?? 0 : 0), 0);
+	const totalDel = editSpotlights.reduce((sum, item) => sum + (item.kind === "edit" ? item.diffStat?.removals ?? 0 : 0), 0);
 	return (
 		<div className={`cl-tool-group ${running ? "running" : failed ? "error" : "done"} ${open ? "is-open" : ""}`}>
 			<button type="button" className="cc-tool-row cc-tool-group-head" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
@@ -955,7 +952,7 @@ function ToolGroup({
 				<span className="cc-tool-head">
 					<span className="cc-tool-verb cc-tool-group-summary">{summary}{failed && <span className="cc-tool-error-label"> · 有失败步骤</span>}</span>
 				</span>
-				{!open && (totalAdd > 0 || totalDel > 0) && (
+				{!open && completeCounts && (totalAdd > 0 || totalDel > 0) && (
 					<span className="cc-tool-diff-stat">
 						{totalAdd > 0 && <span className="add">+{totalAdd}</span>}
 						{totalDel > 0 && <span className="del">-{totalDel}</span>}
@@ -1084,21 +1081,20 @@ function presentTool(name: string, args: unknown, output: string | undefined, st
 	if (name === "edit") {
 		const editPairs = extractEditPairs(a);
 		if (editPairs.length) {
-			let additions = 0;
-			let removals = 0;
-			for (const pair of editPairs) {
-				const d = computeLineDiff(pair.oldText, pair.newText);
-				additions += d.additions;
-				removals += d.removals;
-			}
+			const diffStat = status === "done" ? summarizeLineChanges(editPairs) : undefined;
+			const pathLabel = path || "文件";
 			return {
 				verb: "更新",
-				target: path || "文件",
-				diffStat: { additions, removals },
+				target: pathLabel,
+				diffStat,
 				treeSummary:
 					status === "error"
 						? output?.split("\n")[0] || "编辑失败"
-						: `已更新 ${path || "文件"}（新增 ${additions} 行，移除 ${removals} 行）`,
+						: status === "running"
+							? "正在编辑…"
+							: diffStat
+								? `已更新 ${pathLabel}（新增 ${diffStat.additions} 行，移除 ${diffStat.removals} 行）`
+								: `已更新 ${pathLabel}`,
 				editPairs,
 			};
 		}
@@ -1349,7 +1345,7 @@ function ToolCard({
 	onBackgroundTask?: (taskId: string) => void;
 	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
 	onOpenFile?: OpenFileHandler;
-	onZoomImage?: (img: { src: string; alt: string }) => void;
+	onZoomImage?: (image: ImagePreview) => void;
 }) {
 	const output = result
 		? result.content
@@ -1493,13 +1489,13 @@ function ToolCard({
 					{images.map((img, idx) => {
 						const src = `data:${img.mimeType};base64,${img.data}`;
 						return (
-							<img
+							<ImageThumbnail
 								key={idx}
-								className="cc-tool-image cc-zoomable-img"
+								className="cc-tool-image"
 								alt="工具返回图片"
-								title="点击放大预览"
+								previewLabel={`${info.verb} ${info.target || "图片"}`}
 								src={src}
-								onClick={() => onZoomImage?.({ src, alt: `${info.verb} ${info.target || "图片"}` })}
+								onZoom={onZoomImage}
 							/>
 						);
 					})}

@@ -1,4 +1,4 @@
-import { access, readFile, readlink, realpath } from "node:fs/promises";
+import { access, readFile, readlink, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,7 +16,7 @@ import type {
 
 const readingTools = new Set(["read", "grep", "find", "ls"]);
 const editTools = new Set(["edit", "write", "NotebookEdit"]);
-const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite", "TodoCreate", "TodoGet", "TodoUpdate", "TodoList", "CronList", "BashOutput", "KillShell", "StructuredOutput", "AskUserQuestion", "ExitPlanMode", "LSP"]);
+const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite", "TodoCreate", "TodoGet", "TodoUpdate", "TodoList", "CronList", "BashOutput", "KillShell", "StructuredOutput", "AskUserQuestion", "ExitPlanMode", "LSP", "ToolSearch"]);
 const pathTools = new Set([...readingTools, "edit", "write", "NotebookEdit"]);
 const wrappers = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", ".", "env", "sudo", "doas", "exec", "command", "xargs"]);
 /** Pass-through process wrappers that Claude Code strips before matching command rules. */
@@ -224,16 +224,53 @@ export function validateRuntimePolicy(value: unknown): RuntimePermissionPolicy {
 	};
 }
 
-/** The file is deliberately read for every call so revocation also stops stale tool calls. */
+let cachedPolicyEntry:
+	| {
+			file: string;
+			ino: number;
+			mtimeMs: number;
+			ctimeMs: number;
+			size: number;
+			policy: RuntimePermissionPolicy;
+	  }
+	| undefined;
+
+/**
+ * Re-checks file metadata (`stat`) on every call so atomic policy swaps (`rename` -> new `ino`)
+ * or edits take effect immediately with zero stale window, while skipping redundant JSON reads
+ * and 2000-rule validation when the file has not changed.
+ */
 export async function loadRuntimePermissionPolicy(
 	env: NodeJS.ProcessEnv = process.env,
 	cwd = process.cwd(),
 ): Promise<RuntimePermissionPolicy> {
 	if (env.PI_DESKTOP_POLICY_FILE) {
-		if (!isAbsolute(env.PI_DESKTOP_POLICY_FILE)) throw new Error("运行时权限文件必须为绝对路径。");
-		const content = await readFile(env.PI_DESKTOP_POLICY_FILE, "utf8");
+		const file = env.PI_DESKTOP_POLICY_FILE;
+		if (!isAbsolute(file)) throw new Error("运行时权限文件必须为绝对路径。");
+		const info = await stat(file);
+		if (info.size > 4 * 1024 * 1024) throw new Error("运行时权限配置过大。");
+		if (
+			cachedPolicyEntry &&
+			cachedPolicyEntry.file === file &&
+			cachedPolicyEntry.ino === info.ino &&
+			cachedPolicyEntry.mtimeMs === info.mtimeMs &&
+			cachedPolicyEntry.ctimeMs === info.ctimeMs &&
+			cachedPolicyEntry.size === info.size
+		) {
+			return cachedPolicyEntry.policy;
+		}
+		const content = await readFile(file, "utf8");
 		if (Buffer.byteLength(content) > 4 * 1024 * 1024) throw new Error("运行时权限配置过大。");
-		return validateRuntimePolicy(JSON.parse(content));
+		const policy = validateRuntimePolicy(JSON.parse(content));
+		cachedPolicyEntry = {
+			file,
+			ino: info.ino,
+			mtimeMs: info.mtimeMs,
+			ctimeMs: info.ctimeMs,
+			size: info.size,
+			policy,
+		};
+		return policy;
 	}
 	const mode = env.PI_DESKTOP_PERMISSION_MODE ?? "ask";
 	if (mode === "dontAsk") return validateRuntimePolicy({ version: 1, mode: "ask", dontAsk: true, rules: [], disabledTools: [], project: cwd });
@@ -488,6 +525,20 @@ export async function redactSearchOutput(
 	let removed = 0;
 	const kept: string[] = [];
 	const checked = new Map<string, boolean>();
+	const safeDirCache = new Map<string, string | null>();
+	const fastResolveInSafeDir = async (target: string): Promise<string | null> => {
+		const parent = dirname(target);
+		let canonicalDir = safeDirCache.get(parent);
+		if (canonicalDir === undefined) {
+			canonicalDir = await realpath(parent).catch(() => null);
+			safeDirCache.set(parent, canonicalDir);
+		}
+		if (canonicalDir === null) return canonicalPermissionPath(target, project).catch(() => null);
+		// Use lstat-style readlink check on leaf so symlinks inside a safe directory are still caught.
+		const link = await readlink(target).catch(() => undefined);
+		if (link !== undefined) return canonicalPermissionPath(target, project).catch(() => null);
+		return join(canonicalDir, relative(parent, target));
+	};
 	for (const line of text.split("\n")) {
 		let relativePath: string | undefined;
 		if (toolName === "grep") relativePath = /^(.+?)(?::\d+: |-\d+- )/.exec(line)?.[1];
@@ -496,7 +547,7 @@ export async function redactSearchOutput(
 			const target = relativePath === "" ? root : resolve(root, relativePath);
 			let hidden = checked.get(target);
 			if (hidden === undefined) {
-				const resolved = home === undefined ? target : await canonicalPermissionPath(target, project).catch(() => null);
+				const resolved = home === undefined ? target : await fastResolveInSafeDir(target);
 				hidden = (home !== undefined && (
 					resolved === null || isProtectedFileToolPath(target, home) || isProtectedFileToolPath(resolved, home)
 				)) || (await Promise.all(rules.map((rule) => pathMatches(rule.path!, target, project)))).some(Boolean);

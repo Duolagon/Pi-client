@@ -7,7 +7,7 @@ import { createDraftPullRequest, readPullRequest, readPullRequestComments, setPu
 import { managedFile, writeManagedFile } from "./managed-path.ts";
 import { execFile } from "node:child_process";
 import { randomBytes, randomUUID, createHash } from "node:crypto";
-import { access, cp, lstat, mkdir, mkdtemp, readFile, writeFile, rename, realpath, stat, readdir, rm } from "node:fs/promises";
+import { access, cp, lstat, mkdir, mkdtemp, readFile, writeFile, rename, realpath, stat, readdir, readlink, rm, symlink } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { summarizeEngineError, tildify } from "./desktop-log.ts";
 import { homedir, tmpdir } from "node:os";
@@ -126,7 +126,7 @@ import type {
 import { connectionMode, validateEndpoint } from "./model-connections.ts";
 import { providerModels, providerPresets } from "./provider-presets.ts";
 import { memoryLimit, memoryName, privateMemoryLabel, readProjectText } from "./project-memory.ts";
-import { LanguageService, formatCodeIntelligence, formatLspDiagnostics, isLspSupportedFile, type CodeIntelligenceOperation, type CodePosition } from "./language-service.ts";
+import { LanguageService, buildWorkspaceOutline, formatCodeIntelligence, formatLspDiagnostics, isLspSupportedFile, type CodeIntelligenceOperation, type CodePosition } from "./language-service.ts";
 import { buildGoalInitialPrompt, DEFAULT_GOAL_MAX_TURNS, evaluateGoalContinuation, MAX_GOAL_TURNS, type GoalState } from "./goal-mode.ts";
 import { planRelativePath } from "./plan-path.ts";
 import { buildLaunchShellCommand, launchConfigUrl, readLaunchConfigurations, validateLocalPreviewUrl } from "./launch-config.ts";
@@ -2704,6 +2704,29 @@ export class DesktopService {
 			const operation = String(input.operation) as CodeIntelligenceOperation;
 			const filePath = String(input.filePath);
 			const silent = input.silent === true;
+			if (operation === "workspaceOutline") {
+				const policy = this.permissionPolicy(context.conversationId);
+				const outline = await buildWorkspaceOutline(
+					conv.project,
+					filePath,
+					async (relPath) =>
+						(await evaluatePermission(policy, { toolName: "read", input: { path: relPath } }).catch(() => undefined))?.action === "allow",
+					context.signal,
+				);
+				return {
+					server: "outline",
+					filePath,
+					operation,
+					diagnostics: [],
+					symbols: outline.files.flatMap((f) => f.symbols.map((s) => ({ name: `${f.path}#${s.name}`, line: s.line, column: 1 }))),
+					definitions: [],
+					files: outline.files,
+					scannedFiles: outline.scannedFiles,
+					truncated: outline.truncated,
+					formatted: outline.formatted,
+					text: outline.formatted,
+				};
+			}
 			const trusted = this.store.projectTrust?.[this.trustProjectFor(conv.project)] === "trusted";
 			if (!trusted) {
 				if (silent) return { skipped: true, diagnostics: [] };
@@ -4239,11 +4262,12 @@ export class DesktopService {
 	}
 
 	/** Read the selected raw session branch. Compaction only affects the model's context. */
-	private async grailRequirements(conversation: Conversation, since: number, until: number): Promise<string[]> {
+	private async grailRequirements(conversation: Conversation, since: number, until: number, signal: AbortSignal): Promise<string[]> {
 		const agent = this.runtimes.get(conversation.id)?.agent;
 		const history = agent
-			? await agent.request<SessionEntriesResult>({ type: "get_entries" })
-			: conversation.sessionFile ? await this.history.inspect({ sessionFile: conversation.sessionFile, leafId: conversation.sessionLeafId }) : undefined;
+			? await agent.request<SessionEntriesResult>({ type: "get_entries" }, signal)
+			: conversation.sessionFile ? await this.history.inspect({ sessionFile: conversation.sessionFile, leafId: conversation.sessionLeafId }, signal) : undefined;
+		signal.throwIfAborted();
 		if (!history?.leafId) return [];
 		const entries = new Map(history.entries.map((entry) => [entry.id, entry]));
 		const requirements: string[] = [];
@@ -4343,19 +4367,19 @@ export class DesktopService {
 
 	private async runGrail(conversation: Conversation, run: GrailRun): Promise<GrailVerdict> {
 		run.controller.signal.throwIfAborted();
-		const workspace = await mkdtemp(join(tmpdir(), "pi-grail-review-"));
+		const scratch = await mkdtemp(join(tmpdir(), "pi-grail-review-"));
 		try {
 			run.controller.signal.throwIfAborted();
-			return await this.reviewGrailSnapshot(conversation, run, workspace);
+			return await this.reviewGrailSnapshot(conversation, run, scratch);
 		} finally {
-			await rm(workspace, { recursive: true, force: true });
+			await rm(scratch, { recursive: true, force: true });
 		}
 	}
 
 	private async reviewGrailSnapshot(
 		conversation: Conversation,
 		run: GrailRun,
-		workspace: string,
+		scratch: string,
 	): Promise<GrailVerdict> {
 		const signal = run.controller.signal;
 		const settings = this.store.settings;
@@ -4370,7 +4394,7 @@ export class DesktopService {
 		const { wish, since, checkpoint, reason } = await this.grailWish(conversation, record);
 		const runtime = this.runtimes.get(conversation.id);
 		const model = settings.grailModel ?? runtime?.state?.model ?? settings.defaultModel;
-		const requirement = checkpoint ? await this.grailRequirements(conversation, since, run.startedAt) : [];
+		const requirement = checkpoint ? await this.grailRequirements(conversation, since, run.startedAt, signal) : [];
 		const steps: GrailStepResults = {};
 		let files: GrailVerdict["files"] = [];
 		const finish = (): GrailVerdict => ({
@@ -4391,7 +4415,12 @@ export class DesktopService {
 		if (!checkpoint) return unjudgeable(reason ?? "当前需求没有 Git 检查点。");
 		if (!requirement.length) return unjudgeable("这个愿望里没有用户需求消息。");
 		if (requirement.reduce((size, message) => size + message.length, 0) > 200_000) return unjudgeable("需求原文过长，无法完整鉴定。请封存并用更小的需求范围重新鉴定。");
-		const diff = await this.git.diffToWorktree(conversation.project, checkpoint.id, workspace, signal);
+		const workspace = join(scratch, "selected");
+		const objectiveRoot = join(scratch, "objective");
+		const trusted = this.store.projectTrust?.[this.trustProjectFor(conversation.project)] !== "untrusted";
+		const diff = await this.git.diffToWorktree(conversation.project, checkpoint.id, {
+			selected: workspace, objective: trusted ? objectiveRoot : undefined,
+		}, signal);
 		signal.throwIfAborted();
 		files = diff.files.map((file) => ({ path: file.path, status: file.status }));
 		if (diff.excludedFiles) return unjudgeable("有文件超出 Git 快照容量，无法完整鉴定改动。");
@@ -4410,9 +4439,11 @@ export class DesktopService {
 		if (nonTextFile) return unjudgeable(`存在无法完整引用的非文本改动：${nonTextFile.path}。`);
 
 		step("objective");
-		if (this.store.projectTrust?.[this.trustProjectFor(conversation.project)] === "untrusted")
+		if (!trusted)
 			steps.objective = { status: "unavailable", reason: "项目被标记为不信任，不执行项目脚本。", runs: [] };
-		else steps.objective = await this.grailObjective(conversation.project, workspace, deadline, signal);
+		else if (diff.objective && "project" in diff.objective)
+			steps.objective = await this.grailObjective(diff.objective, objectiveRoot, scratch, deadline, signal);
+		else steps.objective = { status: "unavailable", reason: diff.objective?.reason ?? "客观检查工作区不可用。", runs: [] };
 		signal.throwIfAborted();
 		if (steps.objective.status !== "pass") return finish();
 
@@ -4451,11 +4482,14 @@ export class DesktopService {
 		return finish();
 	}
 
-	private async grailObjective(project: string, workspace: string, deadline: number, signal: AbortSignal): Promise<GrailObjectiveResult> {
+	private async grailObjective(
+		source: { repository: string; project: string }, objectiveRoot: string, scratch: string, deadline: number, signal: AbortSignal,
+	): Promise<GrailObjectiveResult> {
 		signal.throwIfAborted();
+		const { repository, project } = source;
 		let manifest: unknown;
 		try {
-			manifest = JSON.parse(await readFile(join(workspace, "package.json"), { encoding: "utf8", signal }));
+			manifest = JSON.parse(await readFile(join(project, "package.json"), { encoding: "utf8", signal }));
 		} catch (error) {
 			signal.throwIfAborted();
 			const reason = (error as NodeJS.ErrnoException).code === "ENOENT"
@@ -4463,44 +4497,44 @@ export class DesktopService {
 				: "package.json 无法解析。";
 			return { status: "unavailable", reason, runs: [] };
 		}
-		const selectedProject = await realpath(project);
-		const { stdout } = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: selectedProject, timeout: 10000, signal });
-		const repository = await realpath(stdout.replace(/\r?\n$/, ""));
-		if (!inside(repository, selectedProject)) return { status: "unavailable", reason: "无法确定所选项目在 Git 仓库中的位置。", runs: [] };
-		const prefix = relative(repository, selectedProject);
-		const scratch = await mkdtemp(join(tmpdir(), "pi-grail-"));
 		try {
-			const objectiveRoot = join(scratch, "workspace");
-			const objectiveProject = join(objectiveRoot, prefix);
-			const copy = {
-				recursive: true,
-				verbatimSymlinks: true,
-				mode: fsConstants.COPYFILE_FICLONE,
-				filter: () => {
-					signal.throwIfAborted();
-					return true;
-				},
-			};
-			// Snapshots are relative to the selected project. Keep its repository depth
-			// only in the disposable test tree so hoisted dependencies resolve normally.
-			await cp(workspace, objectiveProject, copy);
-			const files = await readdir(objectiveProject);
+			let files: string[] = [];
+			const inheritedManifests: unknown[] = [];
 			const lockfiles = new Set(["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock"]);
-			let hasLockfile = files.some((name) => lockfiles.has(name));
-			for (let source = selectedProject; ; source = dirname(source)) {
+			for (let directory = project; ; directory = dirname(directory)) {
 				signal.throwIfAborted();
-				const modules = join(source, "node_modules");
-				if (await lstat(modules).then((entry) => entry.isDirectory(), () => false)) {
-					const destination = join(objectiveRoot, relative(repository, source), "node_modules");
-					if (!(await access(destination).then(() => true, () => false))) await cp(modules, destination, copy);
+				const sourceModules = join(repository, relative(objectiveRoot, directory), "node_modules");
+				const frozenModules = join(directory, "node_modules");
+				const directoryFiles = await readdir(directory);
+				if (!files.length) files = directoryFiles.filter((name) => lockfiles.has(name));
+				if (directory !== project && directoryFiles.includes("package.json")) {
+					const inherited: unknown = await readFile(join(directory, "package.json"), { encoding: "utf8", signal })
+						.then((content) => JSON.parse(content)).catch(() => undefined);
+					signal.throwIfAborted();
+					inheritedManifests.push(inherited);
 				}
-				if (source !== selectedProject && !hasLockfile) {
-					// Look for the closest workspace lockfile without reading or copying it.
-					const inheritedLockfiles = (await readdir(source)).filter((name) => lockfiles.has(name));
-					files.push(...inheritedLockfiles);
-					hasLockfile = inheritedLockfiles.length > 0;
-				}
-				if (source === repository) break;
+				if (await lstat(sourceModules).then((entry) => entry.isDirectory(), () => false))
+					await cp(sourceModules, frozenModules, {
+						recursive: true,
+						force: false,
+						verbatimSymlinks: true,
+						mode: fsConstants.COPYFILE_FICLONE,
+						filter: async (path, destination) => {
+							signal.throwIfAborted();
+							if (!(await lstat(path)).isSymbolicLink()) return true;
+							const link = await readlink(path);
+							const absolute = isAbsolute(link);
+							const linked = absolute ? await realpath(link).catch(() => link) : resolve(dirname(path), link);
+							if (!inside(repository, linked)) return false;
+							if (!absolute) return true;
+							const target = join(objectiveRoot, relative(repository, linked));
+							await symlink(relative(dirname(destination), target) || ".", destination).catch((error) => {
+								if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+							});
+							return false;
+						},
+					});
+				if (directory === objectiveRoot) break;
 			}
 			signal.throwIfAborted();
 			let sandboxProfile: string | undefined;
@@ -4509,16 +4543,18 @@ export class DesktopService {
 				await writeFile(sandboxProfile, buildSeatbeltProfile(objectiveRoot, [], true), { mode: 0o600 });
 			}
 			return await runObjectiveChecks({
-				project: objectiveProject,
+				project,
 				manifest,
+				inheritedManifests,
 				files,
 				env: scriptEnvironment({ ...process.env, ...this.options.env }, join(scratch, "npm-cache")),
 				sandboxProfile,
 				deadline,
 				signal,
 			});
-		} finally {
-			await rm(scratch, { recursive: true, force: true });
+		} catch (error) {
+			signal.throwIfAborted();
+			return { status: "unavailable", reason: `无法准备客观检查环境：${error instanceof Error ? error.message : String(error)}`, runs: [] };
 		}
 	}
 
@@ -4566,6 +4602,8 @@ export class DesktopService {
 				version: 1, mode: "read", sandbox: true, rules: [], disabledTools: [], project: await realpath(cwd),
 			} satisfies RuntimePermissionPolicy);
 			assertCanReview();
+			const priceFields = ["input", "output", "cacheRead", "cacheWrite"] as const;
+			let pricing: NonNullable<RpcSessionState["model"]>["cost"] | undefined;
 			let last: Extract<Message, { role: "assistant" }> | undefined;
 			let settle!: () => void;
 			let fail!: (error: Error) => void;
@@ -4598,9 +4636,13 @@ export class DesktopService {
 						this.options.tracing?.observe(traceId, event, conversationId, undefined, undefined, "grail");
 					if (event.type === "message_end" && event.message.role === "assistant") {
 						last = event.message;
-						const cost = event.message.usage?.cost?.total;
+						const usage = last.usage;
+						const cost = usage?.cost?.total;
+						const activePricing = pricing;
 						if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) {
 							fail(new Error("评审模型没有返回有效的费用用量，鉴定已停止。"));
+						} else if (cost === 0 && activePricing && priceFields.some((field) => activePricing[field] > 0 && usage[field] > 0)) {
+							fail(new Error("评审模型消耗了计费 Token，却未报告费用，鉴定已停止。"));
 						} else {
 							budget.spent += cost;
 							if (budget.spent > budget.max) fail(new Error(`鉴定费用超过上限 $${budget.max}。`));
@@ -4617,8 +4659,24 @@ export class DesktopService {
 			});
 			onAbort = () => fail(signal.reason instanceof Error ? signal.reason : new Error("鉴定已取消。"));
 			signal.addEventListener("abort", onAbort, { once: true });
-			assertCanReview();
-			await Promise.all([agent.request({ type: "prompt", message: prompt }), completion]);
+			await Promise.all([(async () => {
+				const state = await agent.request<RpcSessionState>({ type: "get_state" }, signal);
+				const active = state.model;
+				if (active?.provider !== model.provider || active.id !== model.id)
+					throw new Error("无法加载指定的评审模型，请检查模型和连接设置。");
+				const activePricing = active.cost;
+				const provider = providers.find((item) => model.provider === item || model.provider === `desktop-${item}`);
+				const catalogModel = provider && providerModels[provider].find((item) => item.id === model.id);
+				const connection = provider && this.store.settings.connections[provider];
+				const custom = model.provider.startsWith("desktop-") && provider && connection && connectionMode({ ...connection, provider }) === "custom";
+				const freeCatalogModel = !custom && catalogModel && priceFields.every((field) => catalogModel.cost[field] === 0);
+				if (!activePricing || !priceFields.every((field) => Number.isFinite(activePricing[field]) && activePricing[field] >= 0)
+					|| (!freeCatalogModel && priceFields.every((field) => activePricing[field] === 0)))
+					throw new Error("评审模型缺少可核算的价格，无法执行费用上限。请选择有价格信息的模型。");
+				pricing = activePricing;
+				assertCanReview();
+				await agent.request({ type: "prompt", message: prompt }, signal);
+			})(), completion]);
 			signal.throwIfAborted();
 			if (!last || last.stopReason === "error" || last.stopReason === "aborted")
 				throw new Error(last?.errorMessage ?? "评审模型没有返回有效回复。");
@@ -4697,7 +4755,7 @@ export class DesktopService {
 				],
 				env,
 				onEvent: (event) => {
-					this.options.tracing?.observe(traceId, event, conv.id, undefined, resultMessage?.stopReason === "error", "btw");
+					this.options.tracing?.observe(traceId, event, conv.id, undefined, resultMessage?.stopReason === "error", "btw", q);
 					if (event.type === "message_end" && event.message.role === "assistant") resultMessage = event.message;
 					if (event.type === "agent_settled") settle();
 					if (event.type === "desktop_error") fail(new Error(event.message));
@@ -6235,6 +6293,10 @@ export class DesktopService {
 	private active(): Conversation | undefined {
 		return this.store.conversations.find((item) => item.id === this.store.activeId);
 	}
+	grailWatchProject(conversationId: string): string | undefined {
+		const active = this.active();
+		return active?.id === conversationId ? active.project : undefined;
+	}
 	private requireActive(): Conversation {
 		const active = this.active();
 		if (!active) throw new Error("请先打开一个项目文件夹。");
@@ -6852,7 +6914,10 @@ export class DesktopService {
 			delete env.PI_DESKTOP_MAX_COST;
 			delete env.PI_DESKTOP_MIN_BALANCE;
 			delete env.PI_DESKTOP_FALLBACK_MODEL;
+			delete env.PI_DESKTOP_ESCALATION_MODEL;
 			if (this.store.settings.fallbackModel) env.PI_DESKTOP_FALLBACK_MODEL = JSON.stringify(this.store.settings.fallbackModel);
+			const escalationModel = this.store.settings.modelRouting?.plan ?? this.store.settings.modelRouting?.review;
+			if (escalationModel) env.PI_DESKTOP_ESCALATION_MODEL = JSON.stringify(escalationModel);
 			if (this.store.settings.minBalance) env.PI_DESKTOP_MIN_BALANCE = String(this.store.settings.minBalance);
 			env.PI_DESKTOP_WEB_SEARCH_ENABLED = this.store.settings.webSearchEnabled === false ? "0" : "1";
 			delete env.PI_DESKTOP_WEB_SEARCH_KEY;
@@ -6910,6 +6975,10 @@ export class DesktopService {
 			env.PI_DESKTOP_AGENT_TEAMS = this.store.settings.agentTeams === true ? "1" : "0";
 			env.PI_DESKTOP_TEAM_MEMBER = delegated?.teamName ? "1" : "0";
 			env.PI_DESKTOP_STRUCTURED_OUTPUT = delegated?.structuredOutputSchema !== undefined ? "1" : "0";
+			const hookMeta = delegated ? await this.hookContextFor(conversation.id) : undefined;
+			env.PI_DESKTOP_HOOK_FASTPATH = "1";
+			env.PI_DESKTOP_HAS_EXTRA_HOOKS = hookMeta?.extraHooks?.length ? "1" : "0";
+			env.PI_DESKTOP_TRUST_PROJECT = this.trustProjectFor(conversation.project);
 			if (delegated?.maxTurns) env.PI_DESKTOP_MAX_TURNS = String(delegated.maxTurns);
 			else delete env.PI_DESKTOP_MAX_TURNS;
 			const toolExtension = this.options.toolControlExtension ?? join(runtimeDir, "tool-control-extension.mjs");

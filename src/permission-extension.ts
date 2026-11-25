@@ -5,9 +5,10 @@ import { get as getHttp } from "node:http";
 import { get as getHttps } from "node:https";
 import { Readable } from "node:stream";
 import { lookup } from "node:dns/promises";
-import { readFile, realpath, writeFile } from "node:fs/promises";
+import { readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { isIP } from "node:net";
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI, ModelRegistry, ProviderModelConfig, ToolDefinition, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
 import type { ConnectionMode, ConnectionProtocol, Provider } from "./shared.ts";
 import { connectionDefaults, connectionMode } from "./model-connections.ts";
@@ -39,10 +40,88 @@ function applyUpdatedInput(target: Record<string, unknown>, patch: Record<string
 	}
 }
 
+type CachedHookFile = { ino: number; mtimeMs: number; ctimeMs: number; size: number; events: ReadonlySet<string> };
+const hookFileCache = new Map<string, CachedHookFile>();
+
+const HOOK_PHASE_EVENTS: Readonly<Record<string, readonly string[]>> = {
+	pre: ["PreToolUse"],
+	permission: ["PermissionRequest"],
+	post: ["PostToolUse", "PostToolUseFailure"],
+	stop: ["Stop", "SubagentStop"],
+	compact: ["PreCompact"],
+};
+
+async function hookEventsInFile(file: string): Promise<ReadonlySet<string>> {
+	let info;
+	try {
+		info = await stat(file);
+	} catch {
+		hookFileCache.delete(file);
+		return new Set();
+	}
+	if (!info.isFile() || info.size === 0 || info.size > 2 * 1024 * 1024) return new Set();
+	const cached = hookFileCache.get(file);
+	if (
+		cached &&
+		cached.ino === info.ino &&
+		cached.mtimeMs === info.mtimeMs &&
+		cached.ctimeMs === info.ctimeMs &&
+		cached.size === info.size
+	) {
+		return cached.events;
+	}
+	const events = new Set<string>();
+	try {
+		const parsed = JSON.parse(await readFile(file, "utf8")) as { hooks?: Record<string, unknown> } | undefined;
+		if (parsed?.hooks && typeof parsed.hooks === "object" && !Array.isArray(parsed.hooks)) {
+			for (const [event, entries] of Object.entries(parsed.hooks)) {
+				if (Array.isArray(entries) && entries.length > 0) events.add(event);
+			}
+		}
+	} catch {
+		// Malformed hook file behaves as empty, matching HooksService.readJsonFile.
+	}
+	hookFileCache.set(file, {
+		ino: info.ino,
+		mtimeMs: info.mtimeMs,
+		ctimeMs: info.ctimeMs,
+		size: info.size,
+		events,
+	});
+	return events;
+}
+
+/**
+ * Fast stat-backed pre-check for DesktopService runtimes (`PI_DESKTOP_HOOK_FASTPATH="1"`).
+ * Eliminates 100% of `/hook` loopback HTTP roundtrips when no hook is configured for that phase,
+ * while immediately detecting any newly created or edited hook config file on disk.
+ */
+async function mayHaveHookForPhase(phase: unknown): Promise<boolean> {
+	if (typeof phase !== "string") return true;
+	const targetEvents = HOOK_PHASE_EVENTS[phase];
+	if (!targetEvents) return true; // e.g. "max_turns" host state transition
+	if (process.env.PI_DESKTOP_HOOK_FASTPATH !== "1") return true;
+	if (process.env.PI_DESKTOP_HAS_EXTRA_HOOKS === "1") return true;
+	const home = homedir();
+	const agentDir = process.env.PI_CODING_AGENT_DIR || join(home, ".pi", "agent");
+	const project = process.env.PI_DESKTOP_TRUST_PROJECT || process.env.PI_DESKTOP_MEMORY_ROOT || process.cwd();
+	const candidates = [
+		join(home, ".claude", "settings.json"),
+		join(home, ".claude", "settings.local.json"),
+		join(agentDir, "hooks.json"),
+		join(project, ".claude", "settings.json"),
+		join(project, ".claude", "settings.local.json"),
+		join(project, ".pi", "hooks.json"),
+	];
+	const sets = await Promise.all(candidates.map(hookEventsInFile));
+	return sets.some((events) => targetEvents.some((ev) => events.has(ev)));
+}
+
 async function callHost(path: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown> | undefined> {
 	const url = process.env.PI_DESKTOP_HOST_URL;
 	const token = process.env.PI_DESKTOP_HOST_TOKEN;
 	if (!url || !token || !/^[a-f0-9]{64}$/.test(token)) return undefined;
+	if (path === "/hook" && !(await mayHaveHookForPhase(body.phase))) return undefined;
 	const response = await fetch(`${new URL(url).origin}${path}`, {
 		method: "POST",
 		headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
@@ -255,6 +334,25 @@ export function escapeConfigValue(value: string): string {
 
 /** Custom message type of the visible notice written when the conversation switches to the fallback model. */
 export const FALLBACK_MESSAGE_TYPE = "desktop_model_fallback";
+/** Custom message type written when consecutive verification failures escalate to a stronger routed model. */
+export const ESCALATION_MESSAGE_TYPE = "desktop_model_escalation";
+
+const VERIFICATION_COMMAND_RE =
+	/\b(?:npm|pnpm|yarn|bun|npx|node|pytest|py\.test|cargo|go|tsc|vitest|jest|mocha|ava|ruff|flake8|mypy|pyright|eslint|biome|make|gradle|mvn)\b[^\r\n]*(?:\btest\b|--test\b|\bcheck\b|\btypecheck\b|--noEmit\b|\blint\b|\bbuild\b|\bclippy\b)/i;
+
+/** Returns true when a bash command string is a test, typecheck, lint, or build verification run. */
+export function isVerificationBashCommand(command: unknown): boolean {
+	if (typeof command !== "string") return false;
+	const trimmed = command.trim();
+	if (!trimmed || trimmed.length > 8192) return false;
+	return VERIFICATION_COMMAND_RE.test(trimmed);
+}
+
+const CODING_DISCIPLINE_GUIDELINES = [
+	"Inspect target files and relevant call sites (`grep` or `LSP`) before editing; use `LSP` with `operation: \"workspaceOutline\"` to map unfamiliar directories in one step instead of reading many files blindly.",
+	"Make minimal, surgical root-cause changes matching existing conventions; avoid speculative abstractions or unrelated refactors.",
+	"After modifying code, run the narrowest relevant test or typecheck command to verify before concluding, and never mask failures with `.skip`, `.only`, `@ts-ignore`, `as any`, or weakened assertions.",
+] as const;
 
 /**
  * Decides whether a final provider error should switch to the fallback model. Returns a short
@@ -787,11 +885,23 @@ export default function permissions(pi: ExtensionAPI) {
 	let turnCount = 0;
 	let stopHookActive = false;
 	let maxTurnsStopped = false;
+	let editedThisRun = false;
+	let consecutiveVerifyFailures = 0;
+	let lastVerifyFailureSummary = "";
 
-	pi.on("before_agent_start", () => {
+	pi.on("before_agent_start", (event) => {
 		turnCount = 0;
 		stopHookActive = false;
 		maxTurnsStopped = false;
+		editedThisRun = false;
+		consecutiveVerifyFailures = 0;
+		lastVerifyFailureSummary = "";
+		if (!testingConnection && event?.systemPromptOptions?.promptGuidelines) {
+			const list = event.systemPromptOptions.promptGuidelines;
+			for (const rule of CODING_DISCIPLINE_GUIDELINES) {
+				if (!list.includes(rule)) list.push(rule);
+			}
+		}
 	});
 	pi.on("turn_start", () => {
 		turnCount++;
@@ -972,6 +1082,48 @@ export default function permissions(pi: ExtensionAPI) {
 				continue: false,
 				entries: [{ type: "custom_message", customType: "desktop_min_balance", content: state.notice, display: true }],
 			};
+		});
+	}
+	const escalation = testingConnection || isChild ? undefined : parseFallbackModel(process.env.PI_DESKTOP_ESCALATION_MODEL);
+	if (escalation) {
+		let escalatedThisRun = false;
+		let escalatedFromModel: { provider: string; id: string } | undefined;
+		pi.on("before_agent_start", () => {
+			escalatedThisRun = false;
+		});
+		pi.on("turn_end", async (event, ctx) => {
+			if (escalatedThisRun || !editedThisRun || consecutiveVerifyFailures < 2) return;
+			if (maxTurns > 0 && turnCount >= maxTurns) return;
+			const current = ctx?.model;
+			if (!current || (current.provider === escalation.provider && current.id === escalation.id)) return;
+			const target = ctx.modelRegistry?.find?.(escalation.provider, escalation.id);
+			const switched = target ? await pi.setModel(target).catch(() => false) : false;
+			if (!target || !switched) return;
+			escalatedThisRun = true;
+			escalatedFromModel = { provider: current.provider, id: current.id };
+			const fromLabel = current.name || current.id;
+			const toLabel = target.name || target.id;
+			const notice = `连续 ${consecutiveVerifyFailures} 次代码验证未通过，已临时从 ${fromLabel} 升档至 ${toLabel} 协助根因诊断与修复。`;
+			ctx.ui?.notify?.(notice, "info");
+			const detail = lastVerifyFailureSummary ? `\n最近一次验证摘要：${lastVerifyFailureSummary}` : "";
+			return {
+				entries: [
+					...(event?.entries ?? []),
+					{
+						type: "custom_message",
+						customType: ESCALATION_MESSAGE_TYPE,
+						content: `${notice}${detail}\n请先审视根因与调用链（避免重复同一无效补丁），给出最小精确修复并重新运行验证。`,
+						display: true,
+					},
+				],
+			};
+		});
+		pi.on("agent_settled", async (_event, ctx) => {
+			const origin = escalatedFromModel;
+			escalatedFromModel = undefined;
+			if (!origin || ctx?.model?.provider !== escalation.provider || ctx.model.id !== escalation.id) return;
+			const target = ctx.modelRegistry?.find?.(origin.provider, origin.id);
+			if (target) await pi.setModel(target).catch(() => false);
 		});
 	}
 	const fallback = testingConnection ? undefined : parseFallbackModel(process.env.PI_DESKTOP_FALLBACK_MODEL);
@@ -1224,6 +1376,31 @@ export default function permissions(pi: ExtensionAPI) {
 			: undefined;
 		const additions = [pathRules, postTodoReminder].filter(Boolean).join("\n\n");
 		const content = additions ? [...event.content, { type: "text" as const, text: additions }] : event.content;
+		if (!testingConnection) {
+			if (!event.isError && (event.toolName === "edit" || event.toolName === "write")) {
+				editedThisRun = true;
+				const fullOut = textFromBlocks(content);
+				if (/\[LSP 诊断 [^\]]+\]:[\s\S]*?\[Error\]/.test(fullOut)) {
+					consecutiveVerifyFailures++;
+					lastVerifyFailureSummary = fullOut.split("\n").find((l) => l.includes("[Error]"))?.slice(0, 240) ?? "LSP 类型检查报错";
+				}
+			} else if (event.toolName === "bash" && editedThisRun) {
+				const rawCmd = (event.input as { command?: unknown } | undefined)?.command;
+				const cleanCmd = typeof rawCmd === "string"
+					? rawCmd.replace(/^\/usr\/bin\/sandbox-exec -f '[^']*' \/bin\/sh -c '/, "").replace(/'$/, "")
+					: rawCmd;
+				if (isVerificationBashCommand(cleanCmd)) {
+					const failed = Boolean(event.isError) || (typeof bashExitCode === "number" && bashExitCode !== 0);
+					if (failed) {
+						consecutiveVerifyFailures++;
+						lastVerifyFailureSummary = textFromBlocks(event.content).trim().split("\n").slice(-3).join(" / ").slice(0, 260);
+					} else {
+						consecutiveVerifyFailures = 0;
+						lastVerifyFailureSummary = "";
+					}
+				}
+			}
+		}
 		const changed = () => {
 			if (!redacted && !additions) return recorded;
 			return { ...recorded, content };
