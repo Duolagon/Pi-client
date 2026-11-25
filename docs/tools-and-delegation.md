@@ -1,13 +1,13 @@
 # 工具、权限与模型委派接入
 
-本文是后端接入契约。没有修改 `src/renderer/` 或 `src/prototype/`；现有通用工具卡片可以显示新模型工具的文本结果，工具管理页、子任务面板和专用卡片由前端接入。
+本文介绍模型工具、客户端管理入口和后端接入契约。
 
 ## 工具清单与启停
 
 ```ts
 const tools = await window.pi.tools.list(conversationId); // 不传则当前会话
 // name, description, parameters, source, sourcePath?, exposure, namespace?,
-// enabled, modelVisible, override?
+// enabled, modelVisible, deferred?, override?
 
 await window.pi.tools.setEnabled({
   name: "bash", enabled: false, scope: "conversation", conversationId,
@@ -17,7 +17,7 @@ await window.pi.tools.setEnabled({ name: "bash", enabled: null, scope: "conversa
 ```
 
 - 清单来自运行中 Pi 的真实工具注册表，包括内置、扩展、MCP 和桌面工具，不是 `get_commands` 或 Skills 数量。
-- `enabled` 表示可调用性；`modelVisible` 表示是否直接声明给模型。MCP 的 deferred/codemode 工具可能前者为 true、后者为 false。`exposure` 保留 Pi 原始语义。
+- `enabled` 表示可调用性，`modelVisible` 表示是否直接声明给模型，`deferred` 标记当前启用且声明延迟加载的工具。`exposure` 保留 Pi 原始语义。工具面板显示延迟加载状态，`/context` 汇总延迟项并展示名称。
 - `source` 为 `builtin / extension / mcp / desktop`；`sourcePath` 可用于展示扩展来源。不是所有工具都有来源文件。
 - `scope` 为 `global / project / conversation`，默认 conversation。项目路径必须是绝对路径，后端 canonicalize；会话默认当前会话。需先打开项目。
 - 覆盖优先级：会话 > 项目 > 全局。`enabled:null` 删除这一层覆盖，恢复继承；没有覆盖时沿用原 Pi 工具选择。首次覆盖前的原选择会单独保存，避免会话恢复的 loadout 污染“恢复默认”。
@@ -35,6 +35,8 @@ const unsubscribe = window.pi.tools.onEvent(async (event) => {
 ```
 
 `permissions.onEvent` 与 `tools.onEvent` 订阅同一 `pi:controls:event`；按 type 区分。重载后重新读取清单，不靠事件缓存推断状态。设置已保存但 Pi 声明刷新失败时 API 会报错；执行守卫已经按新设置生效，重开会话后恢复声明。
+
+`ToolSearch` 支持关键词和 `select:ToolA,ToolB`，`max_results` 对两种方式均生效（默认 8，最多 30）。新一轮根据本条用户消息的意图预加载相应工具声明，也可在本轮调用中通过搜索按需加载。显式启用的低频工具保持直接声明，其余低频工具在新一轮按需加载。工具始终遵守权限与工具启停配置。
 
 ## 细粒度权限
 
@@ -78,7 +80,7 @@ await window.pi.permissions.remove("allow-project-tests");
 
 | 工具 | 参数与结果 |
 | --- | --- |
-| Agent | `{description,prompt,subagent_type?,model?,run_in_background?,name?,isolation?,worktree_id?,executor?,fork?,mode?,team_name?}`，`subagent_type` 缺省为 general-purpose，`"fork"` 复制父会话分支上下文快照（与兼容参数 `fork: true` 等价）；`model` 为 `sonnet/opus/haiku/fable/inherit`；默认 Pi，也可选择本机 codex/claude/kimi/antigravity；`mode`、`team_name` 接收后忽略并在结果中提示 |
+| Agent | `{description,prompt,subagent_type?,model?,run_in_background?,name?,isolation?,worktree_id?,executor?,fork?,mode?,team_name?,scope_paths?}`，`subagent_type` 缺省为 general-purpose，`"fork"` 复制父会话分支上下文快照（与兼容参数 `fork: true` 等价）；`model` 为 `sonnet/opus/haiku/fable/inherit`；默认 Pi，也可选择本机 codex/claude/kimi/antigravity；`scope_paths` 限制本地只读 Agent 的文件范围 |
 | AgentExecutors | `{}`，探测本机外部执行器与权限能力 |
 | SendMessage | `{to,message,summary?,run_in_background?}`，按 agentId 或 `name` 继续本父会话自己的子 Agent（Pi 或外部）：运行中的直接送达，已结束/停止/中断的带完整历史开始下一轮，见下文“SendMessage 续聊” |
 | AgentSend | `{task_id,message,run_in_background?}`，SendMessage 的兼容别名（`task_id` 即 `to`，默认前台）；仍可调用，但不再向模型声明 |
@@ -92,6 +94,8 @@ await window.pi.permissions.remove("allow-project-tests");
 
 Agent 的 `subagent_type`：`general-purpose / Explore / Plan`，或 `.pi/agents`、`.claude/agents` 中定义的自定义 Agent 名称（项目级定义需项目信任）。缺省为 general-purpose；未知名称报 `Agent type 'x' not found. Available agents: …`。除 `mode`、`team_name` 外的未知参数仍被拒绝；`isolation: "remote"` 明确报不支持。`name` 须匹配 `^[A-Za-z][A-Za-z0-9_-]{0,63}$`，同一父会话中不能与仍在运行的子 Agent 重名。
 
+主会话默认可用 `ls` 直接列目录。对于需要分派的独立审查，可在每次本地只读 `Agent` 调用中传入 `scope_paths: ["src/module"]`。宿主验证实际存在的相对路径并拦截越界工具读取。该选项适用于共享工作区中的非 fork 子任务。调用者可不传此项，继续使用原有委派权限。
+
 模型选择优先级：调用参数 `model` > 定义中的 `model` > 父会话当前模型。调用参数中的别名在父会话可用模型中按名称匹配（同服务商优先），匹配不到直接报错，不静默回退；`inherit` 使用父会话模型。fork 忽略 `model`（结果中提示）。
 
 前后台默认值：`run_in_background ?? 定义的 background ?? 设置 subagentDefaultBackground（默认 true）`，即 Agent 默认后台运行、立即返回。Explore/Plan/只读自定义 Agent 使用只读工具上限，默认共享项目读取；git 项目中 general-purpose 与可写自定义 Agent 默认 Git Worktree。非 git 项目中可写子 Agent 没有 Worktree，未显式指定后台时**默认改为前台**并共享项目目录写入：父会话阻塞在这次工具调用上（包括子 Agent 等待审批期间），不会与子 Agent 并发写同一目录；宿主为此豁免正在等待它的父会话对目录的占用。后台、共享、可写三者同时成立时拒绝并提示“请设 run_in_background:false，或在 git 仓库中用 worktree”。git 项目里共享目录的可写委派仍然拒绝（父会话一轮的 Git 恢复点会覆盖子 Agent 的修改）。显式 Worktree 引用必须属于本父会话。外部执行器（codex/claude/kimi/antigravity）的可写任务始终使用 Worktree，同样遵循后台默认值。外部执行器使用自己配置的模型、只能按 task_id 寻址：带 `model`（`inherit` 除外）或 `name` 的外部 Agent 调用直接报错，不静默丢弃；`mode`、`team_name` 同 Pi 子 Agent 一样忽略并在结果的 `warnings` 中提示。
@@ -101,7 +105,7 @@ Agent 的 `subagent_type`：`general-purpose / Explore / Plan`，或 `.pi/agents
 Agent 的工具结果是给模型读的文本，不再是 JSON：
 
 - 后台启动：`Async agent launched successfully.` + `agentId: <id>`（有 `name` 时附上）+ Worktree 路径/分支 + “结果会自动以 <task-notification> 送达，不要轮询；用 TaskStop 取消”，排队中的任务注明 queued。
-- 前台完成：经过注入转义的子 Agent 报告 + `agentId: <id>`（Explore/Plan 以外附 `use SendMessage with to: <id> to continue this agent`）+ Worktree 路径/分支 + `<usage>subagent_tokens: N\ntool_uses: N\nduration_ms: N</usage>`。maxTurns 截断、失败、停止各有一行前缀说明；没有输出时为 `(Subagent completed but returned no output.)`。
+- 前台完成：经过注入转义的子 Agent 报告 + `agentId: <id>`（Explore/Plan 以外附 `use SendMessage with to: <id> to continue this agent`）+ Worktree 路径/分支 + `<usage>subagent_tokens: N\ntool_uses: N\nduration_ms: N</usage>`。只读子任务还会在前台返回和后台通知附上最多 24 条成功 `read` 调用的项目相对路径，读取可能只涵盖部分内容。maxTurns 截断、失败、停止各有一行前缀说明；没有输出时为 `(Subagent completed but returned no output.)`。
 - 结构化结果（`DelegatedTaskResult`，含 `name`、`usage`、`warnings`）放在工具结果的 `details` 里，供界面使用，不进入模型上下文。
 - 工具结果的 `usage` 填子 Agent 本轮的 token 增量，Pi 会把它计入父会话的 `get_session_stats`，但不影响父会话的上下文用量。子任务记录 `stats = {tokens{input,output,cacheRead,cacheWrite,total}, cost, toolUses, startedAt, durationMs, model}`，由子 Agent 每轮开始时的 `statsAtTurnStart` 与结束时的 `get_session_stats` 相减得到（fork 继承的历史不计入）。界面汇总全局成本时应排除子会话，避免重复计算。后台通知的 `<usage>` 使用同样的行格式。后台（含超时转后台的前台）子 Agent 的本轮用量随通知请求的 `usage {provider, model, usage}` 交给父会话扩展（Pi 进程内再次校验）；父会话确认收到该结果（追加 ack 条目）后，再用 Pi 会话管理器的 `appendUsage("subagent", …)` 追加一条 usage 条目，`get_session_stats` 会把它计入父会话。先 ack 后计数：极端情况下崩溃只会少计，不会因重放重复计数；排队到下一轮的结果在该轮开始取走时计数。扩展 API 只暴露只读会话视图，这里依赖锁定版本 Pi 会话管理器的 `appendUsage`，缺失时结果照常交付、只是不计数。
 

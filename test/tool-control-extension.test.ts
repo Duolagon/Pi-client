@@ -6,8 +6,9 @@ import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition, ToolInfo } from "@earendil-works/pi-coding-agent";
+import { buildContextReport } from "../src/context-inspector.ts";
 import toolControl from "../src/tool-control-extension.ts";
-import { desktopModelToolNames, type ToolControlResponse } from "../src/tool-control-types.ts";
+import { deferredSpecialistTools, desktopModelToolNames, type ToolControlResponse } from "../src/tool-control-types.ts";
 import { ToolHostServer } from "../src/tool-host-server.ts";
 import { createCoreFixture } from "./fixtures/core-fixture.ts";
 import { RpcHarness } from "./fixtures/rpc-harness.ts";
@@ -189,6 +190,54 @@ test("a delivered background result counts the child's usage into the parent ses
 	} finally { await item.cleanup(); }
 });
 
+test("Kaggle Computer Use activates for Notebook prompts and sends only the scoped action", async (context) => {
+	const requests: unknown[] = [];
+	const host = new ToolHostServer({ handle: async (request, call) => {
+		requests.push({ request, owner: call.conversationId });
+		return { status: "ready", untrusted_page_output: "synthetic notebook output" };
+	} });
+	await host.start();
+	context.after(() => host.close());
+	const registration = host.register("kaggle-owner");
+	const env = { PI_DESKTOP_HOST_URL: registration.url, PI_DESKTOP_HOST_TOKEN: registration.token };
+	const item = await fixture(env);
+	context.after(item.cleanup);
+	const search = item.definitions.get("ToolSearch")!;
+	const computer = item.definitions.get("KaggleComputerUse")!;
+	const hidden = () => search.prepareLoadout?.({} as never)?.hiddenDeclarations ?? [];
+	assert.ok(hidden().includes(computer.name));
+	assert.deepEqual(await item.handlers.get("before_agent_start")!({ messageType: "user", prompt: "检查 Kaggle Notebook 的单元格输出" }, {}), undefined);
+	assert.ok(!hidden().includes(computer.name));
+	assert.ok(hidden().includes("PreviewCheck"));
+	await item.handlers.get("before_agent_start")!({ messageType: "user", prompt: "Review the tests." }, {});
+	assert.ok(hidden().includes(computer.name));
+	const found = await search.execute("search-kaggle", { query: "select:KaggleComputerUse" }, undefined, undefined, {} as never);
+	assert.match((found.content[0] as { text: string }).text, /"enum":\["inspect","run_all"\]/);
+	assert.ok(!hidden().includes(computer.name));
+
+	const inspected = await computer.execute("inspect-kaggle", { action: "inspect" }, undefined, undefined, {} as never);
+	assert.deepEqual(inspected.details, { status: "ready", untrusted_page_output: "synthetic notebook output" });
+	await computer.execute("run-kaggle", { action: "run_all" }, undefined, undefined, {} as never);
+	assert.deepEqual(requests, [
+		{ request: { tool: "KaggleComputerUse", toolCallId: "inspect-kaggle", input: { action: "inspect" } }, owner: "kaggle-owner" },
+		{ request: { tool: "KaggleComputerUse", toolCallId: "run-kaggle", input: { action: "run_all" } }, owner: "kaggle-owner" },
+	]);
+	for (const input of [
+		{}, { action: "click" }, { action: "inspect", url: "https://example.invalid" },
+		{ action: "inspect", selector: "body" }, { action: "run_all", confirmed: true },
+	]) await assert.rejects(computer.execute("invalid", input, undefined, undefined, {} as never), /action must be|Unknown tool input field/);
+	assert.equal(requests.length, 2);
+
+	const child = await fixture({ ...env, PI_DESKTOP_CHILD: "1" });
+	context.after(child.cleanup);
+	await child.write({ KaggleComputerUse: true });
+	await child.request("apply");
+	assert.ok(!child.active().includes(computer.name));
+	assert.equal((await child.handlers.get("tool_call")!({ toolName: computer.name })).block, true);
+	await assert.rejects(child.definitions.get(computer.name)!.execute("invalid-child", { action: "inspect" }, undefined, undefined, {} as never), /owning conversation/);
+	assert.equal(requests.length, 2);
+});
+
 test("model tools validate inputs, use authenticated host calls, and clamp child capabilities", async (context) => {
 	const requests: unknown[] = [];
 	const host = new ToolHostServer({ handle: async (request, context) => { requests.push({ request, owner: context.conversationId }); return { task_id: "child", status: "running" }; } });
@@ -224,6 +273,7 @@ test("model tools validate inputs, use authenticated host calls, and clamp child
 			{ type: "toolCall", id: "agent-2", name: "Agent", arguments: {} },
 			{ type: "toolCall", id: "write-1", name: "write", arguments: {} },
 			{ type: "toolCall", id: "read-1", name: "read", arguments: {} },
+			{ type: "toolCall", id: "search-1", name: "ToolSearch", arguments: {} },
 			{ type: "toolCall", id: "made-up", name: "not_a_registered_tool", arguments: {} },
 		] } });
 		await agent.execute("agent-1", { description: "edit", prompt: "edit a.ts" }, undefined, undefined, {} as never);
@@ -370,7 +420,7 @@ test("real Pi exposes desktop tools and applies a host command without requestin
 		env: { ...core.env, ...item.env }, onEvent: () => {} });
 	try {
 		const requestId = randomUUID();
-		await item.write({ bash: false, grep: true });
+		await item.write({ bash: false, grep: true, PreviewCheck: false });
 		await writeFile(join(item.directory, "request.json"), JSON.stringify({ requestId, operation: "apply" }));
 		const response = await harness.request<{ disposition: string }>({ type: "prompt", message: `/${item.command} ${item.token} ${requestId}` });
 		assert.equal(response.disposition, "handled");
@@ -380,6 +430,95 @@ test("real Pi exposes desktop tools and applies a host command without requestin
 		assert.equal(inventory.tools.find((entry) => entry.name === "Agent")?.modelVisible, true);
 		assert.equal(inventory.tools.find((entry) => entry.name === "bash")?.enabled, false);
 		assert.equal(inventory.tools.find((entry) => entry.name === "grep")?.modelVisible, true);
+		assert.equal(inventory.tools.find((entry) => entry.name === "WorktreeList")?.deferred, true);
+		assert.equal(inventory.tools.find((entry) => entry.name === "PreviewCheck")?.deferred, undefined);
+		const report = await buildContextReport({ project: core.project, agentDir: core.agentDir, home: core.root, tools: inventory.tools, messages: [] });
+		assert.deepEqual(report.deferredToolNames.sort(), deferredSpecialistTools.filter((tool) => tool !== "PreviewCheck").sort());
 		assert.ok(!harness.events.some((event) => event.type === "agent_start"));
 	} finally { await harness.stop(); await item.cleanup(); await host.close(); await core.cleanup(); }
+});
+
+test("the pinned Pi provider gets current-intent declarations, bounded search activation and stable coding rules", { timeout: 30000 }, async (context) => {
+	const core = await createCoreFixture();
+	context.after(core.cleanup);
+	const directInvocations: string[] = [];
+	const host = new ToolHostServer({ handle: async (request) => {
+		directInvocations.push(request.tool);
+		return { testResult: true };
+	} });
+	await host.start();
+	context.after(() => host.close());
+	const registration = host.register("parent");
+	const item = await fixture({ PI_DESKTOP_HOST_URL: registration.url, PI_DESKTOP_HOST_TOKEN: registration.token });
+	context.after(item.cleanup);
+	await item.write({ Monitor: true });
+
+	const requestsFile = join(core.root, "model-requests.jsonl");
+	await writeFile(join(core.agentDir, "extensions", "faux-provider.js"), `
+import { appendFileSync } from "node:fs";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentSystemMessage, getCurrentTools } from "@earendil-works/pi-ai";
+const provider = "desktop-test";
+const api = "desktop-test-tool-search";
+const model = { id: "desktop-test-1" };
+const local = fauxProvider({ provider, api, models: [model], tokensPerSecond: 2000 });
+export default function (pi) {
+	pi.registerProvider(provider, {
+		api, apiKey: "synthetic", baseUrl: "http://127.0.0.1:0", models: local.models,
+		streamSimple(model, request, options) {
+			const latest = request.messages.findLastIndex((message) => message.role === "user");
+			const user = request.messages[latest].content.map((part) => part.text ?? "").join("");
+			const results = request.messages.slice(latest + 1).filter((message) => message.role === "toolResult");
+			appendFileSync(process.env.PI_DESKTOP_TEST_TOOL_REQUESTS, JSON.stringify({
+				user, names: getCurrentTools(request.messages).map((tool) => tool.name),
+				sections: getCurrentSystemMessage(request.messages).sections, results: results.map((result) => result.content[0]?.text),
+			}) + "\\n");
+			let response = fauxAssistantMessage("Local fixture completed.");
+			if (results.length === 0 && user === "Check branch fixture.")
+				response = fauxAssistantMessage(fauxToolCall("WorktreeList", {}), { stopReason: "toolUse" });
+			if (results.length === 0 && user === "Find one feature.")
+				response = fauxAssistantMessage(fauxToolCall("ToolSearch", { query: "select:CronList,CronCreate,PreviewCheck", max_results: 1 }), { stopReason: "toolUse" });
+			local.setResponses([response]);
+			return local.provider.streamSimple(model, request, options);
+		},
+	});
+}
+`);
+	const run = async (prompts: string[]) => {
+		const harness = new RpcHarness({
+			executable: process.execPath, entry: core.entry, cwd: core.project,
+			args: ["--no-session", "--extension", resolve(import.meta.dirname, "../src/permission-extension.ts"), "--extension", resolve(import.meta.dirname, "../src/tool-control-extension.ts")],
+			env: { ...core.env, ...item.env, PI_DESKTOP_TEST_TOOL_REQUESTS: requestsFile }, onEvent: () => {},
+		});
+		try {
+			for (const message of prompts) {
+				const since = harness.events.length;
+				await harness.request({ type: "prompt", message });
+				await harness.waitFor("agent_settled", since);
+			}
+		} finally { await harness.stop(); }
+	};
+	await run(["Work in a separate worktree.", "Check branch fixture.", "Find one feature.", "Explain project."]);
+	await writeFile(join(core.agentDir, "SYSTEM.md"), "Custom local system preamble.\n");
+	await run(["Explain fixture.", "Continue."]);
+	const requests = (await readFile(requestsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line)) as
+		{ names: string[]; sections: Record<string, string>; results: string[] }[];
+	assert.equal(requests.length, 8);
+	for (const name of ["WorktreeCreate", "WorktreeList", "WorktreeMerge", "WorktreeRemove"])
+		assert.ok(requests[0].names.includes(name), `${name} must be declared on the initial model call`);
+	assert.ok(!requests[1].names.includes("WorktreeList"));
+	assert.deepEqual(directInvocations, ["WorktreeList"], "the hidden tool remains directly executable");
+	assert.ok(!requests[3].names.includes("CronList"));
+	assert.ok(requests[4].names.includes("CronList"));
+	assert.ok(!requests[4].names.includes("CronCreate"));
+	assert.match(requests[4].results[0], /Loaded 1 tool schema\(s\):[\s\S]*### CronList/);
+	assert.ok(!requests[5].names.includes("CronList"));
+	assert.ok(requests.slice(0, 6).every((request) => request.names.includes("Monitor")), "explicit overrides survive each run");
+	const guidelines = requests[0].sections.rules.split("\n").filter((line) =>
+		/Inspect target files|Make minimal, surgical|After modifying code/.test(line));
+	assert.equal(guidelines.length, 3);
+	assert.match(guidelines.join("\n"), /^- Inspect[^\n]+\n- Make minimal[^\n]+\n- After modifying code[^\n]+$/);
+	assert.equal(requests[5].sections.rules, requests[0].sections.rules);
+	assert.equal(requests[6].sections.preamble.trim(), "Custom local system preamble.");
+	assert.equal(requests[6].sections.desktop_coding_discipline, `<desktop_coding_discipline>\n${guidelines.join("\n")}\n</desktop_coding_discipline>`);
+	assert.equal(requests[7].sections.desktop_coding_discipline, requests[6].sections.desktop_coding_discipline);
 });

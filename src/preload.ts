@@ -49,6 +49,7 @@ const api: DesktopAPI = {
 	},
 	permissions: {
 		setMode: (conversationId, mode) => ipcRenderer.invoke("pi:permissions:set-mode", conversationId, mode),
+		setProjectLocalCompute: (conversationId, blocked) => ipcRenderer.invoke("pi:permissions:local-compute", conversationId, blocked),
 		list: (conversationId) => ipcRenderer.invoke("pi:permissions:list", conversationId),
 		upsert: (rule) => ipcRenderer.invoke("pi:permissions:upsert", rule),
 		remove: (id) => ipcRenderer.invoke("pi:permissions:remove", id),
@@ -121,6 +122,13 @@ const api: DesktopAPI = {
 		stop: (id) => ipcRenderer.invoke("pi:monitor:stop", id),
 		onEvent: (listener) => listen("pi:monitor:event", listener),
 	},
+	remoteJobs: {
+		list: (conversationId) => ipcRenderer.invoke("pi:remote-jobs:list", conversationId),
+		track: (conversationId, input) => ipcRenderer.invoke("pi:remote-jobs:track", conversationId, input),
+		refresh: (conversationId, id) => ipcRenderer.invoke("pi:remote-jobs:refresh", conversationId, id),
+		untrack: (conversationId, id) => ipcRenderer.invoke("pi:remote-jobs:untrack", conversationId, id),
+		onChange: (listener) => listen("pi:remote-jobs:event", listener),
+	},
 	cron: {
 		list: (conversationId) => ipcRenderer.invoke("pi:cron:list", conversationId),
 		create: (conversationId, input) => ipcRenderer.invoke("pi:cron:create", conversationId, input),
@@ -191,6 +199,10 @@ const api: DesktopAPI = {
 	checkPreview: (url, mobile) => ipcRenderer.invoke("pi:preview:check", url, mobile),
 	probePreview: (url) => ipcRenderer.invoke("pi:preview:probe", url),
 	defaultPreviewUrl: (conversationId) => ipcRenderer.invoke("pi:preview:default", conversationId),
+	kaggleBrowser: {
+		open: (input) => ipcRenderer.invoke("pi:kaggle-browser:open", input),
+		onSelection: (listener) => listen("pi:kaggle-browser:selection", listener),
+	},
 	inspectCode: (conversationId, path, at) => ipcRenderer.invoke("pi:code:inspect", conversationId, path, at),
 	sandboxStatus: () => ipcRenderer.invoke("pi:sandbox:status"),
 	doctor: () => ipcRenderer.invoke("pi:doctor"),

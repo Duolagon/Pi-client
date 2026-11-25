@@ -2,7 +2,8 @@ import { access, readFile, readlink, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MAX_AGENT_MCP_SERVERS } from "./delegation-limits.ts";
+import { insideAgentScope, scopedReadToolNames, validateAgentScopePaths } from "./agent-read-scope.ts";
+import { isTaskReadPath, MAX_AGENT_MCP_SERVERS } from "./delegation-limits.ts";
 import { knownRemoteOperation } from "./remote-operation.ts";
 import { isProtectedFileToolPath } from "./sandbox.ts";
 import type {
@@ -174,13 +175,15 @@ function agentTypeMatches(rule: PermissionRule, pattern: string, type: string | 
 
 export function validateRuntimePolicy(value: unknown): RuntimePermissionPolicy {
 	const record = object(value, "运行时权限配置");
-	keys(record, ["version", "mode", "dontAsk", "rules", "disabledTools", "allowedMcpServers", "project", "additionalDirs", "sandbox"], "运行时权限配置");
+	keys(record, ["version", "mode", "dontAsk", "rules", "disabledTools", "allowedMcpServers", "project", "additionalDirs", "sandbox", "blockLocalCompute", "readScope"], "运行时权限配置");
 	if (record.version !== 1 || !["ask", "acceptEdits", "auto", "read", "plan"].includes(record.mode as string))
 		throw new Error("运行时权限版本或模式无效。");
 	if (record.dontAsk !== undefined && typeof record.dontAsk !== "boolean")
 		throw new Error("运行时 dontAsk 配置无效。");
 	if (record.sandbox !== undefined && typeof record.sandbox !== "boolean")
 		throw new Error("运行时沙箱配置无效。");
+	if (record.blockLocalCompute !== undefined && typeof record.blockLocalCompute !== "boolean")
+		throw new Error("运行时本机推理限制无效。");
 	if (!Array.isArray(record.rules) || record.rules.length > 2000) throw new Error("权限规则列表无效。");
 	if (!Array.isArray(record.disabledTools) || record.disabledTools.length > 10000) throw new Error("停用工具列表无效。");
 	const rules = record.rules.map(validatePermissionRule);
@@ -221,24 +224,22 @@ export function validateRuntimePolicy(value: unknown): RuntimePermissionPolicy {
 		project,
 		...(additionalDirs !== undefined ? { additionalDirs } : {}),
 		...(record.sandbox !== undefined ? { sandbox: record.sandbox } : {}),
+		...(record.blockLocalCompute === true ? { blockLocalCompute: true } : {}),
+		...(record.readScope !== undefined ? { readScope: validateAgentScopePaths(record.readScope) } : {}),
 	};
 }
 
 let cachedPolicyEntry:
 	| {
 			file: string;
-			ino: number;
-			mtimeMs: number;
-			ctimeMs: number;
-			size: number;
+			version: string;
 			policy: RuntimePermissionPolicy;
 	  }
 	| undefined;
 
 /**
- * Re-checks file metadata (`stat`) on every call so atomic policy swaps (`rename` -> new `ino`)
- * or edits take effect immediately with zero stale window, while skipping redundant JSON reads
- * and 2000-rule validation when the file has not changed.
+ * Re-check file identity and timestamps before reusing the parsed runtime policy.
+ * An atomic replacement is visible to the next check.
  */
 export async function loadRuntimePermissionPolicy(
 	env: NodeJS.ProcessEnv = process.env,
@@ -247,16 +248,11 @@ export async function loadRuntimePermissionPolicy(
 	if (env.PI_DESKTOP_POLICY_FILE) {
 		const file = env.PI_DESKTOP_POLICY_FILE;
 		if (!isAbsolute(file)) throw new Error("运行时权限文件必须为绝对路径。");
-		const info = await stat(file);
+		const info = await stat(file, { bigint: true });
+		if (!info.isFile()) throw new Error("运行时权限配置必须是普通文件。");
 		if (info.size > 4 * 1024 * 1024) throw new Error("运行时权限配置过大。");
-		if (
-			cachedPolicyEntry &&
-			cachedPolicyEntry.file === file &&
-			cachedPolicyEntry.ino === info.ino &&
-			cachedPolicyEntry.mtimeMs === info.mtimeMs &&
-			cachedPolicyEntry.ctimeMs === info.ctimeMs &&
-			cachedPolicyEntry.size === info.size
-		) {
+		const version = [info.dev, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].join(":");
+		if (cachedPolicyEntry?.file === file && cachedPolicyEntry.version === version) {
 			return cachedPolicyEntry.policy;
 		}
 		const content = await readFile(file, "utf8");
@@ -264,10 +260,7 @@ export async function loadRuntimePermissionPolicy(
 		const policy = validateRuntimePolicy(JSON.parse(content));
 		cachedPolicyEntry = {
 			file,
-			ino: info.ino,
-			mtimeMs: info.mtimeMs,
-			ctimeMs: info.ctimeMs,
-			size: info.size,
+			version,
 			policy,
 		};
 		return policy;
@@ -318,6 +311,17 @@ function nativeToolPath(input: string): string {
 	else if (path.startsWith("~/") || (process.platform === "win32" && path.startsWith("~\\"))) path = join(homedir(), path.slice(2));
 	if (path.startsWith("file://")) path = fileURLToPath(path);
 	return path;
+}
+
+/** Path spelling used by a completed native Read call, without exposing paths outside the project. */
+export function observedWorkspaceReadPath(input: unknown, project: string): string | undefined {
+	if (typeof input !== "string") return;
+	try {
+		const path = relative(project, resolve(project, nativeToolPath(input))).split(sep).join("/");
+		if (isTaskReadPath(path)) return path;
+	} catch {
+		// A result marker is optional for path spellings that cannot be normalized.
+	}
 }
 
 async function nativeToolTarget(path: string, project: string, read: boolean): Promise<string> {
@@ -372,16 +376,24 @@ function pathGlobMatches(pattern: string, target: string): boolean {
 	return previous[parts.length];
 }
 
-async function pathMatches(pattern: string, target: string, project: string): Promise<boolean> {
+async function preparePathMatcher(pattern: string, project: string): Promise<(target: string) => boolean> {
 	const expanded = pattern === "~" ? homedir() : pattern.startsWith("~/") ? join(homedir(), pattern.slice(2)) : pattern;
 	const absolute = resolve(project, expanded).split(sep).join("/");
 	const wildcard = absolute.search(/[?*]/);
-	if (wildcard < 0) return target === (await canonicalPermissionPath(expanded, project));
+	if (wildcard < 0) {
+		const canonical = await canonicalPermissionPath(expanded, project);
+		return (target) => target === canonical;
+	}
 	const prefixEnd = absolute.lastIndexOf("/", wildcard);
 	const prefix = absolute.slice(0, prefixEnd) || "/";
 	const suffix = absolute.slice(prefixEnd + 1);
 	const canonical = (await canonicalPermissionPath(prefix, project)).split(sep).join("/");
-	return pathGlobMatches(`${canonical === "/" ? "" : canonical}/${suffix}`, target.split(sep).join("/"));
+	const patternPath = `${canonical === "/" ? "" : canonical}/${suffix}`;
+	return (target) => pathGlobMatches(patternPath, target.split(sep).join("/"));
+}
+
+async function pathMatches(pattern: string, target: string, project: string): Promise<boolean> {
+	return (await preparePathMatcher(pattern, project))(target);
 }
 
 interface ShellCommand {
@@ -459,7 +471,11 @@ const argvWrappers = new Set(["env", "command", "exec", "sudo", "doas", "xargs"]
 const wrapperValueOptions = new Set(["-u", "--unset", "-C", "--chdir", "-g", "-I", "-L", "-n", "-P"]);
 
 /** Inspect literal invocations even in a command chain or a shell wrapper. Unknown scripts remain ordinary Bash. */
-function remoteShellOperation(commands: string[][], depth = 0): string | undefined {
+function classifyShellCommand(
+	commands: string[][],
+	classify: (argv: string[]) => string | undefined,
+	depth = 0,
+): string | undefined {
 	if (depth >= 5) return;
 	for (const command of commands) {
 		let argv = command;
@@ -478,19 +494,42 @@ function remoteShellOperation(commands: string[][], depth = 0): string | undefin
 				argv = argv.slice(index);
 				continue;
 			}
+			const operation = classify(argv);
+			if (operation) return operation;
 			if (inlineShells.has(executable) || executable === "eval") {
 				const selector = argv.findIndex((word, index) => index > 0 && /^-[a-z]*c[a-z]*$/.test(word));
 				const body = executable === "eval" ? argv.slice(1).join(" ") : selector > 0 ? argv[selector + 1] : undefined;
-				const operation = body && remoteShellOperation(parseShell(body).commands, depth + 1);
-				if (operation) return operation;
-				break;
+				const nested = body && classifyShellCommand(parseShell(body).commands, classify, depth + 1);
+				if (nested) return nested;
 			}
-			if (/^python(?:[23](?:\.\d+)?)?$/.test(executable) && argv[1] === "-m" && argv[2] === "kaggle") argv = argv.slice(2);
-			const operation = knownRemoteOperation(argv);
-			if (operation) return operation;
 			break;
 		}
 	}
+}
+
+const pythonCommand = /^python(?:[23](?:\.\d+)?)?$/;
+const localInferenceCommands = new Set(["llama-server", "llama-cli", "llama-bench", "vllm", "mlx_lm.server", "mlx_lm.generate"]);
+const localBenchmarkScript = /(?:^|\/)(?:ab\.sh|eval\/runner\.py)$/;
+
+function knownLocalCompute(argv: string[]): string | undefined {
+	const executable = executableName(argv[0]);
+	const args = argv.slice(1);
+	if (localInferenceCommands.has(executable) && !(args.length === 1 && ["--help", "--version"].includes(args[0]))) return executable;
+	if (executable === "ollama" && ["serve", "run"].includes(args[0])) return "ollama";
+	const directScript = localBenchmarkScript.test(argv[0]);
+	const script = args.find((arg) => !arg.startsWith("-"));
+	if (directScript || (script && (inlineShells.has(executable) || pythonCommand.test(executable)) && localBenchmarkScript.test(script)))
+		return "本机评测脚本";
+	const moduleIndex = args.indexOf("-m");
+	if (pythonCommand.test(executable) && moduleIndex !== -1 &&
+		/^(?:llama_cpp\.server|vllm\.entrypoints\.|mlx_lm\.(?:server|generate))/.test(args[moduleIndex + 1] ?? ""))
+		return "本机模型推理";
+}
+
+function remoteCommand(argv: string[]): string | undefined {
+	return knownRemoteOperation(pythonCommand.test(executableName(argv[0])) && argv[1] === "-m" && argv[2] === "kaggle"
+		? argv.slice(2)
+		: argv);
 }
 
 function commandMatches(selector: PermissionCommandSelector, rawArgv: string[], action: PermissionAction): boolean {
@@ -514,14 +553,17 @@ export async function redactSearchOutput(
 	input: unknown,
 	text: string,
 ): Promise<{ text: string; removed: number }> {
-	const rules = policy.rules.filter(
-		(rule) => rule.action !== "allow" && rule.path !== undefined && !rule.command && !rule.domain && segmentMatches(rule.tool, toolName),
+	const rules = policy.rules.filter((rule) =>
+		rule.action !== "allow" && rule.path !== undefined && !rule.command && !rule.domain &&
+		(segmentMatches(rule.tool, toolName) || Boolean(policy.readScope && segmentMatches(rule.tool, "read"))),
 	);
-	if ((!rules.length && !policy.sandbox) || !["grep", "find", "ls"].includes(toolName)) return { text, removed: 0 };
+	if ((!rules.length && !policy.sandbox && !policy.readScope) || !["grep", "find", "ls"].includes(toolName)) return { text, removed: 0 };
 	const project = await canonicalPermissionPath(policy.project, policy.project);
 	const home = policy.sandbox ? await canonicalPermissionPath(homedir(), project) : undefined;
 	const record = input && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
 	const root = await nativeToolTarget(typeof record.path === "string" ? record.path : ".", project, false);
+	const grepFile = Boolean(policy.readScope && toolName === "grep" && await stat(root).then((info) => info.isFile(), () => false));
+	const ruleMatchers = await Promise.all(rules.map((rule) => preparePathMatcher(rule.path!, project)));
 	let removed = 0;
 	const kept: string[] = [];
 	const checked = new Map<string, boolean>();
@@ -535,22 +577,26 @@ export async function redactSearchOutput(
 		}
 		if (canonicalDir === null) return canonicalPermissionPath(target, project).catch(() => null);
 		// Use lstat-style readlink check on leaf so symlinks inside a safe directory are still caught.
-		const link = await readlink(target).catch(() => undefined);
+		const link = await readlink(target).catch((error: NodeJS.ErrnoException) => {
+			if (!["ENOENT", "ENOTDIR", "EINVAL"].includes(error.code ?? "")) throw error;
+		});
 		if (link !== undefined) return canonicalPermissionPath(target, project).catch(() => null);
 		return join(canonicalDir, relative(parent, target));
 	};
 	for (const line of text.split("\n")) {
 		let relativePath: string | undefined;
 		if (toolName === "grep") relativePath = /^(.+?)(?::\d+: |-\d+- )/.exec(line)?.[1];
-		else if (line.trim() && !line.startsWith("[")) relativePath = line.replace(/\/$/, "");
+		else if (line.trim() && (!line.startsWith("[") || policy.readScope)) relativePath = line.replace(/\/$/, "");
 		if (relativePath !== undefined) {
-			const target = relativePath === "" ? root : resolve(root, relativePath);
+			const target = grepFile || relativePath === "" ? root : resolve(root, relativePath);
 			let hidden = checked.get(target);
 			if (hidden === undefined) {
-				const resolved = home === undefined ? target : await fastResolveInSafeDir(target);
-				hidden = (home !== undefined && (
-					resolved === null || isProtectedFileToolPath(target, home) || isProtectedFileToolPath(resolved, home)
-				)) || (await Promise.all(rules.map((rule) => pathMatches(rule.path!, target, project)))).some(Boolean);
+				const resolved = await fastResolveInSafeDir(target).catch(() => null);
+				hidden = resolved === null || Boolean(policy.readScope && (
+					!insideAgentScope(project, policy.readScope, target) || !insideAgentScope(project, policy.readScope, resolved)
+				)) || (home !== undefined && (
+					isProtectedFileToolPath(target, home) || isProtectedFileToolPath(resolved, home)
+				)) || ruleMatchers.some((matches) => matches(target) || matches(resolved));
 				checked.set(target, hidden);
 			}
 			if (hidden) {
@@ -594,6 +640,21 @@ export async function evaluatePermission(
 	const input = call.input && typeof call.input === "object" && !Array.isArray(call.input)
 		? (call.input as Record<string, unknown>)
 		: {};
+	let scopedTarget: string | undefined;
+	if (policy.readScope) {
+		const outline = call.toolName === "LSP" && input.operation === "workspaceOutline";
+		if (!scopedReadToolNames.has(call.toolName) || (call.toolName === "LSP" && !outline))
+			return { action: "deny", reason: "此子 Agent 仅可读取和搜索指定范围的项目文件。" };
+		const path = outline ? input.filePath : input.path;
+		const raw = typeof path === "string" ? path : ".";
+		const lexical = resolve(project, outline ? raw : nativeToolPath(raw));
+		const target = outline
+			? await canonicalPermissionPath(raw, project)
+			: await nativeToolTarget(raw, project, call.toolName === "read");
+		if (!insideAgentScope(project, policy.readScope, lexical) || !insideAgentScope(project, policy.readScope, target))
+			return { action: "deny", reason: "路径超出此子 Agent 的读取范围。" };
+		scopedTarget = target;
+	}
 	const readModeSafeDelegation =
 		(call.toolName === "SendMessage" || call.toolName === "AgentSend") ||
 		(call.toolName === "Agent" &&
@@ -606,13 +667,20 @@ export async function evaluatePermission(
 		(input.action === "list_configs" || input.action === "server_logs" ||
 			((input.action === undefined || input.action === "check") &&
 				(input.actions === undefined || (Array.isArray(input.actions) && input.actions.length === 0))));
-	if (policy.mode === "read" && !readingTools.has(call.toolName) && !harmlessDesktopTools.has(call.toolName) && call.toolName !== "WebSearch" && !previewReadOnly && !readModeSafeDelegation)
+	const kaggleInspect = call.toolName === "KaggleComputerUse" && input.action === "inspect";
+	const kaggleRun = call.toolName === "KaggleComputerUse" && input.action === "run_all";
+	if (call.toolName === "KaggleComputerUse" && !kaggleInspect && !kaggleRun)
+		return { action: "deny", reason: "未知的 Kaggle 浏览器操作。" };
+	if (kaggleRun && policy.dontAsk)
+		return { action: "deny", reason: "运行 Notebook 需要你单次确认，当前权限模式不弹出确认。" };
+	if (policy.mode === "read" && !readingTools.has(call.toolName) && !harmlessDesktopTools.has(call.toolName) && call.toolName !== "WebSearch" && !previewReadOnly && !kaggleInspect && !readModeSafeDelegation)
 		return { action: "deny", reason: "当前为只读模式，此工具不可执行。" };
 	let targets: string[] = [];
 	const pathInput = call.toolName === "NotebookEdit" ? input.notebook_path : input.path;
 	const rawPath = typeof pathInput === "string" ? pathInput : undefined;
 	const notebookPath = call.toolName === "NotebookEdit" && rawPath !== undefined ? resolve(project, rawPath) : undefined;
-	if (notebookPath !== undefined) targets = [await canonicalPermissionPath(notebookPath, project)];
+	if (scopedTarget !== undefined && (rawPath !== undefined || call.toolName === "LSP")) targets = [scopedTarget];
+	else if (notebookPath !== undefined) targets = [await canonicalPermissionPath(notebookPath, project)];
 	else if (rawPath !== undefined) targets = [pathTools.has(call.toolName)
 		? await nativeToolTarget(rawPath, project, call.toolName === "read")
 		: await canonicalPermissionPath(rawPath, project)];
@@ -645,6 +713,7 @@ export async function evaluatePermission(
 			call.toolName === "WebFetch" ||
 			call.toolName === "WebSearch" ||
 			previewReadOnly ||
+			kaggleInspect ||
 			writingPlanFile ||
 			isSafePlanAgent;
 		if (!allowedInPlan) {
@@ -678,7 +747,9 @@ export async function evaluatePermission(
 		}
 	}
 	const shell = call.toolName === "bash" && typeof input.command === "string" ? parseShell(input.command) : undefined;
-	const remoteOperation = shell && remoteShellOperation(shell.commands);
+	const localCompute = policy.blockLocalCompute && shell && classifyShellCommand(shell.commands, knownLocalCompute);
+	if (localCompute) return { action: "deny", reason: `此项目已禁止启动本机推理或评测命令（${localCompute}）。请使用远端环境，或在项目权限中调整限制。` };
+	const remoteOperation = shell && classifyShellCommand(shell.commands, remoteCommand);
 	const autoForeground = policy.mode === "auto" && !policy.dontAsk && input.run_in_background !== true;
 	const agentType = call.toolName === "Agent"
 		? input.fork === true
@@ -726,11 +797,12 @@ export async function evaluatePermission(
 				};
 			}
 			return {
-				action,
+				// The browser host owns the single Run All confirmation, including for an ask rule.
+				action: kaggleRun && action === "ask" ? "allow" : action,
 				ruleId: match.rule.id,
 				reason: match.conservative ? `复杂 Shell 语法无法安全排除规则 ${match.rule.id}，按规则保守处理。` : `匹配权限规则 ${match.rule.id}。`,
 				...(targets.length ? { targets } : {}),
-				...(remoteOperation ? { remoteMutation: true as const } : {}),
+				...(remoteOperation || kaggleRun ? { remoteMutation: true as const } : {}),
 			};
 		}
 	}
@@ -747,6 +819,8 @@ export async function evaluatePermission(
 			: result("ask", `${remoteOperation} 会修改远端状态，需要你单次确认。`);
 		return { ...decision, remoteMutation: true };
 	}
+	if (kaggleRun) return { ...result("allow", "在 Kaggle 浏览器中运行前由桌面弹窗请求单次确认。"), remoteMutation: true };
+	if (kaggleInspect) return result("allow", "读取此会话已打开的 Kaggle Notebook。");
 	if (policy.mode === "read" && call.toolName === "Agent" && (input.subagent_type === "Explore" || input.subagent_type === "Plan"))
 		return result("allow", "只读模式：允许只读探索/规划子 Agent。");
 	if (policy.mode === "plan") {

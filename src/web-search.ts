@@ -191,24 +191,36 @@ export function isDeepSeekModel(model?: { provider?: string; id?: string; baseUr
  * native built-in `deepseek_web_search` tool (free search, token billing only)
  * instead of the client-side `WebSearch` tool.
  */
-export function injectDeepSeekBuiltinSearch(payload: unknown): unknown {
+export function injectDeepSeekBuiltinSearch(payload: unknown, protocol = "openai-completions"): unknown {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+	if (protocol !== "openai-completions" && protocol !== "openai-responses" && protocol !== "anthropic-messages") return payload;
 	const record = payload as Record<string, unknown>;
 	const existingTools = Array.isArray(record.tools) ? record.tools : [];
+	const isBuiltinSearch = (tool: unknown) => {
+		const entry = tool as { type?: unknown; name?: unknown } | null;
+		return entry?.type === "deepseek_web_search" || entry?.name === "deepseek_web_search";
+	};
 	const filtered = existingTools.filter((tool) => {
 		if (!tool || typeof tool !== "object") return true;
 		const t = tool as { name?: unknown; function?: { name?: unknown } };
 		if (t.name === "WebSearch" || t.function?.name === "WebSearch") return false;
 		return true;
 	});
-	const hasBuiltin = filtered.some((tool) => {
-		if (!tool || typeof tool !== "object") return false;
-		const t = tool as { type?: unknown; name?: unknown };
-		return t.type === "deepseek_web_search" || t.name === "deepseek_web_search";
-	});
-	const nextTools = hasBuiltin
+	const thinking = record.thinking as { type?: unknown } | undefined;
+	const reasoning = record.reasoning as { effort?: unknown } | undefined;
+	const hasClientTools = filtered.some((tool) => !isBuiltinSearch(tool) &&
+		(tool as { type?: unknown } | null)?.type !== "deepseek_read_url");
+	if ((thinking?.type === "disabled" || reasoning?.effort === "none") && hasClientTools) {
+		// DeepSeek rejects mixing built-in search with client tools in non-thinking mode.
+		const clientTools = existingTools.filter((tool) => !isBuiltinSearch(tool));
+		return clientTools.length === existingTools.length ? payload : { ...record, tools: clientTools };
+	}
+	const builtin = protocol === "anthropic-messages"
+		? { type: "deepseek_web_search", name: "deepseek_web_search" }
+		: { type: "deepseek_web_search" };
+	const nextTools = filtered.some(isBuiltinSearch)
 		? filtered
-		: [...filtered, { type: "deepseek_web_search", name: "deepseek_web_search" }];
+		: [...filtered, builtin];
 	// DeepSeek rejects `strict` on function tools whenever a built-in tool such as deepseek_web_search is present.
 	const relaxed = nextTools.map((tool) => {
 		const fn = (tool as { function?: Record<string, unknown> } | null)?.function;

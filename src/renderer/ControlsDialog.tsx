@@ -70,6 +70,7 @@ export function ControlsDialog({
 	const [rulePath, setRulePath] = useState("");
 	const [ruleCmd, setRuleCmd] = useState("");
 	const [syncMsg, setSyncMsg] = useState("");
+	const [savingLocalCompute, setSavingLocalCompute] = useState(false);
 
 	// Hook form
 	const [hookEvent, setHookEvent] = useState<HookEventName>("PreToolUse");
@@ -128,6 +129,18 @@ export function ControlsDialog({
 			setExecutors(await window.pi.externalAgents.configure({ id: exec.id, enabled: !exec.enabled }));
 		} catch (error) {
 			fail(error);
+		}
+	};
+
+	const setLocalComputeBlocked = async (blocked: boolean) => {
+		if (!conversationId) return;
+		setSavingLocalCompute(true);
+		try {
+			setPerms(await window.pi.permissions.setProjectLocalCompute(conversationId, blocked));
+		} catch (error) {
+			fail(error);
+		} finally {
+			setSavingLocalCompute(false);
 		}
 	};
 
@@ -363,7 +376,7 @@ export function ControlsDialog({
 										<div className="cc-tool-ctrl-name">
 											<strong>{tool.name}</strong>
 											<span className="cc-source-tag">{tool.namespace || tool.source}</span>
-											{!tool.modelVisible && <span className="cc-source-tag muted">deferred</span>}
+											{tool.deferred && <span className="cc-source-tag muted">延迟加载</span>}
 										</div>
 										<p className="cc-tool-ctrl-desc">{tool.description}</p>
 									</div>
@@ -395,6 +408,14 @@ export function ControlsDialog({
 
 				{tab === "permissions" && perms && (
 					<div className="cc-controls-body">
+						{project && conversationId && (
+							<label className="cc-perm-sync-bar">
+								<input type="checkbox" checked={perms.effective.blockLocalCompute === true}
+									disabled={savingLocalCompute}
+									onChange={(event) => void setLocalComputeBlocked(event.target.checked)} />
+								<span>拦截已识别的本机推理与评测命令（此项目）</span>
+							</label>
+						)}
 						<form className="cc-rule-form" onSubmit={(e) => void addRule(e)}>
 							<SelectPopover
 								ariaLabel="规则动作"

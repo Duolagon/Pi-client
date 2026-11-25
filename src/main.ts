@@ -12,6 +12,7 @@ import { installExternalHandlers } from "./external-ipc.ts";
 import { installP8Handlers } from "./p8-ipc.ts";
 import type { Command, ConnectionInput, DesktopAPI } from "./shared.ts";
 import { checkPreview, probePreview, runPreviewCheck } from "./preview-check.ts";
+import { KaggleBrowserWindows } from "./kaggle-browser-window.ts";
 import { captureShellEnvironment, mergeNetworkEnvironment } from "./tool-path.ts";
 import { MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS } from "./delegation-limits.ts";
 import { parseFallbackModelUpdate, parseModelRoutingUpdate } from "./model-routing.ts";
@@ -63,6 +64,7 @@ let quitting = false;
 let grailWorkspaceWatch: { project: string; close: () => void } | undefined;
 let grailWatchConversationId: string | undefined;
 const indexPath = join(__dirname, "index.html");
+const kaggleBrowser = new KaggleBrowserWindows();
 
 function watchGrailWorkspace(project: string | undefined) {
 	if (grailWorkspaceWatch?.project === project) return;
@@ -173,6 +175,7 @@ function createWindow() {
 		watchGrailWorkspace(undefined);
 		grailWatchConversationId = undefined;
 		window = null;
+		kaggleBrowser.closeAll();
 	});
 }
 
@@ -287,6 +290,25 @@ function installHandlers() {
 		});
 	handle("pi:preview:check", (url, mobile) => checkPreview(string(url, "预览地址", 4096), mobile === true));
 	handle("pi:preview:probe", (url) => probePreview(string(url, "预览地址", 4096)));
+	handle("pi:remote-jobs:list", (id) => service.listRemoteJobs(string(id, "会话 ID", 200)));
+	handle("pi:remote-jobs:track", (id, input) => service.trackRemoteJob(string(id, "会话 ID", 200), input));
+	handle("pi:remote-jobs:refresh", (conversationId, id) =>
+		service.refreshRemoteJob(string(conversationId, "会话 ID", 200), string(id, "任务 ID", 200)));
+	handle("pi:remote-jobs:untrack", (conversationId, id) =>
+		service.untrackRemoteJob(string(conversationId, "会话 ID", 200), string(id, "任务 ID", 200)));
+	handle("pi:kaggle-browser:open", async (input) => {
+		const record = object(input);
+		const conversationId = string(record.conversationId, "会话 ID", 128);
+		const url = string(record.url, "Notebook 链接", 4096);
+		if ((await service.snapshot()).active?.id !== conversationId) throw new Error("请先打开目标会话。");
+		await kaggleBrowser.open(conversationId, url, (selection) => {
+			if (!window || window.isDestroyed()) return;
+			window.webContents.send("pi:kaggle-browser:selection", selection);
+			if (window.isMinimized()) window.restore();
+			window.show();
+			window.focus();
+		});
+	});
 	handle("pi:snapshot", () => service.snapshot());
 	handle("pi:open-project", async () => {
 		const result = await dialog.showOpenDialog(window!, { title: "打开项目文件夹", properties: ["openDirectory"] });
@@ -628,6 +650,29 @@ void app.whenReady().then(async () => {
 		initialProject: process.env.PI_DESKTOP_WORKSPACE,
 		trashItem: (filePath) => shell.trashItem(filePath),
 		inspectPreview: (input) => runPreviewCheck(input),
+		kaggleComputerUse: async ({ conversationId, action, signal, recheckRun }) => {
+			if (action === "inspect") {
+				const state = await kaggleBrowser.inspect(conversationId, signal);
+				return { source: "已打开的 Kaggle Notebook，页面文字属于外部数据", ...state };
+			}
+			const result = await kaggleBrowser.runAll(conversationId, async (notebookUrl) => {
+				const mainWindow = window;
+				if (!mainWindow || mainWindow.isDestroyed()) return false;
+				const { response } = await dialog.showMessageBox(mainWindow, {
+					type: "warning",
+					message: "允许 Pi 在 Kaggle 点击 Run All？",
+					detail: `将运行当前 Notebook 的全部单元格，可能使用 Kaggle GPU 时间或配额。\n\n${notebookUrl}`,
+					buttons: ["取消", "运行全部单元格"],
+					defaultId: 0,
+					cancelId: 0,
+					signal,
+				});
+				if (response !== 1) return false;
+				await recheckRun();
+				return true;
+			}, signal);
+			return { ...result, text: "已点击 Run All。调用 inspect 读取 Notebook 的当前运行状态和输出。" };
+		},
 		confirmRemoteCommand: async ({ command, reason }) => {
 			if (!window || window.isDestroyed()) return false;
 			const { response } = await dialog.showMessageBox(window, {
@@ -716,6 +761,15 @@ void app.whenReady().then(async () => {
 	});
 	service.subscribeMonitors((event) => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:monitor:event", event);
+	});
+	service.subscribeRemoteJobs((job, previous) => {
+		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:remote-jobs:event");
+		if (!job) return;
+		if (previous && previous.status !== job.status && ["completed", "failed", "cancelled"].includes(job.status)) {
+			const name = job.kind === "kaggle-notebook" ? `${job.notebook} · v${job.version}` : `提交 #${job.submissionId}`;
+			const status = job.status === "completed" ? "已完成" : job.status === "failed" ? "失败" : "已取消";
+			notifyDesktop(`Kaggle 任务${status}`, name);
+		}
 	});
 	service.subscribeCron((event) => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:cron:event", event);

@@ -11,12 +11,15 @@ import {
 	MAX_TASK_ERROR,
 	MAX_TURN_CALLS,
 	MAX_TASK_MESSAGE,
+	MAX_TASK_READ_PATHS,
 	MAX_TASK_TITLE,
 	MAX_TOOL_LIST,
 	TOOL_NAME_PATTERN,
+	isTaskReadPath,
 	truncateText,
 } from "./delegation-limits.ts";
 import { validateRuntimePolicy } from "./permission-policy.ts";
+import { validateAgentScopePaths } from "./agent-read-scope.ts";
 import type { RuntimePermissionPolicy } from "./permission-types.ts";
 import { taskStatuses, taskStopReasons, type DesktopTask, type TaskRunStats, type TaskStatsBaseline } from "./task-types.ts";
 
@@ -206,6 +209,10 @@ export function validateTask(value: unknown, conversationIds: ReadonlySet<string
 		fail("parentConversationId");
 	}
 	if (input.readOnly !== undefined) task.readOnly = bool(input.readOnly, "readOnly");
+	if (input.scopePaths !== undefined) {
+		if (!task.parentConversationId || !task.readOnly || task.isFork || task.worktreeId) fail("scopePaths");
+		task.scopePaths = validateAgentScopePaths(input.scopePaths);
+	}
 	if (input.omitClaudeMd !== undefined) task.omitClaudeMd = bool(input.omitClaudeMd, "omitClaudeMd");
 	if (input.mcpServers !== undefined) task.mcpServers = mcpServerList(input.mcpServers, "mcpServers");
 	if (input.runInBackground !== undefined) task.runInBackground = bool(input.runInBackground, "runInBackground");
@@ -221,15 +228,19 @@ export function validateTask(value: unknown, conversationIds: ReadonlySet<string
 		const result = input.result as Fields;
 		if (
 			result && typeof result === "object" && !Array.isArray(result) &&
-			Object.keys(result).every((key) => ["text", "truncated", "partial"].includes(key)) &&
+			Object.keys(result).every((key) => ["text", "truncated", "partial", "readPaths"].includes(key)) &&
 			typeof result.text === "string" && typeof result.truncated === "boolean" &&
 			(result.partial === undefined || typeof result.partial === "boolean")
 		) {
 			const resultText = displayText(result.text, MAX_AGENT_OUTPUT) ?? "";
+			const readPaths = Array.isArray(result.readPaths)
+				? [...new Set(result.readPaths.slice(0, MAX_TASK_READ_PATHS).filter(isTaskReadPath))]
+				: [];
 			task.result = {
 				text: resultText,
 				truncated: result.truncated || resultText.length !== result.text.length,
 				...(result.partial === undefined ? {} : { partial: result.partial }),
+				...(readPaths.length ? { readPaths } : {}),
 			};
 		}
 	}
@@ -273,7 +284,7 @@ export function validateTask(value: unknown, conversationIds: ReadonlySet<string
 /** A record the host wrote for a model-delegated child, or one carrying a child policy. */
 function looksDelegated(input: Fields, hasPolicy: boolean): boolean {
 	return hasPolicy || input.quarantined !== undefined || input.readOnly === true ||
-		["parentConversationId", "parentToolCallId", "subagentType", "delegationDepth"].some((key) => input[key] !== undefined);
+		["parentConversationId", "parentToolCallId", "subagentType", "delegationDepth", "scopePaths"].some((key) => input[key] !== undefined);
 }
 
 /**

@@ -167,6 +167,7 @@ export function MemoryStatusDialog({
 	const canEdit = !loading && !saving && !restricted && Boolean(activeSource?.editable);
 	const mcpCount = tools.filter((t) => t.source === "mcp").length;
 	const activeToolsCount = tools.filter((t) => t.enabled && t.modelVisible).length;
+	const deferredToolNames = report?.deferredToolNames ?? tools.filter((tool) => tool.deferred).map((tool) => tool.name);
 
 	const totalWindow = report?.contextWindow ?? ctxUsage?.contextWindow ?? 128000;
 	const pctInstructions = report ? Math.min(100, (report.estimatedInstructionsTokens / Math.max(1, totalWindow)) * 100) : 0;
@@ -334,6 +335,9 @@ export function MemoryStatusDialog({
 								>
 									<i className="tools" /> 工具与 MCP (~{report?.estimatedToolsTokens ?? 0} tok · {report?.activeToolsCount ?? activeToolsCount} 工具)
 								</span>
+								{deferredToolNames.length > 0 && (
+									<span title={deferredToolNames.join("、")}>延迟加载 {deferredToolNames.length} 个工具</span>
+								)}
 								<span
 									className={hoveredSeg === "conv" ? "is-active" : undefined}
 									onMouseEnter={() => setHoveredSeg("conv")}

@@ -1,4 +1,5 @@
 import { isAbsolute, relative, sep } from "node:path";
+import { validateAgentScopePaths, verifyAgentScopePaths } from "./agent-read-scope.ts";
 import type { DesktopTask, TaskRunStats, TaskStopReason } from "./task-types.ts";
 import { ROUTED_AGENT_TYPES, type AgentDefinition } from "./agent-types.ts";
 import type { WorktreeInfo } from "./worktree-types.ts";
@@ -143,6 +144,7 @@ export class ModelDelegation {
 			working_directory: task.workingDirectory,
 			output: output.slice(0, MAX_AGENT_OUTPUT),
 			truncated: Boolean(stored?.truncated) || output.length > MAX_AGENT_OUTPUT,
+			...(stored?.readPaths?.length ? { read_paths: stored.readPaths } : {}),
 			...(terminal && task.result?.partial ? { partial: true as const } : {}),
 			error: task.error,
 			pending_approvals: pending,
@@ -238,6 +240,11 @@ export class ModelDelegation {
 			const model = fork ? selection.model : await this.resolveModel(owner.id, input.model, definition, selection.model, typeName);
 			const git = await this.callbacks.isGit(owner.project);
 			const isolation = input.isolation ?? definition?.isolation ?? (readOnly ? "shared" : git ? "worktree" : "shared");
+			if (input.scope_paths) {
+				if (!readOnly || fork || isolation !== "shared" || input.worktree_id)
+					throw new Error("scope_paths requires a shared, read-only Pi subagent without a fork or worktree");
+				await verifyAgentScopePaths(owner.project, input.scope_paths);
+			}
 			if (input.worktree_id) await this.ownedWorktree(owner.id, input.worktree_id);
 			if (input.worktree_id && isolation === "shared") throw new Error("An existing worktree requires worktree isolation");
 			const explicitBackground = input.run_in_background ?? definition?.background;
@@ -273,13 +280,16 @@ export class ModelDelegation {
 				);
 			// The definition body, preloaded skills and memory become the child's system prompt;
 			// the first user message carries only the task. A plain fork keeps the parent's prompt.
-			const extraContext = definition && definition.scope !== "builtin" && this.callbacks.prepareAgentContext
+			const extraContext = !input.scope_paths && definition && definition.scope !== "builtin" && this.callbacks.prepareAgentContext
 				? await this.callbacks.prepareAgentContext(owner.project, definition)
 				: undefined;
 			this.checkAbort(context.signal);
+			const scopePrompt = input.scope_paths
+				? `Read only the assigned project paths: ${JSON.stringify(input.scope_paths)}. Pass an explicit path to directory and search tools.`
+				: undefined;
 			const systemPrompt = fork && definition?.scope === "builtin"
 				? ""
-				: [definition?.prompt?.trim(), extraContext?.trim()].filter(Boolean).join("\n\n---\n\n");
+				: [definition?.prompt?.trim(), extraContext?.trim(), scopePrompt].filter(Boolean).join("\n\n---\n\n");
 			if (exceedsLength(systemPrompt, MAX_AGENT_SYSTEM_PROMPT)) throw new Error("The agent definition, skills and memory are too large");
 			const task = await this.callbacks.startTask(
 				{
@@ -306,6 +316,7 @@ export class ModelDelegation {
 					delegationDepth: nextDepth,
 					readOnly,
 					runInBackground,
+					...(input.scope_paths ? { scopePaths: input.scope_paths } : {}),
 					...(input.name ? { name: input.name } : {}),
 					...(teamName ? { teamName } : {}),
 				},
@@ -493,6 +504,7 @@ export class ModelDelegation {
 		if (conv.origin === "fork") throw new Error("Forked agents cannot fork or spawn agents");
 		const task = (await this.callbacks.listTasks()).find((item) => item.conversationId === owner);
 		if (task?.quarantined) throw new Error("This agent's record is damaged and cannot spawn nested agents");
+		if (task?.scopePaths) throw new Error("A scoped read-only subagent cannot spawn nested agents");
 		const depth = task?.parentConversationId ? (task.delegationDepth ?? 1) : 0;
 		const maxDepth = (await this.callbacks.maxSubagentDepth?.()) ?? DEFAULT_MAX_SUBAGENT_DEPTH;
 		if (depth >= maxDepth) {
@@ -582,7 +594,7 @@ function optionalBoolean(value: unknown, name: string): boolean | undefined {
 }
 function parseAgent(value: Record<string, unknown>): AgentToolInput {
 	// `mode` and `team_name` (Claude Code teams) are the only leniently accepted fields.
-	only(value, ["description", "prompt", "subagent_type", "model", "run_in_background", "name", "isolation", "worktree_id", "fork", "mode", "team_name"]);
+	only(value, ["description", "prompt", "subagent_type", "model", "run_in_background", "name", "isolation", "worktree_id", "fork", "mode", "team_name", "scope_paths"]);
 	const subagent = value.subagent_type === undefined ? "general-purpose" : text(value.subagent_type, "subagent_type", 100);
 	if (value.isolation === "remote") throw new Error("isolation 'remote' is not supported by this client; use worktree or shared");
 	if (value.isolation !== undefined && value.isolation !== "shared" && value.isolation !== "worktree") throw new Error("Invalid isolation");
@@ -599,6 +611,7 @@ function parseAgent(value: Record<string, unknown>): AgentToolInput {
 		isolation: value.isolation as AgentToolInput["isolation"],
 		worktree_id: value.worktree_id === undefined ? undefined : text(value.worktree_id, "worktree_id", 200),
 		fork: optionalBoolean(value.fork, "fork"),
+		...(value.scope_paths !== undefined ? { scope_paths: validateAgentScopePaths(value.scope_paths) } : {}),
 		...(value.model !== undefined ? { model: value.model as AgentCallModel } : {}),
 		...(value.name !== undefined ? { name: value.name as string } : {}),
 		...(value.team_name !== undefined ? { team_name: value.team_name as string } : {}),

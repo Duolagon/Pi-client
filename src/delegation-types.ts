@@ -17,6 +17,8 @@ export interface DelegationMetadata {
 	delegationDepth: number;
 	readOnly: boolean;
 	runInBackground: boolean;
+	/** Specific project-relative paths available to a scoped read-only child. */
+	scopePaths?: string[];
 	/** Call-level Agent `name`. */
 	name?: string;
 	/** Team name when experimental agentTeams is enabled. */
@@ -50,6 +52,8 @@ export interface DelegatedTaskResult {
 	working_directory: string;
 	output: string;
 	truncated: boolean;
+	/** Successful read calls observed in the child's latest run. Paths may be partial reads. */
+	read_paths?: string[];
 	/** Present when maxTurns cut the child short; the output is its last partial answer. */
 	partial?: true;
 	error?: string;
@@ -72,6 +76,7 @@ export interface AgentToolInput {
 	run_in_background?: boolean;
 	isolation?: "worktree" | "shared";
 	worktree_id?: string;
+	scope_paths?: string[];
 	fork?: boolean;
 	model?: AgentCallModel;
 	name?: string;

@@ -5,19 +5,25 @@ import { get as getHttp } from "node:http";
 import { get as getHttps } from "node:https";
 import { Readable } from "node:stream";
 import { lookup } from "node:dns/promises";
-import { readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { readFile, realpath, writeFile } from "node:fs/promises";
 import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import type { ExtensionAPI, ModelRegistry, ProviderModelConfig, ToolDefinition, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ModelRegistry, ProviderModelConfig, ToolDefinition, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
 import type { ConnectionMode, ConnectionProtocol, Provider } from "./shared.ts";
 import { connectionDefaults, connectionMode } from "./model-connections.ts";
 import { providerModels } from "./provider-presets.ts";
 import { BALANCE_PROVIDER_NAMES, balanceFor, fetchBalance, formatBalance, validBalanceTarget } from "./provider-balance.ts";
-import { evaluatePermission, loadRuntimePermissionPolicy, redactSearchOutput } from "./permission-policy.ts";
+import { evaluatePermission, loadRuntimePermissionPolicy, observedWorkspaceReadPath, redactSearchOutput } from "./permission-policy.ts";
 import { isStatusOnlyRequest } from "./remote-operation.ts";
 import { formatWebSearchResults, injectDeepSeekBuiltinSearch, isDeepSeekModel, searchWithDeepSeekApi } from "./web-search.ts";
 import { planRelativePath } from "./plan-path.ts";
+import { AgentRegistry } from "./agent-definitions.ts";
+import { HooksService } from "./hooks-service.ts";
+import type { HookEventName } from "./hook-types.ts";
+import { isVerifyCommand } from "./verification-command.ts";
+import { ESCALATION_MESSAGE_TYPE, FALLBACK_MESSAGE_TYPE, sanitizeFallbackModel } from "./model-routing.ts";
+export { ESCALATION_MESSAGE_TYPE, FALLBACK_MESSAGE_TYPE } from "./model-routing.ts";
 
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
@@ -40,88 +46,48 @@ function applyUpdatedInput(target: Record<string, unknown>, patch: Record<string
 	}
 }
 
-type CachedHookFile = { ino: number; mtimeMs: number; ctimeMs: number; size: number; events: ReadonlySet<string> };
-const hookFileCache = new Map<string, CachedHookFile>();
+const hookHome = () => process.env.PI_DESKTOP_HOOK_HOME || homedir();
+const hookAgentDir = () => process.env.PI_CODING_AGENT_DIR ?? join(hookHome(), ".pi", "agent");
+const hookConfigs = new HooksService({ agentDir: hookAgentDir, homeDir: hookHome });
+const hookAgentDefinitions = new AgentRegistry({ agentDir: hookAgentDir, homeDir: hookHome });
 
-const HOOK_PHASE_EVENTS: Readonly<Record<string, readonly string[]>> = {
-	pre: ["PreToolUse"],
-	permission: ["PermissionRequest"],
-	post: ["PostToolUse", "PostToolUseFailure"],
-	stop: ["Stop", "SubagentStop"],
-	compact: ["PreCompact"],
-};
-
-async function hookEventsInFile(file: string): Promise<ReadonlySet<string>> {
-	let info;
-	try {
-		info = await stat(file);
-	} catch {
-		hookFileCache.delete(file);
-		return new Set();
+function hookEventForRequest(body: Record<string, unknown>, child: boolean): HookEventName | undefined {
+	switch (body.phase) {
+		case "pre": return "PreToolUse";
+		case "permission": return "PermissionRequest";
+		case "post": return body.isError === true ? "PostToolUseFailure" : "PostToolUse";
+		case "stop": return child ? "SubagentStop" : "Stop";
+		case "compact": return "PreCompact";
+		default: return undefined; // "max_turns" is a host state transition.
 	}
-	if (!info.isFile() || info.size === 0 || info.size > 2 * 1024 * 1024) return new Set();
-	const cached = hookFileCache.get(file);
-	if (
-		cached &&
-		cached.ino === info.ino &&
-		cached.mtimeMs === info.mtimeMs &&
-		cached.ctimeMs === info.ctimeMs &&
-		cached.size === info.size
-	) {
-		return cached.events;
-	}
-	const events = new Set<string>();
-	try {
-		const parsed = JSON.parse(await readFile(file, "utf8")) as { hooks?: Record<string, unknown> } | undefined;
-		if (parsed?.hooks && typeof parsed.hooks === "object" && !Array.isArray(parsed.hooks)) {
-			for (const [event, entries] of Object.entries(parsed.hooks)) {
-				if (Array.isArray(entries) && entries.length > 0) events.add(event);
-			}
-		}
-	} catch {
-		// Malformed hook file behaves as empty, matching HooksService.readJsonFile.
-	}
-	hookFileCache.set(file, {
-		ino: info.ino,
-		mtimeMs: info.mtimeMs,
-		ctimeMs: info.ctimeMs,
-		size: info.size,
-		events,
-	});
-	return events;
 }
 
-/**
- * Fast stat-backed pre-check for DesktopService runtimes (`PI_DESKTOP_HOOK_FASTPATH="1"`).
- * Eliminates 100% of `/hook` loopback HTTP roundtrips when no hook is configured for that phase,
- * while immediately detecting any newly created or edited hook config file on disk.
- */
-async function mayHaveHookForPhase(phase: unknown): Promise<boolean> {
-	if (typeof phase !== "string") return true;
-	const targetEvents = HOOK_PHASE_EVENTS[phase];
-	if (!targetEvents) return true; // e.g. "max_turns" host state transition
+/** Use the same sources and parser as host dispatch, then skip HTTP for absent events. */
+async function mayHaveHookForRequest(body: Record<string, unknown>): Promise<boolean> {
 	if (process.env.PI_DESKTOP_HOOK_FASTPATH !== "1") return true;
-	if (process.env.PI_DESKTOP_HAS_EXTRA_HOOKS === "1") return true;
-	const home = homedir();
-	const agentDir = process.env.PI_CODING_AGENT_DIR || join(home, ".pi", "agent");
+	const child = process.env.PI_DESKTOP_CHILD === "1";
+	const event = hookEventForRequest(body, child);
+	if (!event) return true;
 	const project = process.env.PI_DESKTOP_TRUST_PROJECT || process.env.PI_DESKTOP_MEMORY_ROOT || process.cwd();
-	const candidates = [
-		join(home, ".claude", "settings.json"),
-		join(home, ".claude", "settings.local.json"),
-		join(agentDir, "hooks.json"),
-		join(project, ".claude", "settings.json"),
-		join(project, ".claude", "settings.local.json"),
-		join(project, ".pi", "hooks.json"),
-	];
-	const sets = await Promise.all(candidates.map(hookEventsInFile));
-	return sets.some((events) => targetEvents.some((ev) => events.has(ev)));
+	const projectTrusted = process.env.PI_DESKTOP_HOOK_PROJECT_TRUSTED !== "0";
+	const agentProject = process.env.PI_DESKTOP_AGENT_HOOK_PROJECT ?? project;
+	const agentProjectTrusted = process.env.PI_DESKTOP_AGENT_HOOK_PROJECT_TRUSTED ?? process.env.PI_DESKTOP_HOOK_PROJECT_TRUSTED;
+	const definitionTrusted = agentProjectTrusted !== "0";
+	const subagentStop = event === "SubagentStop";
+	const configured = await hookConfigs.list(subagentStop ? agentProject : project, subagentStop ? definitionTrusted : projectTrusted);
+	if (configured.some((entry) => entry.event === event)) return true;
+	const agentType = child && process.env.PI_DESKTOP_AGENT_HOOK_TYPE;
+	if (!agentType) return false;
+	// An agent definition can be edited between tool calls without restarting the child.
+	const definition = await hookAgentDefinitions.resolve(agentProject, agentType, definitionTrusted);
+	return definition?.hooks?.some((entry) => entry.event === event || subagentStop && entry.event === "Stop") ?? false;
 }
 
 async function callHost(path: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown> | undefined> {
 	const url = process.env.PI_DESKTOP_HOST_URL;
 	const token = process.env.PI_DESKTOP_HOST_TOKEN;
 	if (!url || !token || !/^[a-f0-9]{64}$/.test(token)) return undefined;
-	if (path === "/hook" && !(await mayHaveHookForPhase(body.phase))) return undefined;
+	if (path === "/hook" && !(await mayHaveHookForRequest(body).catch(() => true))) return undefined;
 	const response = await fetch(`${new URL(url).origin}${path}`, {
 		method: "POST",
 		headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
@@ -332,20 +298,19 @@ export function escapeConfigValue(value: string): string {
 	return escaped.startsWith("!") ? dollar + escaped : escaped;
 }
 
-/** Custom message type of the visible notice written when the conversation switches to the fallback model. */
-export const FALLBACK_MESSAGE_TYPE = "desktop_model_fallback";
-/** Custom message type written when consecutive verification failures escalate to a stronger routed model. */
-export const ESCALATION_MESSAGE_TYPE = "desktop_model_escalation";
-
-const VERIFICATION_COMMAND_RE =
-	/\b(?:npm|pnpm|yarn|bun|npx|node|pytest|py\.test|cargo|go|tsc|vitest|jest|mocha|ava|ruff|flake8|mypy|pyright|eslint|biome|make|gradle|mvn)\b[^\r\n]*(?:\btest\b|--test\b|\bcheck\b|\btypecheck\b|--noEmit\b|\blint\b|\bbuild\b|\bclippy\b)/i;
-
 /** Returns true when a bash command string is a test, typecheck, lint, or build verification run. */
 export function isVerificationBashCommand(command: unknown): boolean {
-	if (typeof command !== "string") return false;
-	const trimmed = command.trim();
-	if (!trimmed || trimmed.length > 8192) return false;
-	return VERIFICATION_COMMAND_RE.test(trimmed);
+	if (typeof command !== "string" || command.length > 8192) return false;
+	const profile = process.env.PI_DESKTOP_SANDBOX_PROFILE;
+	if (profile) {
+		const prefix = "/usr/bin/sandbox-exec -f " + shellQuote(profile) + " /bin/sh -c ";
+		if (command.startsWith(prefix)) {
+			const quoted = command.slice(prefix.length);
+			const inner = quoted.slice(1, -1).replaceAll("'\\''", "'");
+			if (shellQuote(inner) === quoted) return isVerifyCommand(inner);
+		}
+	}
+	return isVerifyCommand(command);
 }
 
 const CODING_DISCIPLINE_GUIDELINES = [
@@ -386,16 +351,30 @@ export function fallbackReason(errorMessage: unknown): string | undefined {
 export function parseFallbackModel(raw: string | undefined): { provider: string; id: string } | undefined {
 	if (!raw) return undefined;
 	try {
-		const value = JSON.parse(raw) as { provider?: unknown; id?: unknown };
-		if (typeof value?.provider !== "string" || typeof value.id !== "string") return undefined;
-		const provider = value.provider.trim();
-		const id = value.id.trim();
-		if (!provider || !id || provider.length > 200 || id.length > 200) return undefined;
-		return { provider, id };
+		return sanitizeFallbackModel(JSON.parse(raw));
 	} catch {
 		return undefined;
 	}
 }
+
+function escalationModels(raw: string | undefined) {
+	if (!raw) return [];
+	try {
+		const value: unknown = JSON.parse(raw);
+		return (Array.isArray(value) ? value.slice(0, 2) : [value]).flatMap((item) => {
+			const ref = sanitizeFallbackModel(item);
+			return ref ? [ref] : [];
+		});
+	} catch {
+		return [];
+	}
+}
+
+function verificationExit(value: unknown): value is number {
+	return typeof value === "number" && Number.isInteger(value) && value >= 0 && value < 126;
+}
+
+const verificationWrites = new Set(["edit", "write", "NotebookEdit"]);
 
 /** Session spend in USD from the entries Pi records, including subagent usage entries. */
 export function sessionCost(entries: readonly unknown[]): number {
@@ -554,7 +533,7 @@ export default function permissions(pi: ExtensionAPI) {
 				name: "WebSearch",
 				label: "WebSearch",
 				description:
-					"Search the web using DeepSeek Search API ($0.75/1000 calls) and return titles, URLs, snippets, and optional page content. When using a DeepSeek model, DeepSeek's built-in free search is used automatically.",
+					"Search the web for titles, URLs, snippets and optional page content. Calls to the standalone DeepSeek Search API are metered.",
 				promptSnippet: "Search the web for up-to-date information",
 				parameters: {
 					type: "object",
@@ -594,7 +573,7 @@ export default function permissions(pi: ExtensionAPI) {
 				} catch {
 					// If policy file isn't readable, proceed cleanly.
 				}
-				return injectDeepSeekBuiltinSearch(event.payload);
+				return injectDeepSeekBuiltinSearch(event.payload, ctx.model?.api);
 			});
 		}
 		pi.registerTool({
@@ -885,21 +864,21 @@ export default function permissions(pi: ExtensionAPI) {
 	let turnCount = 0;
 	let stopHookActive = false;
 	let maxTurnsStopped = false;
-	let editedThisRun = false;
-	let consecutiveVerifyFailures = 0;
-	let lastVerifyFailureSummary = "";
 
 	pi.on("before_agent_start", (event) => {
 		turnCount = 0;
 		stopHookActive = false;
 		maxTurnsStopped = false;
-		editedThisRun = false;
-		consecutiveVerifyFailures = 0;
-		lastVerifyFailureSummary = "";
-		if (!testingConnection && event?.systemPromptOptions?.promptGuidelines) {
-			const list = event.systemPromptOptions.promptGuidelines;
-			for (const rule of CODING_DISCIPLINE_GUIDELINES) {
-				if (!list.includes(rule)) list.push(rule);
+		const options = event?.systemPromptOptions;
+		if (!testingConnection && options) {
+			if (options.customPrompt) {
+				// Pi omits its standard rules section when SYSTEM.md replaces the preamble.
+				options.sections.desktop_coding_discipline = CODING_DISCIPLINE_GUIDELINES.map((rule) => `- ${rule}`).join("\n");
+			} else {
+				const list = options.promptGuidelines;
+				for (const rule of CODING_DISCIPLINE_GUIDELINES) {
+					if (!list.includes(rule)) list.push(rule);
+				}
 			}
 		}
 	});
@@ -1084,52 +1063,122 @@ export default function permissions(pi: ExtensionAPI) {
 			};
 		});
 	}
-	const escalation = testingConnection || isChild ? undefined : parseFallbackModel(process.env.PI_DESKTOP_ESCALATION_MODEL);
-	if (escalation) {
-		let escalatedThisRun = false;
-		let escalatedFromModel: { provider: string; id: string } | undefined;
-		pi.on("before_agent_start", () => {
-			escalatedThisRun = false;
-		});
-		pi.on("turn_end", async (event, ctx) => {
-			if (escalatedThisRun || !editedThisRun || consecutiveVerifyFailures < 2) return;
-			if (maxTurns > 0 && turnCount >= maxTurns) return;
-			const current = ctx?.model;
-			if (!current || (current.provider === escalation.provider && current.id === escalation.id)) return;
-			const target = ctx.modelRegistry?.find?.(escalation.provider, escalation.id);
-			const switched = target ? await pi.setModel(target).catch(() => false) : false;
-			if (!target || !switched) return;
-			escalatedThisRun = true;
-			escalatedFromModel = { provider: current.provider, id: current.id };
-			const fromLabel = current.name || current.id;
-			const toLabel = target.name || target.id;
-			const notice = `连续 ${consecutiveVerifyFailures} 次代码验证未通过，已临时从 ${fromLabel} 升档至 ${toLabel} 协助根因诊断与修复。`;
-			ctx.ui?.notify?.(notice, "info");
-			const detail = lastVerifyFailureSummary ? `\n最近一次验证摘要：${lastVerifyFailureSummary}` : "";
-			return {
-				entries: [
-					...(event?.entries ?? []),
-					{
-						type: "custom_message",
-						customType: ESCALATION_MESSAGE_TYPE,
-						content: `${notice}${detail}\n请先审视根因与调用链（避免重复同一无效补丁），给出最小精确修复并重新运行验证。`,
-						display: true,
-					},
-				],
-			};
-		});
+	const supportsEscalation = !testingConnection && !isChild;
+	const escalationFile = supportsEscalation ? process.env.PI_DESKTOP_ESCALATION_FILE : undefined;
+	const escalations = supportsEscalation ? escalationModels(process.env.PI_DESKTOP_ESCALATION_MODEL) : [];
+	const fallback = testingConnection ? undefined : parseFallbackModel(process.env.PI_DESKTOP_FALLBACK_MODEL);
+	type ActiveModel = NonNullable<ExtensionContext["model"]>;
+	let temporaryModel: { origin: ActiveModel; target: ActiveModel; thinking: ReturnType<ExtensionAPI["getThinkingLevel"]> | undefined } | undefined;
+	const sameModel = (a: { provider: string; id: string } | undefined, b: { provider: string; id: string }) =>
+		a?.provider === b.provider && a.id === b.id;
+	const switchTemporarily = async (current: ActiveModel, target: ActiveModel) => {
+		const prior = temporaryModel ?? { origin: current, target, thinking: pi.getThinkingLevel?.() };
+		if (!await pi.setModel(target).catch(() => false)) return false;
+		temporaryModel = { ...prior, target };
+		return true;
+	};
+	if (fallback || escalationFile || escalations.length) {
 		pi.on("agent_settled", async (_event, ctx) => {
-			const origin = escalatedFromModel;
-			escalatedFromModel = undefined;
-			if (!origin || ctx?.model?.provider !== escalation.provider || ctx.model.id !== escalation.id) return;
-			const target = ctx.modelRegistry?.find?.(origin.provider, origin.id);
-			if (target) await pi.setModel(target).catch(() => false);
+			const prior = temporaryModel;
+			temporaryModel = undefined;
+			if (!prior || !sameModel(ctx.model, prior.target)) return;
+			const origin = ctx.modelRegistry.find(prior.origin.provider, prior.origin.id);
+			if (origin && await pi.setModel(origin).catch(() => false) && prior.thinking !== undefined)
+				pi.setThinkingLevel(prior.thinking);
 		});
 	}
-	const fallback = testingConnection ? undefined : parseFallbackModel(process.env.PI_DESKTOP_FALLBACK_MODEL);
+	if (escalationFile || escalations.length) {
+		let editedThisRun = false;
+		let escalatedThisRun = false;
+		let consecutiveVerifyFailures = 0;
+		let lastVerifyFailureSummary = "";
+		const verificationShells = new Set<string>();
+		const recordVerification = (failed: boolean, summary = "") => {
+			if (!editedThisRun) return;
+			consecutiveVerifyFailures = failed ? consecutiveVerifyFailures + 1 : 0;
+			lastVerifyFailureSummary = failed ? summary : "";
+		};
+		const completeShell = (details: unknown) => {
+			if (!details || typeof details !== "object" || !("shell_id" in details) ||
+				typeof details.shell_id !== "string" || !("status" in details) || details.status === "running" ||
+				!verificationShells.delete(details.shell_id)) return;
+			if (("exit_code" in details) && verificationExit(details.exit_code) &&
+				(details.status === "completed" || details.status === "failed")) {
+				recordVerification(details.exit_code !== 0, `后台验证命令退出码 ${details.exit_code}`);
+			}
+			return true;
+		};
+		const tryEscalation = async (ctx: ExtensionContext) => {
+			if (escalatedThisRun || !editedThisRun || consecutiveVerifyFailures < 2 ||
+				(maxTurns > 0 && turnCount >= maxTurns) || ctx.signal?.aborted) return;
+			const current = ctx.model;
+			if (!current) return;
+			const configured = escalationFile ? escalationModels(await readFile(escalationFile, "utf8").catch(() => "")) : escalations;
+			if (ctx.signal?.aborted) return;
+			for (const ref of configured) {
+				if (sameModel(current, ref) || sameModel(temporaryModel?.origin, ref)) continue;
+				const target = ctx.modelRegistry.find(ref.provider, ref.id);
+				if (!target || !await switchTemporarily(current, target)) continue;
+				escalatedThisRun = true;
+				const notice = `连续 ${consecutiveVerifyFailures} 次代码验证未通过，已临时从 ${current.name || current.id} 升档至 ${target.name || target.id} 协助根因诊断与修复。`;
+				ctx.ui?.notify?.(notice, "info");
+				const detail = lastVerifyFailureSummary ? `\n最近一次验证摘要：${lastVerifyFailureSummary}` : "";
+				consecutiveVerifyFailures = 0;
+				lastVerifyFailureSummary = "";
+				return {
+					customType: ESCALATION_MESSAGE_TYPE,
+					content: `${notice}${detail}\n请先审视根因与调用链（避免重复同一无效补丁），给出最小精确修复并重新运行验证。`,
+					display: true,
+				};
+			}
+		};
+		pi.on("before_agent_start", async (event, ctx) => {
+			escalatedThisRun = false;
+			if (event.messageType === "custom" && event.message.customType === "desktop_shell_event" &&
+				completeShell(event.message.details)) {
+				// A managed command may finish after the run that started it. The existing
+				// completion notification wakes the agent, so reuse that request.
+				const message = await tryEscalation(ctx);
+				if (message) return { message };
+				return;
+			}
+			editedThisRun = false;
+			consecutiveVerifyFailures = 0;
+			lastVerifyFailureSummary = "";
+			verificationShells.clear();
+		});
+		pi.on("tool_result", (event) => {
+			if (event.toolName === "BashOutput" && !event.isError) {
+				completeShell(event.details);
+				return;
+			}
+			if (!editedThisRun || event.toolName !== "bash" || !isVerificationBashCommand(event.input.command)) return;
+			const result = event.structuredContent;
+			if (!result || typeof result !== "object") return;
+			if ("background" in result && result.background === true &&
+				"shell_id" in result && typeof result.shell_id === "string") {
+				verificationShells.add(result.shell_id);
+			} else if ("exit_code" in result && verificationExit(result.exit_code)) {
+				recordVerification(result.exit_code !== 0, textFromBlocks(event.content).trim().split("\n").slice(-3).join(" / ").slice(0, 260));
+			}
+		});
+		pi.on("message_end", ({ message }) => {
+			// All extension result handlers have run by this point, including the one
+			// that appends write-time language diagnostics.
+			if (message.role !== "toolResult" || message.isError || !verificationWrites.has(message.toolName)) return;
+			editedThisRun = true;
+			const result = (message.details as { desktopLspVerification?: { failed: boolean; summary?: string } } | undefined)?.desktopLspVerification;
+			if (typeof result?.failed === "boolean") recordVerification(result.failed, result.summary);
+		});
+		pi.on("turn_end", async (event, ctx) => {
+			if (event.outcome !== "completed") return;
+			const message = await tryEscalation(ctx);
+			if (!message) return;
+			return { continue: true, entries: [...event.entries, { type: "custom_message", ...message }] };
+		});
+	}
 	if (fallback) {
 		let fallbackUsed = false;
-		let primaryModel: { provider: string; id: string } | undefined;
 		let lastError: string | undefined;
 		// One automatic fallback per prompt (user message, wakeup or other run start).
 		pi.on("before_agent_start", () => {
@@ -1155,13 +1204,12 @@ export default function permissions(pi: ExtensionAPI) {
 				return;
 			fallbackUsed = true;
 			const target = ctx.modelRegistry.find(fallback.provider, fallback.id);
-			const switched = target ? await pi.setModel(target).catch(() => false) : false;
+			const switched = target ? await switchTemporarily(current, target) : false;
 			const primary = current.name || current.id;
 			if (!target || !switched) {
 				ctx.ui.notify(`主模型 ${primary} 暂不可用（${reason}），但备用模型 ${fallback.id} 当前不可用，未自动切换。`, "warning");
 				return;
 			}
-			primaryModel = { provider: current.provider, id: current.id };
 			const notice = `主模型 ${primary} 暂不可用（${reason}），已切换到备用模型 ${target.name || target.id} 继续。`;
 			ctx.ui.notify(notice, "warning");
 			lastError = undefined;
@@ -1177,13 +1225,6 @@ export default function permissions(pi: ExtensionAPI) {
 					},
 				],
 			};
-		});
-		pi.on("agent_settled", async (_event, ctx) => {
-			const primary = primaryModel;
-			primaryModel = undefined;
-			if (!primary || ctx.model?.provider !== fallback.provider || ctx.model.id !== fallback.id) return;
-			const target = ctx.modelRegistry.find(primary.provider, primary.id);
-			if (target) await pi.setModel(target).catch(() => false);
 		});
 	}
 	pi.on("session_before_compact", async (event) => {
@@ -1243,8 +1284,8 @@ export default function permissions(pi: ExtensionAPI) {
 				if (lastUser?.type !== "message" || lastUser.message.role !== "user") return false;
 				const content = lastUser.message.content;
 				if (typeof content === "string") return isStatusOnlyRequest(content);
-				return content.every((item) => item.type === "text") &&
-					isStatusOnlyRequest(content.filter((item) => !isDesktopWorkspaceContext(item.text)).map((item) => item.text).join("\n"));
+				return isStatusOnlyRequest(content.flatMap((item) =>
+					item.type === "text" && !isDesktopWorkspaceContext(item.text) ? [item.text] : []).join("\n"));
 			};
 			const statusBlockReason = "本轮仅查询状态，不能执行远端写操作。";
 			if (decision.remoteMutation && statusOnlyTurn()) return { block: true, reason: statusBlockReason };
@@ -1334,6 +1375,10 @@ export default function permissions(pi: ExtensionAPI) {
 		let recorded: Pick<ToolResultEventResult, "details"> | undefined = typeof bashExitCode === "number" && Number.isInteger(bashExitCode)
 			? { details: { ...(event.details && typeof event.details === "object" ? event.details : {}), exitCode: bashExitCode } }
 			: undefined;
+		if (process.env.PI_DESKTOP_READ_ONLY_CHILD === "1" && !event.isError && event.toolName === "read") {
+			const path = observedWorkspaceReadPath(event.input.path, process.cwd());
+			if (path) recorded = { details: { ...(event.details && typeof event.details === "object" ? event.details : {}), desktopReadPath: path } };
+		}
 		const pathRules = !event.isError && ["read", "write", "edit"].includes(event.toolName) && typeof event.input.path === "string"
 			? await scopedContext("", [event.input.path]).catch(() => "")
 			: "";
@@ -1374,33 +1419,10 @@ export default function permissions(pi: ExtensionAPI) {
 		const postTodoReminder = !testingConnection && callsSinceTodoUpdate === 4
 			? staleTodoReminder(checklist, checklist === "simple" ? activeTodoWriteItems : [...sharedTodoItems.values()])
 			: undefined;
-		const additions = [pathRules, postTodoReminder].filter(Boolean).join("\n\n");
+		const directoryHint = event.isError && event.toolName === "read" && /\bEISDIR\b/.test(textFromBlocks(event.content)) &&
+			pi.getActiveTools().includes("ls") ? "Use ls with the same path to list this directory." : undefined;
+		const additions = [pathRules, directoryHint, postTodoReminder].filter(Boolean).join("\n\n");
 		const content = additions ? [...event.content, { type: "text" as const, text: additions }] : event.content;
-		if (!testingConnection) {
-			if (!event.isError && (event.toolName === "edit" || event.toolName === "write")) {
-				editedThisRun = true;
-				const fullOut = textFromBlocks(content);
-				if (/\[LSP 诊断 [^\]]+\]:[\s\S]*?\[Error\]/.test(fullOut)) {
-					consecutiveVerifyFailures++;
-					lastVerifyFailureSummary = fullOut.split("\n").find((l) => l.includes("[Error]"))?.slice(0, 240) ?? "LSP 类型检查报错";
-				}
-			} else if (event.toolName === "bash" && editedThisRun) {
-				const rawCmd = (event.input as { command?: unknown } | undefined)?.command;
-				const cleanCmd = typeof rawCmd === "string"
-					? rawCmd.replace(/^\/usr\/bin\/sandbox-exec -f '[^']*' \/bin\/sh -c '/, "").replace(/'$/, "")
-					: rawCmd;
-				if (isVerificationBashCommand(cleanCmd)) {
-					const failed = Boolean(event.isError) || (typeof bashExitCode === "number" && bashExitCode !== 0);
-					if (failed) {
-						consecutiveVerifyFailures++;
-						lastVerifyFailureSummary = textFromBlocks(event.content).trim().split("\n").slice(-3).join(" / ").slice(0, 260);
-					} else {
-						consecutiveVerifyFailures = 0;
-						lastVerifyFailureSummary = "";
-					}
-				}
-			}
-		}
 		const changed = () => {
 			if (!redacted && !additions) return recorded;
 			return { ...recorded, content };

@@ -1,4 +1,6 @@
 import type { Message, MonitorRecord } from "../shared.ts";
+import { isVerifyCommand } from "../verification-command.ts";
+export { isVerifyCommand } from "../verification-command.ts";
 
 /** Summarize recorded checks without promoting older results to the current code state. */
 export type QualityOmen =
@@ -51,19 +53,7 @@ function toolName(call: { name: string }): string {
 	return call.name.toLowerCase();
 }
 
-const VERIFY_COMMAND = /^(?:(?:npx(?:\s+--yes)?|uv\s+run|bundle\s+exec|pnpm\s+exec|bunx)\s+)?(?:vitest|jest|mocha|ava|pytest|tsc|tsd|biome|eslint|prettier|ruff|mypy|cargo\s+(?:test|check|clippy)|go\s+test|rspec|phpunit|ctest)\b/i;
-const SCRIPT_VERIFY_COMMAND = /^(?:npm|pnpm|yarn|bun|deno)\s+(?:run\s+)?(?:tests?|check|typecheck|type-check|lint|build|ci)(?:[:_-][\w:-]+)?(?:\s|$)/i;
-const RUNNER_VERIFY_COMMAND = /^(?:node\s+(?:[^\n]*?\s)?--test\b|python3?\s+-m\s+(?:pytest|unittest)\b)/i;
-const SHELL_CONTROL = /[\n;&|<>`]|\$\(/;
-const MUTATING_CHECK_OPTIONS = /(?:^|\s)--(?:fix|fix-only|write|apply|update-snapshots?)(?:[=\s]|$)/i;
 const READ_ONLY_COMMAND = /^(?:pwd|ls|cat|head|tail|wc|rg|grep|find|git\s+(?:status|diff|log|show|ls-files|rev-parse))\b/;
-
-export function isVerifyCommand(command: string): boolean {
-	const text = command.trim();
-	// A compound shell line may contain a check that never runs, or mutate files after it.
-	return !SHELL_CONTROL.test(text) && !MUTATING_CHECK_OPTIONS.test(text) &&
-		(VERIFY_COMMAND.test(text) || SCRIPT_VERIFY_COMMAND.test(text) || RUNNER_VERIFY_COMMAND.test(text));
-}
 
 function mayEditWithShell(command: string): boolean {
 	if (/[<>`]|\$\(/.test(command)) return true;

@@ -71,10 +71,12 @@ import {
 	MAX_HOOK_ADDITIONAL_CONTEXT,
 	MAX_IDLE_CHILD_RUNTIMES,
 	MAX_RECENT_TASK_ACTIVITIES,
+	MAX_TASK_READ_PATHS,
 	MAX_SEND_MESSAGE,
 	MAX_TURN_CALLS,
 	PARENT_MESSAGE_PREFIX,
 	MAX_AGENT_SYSTEM_PROMPT,
+	isTaskReadPath,
 	MAX_AGENT_TURNS,
 	MAX_FOREGROUND_SUBAGENT_TIMEOUT_MS,
 	TASK_PROGRESS_PERSIST_MS,
@@ -146,7 +148,7 @@ import { finalAssistantText, type DelegationMetadata, type ResumeOptions } from 
 import { AgentRegistry } from "./agent-definitions.ts";
 import { buildAgentListing } from "./agent-listing.ts";
 import type { AgentDefinition, AgentModelAlias, AgentPermissionMode, AgentRemoveInput, AgentSaveInput, ModelRouting, ModelRoutingRole } from "./agent-types.ts";
-import { parseFallbackModelUpdate, parseModelRoutingUpdate, sanitizeFallbackModel, sanitizeModelRouting } from "./model-routing.ts";
+import { FALLBACK_MESSAGE_TYPE, parseFallbackModelUpdate, parseModelRoutingUpdate, sanitizeFallbackModel, sanitizeModelRouting, temporaryModelNotice } from "./model-routing.ts";
 import { McpRegistry } from "./mcp-registry.ts";
 import type { McpRemoveInput, McpSaveInput, McpServerInfo } from "./mcp-types.ts";
 import { HooksService, type HookRunContext } from "./hooks-service.ts";
@@ -165,6 +167,9 @@ import { cronToolNames, type CronCreateInput, type CronEvent, type CronJobRecord
 import { TeamsService } from "./teams-service.ts";
 import type { TeamEvent, TeamMessageType, TeamRecord } from "./team-types.ts";
 import { WorkflowService } from "./workflow-service.ts";
+import { RemoteJobsService } from "./remote-jobs.ts";
+import type { RemoteJobRecord } from "./remote-job-types.ts";
+import { createKaggleRemoteJobQuery } from "./kaggle-remote-jobs.ts";
 import { validateJsonSchema } from "./workflow-schema.ts";
 import type { WorkflowApprovalDecision, WorkflowEvent, WorkflowRecord, WorkflowRunInput } from "./workflow-types.ts";
 import { buildContextReport, deleteProjectMemoryRule, writeProjectMemoryFile, type ContextBreakdown, type ContextMemorySource } from "./context-inspector.ts";
@@ -178,7 +183,7 @@ import { ClaudeAdapter } from "./external-claude.ts";
 import { KimiAdapter } from "./external-kimi.ts";
 import { AntigravityAdapter } from "./external-antigravity.ts";
 import type { ExternalAdapter, ExternalApprovalResponse, ExternalEvent, ExternalExecutorInput, ExternalProvider, ExternalTask, ExternalTaskSendInput, ExternalTaskStartInput } from "./external-types.ts";
-import type { DeliverCustomType, DesktopToolInvocation, NotificationDelivery, NotificationDisposition, NotificationUsage, ToolHostContext } from "./tool-control-types.ts";
+import type { DeliverCustomType, DesktopToolInvocation, KaggleComputerUseAction, NotificationDelivery, NotificationDisposition, NotificationUsage, ToolHostContext } from "./tool-control-types.ts";
 import { formatTaskNotification, notificationStatus, TASK_NOTIFICATION_TYPE, type TaskNotificationDetails } from "./delegation-format.ts";
 import { TaskWaiters } from "./task-waiters.ts";
 import type { ExternalNotification } from "./external-agents.ts";
@@ -190,6 +195,7 @@ const DOCTOR_CHECK_TIMEOUT_MS = 4000;
 const providers: Provider[] = ["anthropic", "openai", "google", "openrouter", "deepseek"];
 const permissionModes = new Set<unknown>(["ask", "acceptEdits", "read", "auto", "plan", "dontAsk"]);
 const piBuiltinTools = new Set(["read", "write", "edit", "bash", "grep", "find", "ls", "powershell"]);
+const explicitCliToolFlags = new Set(["--tools", "-t", "--no-tools", "-nt", "--no-builtin-tools", "-nbt"]);
 
 /** An explicit empty result means deny all built-in tools, not "unset". */
 export function piToolAllowlist(tools: string[] | undefined): string[] | undefined {
@@ -308,6 +314,7 @@ interface SessionRuntime {
 	controls?: { directory: string; token: string; command: string; hostToken: string; operation: Promise<void> };
 	policyFile?: string;
 	sandboxProfileFile?: string;
+	escalationFile?: string;
 	/** Environment of the Pi child, reused for its background shells. */
 	shellEnv?: NodeJS.ProcessEnv;
 	/** Output style prompt read by the permission extension each turn; main conversations only. */
@@ -333,6 +340,7 @@ interface SessionRuntime {
 		cost: number;
 		startedAt: number;
 		recentActivities: TaskProgressActivity[];
+		readPaths: Set<string>;
 		emitTimer?: ReturnType<typeof setTimeout>;
 		lastEmitAt: number;
 		lastPersistAt: number;
@@ -382,6 +390,13 @@ export interface ServiceOptions {
 	trashItem?: (filePath: string) => Promise<void>;
 	/** Headless Electron browser verification handler for the PreviewCheck model tool. */
 	inspectPreview?: (input: PreviewInspectInput) => Promise<PreviewInspectResult>;
+	/** The host owns the dedicated window and the native Run All approval. */
+	kaggleComputerUse?: (input: {
+		conversationId: string;
+		action: KaggleComputerUseAction;
+		signal: AbortSignal;
+		recheckRun: () => Promise<void>;
+	}) => Promise<unknown>;
 	archiveEntry?: string;
 	historyEntry?: string;
 	navigationExtension?: string;
@@ -462,6 +477,8 @@ export class DesktopService {
 	private controlListeners = new Set<(event: ControlEvent) => void>();
 	private worktreeOperationOwner?: string;
 	private external: ExternalAgents;
+	private remoteJobs: RemoteJobsService;
+	private remoteJobListeners = new Set<(job: RemoteJobRecord | undefined, previous?: RemoteJobRecord) => void>();
 	private waiters = new TaskWaiters();
 	/** Workflow steps waiting for a free subagent slot; woken on every task status change. */
 	private slotWaiters = new Set<() => void>();
@@ -491,6 +508,19 @@ export class DesktopService {
 		this.skills = new SkillRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
 		this.todos = new TodoService({ dataDir: () => this.options.dataDir });
 		this.monitors = new MonitorService({ deliver: (id, params) => this.deliverToConversation(id, params) });
+		this.remoteJobs = new RemoteJobsService({
+			statePath: join(options.dataDir, "remote-jobs.json"),
+			canQuery: () => process.env.PI_OFFLINE !== "1" && !this.store.settings.sandboxOffline,
+			query: createKaggleRemoteJobQuery({
+				env: options.env,
+				fetch: undiciFetch as unknown as typeof fetch,
+				dispatcher: () => this.balanceDispatcher(),
+			}),
+			onChange: (id, previous) => {
+				const job = this.remoteJobs.list().find((record) => record.id === id);
+				for (const listener of this.remoteJobListeners) listener(job, previous);
+			},
+		});
 		this.cron = new CronService({
 			dataDir: () => this.options.dataDir,
 			deliver: (id, params, project) => this.deliverCronWakeup(id, params, project),
@@ -857,6 +887,9 @@ export class DesktopService {
 		await this.worktrees.initialize();
 		await this.cron.loadGlobal();
 		await this.workflows.initialize();
+		await this.remoteJobs.start().catch(() => {
+			this.options.onDiagnostic?.("warn", "remote_jobs_load_failed", {});
+		});
 		if (this.store.settings.sandbox === undefined && process.env.PI_DESKTOP_NO_AUTO_SANDBOX !== "1") {
 			const seatbelt = await probeSeatbeltSupport();
 			if (seatbelt.supported) this.store.settings.sandbox = true;
@@ -2050,6 +2083,7 @@ export class DesktopService {
 				throw new Error("请先关闭此会话的终端，再移除。");
 			await this.cancelGrail(id);
 			await this.monitors.stopForConversation([id], "user_stop", { includeRoot: true });
+			for (const job of this.remoteJobs.list(id)) await this.remoteJobs.untrack(job.id);
 			for (const job of await this.cron.list(id, conversation.project)) await this.cron.delete(job.id, id);
 			if (runtime) await this.stopRuntime(runtime);
 			await this.terminals.closeConversation(id);
@@ -2693,11 +2727,36 @@ export class DesktopService {
 		};
 	}
 
+	private assertKaggleBrowserOwner(conversationId: string, signal: AbortSignal): void {
+		signal.throwIfAborted();
+		if (this.closed || this.active()?.id !== conversationId ||
+			this.store.tasks.some((task) => task.conversationId === conversationId))
+			throw new Error("请在打开 Kaggle Notebook 的前台会话操作浏览器。");
+		if (this.runtimes.get(conversationId)?.workingTurn?.stopRequested)
+			throw new Error("当前回合已停止。");
+	}
+
 	private async modelTool(request: DesktopToolInvocation, context: ToolHostContext): Promise<unknown> {
 		if (this.closed) throw new Error("桌面服务已关闭。");
 		const input = request.input;
 		if (request.tool === "PreviewCheck") {
 			return this.handlePreviewCheckTool(input, context);
+		}
+		if (request.tool === "KaggleComputerUse") {
+			const { conversationId, signal } = context;
+			const action = input.action;
+			if (action !== "inspect" && action !== "run_all") throw new Error("未知的 Kaggle 浏览器操作。");
+			if (!this.options.kaggleComputerUse) throw new Error("当前运行环境没有 Kaggle 浏览器。");
+			this.assertKaggleBrowserOwner(conversationId, signal);
+			const recheckRun = async () => {
+				this.assertKaggleBrowserOwner(conversationId, signal);
+				if (this.store.settings.sandboxOffline) throw new Error("命令沙箱处于离线模式，无法启动 Kaggle Notebook。");
+				const latest = await evaluatePermission(this.permissionPolicy(conversationId), { toolName: request.tool, input });
+				if (latest.action === "deny") throw new Error(latest.reason);
+				this.assertKaggleBrowserOwner(conversationId, signal);
+			};
+			if (action === "run_all") await recheckRun();
+			return this.options.kaggleComputerUse({ conversationId, action, signal, recheckRun });
 		}
 		if (request.tool === "LSP") {
 			const conv = this.conversation(context.conversationId);
@@ -2877,6 +2936,7 @@ export class DesktopService {
 		}
 		if (request.tool === "AgentExecutors") return { executors: await this.external.executors() };
 		if (request.tool === "Agent" && input.executor && input.executor !== "pi") {
+			if (input.scope_paths !== undefined) throw new Error("scope_paths is only available for local Pi subagents");
 			if (input.isolation === "remote") throw new Error("isolation 'remote' is not supported by this client; use worktree or shared");
 			if (input.subagent_type === "fork" || input.fork) throw new Error("External executors cannot fork this conversation");
 			// An explicit model or name must not be dropped silently: the executor picks its own
@@ -3013,6 +3073,15 @@ export class DesktopService {
 				status: m.status,
 				event_count: m.eventCount,
 			}));
+			const remote = this.remoteJobs.list(context.conversationId).slice(0, 50).map((job) => ({
+				job_id: job.id,
+				target: job.kind === "kaggle-notebook" ? `${job.notebook}/${job.version}` : job.submissionId,
+				kind: job.kind,
+				status: job.status,
+				checked_at: job.checkedAt,
+				evidence: job.evidence,
+				query_error: job.queryError?.code,
+			}));
 			return {
 				tasks: [
 					...pi.tasks,
@@ -3023,6 +3092,7 @@ export class DesktopService {
 				],
 				truncated: pi.truncated || external.length > 128,
 				...(monitors.length ? { monitors } : {}),
+				...(remote.length ? { remote_jobs: remote } : {}),
 			};
 		}
 		if (request.tool === "Agent") {
@@ -3051,6 +3121,45 @@ export class DesktopService {
 	async stopMonitor(id: string): Promise<MonitorRecord> {
 		await this.operation;
 		return this.monitors.stop(id, undefined, "user_stop");
+	}
+
+	subscribeRemoteJobs(listener: (job: RemoteJobRecord | undefined, previous?: RemoteJobRecord) => void): () => void {
+		this.remoteJobListeners.add(listener);
+		return () => this.remoteJobListeners.delete(listener);
+	}
+
+	async listRemoteJobs(conversationId: string): Promise<RemoteJobRecord[]> {
+		await this.operation;
+		return this.remoteJobs.list(this.conversation(conversationId).id);
+	}
+
+	trackRemoteJob(conversationId: string, input: unknown): Promise<RemoteJobRecord> {
+		return this.serialize(async () => {
+			const conversation = this.conversation(conversationId);
+			if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("远端任务格式无效。");
+			const record = input as Record<string, unknown>;
+			const owner = { conversationId, projectDir: this.trustProjectFor(conversation.project) };
+			const useProjectCredentials = record.useProjectCredentials === true;
+			if (record.kind === "kaggle-notebook" && typeof record.notebook === "string" && typeof record.version === "number")
+				return this.remoteJobs.track({ ...owner, kind: record.kind, notebook: record.notebook, version: record.version, useProjectCredentials });
+			if (record.kind === "kaggle-submission" && typeof record.competition === "string" && typeof record.submissionId === "string")
+				return this.remoteJobs.track({ ...owner, kind: record.kind, competition: record.competition, submissionId: record.submissionId, useProjectCredentials });
+			throw new Error("请提供准确的 Kaggle Notebook 版本或比赛提交编号。");
+		});
+	}
+
+	async refreshRemoteJob(conversationId: string, id: string): Promise<RemoteJobRecord | undefined> {
+		const jobs = await this.listRemoteJobs(conversationId);
+		if (!jobs.some((job) => job.id === id)) throw new Error("此会话没有该远端任务。");
+		return this.remoteJobs.refresh(id);
+	}
+
+	untrackRemoteJob(conversationId: string, id: string): Promise<boolean> {
+		return this.serialize(async () => {
+			if (!this.remoteJobs.list(this.conversation(conversationId).id).some((job) => job.id === id))
+				throw new Error("此会话没有该远端任务。");
+			return this.remoteJobs.untrack(id);
+		});
 	}
 
 	private shellRunOwner(runtime: SessionRuntime | undefined, signal: AbortSignal): string | undefined {
@@ -3989,6 +4098,9 @@ export class DesktopService {
 					next.settings.defaultModel = { provider: `desktop-${provider}`, id: connection.modelId };
 			}
 			const permissionChanged = next.settings.permission !== this.store.settings.permission;
+			const escalationChanged =
+				fallbackKey(next.settings.modelRouting?.plan) !== fallbackKey(this.store.settings.modelRouting?.plan) ||
+				fallbackKey(next.settings.modelRouting?.review) !== fallbackKey(this.store.settings.modelRouting?.review);
 			const needsRestart =
 				Boolean(next.settings.sandbox) !== Boolean(this.store.settings.sandbox) ||
 				Boolean(next.settings.sandboxOffline) !== Boolean(this.store.settings.sandboxOffline) ||
@@ -4006,6 +4118,7 @@ export class DesktopService {
 			if (needsRestart) this.assertIdle();
 			const styleChanged = next.settings.outputStyle !== this.store.settings.outputStyle;
 			this.store = next;
+			this.remoteJobs.reschedule();
 			await this.persist();
 			if (permissionChanged) await this.closeReadRestrictedTerminals();
 			if (settings.cronEnabled !== undefined) this.cron.onEnabledChanged();
@@ -4027,6 +4140,11 @@ export class DesktopService {
 					await this.syncState(runtime);
 				}
 			} else if (permissionChanged) await this.refreshControls("permissions_changed");
+			else if (escalationChanged) {
+				for (const runtime of this.runtimes.values()) {
+					if (runtime.escalationFile && !runtime.stopping) await this.writeRuntimeControls(runtime);
+				}
+			}
 			return this.buildSnapshot();
 		});
 	}
@@ -4863,6 +4981,23 @@ export class DesktopService {
 		return { rules: this.toolSettings.rules(), effective: this.permissionPolicy(this.conversation(conversationId).id) };
 	}
 
+	setProjectLocalCompute(conversationId: string, blocked: unknown): Promise<PermissionSettings> {
+		return this.serialize(async () => {
+			if (typeof blocked !== "boolean") throw new Error("项目本机推理设置无效。");
+			const conversation = this.conversation(conversationId);
+			const projectPath = this.trustProjectFor(conversation.project);
+			const project = this.store.projects.find((item) => item.path === projectPath);
+			if (!project) throw new Error("项目未打开。");
+			if (Boolean(project.blockLocalCompute) !== blocked) {
+				if (blocked) project.blockLocalCompute = true;
+				else delete project.blockLocalCompute;
+				await this.persist();
+				await this.refreshControls("permissions_changed");
+			}
+			return { rules: this.toolSettings.rules(), effective: this.permissionPolicy(conversation.id) };
+		});
+	}
+
 	upsertPermission(input: PermissionRule): Promise<PermissionSettings> {
 		return this.serialize(async () => {
 			let rule = validatePermissionRule(input);
@@ -4897,7 +5032,7 @@ export class DesktopService {
 	private canDelegateFurther(conversationId: string): boolean {
 		const task = this.store.tasks.find((item) => item.conversationId === conversationId);
 		if (!task) return true;
-		if (task.quarantined || task.isFork) return false;
+		if (task.quarantined || task.isFork || task.scopePaths) return false;
 		const depth = task.delegationDepth ?? 1;
 		const maxDepth = this.store.settings.maxSubagentDepth ?? DEFAULT_MAX_SUBAGENT_DEPTH;
 		return Boolean(task.parentConversationId) && depth < maxDepth;
@@ -4983,9 +5118,13 @@ export class DesktopService {
 			? serverLists.reduce((acc, list) => acc.filter((name) => list.includes(name)))
 			: undefined;
 		const additionalDirs = Array.from(new Set([...(parent?.additionalDirs ?? []), ...(conversation.additionalDirs ?? [])]));
+		const projectPath = this.trustProjectFor(conversation.project);
+		const blockLocalCompute = parent?.blockLocalCompute ||
+			this.store.projects.some((item) => item.path === projectPath && item.blockLocalCompute);
 		return {
 			version: 1,
 			mode,
+			...(blockLocalCompute ? { blockLocalCompute: true } : {}),
 			...(dontAsk ? { dontAsk: true } : {}),
 			...(this.store.settings.sandbox || inherited?.sandbox || parent?.sandbox || this.runtimes.get(conversationId)?.sandboxProfileFile
 				? { sandbox: true }
@@ -4995,6 +5134,7 @@ export class DesktopService {
 			...(allowedMcpServers !== undefined ? { allowedMcpServers } : {}),
 			project: conversation.project,
 			...(additionalDirs.length > 0 ? { additionalDirs } : {}),
+			...(task?.scopePaths ? { readScope: task.scopePaths } : {}),
 		};
 	}
 
@@ -5027,6 +5167,10 @@ export class DesktopService {
 		const write = (runtime.controlWrites ?? Promise.resolve()).catch(() => {}).then(async () => {
 			const policy = this.permissionPolicy(runtime.conversationId);
 			if (runtime.policyFile) await this.atomicJson(runtime.policyFile, policy);
+			if (runtime.escalationFile) {
+				const { plan, review } = this.store.settings.modelRouting ?? {};
+				await this.atomicJson(runtime.escalationFile, [plan, review].filter(Boolean));
+			}
 			runtime.sessionPermissionMode = policy.dontAsk ? "dontAsk" : policy.mode;
 			if (runtime.sandboxProfileFile) {
 				const conversation = this.store.conversations.find((item) => item.id === runtime.conversationId);
@@ -5620,6 +5764,7 @@ export class DesktopService {
 			subagentType: task.subagentType,
 			turn,
 			result: task.result?.text ?? "",
+			readPaths: task.result?.readPaths,
 			truncated: task.result?.truncated,
 			partial: task.status === "completed" && task.result?.partial,
 			error: task.error,
@@ -6243,6 +6388,7 @@ export class DesktopService {
 
 	async close(): Promise<void> {
 		this.closed = true;
+		this.remoteJobs.dispose();
 		this.languages.close();
 		this.agentWatcher?.stop();
 		this.agentWatcher = undefined;
@@ -6534,10 +6680,15 @@ export class DesktopService {
 				// Record the result even when the process is already gone, so reading it later
 				// never needs to start the child again.
 				const text = await this.childFinalText(runtime).catch(() => undefined);
+				const progress = runtime.progress;
+				const readPaths = progress?.taskId === task.id && progress.turn === (task.turn ?? 1)
+					? [...progress.readPaths]
+					: [];
 				if (text !== undefined)
 					task.result = {
 						text: text.slice(0, MAX_AGENT_OUTPUT),
 						truncated: text.length > MAX_AGENT_OUTPUT,
+						...(readPaths.length ? { readPaths } : {}),
 						...(limitStop ? { partial: true } : {}),
 					};
 				else if (limitStop && task.result) task.result.partial = true;
@@ -6645,6 +6796,7 @@ export class DesktopService {
 		}
 		if (runtime.policyFile) await rm(runtime.policyFile, { force: true });
 		if (runtime.sandboxProfileFile) await rm(runtime.sandboxProfileFile, { force: true });
+		if (runtime.escalationFile) await rm(runtime.escalationFile, { force: true });
 		if (runtime.outputStyleFile) await rm(runtime.outputStyleFile, { force: true });
 		await this.releaseRuntimeCost(runtime);
 		if (runtime.costLimitFile) await this.serializeCost(() => rm(runtime.costLimitFile!, { force: true }));
@@ -6915,13 +7067,16 @@ export class DesktopService {
 			delete env.PI_DESKTOP_MIN_BALANCE;
 			delete env.PI_DESKTOP_FALLBACK_MODEL;
 			delete env.PI_DESKTOP_ESCALATION_MODEL;
+			delete env.PI_DESKTOP_ESCALATION_FILE;
 			if (this.store.settings.fallbackModel) env.PI_DESKTOP_FALLBACK_MODEL = JSON.stringify(this.store.settings.fallbackModel);
-			const escalationModel = this.store.settings.modelRouting?.plan ?? this.store.settings.modelRouting?.review;
-			if (escalationModel) env.PI_DESKTOP_ESCALATION_MODEL = JSON.stringify(escalationModel);
 			if (this.store.settings.minBalance) env.PI_DESKTOP_MIN_BALANCE = String(this.store.settings.minBalance);
-			env.PI_DESKTOP_WEB_SEARCH_ENABLED = this.store.settings.webSearchEnabled === false ? "0" : "1";
+			const task = this.store.tasks.find((item) => item.conversationId === conversation.id);
+			const delegated = task?.parentConversationId ? task : undefined;
+			const scopedRead = Boolean(delegated?.scopePaths);
+			const webSearchEnabled = this.store.settings.webSearchEnabled !== false && !scopedRead;
+			env.PI_DESKTOP_WEB_SEARCH_ENABLED = webSearchEnabled ? "1" : "0";
 			delete env.PI_DESKTOP_WEB_SEARCH_KEY;
-			if (this.store.settings.webSearchEnabled !== false) {
+			if (webSearchEnabled) {
 				const rawSearchKey = this.store.webSearchApiKey ?? this.store.keys.deepseek;
 				if (rawSearchKey && this.options.decrypt) {
 					try {
@@ -6934,8 +7089,10 @@ export class DesktopService {
 			}
 			runtime.policyFile = join(this.options.dataDir, `policy-${conversation.id}-${randomBytes(8).toString("hex")}.json`);
 			env.PI_DESKTOP_POLICY_FILE = runtime.policyFile;
-			const task = this.store.tasks.find((item) => item.conversationId === conversation.id);
-			const delegated = task?.parentConversationId ? task : undefined;
+			if (!delegated) {
+				runtime.escalationFile = runtime.policyFile + ".verification";
+				env.PI_DESKTOP_ESCALATION_FILE = runtime.escalationFile;
+			}
 			delete env.PI_DESKTOP_SANDBOX_PROFILE;
 			const shouldConfineWorktreeChild = Boolean(
 				delegated && !delegated.readOnly && delegated.worktreeId && this.store.settings.confineSubagentBash !== false,
@@ -6969,16 +7126,20 @@ export class DesktopService {
 				env.PI_DESKTOP_MAX_COST_FILE = runtime.costLimitFile;
 			}
 			env.PI_DESKTOP_READ_ONLY_CHILD = delegated?.readOnly ? "1" : "0";
+			env.PI_DESKTOP_AGENT_SCOPED = scopedRead ? "1" : "0";
 			env.PI_DESKTOP_FORK_CHILD = delegated?.isFork ? "1" : "0";
 			env.PI_DESKTOP_DELEGATION_DEPTH = String(delegated ? (delegated.delegationDepth ?? 1) : 0);
 			env.PI_DESKTOP_MAX_DEPTH = String(this.store.settings.maxSubagentDepth ?? DEFAULT_MAX_SUBAGENT_DEPTH);
 			env.PI_DESKTOP_AGENT_TEAMS = this.store.settings.agentTeams === true ? "1" : "0";
 			env.PI_DESKTOP_TEAM_MEMBER = delegated?.teamName ? "1" : "0";
 			env.PI_DESKTOP_STRUCTURED_OUTPUT = delegated?.structuredOutputSchema !== undefined ? "1" : "0";
-			const hookMeta = delegated ? await this.hookContextFor(conversation.id) : undefined;
 			env.PI_DESKTOP_HOOK_FASTPATH = "1";
-			env.PI_DESKTOP_HAS_EXTRA_HOOKS = hookMeta?.extraHooks?.length ? "1" : "0";
+			env.PI_DESKTOP_HOOK_HOME = homedir();
 			env.PI_DESKTOP_TRUST_PROJECT = this.trustProjectFor(conversation.project);
+			env.PI_DESKTOP_HOOK_PROJECT_TRUSTED = this.isProjectTrusted(conversation.project) ? "1" : "0";
+			env.PI_DESKTOP_AGENT_HOOK_TYPE = delegated?.subagentType;
+			env.PI_DESKTOP_AGENT_HOOK_PROJECT = delegated?.project;
+			env.PI_DESKTOP_AGENT_HOOK_PROJECT_TRUSTED = delegated ? this.isProjectTrusted(delegated.project) ? "1" : "0" : undefined;
 			if (delegated?.maxTurns) env.PI_DESKTOP_MAX_TURNS = String(delegated.maxTurns);
 			else delete env.PI_DESKTOP_MAX_TURNS;
 			const toolExtension = this.options.toolControlExtension ?? join(runtimeDir, "tool-control-extension.mjs");
@@ -7023,7 +7184,7 @@ export class DesktopService {
 			const trustResources = await detectProjectTrustResources(conversation.project);
 			const trustProject = this.trustProjectFor(conversation.project);
 			const trustDecision = this.store.projectTrust?.[trustProject];
-			if (task?.omitClaudeMd) {
+			if (task?.omitClaudeMd || scopedRead) {
 				env.PI_DESKTOP_MEMORY_ROOT = "";
 				env.PI_DESKTOP_MEMORY_FILE = "";
 				env.PI_DESKTOP_USER_MEMORY_FILE = "";
@@ -7040,13 +7201,14 @@ export class DesktopService {
 				"--session-dir",
 				sessionDir,
 				...(sessionFile ? ["--session", sessionFile] : ["--session-id", conversation.id]),
-				...(task?.omitClaudeMd ? ["--no-context-files"] : []),
+				...(task?.omitClaudeMd || scopedRead ? ["--no-context-files"] : []),
+				...(scopedRead ? ["--no-skills", "--no-prompt-templates"] : []),
 				"--extension",
 				this.options.permissionExtension ?? join(runtimeDir, "permission-extension.mjs"),
 				...(navigationInstalled ? ["--extension", navigationExtension] : []),
 				...(toolsInstalled ? ["--extension", toolExtension] : []),
 				...(trustResources.length ? [trustDecision === "trusted" ? "--approve" : "--no-approve"] : []),
-				...(await this.claudeResourceArgs(conversation.project, trustDecision === "trusted")),
+				...(scopedRead ? [] : await this.claudeResourceArgs(conversation.project, trustDecision === "trusted")),
 				...(this.options.args ?? []),
 			];
 			if (!sessionFile && this.store.settings.defaultModel) {
@@ -7058,11 +7220,15 @@ export class DesktopService {
 			const dynamicPermissions = toolsInstalled && !delegated;
 			if (dynamicPermissions) env.PI_DESKTOP_DYNAMIC_PERMISSION = "1";
 			else delete env.PI_DESKTOP_DYNAMIC_PERMISSION;
-			args.push(...piToolArgs(task, dynamicPermissions ? "ask" : policyMode, { canDelegate: this.canDelegateFurther(conversation.id) }));
+			const toolArgs = piToolArgs(task, dynamicPermissions ? "ask" : policyMode, { canDelegate: this.canDelegateFurther(conversation.id) });
+			// Pi's coding defaults omit ls; add it without replacing the configured tool set.
+			if (!task && toolArgs.length === 0 && !this.options.args?.some((arg) => explicitCliToolFlags.has(arg)))
+				toolArgs.push("--tools", "+ls");
+			args.push(...toolArgs);
 			if (task?.parentConversationId && task.systemPromptFile && !task.quarantined) {
 				// An explicit --append-system-prompt replaces Pi's APPEND_SYSTEM.md discovery;
 				// pass the file Pi would have found first so the child keeps it.
-				const discovered = await appendSystemPromptFile(conversation.project, trustDecision === "trusted", this.store.settings.agentDir ?? this.defaultAgentDir());
+				const discovered = await appendSystemPromptFile(conversation.project, !scopedRead && trustDecision === "trusted", this.store.settings.agentDir ?? this.defaultAgentDir());
 				const own = await stat(task.systemPromptFile).then((info) => info.isFile(), () => false);
 				if (own) args.push(...(discovered ? ["--append-system-prompt", discovered] : []), "--append-system-prompt", task.systemPromptFile);
 			}
@@ -7137,6 +7303,7 @@ export class DesktopService {
 			cost: 0,
 			startedAt: task.statsAtTurnStart?.startedAt ?? now,
 			recentActivities: [],
+			readPaths: new Set(),
 			lastEmitAt: 0,
 			lastPersistAt: now,
 		};
@@ -7310,11 +7477,10 @@ export class DesktopService {
 			].includes(event.type)
 		)
 			runtime.transcriptRevision++;
-		// The extension switched to the fallback model mid-run; refresh the cached model state.
-		if (event.type === "entry_appended" && event.entry.type === "custom_message" && event.entry.customType === "desktop_model_fallback") {
-			runtime.transcriptRevision++;
-			// The run continues on the fallback model, so the primary's error is no longer the outcome.
-			runtime.lastError = undefined;
+		const modelNotice = temporaryModelNotice(event);
+		if (modelNotice) {
+			if (event.type === "entry_appended") runtime.transcriptRevision++;
+			if (modelNotice === FALLBACK_MESSAGE_TYPE) runtime.lastError = undefined;
 			void this.syncState(runtime).catch(() => {});
 		}
 		const task = this.store.tasks.find((item) => item.conversationId === conversationId);
@@ -7374,6 +7540,12 @@ export class DesktopService {
 				p.recentActivities.splice(0, p.recentActivities.length - MAX_RECENT_TASK_ACTIVITIES);
 			}
 			this.scheduleProgressEmit(runtime, task);
+		}
+		if (event.type === "tool_execution_end" && event.toolName === "read" && !event.isError && event.durationMs !== undefined &&
+			task?.parentConversationId && task.readOnly && runtime.progress?.taskId === task.id && runtime.progress.turn === (task.turn ?? 1)) {
+			const path = event.result?.details?.desktopReadPath;
+			if (isTaskReadPath(path) && runtime.progress.readPaths.size < MAX_TASK_READ_PATHS)
+				runtime.progress.readPaths.add(path);
 		}
 		if (event.type === "compaction_start" && runtime.state) runtime.state.isCompacting = true;
 		if (event.type === "compaction_end" && runtime.state) runtime.state.isCompacting = false;
@@ -7787,7 +7959,11 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 		{ promptDir },
 	);
 	const state: StoredState = {
-		projects: value.projects,
+		projects: value.projects.map(({ path, name, blockLocalCompute }) => ({
+			path,
+			name,
+			...(blockLocalCompute === true ? { blockLocalCompute: true } : {}),
+		})),
 		conversations: value.conversations.map((conversation) => ({
 			...conversation,
 			permissionMode: permissionModes.has(conversation.permissionMode) ? conversation.permissionMode : undefined,

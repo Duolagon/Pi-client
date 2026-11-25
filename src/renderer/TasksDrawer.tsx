@@ -8,6 +8,8 @@ import { CheckpointsDialog } from "./CheckpointsDialog.tsx";
 import { SlidingTabList } from "./SegmentedTabs.tsx";
 import { SelectPopover } from "./SelectPopover.tsx";
 import { SurfacePresence } from "./Presence.tsx";
+import { RemoteJobsPanel } from "./RemoteJobsPanel.tsx";
+import type { RemoteJobRecord } from "../remote-job-types.ts";
 import { applyEvent, transcript, type Transcript } from "./messages.ts";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
 import { computeChecklistEta, computeMonitorTiming, computeTodoTiming } from "../task-eta.ts";
@@ -32,7 +34,8 @@ export function TasksDrawer({
 	fail: (error: unknown) => void;
 }) {
 	const { confirm, confirmation } = useConfirmation();
-	const [tab, setTab] = useState<"tasks" | "todos" | "cron" | "workflows" | "teams" | "worktrees">("tasks");
+	const [tab, setTab] = useState<"tasks" | "remote" | "todos" | "cron" | "workflows" | "teams" | "worktrees">("tasks");
+	const [remoteJobs, setRemoteJobs] = useState<RemoteJobRecord[]>([]);
 	const [tasks, setTasks] = useState<DesktopTask[]>([]);
 	const [externalTasks, setExternalTasks] = useState<ExternalTask[]>([]);
 	const [monitors, setMonitors] = useState<MonitorRecord[]>([]);
@@ -173,6 +176,23 @@ export function TasksDrawer({
 			unsubTeams?.();
 		};
 	}, [project, conversationId, agentTeams]);
+
+	useEffect(() => {
+		setRemoteJobs([]);
+		if (!conversationId || !window.pi.remoteJobs) return;
+		let active = true;
+		const load = () => {
+			void window.pi.remoteJobs.list(conversationId).then((jobs) => {
+				if (active) setRemoteJobs(jobs);
+			}).catch((error) => { if (active) fail(error); });
+		};
+		const unsubscribe = window.pi.remoteJobs.onChange(load);
+		load();
+		return () => {
+			active = false;
+			unsubscribe();
+		};
+	}, [conversationId]);
 
 	// A shown child conversation keeps its process; the host may stop idle finished ones otherwise.
 	const viewedConversationId = detailTask?.conversationId;
@@ -367,6 +387,11 @@ export function TasksDrawer({
 					<button type="button" role="tab" aria-selected={tab === "tasks"} onClick={() => setTab("tasks")}>
 						任务与子 Agent ({totalTasks})
 					</button>
+					{conversationId && (
+						<button type="button" role="tab" aria-selected={tab === "remote"} onClick={() => setTab("remote")}>
+							远端任务 ({remoteJobs.length})
+						</button>
+					)}
 					<button type="button" role="tab" aria-selected={tab === "todos"} onClick={() => setTab("todos")}>
 						<ListTodo size={13} /> 任务清单 ({todos.length})
 					</button>
@@ -387,6 +412,9 @@ export function TasksDrawer({
 				</SlidingTabList>
 
 				<div key={tab} className="cc-tab-panel">
+				{tab === "remote" && conversationId && (
+					<RemoteJobsPanel key={conversationId} conversationId={conversationId} jobs={remoteJobs} fail={fail} />
+				)}
 				{tab === "tasks" && (
 					<div className="cc-controls-body">
 						{backgroundCount > 0 && !detailTranscript && !extDetail && (

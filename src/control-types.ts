@@ -38,6 +38,7 @@ export interface DesktopToolsAPI {
 }
 export interface DesktopPermissionsAPI {
 	setMode(conversationId: string, mode: PermissionMode): Promise<Snapshot>;
+	setProjectLocalCompute(conversationId: string, blocked: boolean): Promise<PermissionSettings>;
 	list(conversationId?: string): Promise<PermissionSettings>;
 	upsert(rule: PermissionRule): Promise<PermissionSettings>;
 	remove(id: string): Promise<PermissionSettings>;

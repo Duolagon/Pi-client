@@ -21,6 +21,15 @@ export function exceedsLength(value: string, max: number): boolean {
 export const MAX_AGENT_PROMPT = 512 * KIB;
 /** Bounded child result returned to the parent model and stored on the task. */
 export const MAX_AGENT_OUTPUT = 48 * KIB;
+export const MAX_TASK_READ_PATHS = 24;
+export const MAX_TASK_READ_PATH_LENGTH = 256;
+
+/** Compact project-relative names, with no control characters or ambiguous path segments. */
+export function isTaskReadPath(path: unknown): path is string {
+	return typeof path === "string" && path.length <= MAX_TASK_READ_PATH_LENGTH &&
+		!/[\u0000-\u001f\u007f\\:]/.test(path) &&
+		path.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..");
+}
 /** Serialized background-result notification delivered into a parent session. */
 export const MAX_NOTIFICATION = 512 * KIB;
 /** SendMessage (and its AgentSend alias) / follow-up message to an existing child conversation. */

@@ -78,7 +78,7 @@ test("real Pi tool inventory and toggles persist and deny actual shell and file 
 	let current = data.service;
 	try {
 		const initial = await current.listTools();
-		assert.deepEqual(initial.filter((tool) => tool.source === "builtin" && tool.modelVisible).map((tool) => tool.name).sort(), ["bash", "edit", "read", "write"]);
+		assert.deepEqual(initial.filter((tool) => tool.source === "builtin" && tool.modelVisible).map((tool) => tool.name).sort(), ["bash", "edit", "ls", "read", "write"]);
 		assert.equal(initial.find((tool) => tool.name === "Agent")?.source, "desktop");
 		assert.ok(!(await current.snapshot()).commands.some((command) => command.name.startsWith("desktop-tools-")));
 		await current.setToolEnabled({ name: "bash", enabled: false, scope: "global" });
@@ -115,6 +115,10 @@ test("model Agent delegates to real read-only Pi child and returns its result to
 		assert.equal(child.status, "completed");
 		assert.ok(child.parentToolCallId);
 		assert.ok(assistant(snapshot, "CHILD_EXPLORE_COMPLETE read:ok,write:error,bash:error,Agent:error"));
+		assert.deepEqual(child.result?.readPaths, ["seed.txt"]);
+		const returned = snapshot.messages.find((message) => message.role === "toolResult" && message.toolName === "Agent");
+		assert.ok(returned);
+		assert.match(content(returned), /<read-coverage>Host-observed successful project-relative read calls, which may be partial: \["seed.txt"\]<\/read-coverage>/);
 		const tools = await data.service.listTools(child.conversationId);
 		assert.ok(tools.filter((tool) => tool.modelVisible).every((tool) => ["read", "grep", "find", "ls", "TaskOutput", "TaskStop", "TaskList", "WorktreeList", "TodoGet", "TodoList"].includes(tool.name)));
 		assert.ok(!tools.find((tool) => tool.name === "Agent")?.enabled);
@@ -125,6 +129,7 @@ test("model Agent delegates to real read-only Pi child and returns its result to
 		assert.equal(output.status, "completed");
 		assert.equal(output.parent_tool_call_id, child.parentToolCallId);
 		assert.match(output.output, /read:ok/);
+		assert.deepEqual(output.read_paths, ["seed.txt"]);
 	} finally { await data.service.close(); await data.fixture.cleanup(); }
 });
 
@@ -153,6 +158,7 @@ test("background child result automatically reaches parent once and other models
 		assert.equal(child.runInBackground, true);
 		assert.equal(child.status, "completed");
 		assert.equal(snapshot.messages.filter((message) => "customType" in message && message.customType === "desktop_task_notification").length, 1);
+		assert.match(content(notifications(snapshot)[0]), /<read-coverage>[^\n]+\["seed.txt"\]<\/read-coverage>/);
 		await delay(300);
 		assert.equal((await data.service.snapshot()).messages.filter((message) => "customType" in message && message.customType === "desktop_task_notification").length, 1);
 		await data.service.newConversation();

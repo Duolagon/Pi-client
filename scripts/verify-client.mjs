@@ -20,6 +20,7 @@ const builtExecutable = join(
 // To test the installed copy, pass --executable "/Applications/Pi Desktop.app/Contents/MacOS/Pi Desktop".
 const executable = executableArgument >= 0 ? resolve(process.argv[executableArgument + 1]) : builtExecutable;
 const capture = process.argv.includes("--screenshots");
+const contestScreenshots = process.argv.includes("--contest-screenshots") ? join(repo, "artifacts/contest-handoff") : undefined;
 const testArgs = process.platform === "darwin" ? ["--use-mock-keychain"] : [];
 async function until(check, label) {
 	const deadline = Date.now() + 20000;
@@ -173,6 +174,184 @@ try {
 	};
 	await ready();
 	assert.ok((await snapshot()).models.length >= 2);
+	// Stub only the separate Kaggle browser profile. The app and its conversation
+	// still use the same Chromium and host IPC as the packaged build.
+	const fixtureNotebook = "https://www.kaggle.com/code/fixture/local-notebook/edit";
+	const notebookWithQuery = `${fixtureNotebook}?private-preview=fixture`;
+	await application.evaluate(({ BrowserWindow, Menu, dialog, session }, { notebookWithQuery }) => {
+		const isolated = session.fromPartition("persist:pi-kaggle-browser");
+		const content = `<!doctype html>
+			<title>Fixture Kaggle Notebook</title>
+			<h1>Fixture Kaggle Notebook</h1>
+			<div role="toolbar" aria-label="Notebook actions">
+				<button id="run-all" type="button">Run All</button>
+			</div>
+			<div role="status" id="status">Ready</div>
+			<pre id="output" data-testid="cell-output">GPU fixture complete\nrows: 12</pre>
+			<pre hidden data-testid="cell-output">FIXTURE_HIDDEN_OUTPUT</pre>
+			<input type="password" value="FIXTURE_PASSWORD" />
+			<script>
+				document.getElementById("run-all").addEventListener("click", () => {
+					const status = document.getElementById("status");
+					const runCount = Number(status.dataset.runs ?? 0) + 1;
+					status.dataset.runs = runCount;
+					status.textContent = "Complete";
+					document.getElementById("output").textContent = "FIXTURE_EXECUTED count=" + runCount;
+				});
+			</script>`;
+		isolated.protocol.handle("https", (request) => new Response(
+			request.url === notebookWithQuery ? content : "Unexpected URL",
+			{ status: request.url === notebookWithQuery ? 200 : 404, headers: { "content-type": "text/html; charset=utf-8" } },
+		));
+		globalThis.__piFixtureNativeMenuPopup = Menu.prototype.popup;
+		Menu.prototype.popup = function (options) {
+			const action = this.items.find((item) => item.label === "预览所选文本并附加到 Pi 草稿");
+			if (action?.enabled) action.click(undefined, options.window);
+		};
+		globalThis.__piFixtureNotebookConfirmations = [];
+		const responses = [0, 1, 1];
+		globalThis.__piFixtureShowMessageBox = dialog.showMessageBox;
+		dialog.showMessageBox = async function (...args) {
+			const options = args.at(-1);
+			if (options?.message !== "允许 Pi 在 Kaggle 点击 Run All？") {
+				return globalThis.__piFixtureShowMessageBox.apply(this, args);
+			}
+			const response = responses.shift();
+			if (response === undefined) throw new Error("Unexpected Kaggle Run All approval");
+			globalThis.__piFixtureNotebookConfirmations.push({
+				response,
+				buttons: options.buttons,
+				defaultId: options.defaultId,
+				cancelId: options.cancelId,
+			});
+			if (responses.length === 0) {
+				const notebook = BrowserWindow.getAllWindows().find((entry) => entry.webContents.getURL() === notebookWithQuery);
+				if (!notebook) throw new Error("Missing Notebook fixture for reload-before-confirmation");
+				const reloaded = new Promise((resolve) => notebook.webContents.once("did-finish-load", resolve));
+				notebook.webContents.reload();
+				await reloaded;
+			}
+			return { response, checkboxChecked: false };
+		};
+	}, { notebookWithQuery });
+	const kaggleInput = page.getByRole("textbox", { name: "输入任务", exact: true });
+	await kaggleInput.fill("这段草稿保留");
+	const messageCountBeforeHandoff = (await snapshot()).messages.length;
+	await openMore("打开 Kaggle Notebook");
+	const openKaggle = page.getByRole("dialog", { name: "打开 Kaggle Notebook", exact: true });
+	await openKaggle.waitFor();
+	const notebookLink = openKaggle.getByLabel("Notebook 链接", { exact: true });
+	const openNotebook = openKaggle.getByRole("button", { name: "打开 Notebook", exact: true });
+	await notebookLink.fill("https://www.kaggle.com.example.invalid/code/fixture/local-notebook");
+	await openNotebook.click();
+	await openKaggle.getByRole("alert").filter({ hasText: "请输入 HTTPS Kaggle Notebook 链接" }).waitFor();
+	assert.equal(application.windows().length, 1);
+	await notebookLink.fill(notebookWithQuery);
+	const browserOpened = application.waitForEvent("window");
+	await openNotebook.click();
+	const kagglePage = await browserOpened;
+	const output = kagglePage.locator("#output");
+	await output.waitFor();
+	assert.equal(await kagglePage.evaluate(() => typeof window.pi), "undefined");
+	assert.equal(await kagglePage.evaluate(() => typeof window.require), "undefined");
+	await openKaggle.waitFor({ state: "detached" });
+	await output.selectText();
+	await output.click({ button: "right", position: { x: 20, y: 7 } });
+	const previewHandoff = page.getByRole("dialog", { name: "预览 Kaggle Notebook 输出", exact: true });
+	await previewHandoff.waitFor();
+	assert.equal(await previewHandoff.locator("pre").textContent(), "GPU fixture complete\nrows: 12");
+	assert.equal(await previewHandoff.locator(".kaggle-browser-source").textContent(), fixtureNotebook);
+	assert.equal(await kaggleInput.inputValue(), "这段草稿保留");
+	if (contestScreenshots) {
+		await mkdir(contestScreenshots, { recursive: true });
+		await page.screenshot({ path: join(contestScreenshots, "notebook-output-handoff.png"), scale: "css", animations: "disabled" });
+	}
+	await previewHandoff.getByRole("button", { name: "附加到草稿", exact: true }).click();
+	await previewHandoff.waitFor({ state: "detached" });
+	assert.equal(await kaggleInput.inputValue(), `这段草稿保留\n\n从 Kaggle Notebook 选择的外部文本\n${fixtureNotebook}\n\n> GPU fixture complete\n> rows: 12`);
+	assert.equal((await snapshot()).messages.length, messageCountBeforeHandoff);
+	await kaggleInput.fill("");
+	checks.push("isolated Kaggle browser captures an explicit selection into its originating draft without a model call");
+
+	const notebookConversationId = (await snapshot()).active.id;
+	const confirmations = () => application.evaluate(() => globalThis.__piFixtureNotebookConfirmations);
+	const notebookPrompts = {
+		inspect: "Kaggle Computer Use 验证读取状态和输出",
+		run_all: "Kaggle Computer Use 验证运行全部单元格",
+		status_only: "查看 Kaggle 当前队列状态",
+	};
+	const requestNotebookAction = async (action) => {
+		const before = (await snapshot()).messages.length;
+		await submit(notebookPrompts[action]);
+		await until(async () =>
+			(await snapshot()).messages.slice(before).some((message) => message.role === "assistant" &&
+				message.content?.some((part) => part.type === "text" && part.text.startsWith("Kaggle Computer Use 演示"))),
+		`Kaggle Computer Use ${action} tool result`);
+		await idle();
+		const results = (await snapshot()).messages.slice(before).filter((message) => message.role === "toolResult");
+		assert.equal(results.length, 1);
+		assert.equal(results[0].toolName, "KaggleComputerUse");
+		return results[0];
+	};
+	const readNotebook = await requestNotebookAction("inspect");
+	assert.equal(readNotebook.isError, false);
+	assert.match(JSON.stringify(readNotebook.content), /GPU fixture complete/);
+	assert.match(JSON.stringify(readNotebook.content), /Ready/);
+	assert.doesNotMatch(JSON.stringify(readNotebook.content), /FIXTURE_HIDDEN_OUTPUT|FIXTURE_PASSWORD|private-preview/);
+	const statusOnly = await requestNotebookAction("status_only");
+	assert.equal(statusOnly.isError, true);
+	assert.match(JSON.stringify(statusOnly.content), /仅查询状态/);
+	assert.equal(await kagglePage.locator("#status").getAttribute("data-runs"), null);
+	assert.deepEqual(await confirmations(), []);
+	await requestNotebookAction("run_all");
+	assert.equal(await kagglePage.locator("#status").getAttribute("data-runs"), null);
+	assert.deepEqual(await confirmations(), [
+		{ response: 0, buttons: ["取消", "运行全部单元格"], defaultId: 0, cancelId: 0 },
+	]);
+	const launchNotebook = await requestNotebookAction("run_all");
+	assert.equal(launchNotebook.isError, false);
+	assert.equal(await output.textContent(), "FIXTURE_EXECUTED count=1");
+	assert.deepEqual((await confirmations()).map(({ response }) => response), [0, 1]);
+	const readRun = await requestNotebookAction("inspect");
+	assert.equal(readRun.isError, false);
+	assert.match(JSON.stringify(readRun.content), /FIXTURE_EXECUTED count=1/);
+	if (contestScreenshots)
+		await kagglePage.screenshot({ path: join(contestScreenshots, "notebook-computer-use.png"), scale: "css", animations: "disabled" });
+
+	const staleApproval = await requestNotebookAction("run_all");
+	assert.equal(staleApproval.isError, true);
+	assert.match(JSON.stringify(staleApproval.content), /页面已切换|控件已变化/);
+	assert.equal(await kagglePage.locator("#status").getAttribute("data-runs"), null);
+	assert.equal(await output.textContent(), "GPU fixture complete\nrows: 12");
+	assert.deepEqual((await confirmations()).map(({ response }) => response), [0, 1, 1]);
+
+	await page.getByRole("button", { name: "新建会话", exact: true }).first().click();
+	await until(async () => (await snapshot()).active.id !== notebookConversationId, "isolated notebook permission check conversation");
+	await ready();
+	const unrelatedConversationId = (await snapshot()).active.id;
+	const unrelatedRead = await requestNotebookAction("inspect");
+	assert.equal(unrelatedRead.isError, true);
+	assert.doesNotMatch(JSON.stringify(unrelatedRead.content), /GPU fixture complete|FIXTURE_EXECUTED/);
+	assert.deepEqual((await confirmations()).map(({ response }) => response), [0, 1, 1]);
+	await page.evaluate(async ({ notebookConversationId, unrelatedConversationId }) => {
+		await window.pi.selectConversation(notebookConversationId);
+		await window.pi.removeConversation(unrelatedConversationId);
+	}, { notebookConversationId, unrelatedConversationId });
+	await page.reload();
+	await ready();
+	checks.push("Kaggle Computer Use reads bounded Notebook output, enforces native Run All approval, and rejects stale or cross-conversation access");
+
+	const kaggleWindow = await application.browserWindow(kagglePage);
+	await kaggleWindow.evaluate((browser) => browser.destroy());
+	await kaggleWindow.dispose();
+	await application.evaluate(({ Menu, dialog, session }) => {
+		Menu.prototype.popup = globalThis.__piFixtureNativeMenuPopup;
+		delete globalThis.__piFixtureNativeMenuPopup;
+		dialog.showMessageBox = globalThis.__piFixtureShowMessageBox;
+		delete globalThis.__piFixtureShowMessageBox;
+		delete globalThis.__piFixtureNotebookConfirmations;
+		session.fromPartition("persist:pi-kaggle-browser").protocol.unhandle("https");
+	});
 	const modelControl = selectControl("选择模型");
 	assert.equal(await modelControl.count(), 1);
 	await modelControl.focus();
@@ -808,6 +987,7 @@ try {
 	}, "ui-rule.md created");
 	await page.getByRole("tab", { name: /上下文分析/ }).click();
 	await page.locator('[aria-label="上下文分段占用条"]').waitFor();
+	await page.getByText(/^延迟加载 \d+ 个工具$/).waitFor();
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
 	const keyboardMenu = page.getByRole("button", { name: "更多工具", exact: true });
@@ -1311,12 +1491,18 @@ try {
 	const queried = (await snapshot()).messages.filter((message) => message.role === "toolResult");
 	assert.deepEqual(queried.map((message) => message.isError), [false, true, true]);
 	assert.equal(await readFile(kaggleLog, "utf8"), "status\n");
+	await submit("现在怎么样了");
+	await page.getByText("演示比赛状态查询结束。", { exact: true }).waitFor();
+	await idle();
+	const submissions = (await snapshot()).messages.filter((message) => message.role === "toolResult").slice(-2);
+	assert.deepEqual(submissions.map((message) => message.isError), [false, true]);
+	assert.equal(await readFile(kaggleLog, "utf8"), "status\nsubmissions\n");
 	const remoteApproval = page.getByRole("region", { name: /远端写入/ });
 	await submit("请删除演示云端作业");
 	await page.getByText("演示远端操作结束。", { exact: true }).waitFor();
 	await idle();
 	assert.equal(await remoteApproval.count(), 0);
-	assert.equal(await readFile(kaggleLog, "utf8"), "status\ndelete\n");
+	assert.equal(await readFile(kaggleLog, "utf8"), "status\nsubmissions\ndelete\n");
 
 	await newChat();
 	assert.equal(permissionOf(await snapshot()), "ask");
@@ -1324,12 +1510,51 @@ try {
 	await submit("请删除演示云端作业");
 	await remoteApproval.waitFor();
 	assert.equal(await remoteApproval.getByRole("button", { name: /始终允许/ }).count(), 0);
-	assert.equal(await readFile(kaggleLog, "utf8"), "status\ndelete\n");
+	assert.equal(await readFile(kaggleLog, "utf8"), "status\nsubmissions\ndelete\n");
 	await remoteApproval.getByRole("button", { name: "仅本次执行", exact: true }).click();
 	await page.getByText("演示远端操作结束。", { exact: true }).waitFor();
 	await idle();
-	assert.equal(await readFile(kaggleLog, "utf8"), "status\ndelete\ndelete\n");
+	assert.equal(await readFile(kaggleLog, "utf8"), "status\nsubmissions\ndelete\ndelete\n");
 	checks.push("status-only requests cannot mutate the remote queue; explicit writes follow auto and manual approval modes");
+
+	await openMore("工具与权限");
+	await page.getByRole("tab", { name: /权限规则/ }).click();
+	const localComputeGuard = page.getByRole("checkbox", { name: "拦截已识别的本机推理与评测命令（此项目）" });
+	await localComputeGuard.click();
+	await until(() => localComputeGuard.isChecked(), "local compute preference applied");
+	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
+	const localComputeMarker = join(project, "local-compute-ran");
+	await writeFile(join(project, "llama-server"), '#!/bin/sh\ntouch local-compute-ran\n', { mode: 0o755 });
+	await assert.rejects(page.evaluate(() => window.pi.command({ type: "bash", command: "./llama-server" })), /禁止启动本机推理/);
+	await assert.rejects(access(localComputeMarker));
+	await page.getByRole("button", { name: "后台任务与 Worktree", exact: true }).click();
+	const remoteDrawer = page.getByRole("dialog", { name: "后台任务、子 Agent 与 Worktree (/tasks)", exact: true });
+	await remoteDrawer.getByRole("tab", { name: /远端任务/ }).click();
+	await remoteDrawer.getByLabel("检查 Notebook 配置").setInputFiles({
+		name: "kernel-metadata.json", mimeType: "application/json",
+		buffer: Buffer.from(JSON.stringify({ id: "fixture/notebook-demo", code_file: "eval.ipynb", enable_gpu: "true", enable_internet: "false" })),
+	});
+	await remoteDrawer.getByText(/未指定加速器型号/).waitFor();
+	await remoteDrawer.getByRole("button", { name: "关闭预检结果", exact: true }).click();
+	await remoteDrawer.getByRole("button", { name: "添加跟踪", exact: true }).click();
+	await remoteDrawer.getByLabel("Notebook 标识").fill("fixture/notebook-demo");
+	await remoteDrawer.getByLabel("版本号").fill("3");
+	await remoteDrawer.getByRole("button", { name: "开始跟踪", exact: true }).click();
+	await remoteDrawer.getByText("fixture/notebook-demo · v3", { exact: true }).waitFor();
+	await remoteDrawer.getByText("尚未确认", { exact: true }).waitFor();
+	if (contestScreenshots) {
+		await mkdir(contestScreenshots, { recursive: true });
+		await page.screenshot({ path: join(contestScreenshots, "remote-job-tracking.png") });
+	}
+	await remoteDrawer.getByRole("button", { name: "移除跟踪", exact: true }).click();
+	await remoteDrawer.getByText("此会话暂无远端任务。", { exact: true }).waitFor();
+	await remoteDrawer.getByRole("button", { name: "关闭对话框", exact: true }).click();
+	await openMore("工具与权限");
+	await page.getByRole("tab", { name: /权限规则/ }).click();
+	await localComputeGuard.click();
+	await until(async () => !(await localComputeGuard.isChecked()), "local compute preference restored");
+	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
+	checks.push("project local compute gate and offline remote-job tracking are available through the desktop UI");
 
 	await newChat();
 	await setPermissionMode("auto");
@@ -1405,8 +1630,8 @@ try {
 	const wideTable = page.getByRole("table").filter({ hasText: "本地命令" });
 	await wideTable.waitFor();
 	assert.equal(await wideTable.getByRole("columnheader").count(), 28);
-	const tableGeometry = await wideTable.evaluate(async (table) => {
-		await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+	await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+	const tableGeometry = await wideTable.evaluate((table) => {
 		const scroller = table.parentElement;
 		const transcript = table.closest(".cl-scroll");
 		const previous = scroller.scrollLeft;
@@ -1573,7 +1798,7 @@ try {
 	if (capture)
 		for (const name of ["client-light.png", "client-dark.png"])
 			assert.ok((await stat(join(repo, "docs/screenshots", name))).size < 1024 * 1024);
-	console.log(JSON.stringify({ passed: checks, screenshots: capture ? "docs/screenshots" : undefined }, null, 2));
+	console.log(JSON.stringify({ passed: checks, screenshots: capture ? "docs/screenshots" : undefined, contestScreenshots }, null, 2));
 } catch (error) {
 	const artifacts = join(repo, "artifacts");
 	await mkdir(artifacts, { recursive: true });

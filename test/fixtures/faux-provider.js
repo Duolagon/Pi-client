@@ -60,6 +60,18 @@ export default function desktopTestProvider(pi) {
 				// Never finishes on its own: every response asks for another tool call, so only a
 				// host-enforced turn limit can end the run.
 				response = fauxAssistantMessage(fauxToolCall("read", { path: "seed.txt" }), { stopReason: "toolUse" });
+			} else if (text === "directory-recovery-probe") {
+				if (results.length === 0) {
+					response = fauxAssistantMessage(fauxToolCall("read", { path: "." }), { stopReason: "toolUse" });
+				} else if (results.length === 1) {
+					const text = results[0].content.map((block) => block.text ?? "").join("\n");
+					response = text.includes("Use ls with the same path")
+						? fauxAssistantMessage(fauxToolCall("ls", { path: "." }), { stopReason: "toolUse" })
+						: fauxAssistantMessage("DIRECTORY_RECOVERY_MISSING");
+				} else {
+					const listing = results[1].content.map((block) => block.text ?? "").join("\n");
+					response = fauxAssistantMessage(!results[1].isError && listing.includes("seed.txt") ? "DIRECTORY_RECOVERY_OK" : "DIRECTORY_RECOVERY_FAILED");
+				}
 			} else if (text.includes("read-write-bash")) {
 				const steps = [
 					fauxToolCall("read", { path: "seed.txt" }),

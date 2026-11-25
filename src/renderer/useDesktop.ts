@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Command, DesktopAPI, DesktopEvent, DesktopPromptResult, Snapshot, RpcExtensionUIRequest, BashResult, SessionActivity } from "../shared.ts";
 import { emptyDraft, mergeDrafts, type ComposerAttachment, type ComposerDraft, type Prompt } from "../composer-draft.ts";
+import { temporaryModelNotice } from "../model-routing.ts";
 import { readDraft, writeDraft } from "./draft-storage.ts";
 import { phaseFromEvent, phaseFromSnapshot, type RunPhase } from "./run-status.ts";
 import { applyEvent, transcript, type Transcript } from "./messages.ts";
@@ -239,9 +240,7 @@ export function useDesktop(api: DesktopAPI) {
 					: previous,
 			);
 		if (event.type === "tool_execution_end") setRevision((value) => value + 1);
-		// The fallback notice is committed outside message events, and the model changed with it.
-		if (event.type === "entry_appended" && event.entry.type === "custom_message" && event.entry.customType === "desktop_model_fallback")
-			void refresh();
+			if (temporaryModelNotice(event)) void refresh();
 		setHistory((state) => applyEvent(state, event));
 	};
 	useEffect(() => {

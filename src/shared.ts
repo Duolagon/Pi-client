@@ -29,6 +29,7 @@ export type { GoalState } from "./goal-mode.ts";
 import type { PreviewCheck } from "./preview-check.ts";
 import type { TodoCreateInput, TodoEvent, TodoRecord, TodoUpdateInput } from "./todo-types.ts";
 import type { MonitorEvent, MonitorRecord } from "./monitor-types.ts";
+import type { RemoteJobRecord, RemoteJobTrackInput } from "./remote-job-types.ts";
 import type { CronCreateInput, CronEvent, CronJobRecord } from "./cron-types.ts";
 import type { TeamEvent, TeamRecord } from "./team-types.ts";
 import type { WorkflowApprovalDecision, WorkflowEvent, WorkflowRecord, WorkflowRunInput } from "./workflow-types.ts";
@@ -242,6 +243,7 @@ export interface ConversationMetaPatch {
 export interface Project {
 	path: string;
 	name: string;
+	blockLocalCompute?: boolean;
 }
 export interface Settings {
 	agentDir?: string;
@@ -716,6 +718,14 @@ export interface DesktopAPI {
 	worktrees: DesktopWorktreeAPI;
 	todos: DesktopTodosAPI;
 	monitors: DesktopMonitorsAPI;
+	remoteJobs: {
+		list(conversationId: string): Promise<RemoteJobRecord[]>;
+		track(conversationId: string, input: Omit<Extract<RemoteJobTrackInput, { kind: "kaggle-notebook" }>, "conversationId" | "projectDir"> |
+			Omit<Extract<RemoteJobTrackInput, { kind: "kaggle-submission" }>, "conversationId" | "projectDir">): Promise<RemoteJobRecord>;
+		refresh(conversationId: string, id: string): Promise<RemoteJobRecord | undefined>;
+		untrack(conversationId: string, id: string): Promise<boolean>;
+		onChange(listener: () => void): () => void;
+	};
 	cron: DesktopCronAPI;
 	teams: DesktopTeamsAPI;
 	workflow: DesktopWorkflowAPI;
@@ -765,6 +775,10 @@ export interface DesktopAPI {
 	/** True when something answers on the local preview address. */
 	probePreview(url: string): Promise<boolean>;
 	defaultPreviewUrl(conversationId: string): Promise<string>;
+	kaggleBrowser: {
+		open(input: { conversationId: string; url: string }): Promise<void>;
+		onSelection(listener: (selection: import("./kaggle-browser.ts").KaggleSelection) => void): () => void;
+	};
 	inspectCode(conversationId: string, path: string, at?: CodePosition): Promise<CodeIntelligence>;
 	sandboxStatus(): Promise<SandboxStatus>;
 	/** Local environment diagnosis (/doctor); no network or model requests. */

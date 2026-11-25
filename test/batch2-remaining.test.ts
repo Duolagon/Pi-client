@@ -199,6 +199,21 @@ test("#14 WebSearch: DeepSeek Search API client and DeepSeek built-in search pay
 	assert.equal(strictPayload.tools.some((t) => t.type === "deepseek_web_search"), true);
 	assert.equal(strictPayload.tools.some((t) => t.function && "strict" in t.function), false);
 	assert.equal(strictPayload.tools[0].function?.name, "read");
+	assert.deepEqual(strictPayload.tools.at(-1), { type: "deepseek_web_search" });
+
+	const webSearch = { type: "function", function: { name: "WebSearch" } };
+	const read = { type: "function", function: { name: "read" } };
+	const nonThinking = { thinking: { type: "disabled" }, tools: [read, webSearch] };
+	assert.deepEqual(injectDeepSeekBuiltinSearch(nonThinking), nonThinking);
+	assert.deepEqual(injectDeepSeekBuiltinSearch({
+		...nonThinking, tools: [read, webSearch, { type: "deepseek_web_search" }],
+	}), nonThinking);
+	assert.deepEqual(injectDeepSeekBuiltinSearch({ ...nonThinking, tools: [webSearch] }), {
+		...nonThinking, tools: [{ type: "deepseek_web_search" }],
+	});
+	assert.deepEqual(injectDeepSeekBuiltinSearch({ tools: [{ name: "WebSearch" }] }, "anthropic-messages"), {
+		tools: [{ type: "deepseek_web_search", name: "deepseek_web_search" }],
+	});
 
 	let seenAuth = "";
 	let seenUrl = "";

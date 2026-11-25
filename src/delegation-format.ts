@@ -1,4 +1,4 @@
-import { MAX_AGENT_OUTPUT, MAX_NOTIFICATION, truncateText } from "./delegation-limits.ts";
+import { isTaskReadPath, MAX_AGENT_OUTPUT, MAX_NOTIFICATION, MAX_TASK_READ_PATHS, truncateText } from "./delegation-limits.ts";
 import type { DesktopTask, TaskProgress } from "./task-types.ts";
 import type { DelegatedTaskResult } from "./delegation-types.ts";
 
@@ -24,6 +24,7 @@ export interface TaskNotificationInput {
 	executor?: string;
 	turn: number;
 	result: string;
+	readPaths?: string[];
 	/** The stored result was already cut before it reached the formatter. */
 	truncated?: boolean;
 	/** maxTurns stopped the child; the result is its last partial answer. */
@@ -47,6 +48,7 @@ export interface TaskNotificationDetails {
 	executor?: string;
 	turn: number;
 	result: string;
+	read_paths?: string[];
 	truncated: boolean;
 	partial?: true;
 	error?: string;
@@ -66,7 +68,7 @@ export interface EscapedOutput {
 
 // Envelope, harness and role tags. Escaping the `<` keeps the text readable while making
 // it inert: the child cannot close <result>, open a new <status> or forge a reminder.
-const markupTag = /<(\s*\/?\s*)(system[\w-]*|task-notification|task-id|tool-use-id|status|summary|result|usage|subagent_tokens|tool_uses|duration_ms|human|assistant|user|function_calls|invoke|parameter)(?=[\s>/]|$)/gi;
+const markupTag = /<(\s*\/?\s*)(system[\w-]*|task-notification|task-id|tool-use-id|status|summary|result|read-coverage|usage|subagent_tokens|tool_uses|duration_ms|human|assistant|user|function_calls|invoke|parameter)(?=[\s>/]|$)/gi;
 const harnessTag = /<\s*\/?\s*(system[\w-]*|task-notification)(?=[\s>/]|$)/i;
 const rolePrefix = /^([ \t>]*)(Human|Assistant|User|System)([ \t]*):/gim;
 const instructionPatterns: Array<[string, RegExp]> = [
@@ -111,6 +113,11 @@ function oneLine(value: string, max: number): string {
 	return escapeMarkup(truncateText(value.replace(/\s+/g, " ").trim(), max));
 }
 
+function formatReadCoverage(paths: string[] | undefined): string {
+	if (!paths?.length) return "";
+	return `<read-coverage>Host-observed successful project-relative read calls, which may be partial: ${escapeMarkup(JSON.stringify(paths))}</read-coverage>`;
+}
+
 /** Map a terminal task to the native notification status. */
 export function notificationStatus(task: Pick<DesktopTask, "status">): TaskNotificationStatus {
 	if (task.status === "completed") return "completed";
@@ -141,6 +148,7 @@ export function formatTaskNotification(input: TaskNotificationInput): { content:
 		...(validCount(input.durationMs) ? [`duration_ms: ${Math.round(input.durationMs!)}`] : []),
 	];
 	const usage = usageLines.length ? `<usage>${usageLines.join("\n")}</usage>\n` : "";
+	const readPaths = input.readPaths?.slice(0, MAX_TASK_READ_PATHS).filter(isTaskReadPath);
 	const lines = [
 		TASK_NOTIFICATION_HEADER,
 		"<task-notification>",
@@ -148,6 +156,7 @@ export function formatTaskNotification(input: TaskNotificationInput): { content:
 		...(input.toolUseId ? [`<tool-use-id>${escapeMarkup(input.toolUseId)}</tool-use-id>`] : []),
 		`<status>${input.status}</status>`,
 		`<summary>${summary}</summary>`,
+		...(readPaths?.length ? [formatReadCoverage(readPaths)] : []),
 		`<result>\n${escaped.text || "(Subagent returned no output.)"}\n</result>`,
 	];
 	let content = `${lines.join("\n")}\n${usage}</task-notification>`;
@@ -161,6 +170,7 @@ export function formatTaskNotification(input: TaskNotificationInput): { content:
 		...(input.executor ? { executor: input.executor } : {}),
 		turn: input.turn,
 		result: truncateText(input.result, MAX_AGENT_OUTPUT),
+		...(readPaths?.length ? { read_paths: readPaths } : {}),
 		truncated: escaped.truncated,
 		...(input.partial ? { partial: true as const } : {}),
 		...(input.error ? { error: truncateText(input.error, 4000) } : {}),
@@ -228,7 +238,8 @@ export function formatAgentToolText(
 	// Explore and Plan are one-shot; every other finished agent can be continued.
 	const resumable = result.subagent_type !== "Explore" && result.subagent_type !== "Plan";
 	const hint = resumable ? ` (use SendMessage with to: ${id} to continue this agent)` : "";
-	return `${header}${report}\n\nagentId: ${id}${handle}${hint}${worktree}${usage}${warnings}`;
+	const readCoverage = result.read_paths?.length ? `\n${formatReadCoverage(result.read_paths)}` : "";
+	return `${header}${report}\n\nagentId: ${id}${handle}${hint}${worktree}${readCoverage}${usage}${warnings}`;
 }
 
 /** Format compact token count, e.g. `23.4k` or `850`. */

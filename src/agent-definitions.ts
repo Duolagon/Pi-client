@@ -1,5 +1,5 @@
 import { watch, type FSWatcher } from "node:fs";
-import { lstat, readFile, readdir, realpath, rm } from "node:fs/promises";
+import { lstat, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import {
@@ -106,8 +106,9 @@ const builtins: AgentDefinition[] = [
 		prompt: [
 			"You are a file search specialist subagent. You excel at navigating codebases: finding files with glob patterns, searching contents with regular expressions and reading files to answer a question.",
 			readOnlyRules,
+			"Work within the assigned paths. Use ls or find for file inventory. Read file contents when they are needed to answer the task.",
 			'Match the thoroughness the caller asked for: "quick" means a few targeted searches; "medium" means checking the main locations and naming conventions; "very thorough" means searching every plausible location and alternative name before concluding. Default to medium.',
-			"Run independent searches in parallel when you can. Return absolute file paths with line references; do not paste whole files.",
+			"Run independent searches in parallel when you can. Report concrete findings with file paths and line references, impact, inspected files, and any remaining evidence gaps. Quote only the lines needed to support each finding.",
 			reportFormat,
 		].join("\n\n"),
 		tools: ["read", "grep", "find", "ls"],
@@ -563,9 +564,12 @@ async function projectAncestors(project: string): Promise<string[]> {
 /** Read and write project/user agent definitions without following paths outside the managed folders. */
 export class AgentRegistry {
 	private agentDir: () => string;
+	private homeDir: () => string;
+	private definitionCache = new Map<string, { version: string; definition: AgentDefinition | undefined }>();
 
-	constructor(options: { agentDir: () => string }) {
+	constructor(options: { agentDir: () => string; homeDir?: () => string }) {
 		this.agentDir = options.agentDir;
+		this.homeDir = options.homeDir ?? homedir;
 	}
 
 	private async directories(project: string): Promise<AgentDirectory[]> {
@@ -574,7 +578,7 @@ export class AgentRegistry {
 		// agentDir/agents < ~/.claude/agents < project .pi/agents < project .claude/agents (closest to cwd wins).
 		return [
 			{ scope: "user", base: this.agentDir(), segments: ["agents"], removable: true },
-			{ scope: "user", base: join(homedir(), ".claude"), segments: ["agents"], removable: false },
+			{ scope: "user", base: join(this.homeDir(), ".claude"), segments: ["agents"], removable: false },
 			...ancestors.map((base) => ({ scope: "project" as const, base, segments: [".pi", "agents"], removable: base === project })),
 			...ancestors.map((base) => ({ scope: "project" as const, base, segments: [".claude", "agents"], removable: false })),
 		];
@@ -639,8 +643,9 @@ export class AgentRegistry {
 		};
 	}
 
-	async list(project: string, trusted = true): Promise<AgentDefinition[]> {
+	async list(project: string, trusted = true, cacheDefinitions = false): Promise<AgentDefinition[]> {
 		const merged = new Map<string, AgentDefinition>(builtins.map((agent) => [agent.name, agent]));
+		const seen = new Set<string>();
 		for (const descriptor of await this.directories(project)) {
 			if (!trusted && descriptor.scope === "project") continue;
 			const root = await managedDirectory(descriptor.base, descriptor.segments, false);
@@ -653,13 +658,18 @@ export class AgentRegistry {
 				try {
 					const actual = await realpath(file);
 					if (!inside(root, actual)) continue;
-					const definition = parseAgent(await readFile(actual, "utf8"), actual, descriptor.scope, descriptor.removable);
+					const definition = cacheDefinitions
+						? await this.readCachedDefinition(actual, descriptor, seen)
+						: parseAgent(await readFile(actual, "utf8"), actual, descriptor.scope, descriptor.removable);
 					if (definition) merged.set(definition.name, definition);
 				} catch (error) {
 					if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
 					// One malformed or unreadable agent must not hide the rest.
 				}
 			}
+		}
+		if (cacheDefinitions) {
+			for (const key of this.definitionCache.keys()) if (!seen.has(key)) this.definitionCache.delete(key);
 		}
 		return [...merged.values()].sort((left, right) => {
 			if (left.scope === "builtin" && right.scope !== "builtin") return -1;
@@ -669,8 +679,20 @@ export class AgentRegistry {
 		});
 	}
 
+	private async readCachedDefinition(file: string, descriptor: AgentDirectory, seen: Set<string>): Promise<AgentDefinition | undefined> {
+		const info = await stat(file, { bigint: true });
+		const key = JSON.stringify([file, descriptor.scope, descriptor.removable]);
+		const version = [info.dev, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].join(":");
+		seen.add(key);
+		const cached = this.definitionCache.get(key);
+		if (cached?.version === version) return cached.definition;
+		const definition = parseAgent(await readFile(file, "utf8"), file, descriptor.scope, descriptor.removable);
+		this.definitionCache.set(key, { version, definition });
+		return definition;
+	}
+
 	async resolve(project: string, name: string, trusted = true): Promise<AgentDefinition | undefined> {
-		const agents = await this.list(project, trusted);
+		const agents = await this.list(project, trusted, true);
 		return agents.find((agent) => agent.name === name);
 	}
 

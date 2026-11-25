@@ -92,6 +92,11 @@ export default function uiProvider(pi) {
 						description: "等待工具折叠验证",
 						timeout: 20,
 					}), { stopReason: "toolUse" });
+			} else if (prompt.startsWith("Kaggle Computer Use 验证") || prompt === "查看 Kaggle 当前队列状态") {
+				const action = prompt.endsWith("读取状态和输出") ? "inspect" : "run_all";
+				response = results.length
+					? fauxAssistantMessage(`Kaggle Computer Use 演示${results[0].isError ? "已拦截" : "已完成"}。`)
+					: fauxAssistantMessage(fauxToolCall("KaggleComputerUse", { action }), { stopReason: "toolUse" });
 			} else if (prompt === "为啥要排队，现在在跑什么") {
 				const commands = [
 					".venv/bin/kaggle kernels status research/demo",
@@ -101,6 +106,14 @@ export default function uiProvider(pi) {
 				response = results.length < commands.length
 					? fauxAssistantMessage(fauxToolCall("bash", { command: commands[results.length] }), { stopReason: "toolUse" })
 					: fauxAssistantMessage("演示队列状态查询结束。");
+			} else if (prompt === "现在怎么样了") {
+				const commands = [
+					".venv/bin/kaggle competitions submissions -c demo",
+					".venv/bin/kaggle competitions submit -c demo -f submission.zip",
+				];
+				response = results.length < commands.length
+					? fauxAssistantMessage(fauxToolCall("bash", { command: commands[results.length] }), { stopReason: "toolUse" })
+					: fauxAssistantMessage("演示比赛状态查询结束。");
 			} else if (prompt === "请删除演示云端作业") {
 				response = results.length ? fauxAssistantMessage("演示远端操作结束。")
 					: fauxAssistantMessage(fauxToolCall("bash", { command: ".venv/bin/kaggle kernels delete -k research/demo" }), { stopReason: "toolUse" });

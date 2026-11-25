@@ -418,13 +418,16 @@ const IGNORED_OUTLINE_DIRS = new Set([
 	"target", "vendor", "__pycache__", ".venv", "venv", "coverage", ".cache",
 ]);
 
-function extractOutlineSymbols(text: string, ext: string): WorkspaceOutlineSymbol[] {
+// Mask comments and strings while keeping each declaration on its original source line.
+const outlinePythonTrivia = /"""[\s\S]*?(?:"""|$)|'''[\s\S]*?(?:'''|$)|"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|#[^\r\n]*/g;
+const outlineBraceTrivia = /\/\*[\s\S]*?(?:\*\/|$)|\/\/[^\r\n]*|\x60(?:\\[\s\S]|[^\x60\\])*(?:\x60|$)|"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'/g;
+
+function extractOutlineSymbols(text: string, ext: string): { symbols: WorkspaceOutlineSymbol[]; truncated: boolean } {
 	const symbols: WorkspaceOutlineSymbol[] = [];
 	const seen = new Set<string>();
-	const lines = text.split(/\r?\n/);
-	for (let i = 0; i < lines.length && symbols.length < 40; i++) {
+	const lines = text.replace(ext === ".py" ? outlinePythonTrivia : outlineBraceTrivia, (token) => token.replace(/[^\r\n]/g, " ")).split(/\r?\n/);
+	for (let i = 0; i < lines.length; i++) {
 		const raw = lines[i]!;
-		if (raw.length > 400) continue;
 		let match: RegExpExecArray | null = null;
 		let kind = "";
 		let name = "";
@@ -435,25 +438,25 @@ function extractOutlineSymbols(text: string, ext: string): WorkspaceOutlineSymbo
 			match = /^(func|type)\s+(?:\([^)]+\)\s*)?([A-Za-z_]\w*)/.exec(raw);
 			if (match) { kind = match[1]!; name = match[2]!; }
 		} else if (ext === ".rs") {
-			match = /^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(fn|struct|enum|trait|mod|type)\s+([A-Za-z_]\w*)/.exec(raw);
+			match = /^(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const)\s+)*(fn|struct|enum|trait|mod|type)\s+([A-Za-z_]\w*)/.exec(raw);
 			if (match) { kind = match[1]!; name = match[2]!; }
 		} else {
-			match = /^export\s+(?:default\s+)?(?:async\s+)?(function|class|interface|type|const|let|enum)\s+([A-Za-z_$][\w$]*)/.exec(raw)
-				?? /^(?:async\s+)?(function|class|interface)\s+([A-Za-z_$][\w$]*)/.exec(raw);
+			match = /^export\s+(?:(?:default|declare|abstract|async)\s+)*(function|class|interface|type|const|let|var|enum|namespace)\s+([A-Za-z_$][\w$]*)/.exec(raw)
+				?? /^(?:(?:declare|abstract|async)\s+)*(function|class|interface)\s+([A-Za-z_$][\w$]*)/.exec(raw);
 			if (match) { kind = match[1]!; name = match[2]!; }
 		}
 		if (name && !seen.has(`${kind}:${name}`)) {
+			if (symbols.length === 40) return { symbols, truncated: true };
 			seen.add(`${kind}:${name}`);
 			symbols.push({ line: i + 1, kind, name });
 		}
 	}
-	return symbols;
+	return { symbols, truncated: false };
 }
 
 /**
- * Fast, zero-dependency RepoMap / directory symbol skeleton builder.
- * Maps up to `maxFiles` source files inside `targetPath` without spawning an external LSP process,
- * gated per-file by `allowFile` so read permissions and sandbox rules are strictly enforced.
+ * Build a bounded source outline without spawning an external language server.
+ * The file limit applies to readable files after permission checks.
  */
 export async function buildWorkspaceOutline(
 	project: string,
@@ -469,52 +472,68 @@ export async function buildWorkspaceOutline(
 		throw new Error("路径超出项目目录。");
 	}
 	const targetStat = await stat(resolvedTarget);
-	const candidateFiles: string[] = [];
+	const outlines: WorkspaceFileOutline[] = [];
+	let inspected = 0;
 	let truncated = false;
 
-	if (targetStat.isFile()) {
-		candidateFiles.push(resolvedTarget);
-	} else if (targetStat.isDirectory()) {
+	const inspectFile = async (file: string): Promise<boolean> => {
+		signal?.throwIfAborted();
+		if (outlines.length >= maxFiles || inspected >= 1_000) {
+			truncated = true;
+			return false;
+		}
+		inspected++;
+		const realFile = await realpath(file).catch(() => undefined);
+		if (!realFile) {
+			truncated = true;
+			return true;
+		}
+		const path = within(root, realFile);
+		if (!path || path.split("/").some(ignoredOutlineEntry)) return true;
+		if (allowFile && !(await allowFile(path))) return true;
+		const info = await stat(realFile).catch(() => undefined);
+		if (!info?.isFile() || info.size > 256 * 1024) {
+			truncated = true;
+			return true;
+		}
+		const contents = await readFile(realFile, { encoding: "utf8", signal }).catch(() => undefined);
+		signal?.throwIfAborted();
+		if (contents === undefined) {
+			truncated = true;
+			return true;
+		}
+		const { symbols, truncated: limitedSymbols } = extractOutlineSymbols(contents, extname(realFile).toLowerCase());
+		truncated ||= limitedSymbols;
+		outlines.push({ path, symbols });
+		return true;
+	};
+	const label = within(root, resolvedTarget) ?? ".";
+	if (targetStat.isFile() && OUTLINE_EXTENSIONS.has(extname(resolvedTarget).toLowerCase())) {
+		await inspectFile(resolvedTarget);
+	} else if (targetStat.isDirectory() && (label === "." || !label.split("/").some(ignoredOutlineEntry))) {
 		const queue: string[] = [resolvedTarget];
-		for (let qIdx = 0; qIdx < queue.length && candidateFiles.length < maxFiles; qIdx++) {
+		directories: for (const dir of queue) {
 			signal?.throwIfAborted();
-			const dir = queue[qIdx]!;
-			const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+			const entries = await readdir(dir, { withFileTypes: true }).catch(() => undefined);
+			if (!entries) {
+				truncated = true;
+				continue;
+			}
 			entries.sort((a, b) => a.name.localeCompare(b.name));
 			for (const entry of entries) {
-				if (entry.name.startsWith(".") || IGNORED_OUTLINE_DIRS.has(entry.name)) continue;
+				if (ignoredOutlineEntry(entry.name)) continue;
 				const full = join(dir, entry.name);
 				if (entry.isDirectory()) {
 					if (queue.length < 200) queue.push(full);
+					else truncated = true;
 				} else if (entry.isFile() && OUTLINE_EXTENSIONS.has(extname(entry.name).toLowerCase())) {
-					if (candidateFiles.length >= maxFiles) {
-						truncated = true;
-						break;
-					}
-					candidateFiles.push(full);
+					if (!await inspectFile(full)) break directories;
 				}
 			}
 		}
 	}
 
-	const outlines: WorkspaceFileOutline[] = [];
-	for (const file of candidateFiles) {
-		signal?.throwIfAborted();
-		const realFile = await realpath(file).catch(() => undefined);
-		if (!realFile || (realFile !== root && !within(root, realFile))) continue;
-		const rel = within(root, realFile);
-		if (!rel) continue;
-		if (allowFile && !(await allowFile(rel))) continue;
-		const info = await stat(realFile).catch(() => undefined);
-		if (!info?.isFile() || info.size > 256 * 1024) continue;
-		const content = await readFile(realFile, { encoding: "utf8", signal }).catch(() => "");
-		if (!content) continue;
-		const symbols = extractOutlineSymbols(content, extname(realFile).toLowerCase());
-		outlines.push({ path: rel, symbols });
-	}
-
-	const label = within(root, resolvedTarget) ?? ".";
-	const lines: string[] = [`[Workspace Symbol Outline (${label}) — ${outlines.length} file(s)${truncated ? ", truncated" : ""}]:`];
+	const lines: string[] = [""];
 	let charBudget = 20_000;
 	for (const item of outlines) {
 		const symSummary = item.symbols.length
@@ -529,10 +548,15 @@ export async function buildWorkspaceOutline(
 		lines.push(row);
 		charBudget -= row.length + 1;
 	}
+	lines[0] = `[Workspace Symbol Outline (${label}) — ${outlines.length} file(s)${truncated ? ", truncated" : ""}]:`;
 	return {
 		files: outlines,
 		scannedFiles: outlines.length,
 		truncated,
 		formatted: lines.join("\n"),
 	};
+}
+
+function ignoredOutlineEntry(name: string): boolean {
+	return name.startsWith(".") || IGNORED_OUTLINE_DIRS.has(name);
 }

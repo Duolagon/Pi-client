@@ -4,11 +4,14 @@ import type { ModelToolResult, ToolUsage } from "./delegation-types.ts";
 import { MAX_BACKGROUND_SHELL_TIMEOUT_SECONDS } from "./monitor-types.ts";
 import { todoStatuses } from "./todo-types.ts";
 import { teamMessageTypes } from "./team-types.ts";
+import { validateAgentScopePaths } from "./agent-read-scope.ts";
 
 /** Values accepted by the Agent tool's `model` parameter. */
 export const agentModelValues = ["sonnet", "opus", "haiku", "fable", "inherit"] as const;
 /** `remote` is accepted by the schema only so the host can explain that it is unsupported. */
 export const agentIsolationValues = ["worktree", "shared", "remote"] as const;
+export const kaggleComputerUseActions = ["inspect", "run_all"] as const;
+export type KaggleComputerUseAction = (typeof kaggleComputerUseActions)[number];
 
 export const desktopModelToolNames = [
 	"Agent", "SendMessage", "AgentSend", "AgentExecutors", "TaskOutput", "TaskStop", "TaskList",
@@ -17,13 +20,13 @@ export const desktopModelToolNames = [
 	"Monitor", "BashOutput", "KillShell",
 	"ScheduleWakeup", "CronCreate", "CronList", "CronDelete",
 	"TeamCreate", "TeamDelete",
-	"WorkflowRun", "StructuredOutput", "LSP", "PreviewCheck", "ToolSearch",
+	"WorkflowRun", "StructuredOutput", "LSP", "PreviewCheck", "KaggleComputerUse", "ToolSearch",
 ] as const;
 export type DesktopModelToolName = (typeof desktopModelToolNames)[number];
 
 /**
  * Specialist desktop tools whose full JSON schemas are omitted from initial model requests
- * to cut prompt-token overhead and tool dilution, while staying 100% callable and loadable via `ToolSearch`.
+ * to reduce declaration size. Enabled specialists remain executable and can be loaded via `ToolSearch`.
  */
 export const deferredSpecialistTools = [
 	"AgentExecutors",
@@ -32,6 +35,7 @@ export const deferredSpecialistTools = [
 	"ScheduleWakeup", "CronCreate", "CronList", "CronDelete",
 	"WorkflowRun",
 	"PreviewCheck",
+	"KaggleComputerUse",
 ] as const satisfies readonly DesktopModelToolName[];
 /**
  * Host calls that are not separate model tools. `BashBackground` is the `bash` tool's
@@ -56,6 +60,8 @@ export interface DesktopToolInfo {
 	enabled: boolean;
 	/** Whether Pi currently declares this tool directly to the model. */
 	modelVisible: boolean;
+	/** Enabled for discovery but its declaration is currently omitted. */
+	deferred?: true;
 	/** Explicit desktop setting; absent when the existing Pi configuration governs the tool. */
 	override?: boolean;
 }
@@ -251,7 +257,7 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 	const input = object(value);
 	const allowed: Record<HostToolName, string[]> = {
 		// `mode` and `team_name` are the only leniently accepted fields; they are ignored.
-		Agent: ["description", "prompt", "subagent_type", "model", "run_in_background", "name", "isolation", "worktree_id", "executor", "fork", "mode", "team_name"],
+		Agent: ["description", "prompt", "subagent_type", "model", "run_in_background", "name", "isolation", "worktree_id", "executor", "fork", "mode", "team_name", "scope_paths"],
 		SendMessage: ["to", "message", "summary", "run_in_background", "message_type", "request_id", "approve"],
 		AgentSend: ["task_id", "message", "run_in_background"], AgentExecutors: [],
 		TaskOutput: ["task_id", "block", "timeout"], TaskStop: ["task_id"], TaskList: [],
@@ -274,6 +280,7 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 		StructuredOutput: ["data"],
 		LSP: ["operation", "filePath", "line", "character", "silent"],
 		PreviewCheck: ["action", "name", "server_id", "url", "mobile", "actions", "selector", "read_dom", "screenshot", "wait_ms"],
+		KaggleComputerUse: ["action"],
 		ToolSearch: ["query", "max_results"],
 	};
 	if (Object.keys(input).some((key) => !allowed[tool].includes(key))) throw new Error("Unknown tool input field");
@@ -292,6 +299,7 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 		if (input.mode !== undefined) text(input.mode, "mode", 100);
 		if (input.team_name !== undefined) text(input.team_name, "team_name", 200);
 		if (input.worktree_id !== undefined) text(input.worktree_id, "worktree_id", 200);
+		if (input.scope_paths !== undefined) validateAgentScopePaths(input.scope_paths);
 	} else if (tool === "SendMessage") {
 		text(input.to, "to", MAX_SEND_TARGET); text(input.message, "message", MAX_SEND_MESSAGE);
 		if (input.summary !== undefined) text(input.summary, "summary", MAX_SEND_SUMMARY);
@@ -424,6 +432,9 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 			throw new Error("LSP character must be a positive integer");
 		}
 		optionalBoolean(input.silent, "silent");
+	} else if (tool === "KaggleComputerUse") {
+		if (input.action !== "inspect" && input.action !== "run_all")
+			throw new Error("KaggleComputerUse action must be inspect or run_all");
 	} else if (tool === "ToolSearch") {
 		text(input.query, "query", 500);
 		if (input.max_results !== undefined && (!Number.isSafeInteger(input.max_results) || Number(input.max_results) < 1 || Number(input.max_results) > 30)) {

@@ -36,6 +36,8 @@ export interface RuntimePermissionPolicy {
 	dontAsk?: boolean;
 	/** Apply the workspace write and credential rules to native file tools. */
 	sandbox?: boolean;
+	/** Block recognized local inference and benchmark launch commands in this project. */
+	blockLocalCompute?: boolean;
 	/** The host resolves global/project/conversation scopes before writing this list. */
 	rules: PermissionRule[];
 	disabledTools: string[];
@@ -44,6 +46,8 @@ export interface RuntimePermissionPolicy {
 	project: string;
 	/** Additional directories granted read/write access via /add-dir. */
 	additionalDirs?: string[];
+	/** Literal relative paths granted to a scoped read-only child. */
+	readScope?: string[];
 }
 
 export interface PermissionToolCall {

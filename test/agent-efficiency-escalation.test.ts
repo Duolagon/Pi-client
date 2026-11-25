@@ -24,7 +24,6 @@ test("ToolSearch defers heavy specialist tool schemas by default, unlocks via qu
 	const definitions = new Map<string, ToolDefinition>();
 	const handlers = new Map<string, Function>();
 	let active = ["read", "bash", "edit", "write", "grep"];
-	let lastUserMessage = "帮我重构一下登录表单校验逻辑";
 
 	const prevEnv: Record<string, string | undefined> = {};
 	const envPatch: Record<string, string> = {
@@ -84,12 +83,7 @@ test("ToolSearch defers heavy specialist tool schemas by default, unlocks via qu
 	const searchDef = definitions.get("ToolSearch")!;
 	assert.ok(searchDef, "ToolSearch must be registered");
 
-	const ctx = {
-		sessionManager: {
-			getBranch: () => [{ type: "message", message: { role: "user", content: lastUserMessage } }],
-		},
-	};
-	await handlers.get("before_agent_start")!({ systemPromptOptions: { sections: {} } }, ctx);
+	await handlers.get("before_agent_start")!({ messageType: "user", prompt: "帮我重构一下登录表单校验逻辑", systemPromptOptions: { sections: {} } }, {});
 
 	// All 12 specialist tools are hidden from outgoing declarations initially.
 	const initialHidden = searchDef.prepareLoadout?.({} as never)?.hiddenDeclarations ?? [];
@@ -105,11 +99,11 @@ test("ToolSearch defers heavy specialist tool schemas by default, unlocks via qu
 	assert.ok(afterSearchHidden.includes("CronCreate"), "Unrelated specialist tools remain deferred");
 
 	// Mentioning worktree in user prompt auto-unlocks worktree tools before the first model call!
-	lastUserMessage = "请在独立 worktree 分支隔离里实现实验特性";
-	await handlers.get("before_agent_start")!({ systemPromptOptions: { sections: {} } }, ctx);
+	await handlers.get("before_agent_start")!({ messageType: "user", prompt: "请在独立 worktree 分支隔离里实现实验特性", systemPromptOptions: { sections: {} } }, {});
 	const afterPromptHidden = searchDef.prepareLoadout?.({} as never)?.hiddenDeclarations ?? [];
 	assert.ok(!afterPromptHidden.includes("WorktreeCreate"));
 	assert.ok(!afterPromptHidden.includes("WorktreeMerge"));
+	assert.ok(afterPromptHidden.includes("PreviewCheck"), "Unrelated declarations defer again at the start of the next run");
 });
 
 test("buildWorkspaceOutline maps multi-language symbols, ignores build dirs, and enforces read permission filter", async (context) => {
@@ -218,6 +212,13 @@ test("zero-hook fastpath skips loopback /hook calls until a hook config file app
 
 	assert.equal(isVerificationBashCommand("npm test"), true);
 	assert.equal(isVerificationBashCommand("npx tsc --noEmit"), true);
+	assert.equal(isVerificationBashCommand("pytest -q"), true);
+	assert.equal(isVerificationBashCommand("eslint src"), true);
+	assert.equal(isVerificationBashCommand("CI=1 npm test --silent"), true);
+	assert.equal(isVerificationBashCommand("eslint --fix src"), false);
+	assert.equal(isVerificationBashCommand("ruff format src"), false);
+	assert.equal(isVerificationBashCommand("npx prettier --check src"), true);
+	assert.equal(isVerificationBashCommand("cat test.json && npm test"), false);
 	assert.equal(isVerificationBashCommand("ls -la src"), false);
 
 	const handlers = new Map<string, Function[]>();
@@ -273,6 +274,7 @@ test("zero-hook fastpath skips loopback /hook calls until a hook config file app
 	// 1. With zero hook files on disk, PreToolUse & PostToolUse make 0 HTTP calls to /hook!
 	await fire("tool_call", { toolName: "edit", toolCallId: "e1", input: { path: "a.ts" } }, ctx);
 	await fire("tool_result", { toolName: "edit", toolCallId: "e1", input: { path: "a.ts" }, isError: false, content: [{ type: "text", text: "ok" }] }, ctx);
+	await fire("message_end", { message: { role: "toolResult", toolName: "edit", isError: false } }, ctx);
 	assert.equal(hookHttpCalls, 0, "Expected zero loopback /hook HTTP calls when no hooks exist");
 
 	// 2. Two consecutive failing test runs trigger automatic escalation to Claude Opus 4.6 on turn_end!
@@ -284,7 +286,7 @@ test("zero-hook fastpath skips loopback /hook calls until a hook config file app
 		structuredContent: { exit_code: 1 },
 		content: [{ type: "text", text: "AssertionError: expected 1 to equal 2" }],
 	}, ctx);
-	let turnRes = await fire("turn_end", { entries: [] }, ctx);
+	let turnRes = await fire("turn_end", { entries: [], outcome: "completed" }, ctx);
 	assert.equal(currentModel.id, "deepseek-chat", "Single failure should let primary model retry once");
 	assert.equal(turnRes.length, 0);
 
@@ -296,7 +298,7 @@ test("zero-hook fastpath skips loopback /hook calls until a hook config file app
 		structuredContent: { exit_code: 1 },
 		content: [{ type: "text", text: "AssertionError: still failing" }],
 	}, ctx);
-	turnRes = await fire("turn_end", { entries: [] }, ctx);
+	turnRes = await fire("turn_end", { entries: [], outcome: "completed" }, ctx);
 	assert.equal(currentModel.id, "claude-opus-4-6", "Second consecutive failure must escalate to routed strong model");
 	assert.equal(turnRes[0]?.entries?.[0]?.customType, ESCALATION_MESSAGE_TYPE);
 	assert.ok(notifications.some((n) => n.includes("Claude Opus 4.6")));

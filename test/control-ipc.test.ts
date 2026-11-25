@@ -67,7 +67,7 @@ test("control IPC lists real Pi tools, applies scoped overrides, and exposes fin
 		"pi:hooks:list", "pi:hooks:remove", "pi:hooks:save", "pi:hooks:test",
 		"pi:mcp:list", "pi:mcp:remove", "pi:mcp:save",
 		"pi:permissions:check", "pi:permissions:export-claude", "pi:permissions:import-claude",
-		"pi:permissions:list", "pi:permissions:remove", "pi:permissions:set-mode", "pi:permissions:upsert",
+		"pi:permissions:list", "pi:permissions:local-compute", "pi:permissions:remove", "pi:permissions:set-mode", "pi:permissions:upsert",
 		"pi:skills:list", "pi:skills:remove", "pi:skills:save",
 		"pi:task:result", "pi:tools:list", "pi:tools:set-enabled",
 	]);
@@ -150,6 +150,32 @@ test("task result IPC returns the persisted result of a real isolated Pi child a
 	await data.service.cancelTask(manual.id);
 });
 
+test("root directory listing survives mode switches and recovers from read(EISDIR) without delegation", { timeout: 45000 }, async (t) => {
+	const data = await setup();
+	t.after(data.cleanup);
+	const list = () => data.invoke<DesktopToolInfo[]>("pi:tools:list", data.id);
+	const ls = async () => (await list()).find((tool) => tool.name === "ls");
+	assert.equal((await ls())?.modelVisible, true);
+	await data.invoke("pi:tools:set-enabled", { name: "ls", enabled: false, conversationId: data.id });
+	assert.equal((await ls())?.modelVisible, false);
+	await data.invoke("pi:permissions:set-mode", data.id, "read");
+	assert.equal((await ls())?.modelVisible, false);
+	await data.invoke("pi:tools:set-enabled", { name: "ls", enabled: null, conversationId: data.id });
+	assert.equal((await ls())?.modelVisible, true);
+	await data.invoke("pi:permissions:set-mode", data.id, "plan");
+	assert.equal((await ls())?.modelVisible, true);
+	assert.equal((await list()).find((tool) => tool.name === "bash")?.modelVisible, false);
+	await data.invoke("pi:permissions:set-mode", data.id, "read");
+
+	await data.service.command({ type: "prompt", message: "directory-recovery-probe" }, data.id);
+	const transcript = async () => (await data.service.snapshot()).messages;
+	await waitFor(async () => (await transcript()).some((message) => message.role === "assistant" &&
+		JSON.stringify(message.content).includes("DIRECTORY_RECOVERY_OK")), "successful direct directory listing");
+	const results = (await transcript()).filter((message) => message.role === "toolResult");
+	assert.deepEqual(results.map((result) => [result.toolName, result.isError]), [["read", true], ["ls", false]]);
+	assert.deepEqual(await data.service.listTasks(), []);
+});
+
 test("control IPC rejects malformed objects, scopes, booleans, selectors, payloads and wait limits", { timeout: 45000 }, async (t) => {
 	const data = await setup();
 	t.after(data.cleanup);
@@ -168,6 +194,7 @@ test("control IPC rejects malformed objects, scopes, booleans, selectors, payloa
 		["pi:tools:set-enabled", { name: "bash", enabled: false, conversationId: "missing-id" }],
 		["pi:permissions:list", "../outside"],
 		["pi:permissions:set-mode", data.id, "anything"],
+		["pi:permissions:local-compute", data.id, "true"],
 		["pi:permissions:set-mode", "missing-id", "ask"],
 		["pi:permissions:upsert", { id: "x", scope: "global", project: data.fixture.project, action: "allow", tool: "read" }],
 		["pi:permissions:upsert", { id: "x", scope: "project", action: "allow", tool: "read" }],

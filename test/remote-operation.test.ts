@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import type { UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { DesktopService } from "../src/backend.ts";
+import { wrapDesktopWorkspaceContext } from "../src/file-references.ts";
 import permissions from "../src/permission-extension.ts";
 import { evaluatePermission } from "../src/permission-policy.ts";
 import type { RuntimePermissionPolicy } from "../src/permission-types.ts";
@@ -81,14 +83,29 @@ test("protected writes cannot be dispatched as background commands or monitors",
 	}
 });
 
-test("status-only requests block mutations in auto mode and configured hook approvals still apply", async () => {
-	assert.equal(isStatusOnlyRequest("为啥要排队，现在在跑什么"), true);
-	assert.equal(isStatusOnlyRequest("现在什么情况？"), true);
-	assert.equal(isStatusOnlyRequest("现在什么进展"), true);
-	assert.equal(isStatusOnlyRequest("What is running now? Why is it queued?"), true);
-	assert.equal(isStatusOnlyRequest("查看 Kaggle 当前队列状态"), true);
-	assert.equal(isStatusOnlyRequest("查看状态，再删除这个测试作业"), false);
+test("standalone progress questions stay read-only and explicit follow-up actions do not", () => {
+	for (const message of [
+		"为啥要排队，现在在跑什么",
+		"我们现在什么情况",
+		"现在什么情况？",
+		"现在什么情况了",
+		"现在怎么样了",
+		"现在什么进展",
+		"现在出分了吗",
+		"请帮我查一下 Kaggle 作业进度",
+		"现在怎么样了\n查看队列状态",
+		"What is running now? Why is it queued?",
+		"Any updates?",
+	]) assert.equal(isStatusOnlyRequest(message), true, message);
+	for (const message of [
+		"查看状态，再删除这个测试作业",
+		"现在怎么样了\n然后提交这一版",
+		"看看进度后重跑",
+		"跑完再提交",
+	]) assert.equal(isStatusOnlyRequest(message), false, message);
+});
 
+test("status-only requests block mutations in auto mode and configured hook approvals still apply", async () => {
 	const project = await realpath(await mkdtemp(join(tmpdir(), "pi-remote-operation-")));
 	const policyFile = join(project, "policy.json");
 	const environment = ["PI_DESKTOP_HOST_URL", "PI_DESKTOP_HOST_TOKEN", "PI_DESKTOP_POLICY_FILE", "PI_DESKTOP_CONNECTION_TEST"] as const;
@@ -116,15 +133,27 @@ test("status-only requests block mutations in auto mode and configured hook appr
 		const decide = handlers.get("tool_call")!;
 		const titles: string[] = [];
 		const approvalTitle = "允许执行 bash（远端写入，仅本次）？";
-		const invoke = (command: string, userText: string) => decide({ toolName: "bash", toolCallId: "remote-test", input: { command } }, {
-			sessionManager: { getBranch: () => [{ type: "message", message: { role: "user", content: [{ type: "text", text: userText }] } }] },
+		const invoke = (command: string, content: UserMessage["content"]) => decide({ toolName: "bash", toolCallId: "remote-test", input: { command } }, {
+			sessionManager: { getBranch: () => [{ type: "message", message: { role: "user", content } }] },
 			ui: { confirm: async (title: string) => { titles.push(title); return true; } },
 		});
-		const status = "为啥要排队，现在在跑什么";
-		assert.equal(await invoke("kaggle kernels status research/demo", status), undefined);
 		const blocked = { block: true, reason: "本轮仅查询状态，不能执行远端写操作。" };
-		assert.deepEqual(await invoke(deleteCommand, status), blocked);
-		assert.deepEqual(await invoke("echo rewritten", status), blocked);
+		const submitCommand = ".venv/bin/kaggle competitions submit -c contest -f result.csv";
+		for (const status of ["为啥要排队，现在在跑什么", "我们现在什么情况", "现在什么情况了", "现在怎么样了"]) {
+			assert.equal(await invoke("kaggle kernels status research/demo", status), undefined);
+			assert.deepEqual(await invoke(deleteCommand, status), blocked);
+			assert.deepEqual(await invoke(submitCommand, status), blocked);
+			assert.deepEqual(await invoke("echo rewritten", status), blocked);
+		}
+		assert.deepEqual(await invoke(submitCommand, [
+			{ type: "text", text: "现在怎么样了" },
+			{ type: "image", data: "", mimeType: "image/png" },
+			{ type: "text", text: wrapDesktopWorkspaceContext("Local project information") },
+		]), blocked);
+		assert.equal(await invoke(submitCommand, [
+			{ type: "text", text: "现在怎么样了" },
+			{ type: "text", text: "再提交这一版" },
+		]), undefined);
 		assert.equal(await invoke(deleteCommand, "删除这个测试作业"), undefined);
 		assert.deepEqual(titles, []);
 		hookNeedsApproval = true;

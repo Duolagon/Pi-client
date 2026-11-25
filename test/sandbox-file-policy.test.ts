@@ -71,6 +71,22 @@ test("recursive search results hide protected files while preserving ordinary ma
 	assert.equal((await redactSearchOutput({ ...policy, sandbox: false }, "grep", {}, output)).text, output);
 });
 
+test("recursive search honors explicit path rules for canonical directory names", { skip: process.platform === "win32" }, async (t) => {
+	const project = await mkdtemp(join(tmpdir(), "pi-file-tool-result-rules-"));
+	t.after(() => rm(project, { recursive: true, force: true }));
+	await mkdir(join(project, "restricted"));
+	await writeFile(join(project, "restricted", "example.txt"), "fixture");
+	await symlink(join(project, "restricted"), join(project, "alias"), "dir");
+	const policy: RuntimePermissionPolicy = {
+		version: 1, mode: "auto", project, disabledTools: [],
+		rules: [{ id: "restrict", scope: "global", action: "deny", tool: "grep", path: "restricted/**" }],
+	};
+	const output = "alias/example.txt:1: fixture\nregular.txt:1: fixture";
+	assert.deepEqual(await redactSearchOutput(policy, "grep", {}, output), {
+		text: "regular.txt:1: fixture", removed: 1,
+	});
+});
+
 test("the result hook removes original truncation text and fails closed when the policy cannot load", async (t) => {
 	const project = await mkdtemp(join(tmpdir(), "pi-file-tool-result-hook-"));
 	t.after(() => rm(project, { recursive: true, force: true }));

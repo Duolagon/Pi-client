@@ -73,6 +73,8 @@ export interface DesktopTask {
 	/** 1 for a direct child of a user conversation; validated against MAX_DELEGATION_DEPTH. */
 	delegationDepth?: number;
 	readOnly?: boolean;
+	/** Literal project-relative paths granted to this read-only child. */
+	scopePaths?: string[];
 	/** Explicit tool allowlist for a custom agent; built-in Pi tools only. */
 	allowedTools?: string[];
 	disallowedTools?: string[];
@@ -83,7 +85,7 @@ export interface DesktopTask {
 	mcpServers?: string[];
 	runInBackground?: boolean;
 	/** `partial` marks a result cut short by maxTurns. */
-	result?: { text: string; truncated: boolean; partial?: boolean };
+	result?: { text: string; truncated: boolean; partial?: boolean; readPaths?: string[] };
 	stopReason?: TaskStopReason;
 	/**
 	 * Private file under `<dataDir>/agent-prompts/` holding the definition prompt, skills

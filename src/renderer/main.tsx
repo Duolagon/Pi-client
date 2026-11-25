@@ -91,6 +91,9 @@ import { MemoryStatusDialog } from "./MemoryStatusDialog.tsx";
 import { DoctorDialog } from "./DoctorDialog.tsx";
 import { UsageStatsDialog } from "./UsageStatsDialog.tsx";
 import { PreviewPanel } from "./PreviewPanel.tsx";
+import { KaggleBrowserDialog, KaggleSelectionDialog } from "./KaggleBrowserDialog.tsx";
+import { formatKaggleSelection, type KaggleSelection } from "../kaggle-browser.ts";
+import { maximumPromptLength } from "../composer-draft.ts";
 import { CommandPalette, type PaletteAction } from "./CommandPalette.tsx";
 import { ProjectTrustDialog } from "./ProjectTrustDialog.tsx";
 import { AgentsDialog } from "./AgentsDialog.tsx";
@@ -245,6 +248,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [sessionsOpen, setSessionsOpen] = useState(false);
 	const [memoryTab, setMemoryTab] = useState<"memory" | "context" | "status" | null>(null);
 	const [paletteOpen, setPaletteOpen] = useState(false);
+	const [kaggleBrowserConversation, setKaggleBrowserConversation] = useState<string>();
+	const [kaggleSelections, setKaggleSelections] = useState<Record<string, KaggleSelection>>({});
 	const [planState, setPlanState] = useState<PlanFileState | null>(null);
 	const [planEditorOpen, setPlanEditorOpen] = useState(false);
 	const [planDraft, setPlanDraft] = useState("");
@@ -430,6 +435,22 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const activeConversationId = snapshot?.active?.id;
 	const activeConversationRef = useRef(activeConversationId);
 	activeConversationRef.current = activeConversationId;
+	const kaggleSelection = activeConversationId ? kaggleSelections[activeConversationId] : undefined;
+	useEffect(() => api.kaggleBrowser.onSelection((selection) => {
+		setKaggleBrowserConversation((conversationId) => conversationId === selection.conversationId ? undefined : conversationId);
+		setKaggleSelections((pending) => ({ ...pending, [selection.conversationId]: selection }));
+		if (activeConversationRef.current !== selection.conversationId) app.setNotice("Kaggle 选区已就绪。回到来源会话后可以预览。");
+	}), [api, app.setNotice]);
+	const nextKaggleDraft = kaggleSelection ? [app.draft, formatKaggleSelection(kaggleSelection)].filter(Boolean).join("\n\n") : "";
+	const kaggleAttachDisabled = app.draftLoading ? "草稿加载中。" : nextKaggleDraft.length > maximumPromptLength ? "附加后会超过草稿长度上限。请先缩短草稿或选择更少的输出。" : undefined;
+	const clearKaggleSelection = () => {
+		if (!kaggleSelection) return;
+		setKaggleSelections((pending) => {
+			const next = { ...pending };
+			delete next[kaggleSelection.conversationId];
+			return next;
+		});
+	};
 	const grailRefresh = useRef(0);
 	const loadGrail = useCallback(
 		(id: string | undefined) => {
@@ -1488,6 +1509,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		{ id: "status", label: "运行与上下文状态 (/status)", keywords: "status tokens cost model", run: () => setMemoryTab("status") },
 		{ id: "init", label: "/init 生成项目 AGENTS.md 指南", keywords: "init onboard agents.md", disabled: !snapshot.active, run: () => sendInitPrompt() },
 		{ id: "preview", label: previewUrl ? "关闭本地网页预览" : "打开本地网页预览 (/preview)", keywords: "web preview localhost", disabled: !snapshot.active, run: () => openPreview(true) },
+		{ id: "kaggle-browser", label: "打开 Kaggle Notebook", keywords: "kaggle notebook browser browser use 浏览器 接管 运行输出", disabled: !snapshot.active, run: () => setKaggleBrowserConversation(snapshot.active?.id) },
 		{ id: "terminal", label: terminalOpen ? "关闭终端面板" : "打开终端 / PTY 面板", keywords: "terminal bash pty", run: () => setTerminalOpen((v) => !v) },
 		{ id: "changes", label: "查看 Git 修改与暂存提交", keywords: "git diff stage commit", run: () => { setPane(pane === "changes" ? null : "changes"); } },
 		{ id: "files", label: "浏览项目文件", keywords: "files explorer", run: () => { setPane(pane === "files" ? null : "files"); } },
@@ -2092,6 +2114,19 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										>
 											<Globe size={14} />
 											<span>本地网页预览</span>
+										</button>
+										<button
+											type="button"
+											role="menuitem"
+											className="cc-more-item"
+											disabled={!snapshot.active}
+											onClick={() => {
+												setMoreMenuOpen(false);
+												setKaggleBrowserConversation(snapshot.active?.id);
+											}}
+										>
+											<Globe size={14} />
+											<span>打开 Kaggle Notebook</span>
 										</button>
 										<button
 											type="button"
@@ -3485,6 +3520,26 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			)}
 			{grailReveal && <GrailReveal label={grailText.grades.grail} />}
 			{doctorOpen && <DoctorDialog close={() => setDoctorOpen(false)} onNotice={(msg) => app.setNotice(msg)} />}
+			{kaggleBrowserConversation && (
+				<KaggleBrowserDialog
+					open={(url) => api.kaggleBrowser.open({ conversationId: kaggleBrowserConversation, url })}
+					close={() => setKaggleBrowserConversation(undefined)}
+				/>
+			)}
+			{kaggleSelection && (
+				<KaggleSelectionDialog
+					selection={kaggleSelection}
+					attachDisabled={kaggleAttachDisabled}
+					onAttach={() => {
+						if (kaggleSelection.conversationId !== activeConversationRef.current || kaggleAttachDisabled) return;
+						app.setDraft(nextKaggleDraft);
+						clearKaggleSelection();
+						app.setNotice("已附加 Kaggle Notebook 输出到草稿。");
+						requestAnimationFrame(() => composerInputRef.current?.focus({ preventScroll: true }));
+					}}
+					close={clearKaggleSelection}
+				/>
+			)}
 			{paletteOpen && (
 				<CommandPalette
 					actions={paletteActions}

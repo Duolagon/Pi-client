@@ -1274,7 +1274,7 @@ export function SettingsDialog({
 						<fieldset className="live-routing">
 							<legend>子 Agent 模型路由与自动升档</legend>
 							<small>
-								内置 Explore / Plan / Review 子 Agent 默认使用这里的模型；同时当主模型（如高速轻量模型）在改代码后连续 2 次验证（单测 / 类型检查 / LSP）失败时，会自动临时升档至 Plan 或 Review 强模型协助破局，完成后自动切回主模型。
+								内置 Explore / Plan / Review 子 Agent 默认使用这里的模型。改代码后连续两次验证失败时，主会话优先临时使用 Plan 模型诊断，Plan 不可用或与主模型相同时尝试 Review，任务结束后恢复主模型。
 							</small>
 							{MODEL_ROUTING_ROLES.map((role) => {
 								const value = routing[role];

@@ -1,4 +1,15 @@
 import { MODEL_ROUTING_ROLES, type ModelRouting } from "./agent-types.ts";
+import type { DesktopEvent } from "./shared.ts";
+
+export const FALLBACK_MESSAGE_TYPE = "desktop_model_fallback";
+export const ESCALATION_MESSAGE_TYPE = "desktop_model_escalation";
+
+export function temporaryModelNotice(event: DesktopEvent["event"]) {
+	const customType = event.type === "entry_appended" && event.entry.type === "custom_message" ? event.entry.customType
+		: event.type === "message_end" && event.message.role === "custom" ? event.message.customType
+		: undefined;
+	return customType === FALLBACK_MESSAGE_TYPE || customType === ESCALATION_MESSAGE_TYPE ? customType : undefined;
+}
 
 const MAX_FIELD = 200;
 

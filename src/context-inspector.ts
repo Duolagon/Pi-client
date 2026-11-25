@@ -37,6 +37,7 @@ export interface ContextBreakdown {
 	cacheHitPercent: number;
 	cost: number;
 	activeToolsCount: number;
+	deferredToolNames: string[];
 	mcpToolsCount: number;
 	messageCount: number;
 	autoCompactionEnabled: boolean;
@@ -263,6 +264,7 @@ export async function buildContextReport(params: {
 		cacheHitPercent,
 		cost: stats?.cost ?? 0,
 		activeToolsCount: activeTools.length,
+		deferredToolNames: tools.filter((tool) => tool.enabled && tool.deferred).map((tool) => tool.name),
 		mcpToolsCount,
 		messageCount: messages.length,
 		autoCompactionEnabled,

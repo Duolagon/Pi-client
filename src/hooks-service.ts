@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { managedFile, writeManagedFile } from "./managed-path.ts";
@@ -34,6 +34,7 @@ export const hookEventNames: HookEventName[] = [
 
 const maxTimeoutMs = 60000;
 const maxResponseBytes = 256 * 1024;
+const maxHookConfigBytes = 2 * 1024 * 1024;
 const toolHookEvents = new Set<HookEventName>(["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest"]);
 
 interface RawHookHandler {
@@ -145,15 +146,19 @@ function normalizeTimeout(raw: unknown, timeoutInSeconds: boolean): number | und
 	return Math.min(Math.max(500, Math.floor(ms)), maxTimeoutMs);
 }
 
-async function readJsonFile(path: string): Promise<Record<string, unknown> | undefined> {
+function parseJsonFile(raw: string): Record<string, unknown> | undefined {
+	if (Buffer.byteLength(raw, "utf8") > maxHookConfigBytes) return undefined;
 	try {
-		const raw = await readFile(path, "utf8");
-		if (Buffer.byteLength(raw, "utf8") > 2 * 1024 * 1024) return undefined;
 		const parsed: unknown = JSON.parse(raw);
 		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined;
 	} catch {
 		return undefined;
 	}
+}
+
+async function readJsonFile(path: string): Promise<Record<string, unknown> | undefined> {
+	const raw = await readFile(path, "utf8").catch(() => undefined);
+	return raw === undefined ? undefined : parseJsonFile(raw);
 }
 
 function parseHandlerObject(
@@ -412,10 +417,13 @@ function parseHookJsonOutput(rawText: string, event: HookEventName, fallbackEntr
 
 export class HooksService {
 	private agentDir: () => string;
+	private homeDir: () => string;
 	private disabled: () => boolean;
+	private configCache = new Map<string, { version: string; entries: HookEntry[] }>();
 
-	constructor(options: { agentDir: () => string; disabled?: () => boolean }) {
+	constructor(options: { agentDir: () => string; homeDir?: () => string; disabled?: () => boolean }) {
 		this.agentDir = options.agentDir;
+		this.homeDir = options.homeDir ?? homedir;
 		this.disabled = options.disabled ?? (() => false);
 	}
 
@@ -426,24 +434,39 @@ export class HooksService {
 	}
 
 	async list(project?: string, projectTrusted = true): Promise<HookEntry[]> {
-		const claudeHome = join(homedir(), ".claude", "settings.json");
-		const claudeHomeLocal = join(homedir(), ".claude", "settings.local.json");
-		const piHome = join(this.agentDir(), "hooks.json");
-		const entries: HookEntry[] = [
-			...parseHooksMap((await readJsonFile(claudeHome))?.hooks, "user", claudeHome, false, true),
-			...parseHooksMap((await readJsonFile(claudeHomeLocal))?.hooks, "user", claudeHomeLocal, false, true),
-			...parseHooksMap((await readJsonFile(piHome))?.hooks, "user", piHome, true, false),
+		const home = this.homeDir();
+		const sources = [
+			this.readConfiguration(join(home, ".claude", "settings.json"), "user", false),
+			this.readConfiguration(join(home, ".claude", "settings.local.json"), "user", false),
+			this.readConfiguration(join(this.agentDir(), "hooks.json"), "user", true),
 		];
 		if (project && isAbsolute(project) && projectTrusted) {
-			const claudeProj = join(project, ".claude", "settings.json");
-			const claudeLocal = join(project, ".claude", "settings.local.json");
-			const piProj = join(project, ".pi", "hooks.json");
-			entries.push(
-				...parseHooksMap((await readJsonFile(claudeProj))?.hooks, "project", claudeProj, false, true),
-				...parseHooksMap((await readJsonFile(claudeLocal))?.hooks, "project", claudeLocal, false, true),
-				...parseHooksMap((await readJsonFile(piProj))?.hooks, "project", piProj, true, false),
+			sources.push(
+				this.readConfiguration(join(project, ".claude", "settings.json"), "project", false),
+				this.readConfiguration(join(project, ".claude", "settings.local.json"), "project", false),
+				this.readConfiguration(join(project, ".pi", "hooks.json"), "project", true),
 			);
 		}
+		return (await Promise.all(sources)).flat();
+	}
+
+	private async readConfiguration(file: string, scope: HookScope, editable: boolean): Promise<HookEntry[]> {
+		const key = scope + ":" + file;
+		const info = await stat(file, { bigint: true }).catch(() => undefined);
+		if (!info?.isFile() || info.size === 0n || info.size > maxHookConfigBytes) {
+			this.configCache.delete(key);
+			return [];
+		}
+		const version = [info.dev, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].join(":");
+		const cached = this.configCache.get(key);
+		if (cached?.version === version) return cached.entries;
+		const raw = await readFile(file, "utf8").catch(() => undefined);
+		if (raw === undefined) {
+			this.configCache.delete(key);
+			return [];
+		}
+		const entries = parseHooksMap(parseJsonFile(raw)?.hooks, scope, file, editable);
+		this.configCache.set(key, { version, entries });
 		return entries;
 	}
 

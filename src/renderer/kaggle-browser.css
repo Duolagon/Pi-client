@@ -1,0 +1,23 @@
+.kaggle-browser-form {
+	display: grid;
+	gap: 10px;
+}
+
+.kaggle-browser-source,
+.kaggle-browser-output {
+	overflow-wrap: anywhere;
+}
+
+.kaggle-browser-output {
+	max-height: min(52vh, 500px);
+	margin: 0;
+	overflow: auto;
+	padding: 12px;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	white-space: pre-wrap;
+}
+
+.kaggle-browser-error {
+	color: var(--red);
+}
