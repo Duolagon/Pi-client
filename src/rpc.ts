@@ -9,7 +9,7 @@ export class AgentProcess {
 	private child: ChildProcessWithoutNullStreams;
 	private pending = new Map<
 		string,
-		{ resolve: (value: unknown) => void; reject: (error: Error) => void; timer?: NodeJS.Timeout }
+		{ resolve: (value: unknown) => void; reject: (error: unknown) => void }
 	>();
 	private stopped = false;
 	private childClosed = false;
@@ -49,8 +49,6 @@ export class AgentProcess {
 						if (!record.id) continue;
 						const pending = this.pending.get(record.id);
 						if (!pending) continue;
-						clearTimeout(pending.timer);
-						this.pending.delete(record.id);
 						if (record.success) pending.resolve("data" in record ? record.data : undefined);
 						else pending.reject(new Error(record.error));
 					} else options.onEvent(record);
@@ -88,22 +86,34 @@ export class AgentProcess {
 		});
 	}
 
-	request<T>(command: Command): Promise<T> {
+	request<T>(command: Command, signal?: AbortSignal): Promise<T> {
 		if (this.failure) return Promise.reject(this.failure);
 		const id = randomUUID();
 		return new Promise<T>((resolve, reject) => {
+			signal?.throwIfAborted();
+			const cleanup = () => {
+				this.pending.delete(id);
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
+			};
+			const fail = (error: unknown) => {
+				cleanup();
+				reject(error);
+			};
+			const onAbort = () => fail(signal?.reason);
 			const timer =
 				command.type === "bash"
 					? undefined
 					: setTimeout(
-							() => {
-								this.pending.delete(id);
-								reject(new Error(`Pi 请求超时：${command.type}`));
-							},
+							() => fail(new Error(`Pi 请求超时：${command.type}`)),
 							command.type === "compact" ? 180000 : 45000,
 						);
-			this.pending.set(id, { resolve: (data) => resolve(data as T), reject, timer });
-			void this.write({ ...command, id }).catch((error: Error) => this.fail(error));
+			this.pending.set(id, {
+				resolve: (data) => { cleanup(); resolve(data as T); },
+				reject: fail,
+			});
+			signal?.addEventListener("abort", onAbort, { once: true });
+			void this.write({ ...command, id }, signal).catch((error: Error) => this.fail(error));
 		});
 	}
 
@@ -129,12 +139,13 @@ export class AgentProcess {
 		});
 	}
 
-	private write(record: unknown): Promise<void> {
+	private write(record: unknown, signal?: AbortSignal): Promise<void> {
 		// Serialize writes and wait for callbacks to honor pipe backpressure.
 		this.writes = this.writes.then(
 			() =>
 				new Promise<void>((resolve, reject) => {
 					if (this.failure) return reject(this.failure);
+					if (signal?.aborted) return resolve();
 					this.child.stdin.write(`${JSON.stringify(record)}\n`, (error) => (error ? reject(error) : resolve()));
 				}),
 		);
@@ -143,10 +154,6 @@ export class AgentProcess {
 
 	private fail(error: Error): void {
 		this.failure ??= error;
-		for (const request of this.pending.values()) {
-			clearTimeout(request.timer);
-			request.reject(error);
-		}
-		this.pending.clear();
+		for (const request of this.pending.values()) request.reject(error);
 	}
 }

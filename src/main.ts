@@ -1,5 +1,6 @@
 import { maximumImageDataLength, maximumPromptLength, type ComposerAttachment, type PromptImage } from "./composer-draft.ts";
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, safeStorage, shell } from "electron";
+import { watch } from "node:fs";
 import { join } from "node:path";
 import { mkdir, stat } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
@@ -59,7 +60,41 @@ let window: BrowserWindow | null = null;
 let service: DesktopService;
 let ready: Promise<unknown>;
 let quitting = false;
+let grailWorkspaceWatch: { project: string; close: () => void } | undefined;
+let grailWatchConversationId: string | undefined;
 const indexPath = join(__dirname, "index.html");
+
+function watchGrailWorkspace(project: string | undefined) {
+	if (grailWorkspaceWatch?.project === project) return;
+	grailWorkspaceWatch?.close();
+	grailWorkspaceWatch = undefined;
+	if (!project) return;
+
+	try {
+		const watcher = watch(project, { recursive: true, persistent: false });
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const close = () => {
+			clearTimeout(timer);
+			watcher.close();
+		};
+		grailWorkspaceWatch = { project, close };
+		watcher.on("change", (_event, filename) => {
+			if (filename?.toString().split(/[\\/]/).some((part) => part.toLowerCase() === ".git")) return;
+			clearTimeout(timer);
+			timer = setTimeout(() => {
+				if (grailWorkspaceWatch?.close !== close || !window || window.webContents.isDestroyed()) return;
+				const conversationId = grailWatchConversationId;
+				if (conversationId && service.grailWatchProject(conversationId) === project)
+					window.webContents.send("pi:grail:event", { type: "grail_workspace_changed", conversationId });
+			}, 650);
+		});
+		watcher.on("error", () => {
+			if (grailWorkspaceWatch?.close === close) watchGrailWorkspace(undefined);
+		});
+	} catch {
+		// Some filesystems cannot be watched. Window focus still refreshes readiness.
+	}
+}
 
 function encryptLocal(value: string): string {
 	if (!safeStorage.isEncryptionAvailable() || (process.platform === "linux" && safeStorage.getSelectedStorageBackend() === "basic_text"))
@@ -135,6 +170,8 @@ function createWindow() {
 	window.on("responsive", () => log.info("window-responsive"));
 	window.on("focus", () => updateDock());
 	window.on("closed", () => {
+		watchGrailWorkspace(undefined);
+		grailWatchConversationId = undefined;
 		window = null;
 	});
 }
@@ -465,7 +502,16 @@ function installHandlers() {
 	});
 	handle("pi:grail:start", (id) => service.startGrail(string(id, "会话 ID", 200)));
 	handle("pi:grail:cancel", (id) => service.cancelGrail(string(id, "会话 ID", 200)));
-	handle("pi:grail:state", (id) => service.grailState(string(id, "会话 ID", 200)));
+	handle("pi:grail:state", async (id) => {
+		const conversationId = string(id, "会话 ID", 200);
+		const state = await service.grailState(conversationId);
+		const project = service.grailWatchProject(conversationId);
+		if (project && window) {
+			grailWatchConversationId = conversationId;
+			watchGrailWorkspace(state.readiness === "ready" || state.readiness === "clean" ? project : undefined);
+		}
+		return state;
+	});
 	handle("pi:grail:seal", (id) => service.sealGrailWish(string(id, "会话 ID", 200)));
 	handle("pi:doctor", () => service.doctor());
 	handle("pi:usage-stats", (input) => {

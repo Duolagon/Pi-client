@@ -7,6 +7,102 @@ export interface DiffLine {
 	section?: string;
 }
 
+export interface LineChangeCounts {
+	additions: number;
+	removals: number;
+}
+
+/** Compare only the changed range so small edits to long snippets still get exact counts. */
+export function computeLineDiff(oldText: string, newText: string): { lines: DiffLine[]; counts?: LineChangeCounts } {
+	const a = splitDiffLines(oldText);
+	const b = splitDiffLines(newText);
+	const lines: DiffLine[] = [];
+	let start = 0;
+	while (start < a.length && start < b.length && a[start] === b[start]) {
+		lines.push({ type: "ctx", text: a[start], oldNum: start + 1, newNum: start + 1 });
+		start++;
+	}
+	let oldEnd = a.length;
+	let newEnd = b.length;
+	while (oldEnd > start && newEnd > start && a[oldEnd - 1] === b[newEnd - 1]) {
+		oldEnd--;
+		newEnd--;
+	}
+	const m = oldEnd - start;
+	const n = newEnd - start;
+	let counts: LineChangeCounts | undefined;
+
+	// Keep a bounded comparison. For a large unmatched range, display both versions without guessed counts.
+	if (m * n > 40000) {
+		lines.push({ type: "meta", text: "改动前（未逐行对比）" });
+		for (let i = start; i < oldEnd; i++) lines.push({ type: "ctx", text: a[i], oldNum: i + 1 });
+		lines.push({ type: "meta", text: "改动后（未逐行对比）" });
+		for (let j = start; j < newEnd; j++) lines.push({ type: "ctx", text: b[j], newNum: j + 1 });
+	} else {
+		counts = { additions: 0, removals: 0 };
+		let i = 0;
+		let j = 0;
+		if (m && n) {
+			const dp: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
+			for (let row = m - 1; row >= 0; row--) {
+				for (let col = n - 1; col >= 0; col--) {
+					dp[row][col] = a[start + row] === b[start + col]
+						? 1 + dp[row + 1][col + 1]
+						: Math.max(dp[row + 1][col], dp[row][col + 1]);
+				}
+			}
+			while (i < m && j < n) {
+				if (a[start + i] === b[start + j]) {
+					lines.push({ type: "ctx", text: a[start + i], oldNum: start + i + 1, newNum: start + j + 1 });
+					i++;
+					j++;
+				} else if (dp[i + 1][j] >= dp[i][j + 1]) {
+					lines.push({ type: "del", text: a[start + i], oldNum: start + i + 1 });
+					counts.removals++;
+					i++;
+				} else {
+					lines.push({ type: "add", text: b[start + j], newNum: start + j + 1 });
+					counts.additions++;
+					j++;
+				}
+			}
+		}
+		while (i < m) {
+			lines.push({ type: "del", text: a[start + i], oldNum: start + i + 1 });
+			counts.removals++;
+			i++;
+		}
+		while (j < n) {
+			lines.push({ type: "add", text: b[start + j], newNum: start + j + 1 });
+			counts.additions++;
+			j++;
+		}
+	}
+
+	for (let i = oldEnd, j = newEnd; i < a.length; i++, j++) {
+		lines.push({ type: "ctx", text: a[i], oldNum: i + 1, newNum: j + 1 });
+	}
+	return { lines, counts };
+}
+
+function splitDiffLines(text: string): string[] {
+	if (!text) return [];
+	const lines = text.split(/\r?\n/);
+	if (lines.at(-1) === "") lines.pop();
+	return lines;
+}
+
+export function summarizeLineChanges(edits: readonly { oldText: string; newText: string }[]): LineChangeCounts | undefined {
+	const counts = { additions: 0, removals: 0 };
+	for (const { oldText, newText } of edits) {
+		const edit = computeLineDiff(oldText, newText).counts;
+		if (!edit) return undefined;
+		counts.additions += edit.additions;
+		counts.removals += edit.removals;
+	}
+	return counts;
+}
+
 const unifiedHunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 
 export function diffHunkCount(raw: string): number {

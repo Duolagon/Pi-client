@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
-import { access, cp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { DesktopService } from "../src/backend.ts";
+import type { GitSnapshots } from "../src/git-snapshots.ts";
 import type { AgentProcess } from "../src/rpc.ts";
 import type { DesktopEvent, GrailEvent, GrailVerdict } from "../src/shared.ts";
 import { createCoreFixture } from "./fixtures/core-fixture.ts";
@@ -26,9 +28,25 @@ async function setup(nested = false) {
 	}));
 	await writeFile(join(project, "lint.mjs"), 'import { readFileSync } from "node:fs";\nif (/ +$/m.test(readFileSync("src/add.mjs", "utf8"))) process.exitCode = 1;\n');
 	await writeFile(join(project, "src", "add.mjs"), "export function add(a, b) {\n\treturn 0;\n}\n");
+	let testFixture = 'import assert from "node:assert/strict";\nimport { writeFileSync } from "node:fs";\nimport { test } from "node:test";\nimport { add } from "../src/add.mjs";\n';
+	if (nested) {
+		const sibling = join(fixture.project, "packages", "shared");
+		const installed = join(fixture.project, "node_modules");
+		await mkdir(sibling);
+		await mkdir(installed);
+		await writeFile(join(fixture.project, "package.json"), JSON.stringify({ private: true, workspaces: ["packages/*"] }));
+		await writeFile(join(fixture.project, ".gitignore"), "node_modules/\n");
+		await writeFile(join(sibling, "package.json"), JSON.stringify({ name: "grail-shared", type: "module", exports: "./index.mjs" }));
+		await writeFile(join(sibling, "index.mjs"), "export const expected = 3;\n");
+		await symlink(sibling, join(installed, "grail-shared"));
+		testFixture += 'import { expected } from "../../shared/index.mjs";\nimport { expected as linked } from "grail-shared";\n';
+		testFixture += 'test("add", () => { writeFileSync("grail-local-artifact", "test"); assert.equal(expected, 3); assert.equal(add(1, 2), expected); assert.equal(linked, expected); });\n';
+	} else {
+		testFixture += 'test("add", () => { writeFileSync("grail-local-artifact", "test"); assert.equal(add(1, 2), 3); });\n';
+	}
 	await writeFile(
 		join(project, "test", "add.test.mjs"),
-		'import assert from "node:assert/strict";\nimport { writeFileSync } from "node:fs";\nimport { test } from "node:test";\nimport { add } from "../src/add.mjs";\ntest("add", () => { writeFileSync("grail-local-artifact", "test"); assert.equal(add(1, 2), 3); });\n',
+		testFixture,
 	);
 	await exec("git", ["init", "-q", fixture.project]);
 	await exec("git", ["add", "."], { cwd: fixture.project });
@@ -159,7 +177,7 @@ test("Grail judgement: grail, 愿望达成, failing test, cancel and seal, never
 	}
 });
 
-test("nested Git project assesses the entire selected raw branch and rejects truncated diffs", { timeout: 60_000 }, async () => {
+test("nested Git project tests selected changes against frozen siblings and rejects truncated diffs", { timeout: 60_000 }, async () => {
 	const { fixture, project, service, grail, session, log } = await setup(true);
 	try {
 		const snapshot = await service.initialize();
@@ -188,6 +206,13 @@ test("nested Git project assesses the entire selected raw branch and rejects tru
 			: command<T>(input);
 		await writeFile(join(project, "src", "add.mjs"), "export function add(a, b) {\n\treturn a + b;\n}\n");
 		assert.equal((await service.grailState(conversationId)).readiness, "ready");
+		const git = (service as unknown as { git: GitSnapshots }).git;
+		const diff = git.diffToWorktree.bind(git);
+		git.diffToWorktree = async (...args) => {
+			const result = await diff(...args);
+			await writeFile(join(fixture.project, "packages", "shared", "index.mjs"), "export const expected = 99;\n");
+			return result;
+		};
 		const judge = async () => {
 			const { id } = await service.startGrail(conversationId);
 			const done = await waitFor(() => grail.find((event) => (event.type === "grail_verdict" && event.verdict.id === id) || (event.type === "grail_failed" && event.id === id)), "verdict");
@@ -195,15 +220,39 @@ test("nested Git project assesses the entire selected raw branch and rejects tru
 			return done.verdict;
 		};
 		const result = await judge();
-		assert.equal(result.grade, "grail", JSON.stringify(result.reasons));
+		assert.equal(result.grade, "grail", JSON.stringify(result.reasons) + (result.steps.objective?.runs[0]?.output ?? ""));
 		assert.deepEqual(result.requirement, ["Define add using both operands.", "Preserve the sum for negative operands."]);
 		assert.deepEqual(result.steps.objective?.runs.map(({ name }) => name), ["test", "check", "lint"]);
+		assert.deepEqual(result.files.map(({ path }) => path), ["src/add.mjs"]);
+		const blob = (content: string) => join(fixture.dataDir, "checkpoints", "git-snapshots", "blobs", createHash("sha256").update(content).digest("hex"));
+		await access(blob("export function add(a, b) {\n\treturn a + b;\n}\n"));
+		await assert.rejects(access(blob("export const expected = 3;\n")), { code: "ENOENT" });
 		const calls = await readFile(log, "utf8");
 		await writeFile(join(project, "z-data.txt"), "y".repeat(210_000));
 		const incomplete = await judge();
 		assert.equal(incomplete.grade, "unjudgeable");
 		assert.match(incomplete.reasons.join(" "), /容量/);
 		assert.equal(await readFile(log, "utf8"), calls, "incomplete diffs must not dispatch paid review stages");
+	} finally {
+		await service.close();
+		await fixture.cleanup();
+	}
+});
+
+test("Grail refuses unpriced models before dispatch and rejects priced usage without cost", { timeout: 20000 }, async () => {
+	const { fixture, project, service, control, log } = await setup();
+	try {
+		const run = (service as unknown as {
+			grailModelRun(cwd: string, model: { provider: string; id: string }, prompt: string, budget: { max: number; spent: number }, deadline: number, signal: AbortSignal, id: string): Promise<string>;
+		}).grailModelRun.bind(service);
+		const signal = new AbortController().signal;
+		const budget = { max: 0.01, spent: 0 };
+		await assert.rejects(run(project, { provider: "grail-test", id: "grail-unpriced" }, "【圣杯盲解】", budget, Date.now() + 10000, signal, "test"), /缺少可核算的价格/);
+		await assert.rejects(access(log), { code: "ENOENT" });
+		await writeFile(control, "zero-cost");
+		await assert.rejects(run(project, { provider: "grail-test", id: "grail-judge-1" }, "【圣杯盲解】", budget, Date.now() + 10000, signal, "test"), /消耗了计费 Token，却未报告费用/);
+		assert.equal((await readFile(log, "utf8")).trim().split("\n").length, 1);
+		assert.equal(budget.spent, 0);
 	} finally {
 		await service.close();
 		await fixture.cleanup();

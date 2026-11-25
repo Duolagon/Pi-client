@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { DesktopService } from "../src/backend.ts";
+import { AgentProcess } from "../src/rpc.ts";
 import type { GrailEvent, GrailVerdict } from "../src/shared.ts";
 import { createCoreFixture } from "./fixtures/core-fixture.ts";
 
@@ -15,6 +16,8 @@ interface ReviewRun {
 
 interface GrailInternals {
 	store: { settings: { grailTimeoutSec?: number } };
+	runtimes: Map<string, { agent: AgentProcess }>;
+	grailWish(): Promise<{ since: number; wish: number; checkpoint: { id: string } }>;
 	runGrail(conversation: { id: string }, run: ReviewRun): Promise<GrailVerdict>;
 	atomicJson(path: string, value: unknown, beforePublish?: () => void): Promise<void>;
 	grailModelRun(cwd: string, model: { provider: string; id: string }, prompt: string, budget: { spent: number; max: number }, deadline: number, signal: AbortSignal, id: string): Promise<string>;
@@ -127,4 +130,44 @@ test("Grail does not launch a new model stage at an exhausted budget", { timeout
 			{ spent: 0.01, max: 0.01 }, Date.now() + 10000, new AbortController().signal, id),
 		/鉴定费用额度已用完/,
 	);
+});
+
+test("Grail cancels and times out during live history RPC without closing the agent", { timeout: 10000 }, async (t) => {
+	const { service, internals, fixture, id, events } = await setup(t);
+	const entry = join(fixture.root, "hung-history.mjs");
+	await writeFile(entry, `import { createInterface } from "node:readline";
+for await (const line of createInterface({ input: process.stdin })) {
+	const { id, type } = JSON.parse(line);
+	if (type === "get_entries") console.log(JSON.stringify({ type: "history_started" }));
+	else console.log(JSON.stringify({ id, type: "response", command: type, success: true, data: "alive" }));
+}`);
+	let entered = Promise.withResolvers<void>();
+	const transport = new AgentProcess({
+		executable: process.execPath, entry, cwd: fixture.project, args: [], env: fixture.env,
+		onEvent: () => entered.resolve(),
+	});
+	t.after(() => transport.stop());
+	const interactive = internals.runtimes.get(id)!.agent;
+	const request = interactive.request.bind(interactive);
+	interactive.request = <T>(command: Parameters<AgentProcess["request"]>[0], signal?: AbortSignal) => command.type === "get_entries" && signal
+		? transport.request<T>(command, signal)
+		: request<T>(command, signal);
+	internals.grailWish = async () => ({ wish: 0, since: 0, checkpoint: { id: "unused" } });
+
+	const first = await service.startGrail(id);
+	await entered.promise;
+	assert.equal(await service.cancelGrail(id), true);
+	assert.deepEqual(events.at(-1), { type: "grail_failed", conversationId: id, id: first.id, error: "鉴定已取消。", cancelled: true });
+	assert.equal(await transport.request({ type: "get_state" }), "alive");
+
+	entered = Promise.withResolvers<void>();
+	internals.store.settings.grailTimeoutSec = 0.5;
+	const terminal = Promise.withResolvers<GrailEvent>();
+	const unsubscribe = service.subscribeGrail((event) => terminal.resolve(event));
+	t.after(unsubscribe);
+	const second = await service.startGrail(id);
+	await entered.promise;
+	assert.deepEqual(await terminal.promise, { type: "grail_failed", conversationId: id, id: second.id, error: "鉴定超时。", cancelled: false });
+	assert.equal(await transport.request({ type: "get_state" }), "alive");
+	assert.ok(await interactive.request({ type: "get_state" }));
 });

@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { ChevronRight, ExternalLink, GitPullRequest, MessageSquareCode, Plus, RefreshCw, Send } from "lucide-react";
 import { formatPullRequestCommentsPrompt, type PullRequestComment, type PullRequestMergeMethod, type PullRequestStatus } from "../shared.ts";
-import { SelectPopover } from "./SelectPopover.tsx";
 import { SmoothCollapse } from "./SmoothCollapse.tsx";
 
 export function PullRequestPanel({ conversationId, branch, readOnly }: { conversationId?: string; branch: string; readOnly: boolean }) {
@@ -187,18 +186,17 @@ export function PullRequestPanel({ conversationId, branch, readOnly }: { convers
 								{!readOnly && pr.state === "OPEN" && (
 									<>
 										{!pr.autoMerge?.enabled && (
-											<SelectPopover
-												ariaLabel="自动合并方式"
-												direction="down"
+											<select
+												className="cc-pr-merge-method"
+												aria-label="自动合并方式"
 												value={mergeMethod}
 												disabled={togglingAutoMerge}
-												options={[
-													{ value: "squash", label: "Squash" },
-													{ value: "merge", label: "Merge" },
-													{ value: "rebase", label: "Rebase" },
-												]}
-												onChange={(val) => setMergeMethod(val as PullRequestMergeMethod)}
-											/>
+												onChange={(event) => setMergeMethod(event.target.value as PullRequestMergeMethod)}
+											>
+												<option value="squash">Squash</option>
+												<option value="merge">Merge</option>
+												<option value="rebase">Rebase</option>
+											</select>
 										)}
 										<button type="button" className="cc-mini-btn" disabled={togglingAutoMerge} onClick={() => void toggleAutoMerge()}>
 											{togglingAutoMerge ? "处理中…" : pr.autoMerge?.enabled ? "关闭自动合并" : "开启自动合并"}

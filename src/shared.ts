@@ -519,7 +519,8 @@ export type GrailEvent =
 	| { type: "grail_progress"; conversationId: string; id: string; step: GrailStep }
 	| { type: "grail_verdict"; conversationId: string; verdict: GrailVerdict }
 	| { type: "grail_failed"; conversationId: string; id: string; error: string; cancelled: boolean }
-	| { type: "grail_sealed"; conversationId: string; wish: number };
+	| { type: "grail_sealed"; conversationId: string; wish: number }
+	| { type: "grail_workspace_changed"; conversationId: string };
 export interface DesktopGrailAPI {
 	/** Starts a judgement of the current wish; cancels a running one of the same conversation. */
 	start(conversationId: string): Promise<{ id: string }>;

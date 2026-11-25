@@ -40,7 +40,7 @@ type Generation = { span: Span; firstOutput?: number };
 type MessageText = { role: "user" | "assistant" | "tool"; content: string; tool_call_id?: string;
 	tool_calls?: { id: string; type: "function"; function: { name: string; arguments: string } }[] };
 type ConversationText = { context: MessageText[]; firstUser?: MessageText; latestUser?: MessageText; latestReply?: MessageText };
-type Run = { root: Span; attributes: Attributes; generation?: Generation; tools: Map<string, Span>; text?: ConversationText };
+type Run = { root: Span; attributes: Attributes; source: Source; generation?: Generation; tools: Map<string, Span>; text?: ConversationText };
 
 function traceText(text: string): string {
 	const redacted = redactLogText(visiblePromptText(text)).replace(
@@ -81,17 +81,22 @@ export class PiTracing {
 		this.tracer = provider.getTracer(scope);
 	}
 
-	observe(id: string, event: DesktopEvent["event"], sessionId: string, parentId?: string, failed?: boolean, source: Source = "agent"): void {
+	observe(id: string, event: DesktopEvent["event"], sessionId: string, parentId?: string, failed?: boolean,
+		source: Source = "agent", sideQuestion?: string): void {
 		switch (event.type) {
-			case "agent_start": this.startRun(id, sessionId, parentId, source); break;
+			case "agent_start": this.startRun(id, sessionId, parentId, source, sideQuestion); break;
 			case "turn_start": this.startGeneration(id); break;
 			case "message_update":
 				if (["text_delta", "thinking_delta", "toolcall_start"].includes(event.assistantMessageEvent.type)) this.firstOutput(id);
 				break;
-			case "message_end":
+			case "message_end": {
 				if (event.message.role === "assistant") this.finishGeneration(id, event.message);
-				else if (event.message.role === "user") this.captureUserMessage(id, event.message.content);
+				else if (event.message.role === "user") {
+					const run = this.runs.get(id);
+					if (run?.source === "agent") this.captureUserMessage(run, event.message.content);
+				}
 				break;
+			}
 			case "tool_execution_start": this.startTool(id, event.toolCallId, event.toolName); break;
 			case "tool_execution_end": this.finishTool(id, event.toolCallId, event.isError); break;
 			case "agent_settled": this.finishRun(id, event.aborted ? "aborted" : failed ? "error" : "success"); break;
@@ -99,22 +104,25 @@ export class PiTracing {
 		}
 	}
 
-	startRun(id: string, sessionId: string, parentId?: string, source: Source = "agent"): string | undefined {
+	startRun(id: string, sessionId: string, parentId?: string, source: Source = "agent", sideQuestion?: string): string | undefined {
 		if (this.closed) return;
 		this.finishRun(id, "aborted");
 		const parent = parentId && this.runs.get(parentId);
+		// Grail prompts and raw model responses can include private diffs and historical context.
+		const captureText = this.captureContent && (source === "agent" || source === "btw");
 		const attributes = {
 			"langfuse.session.id": createHmac("sha256", this.sessionKey).update(sessionId).digest("hex").slice(0, 32),
 			"pi.client": scope,
 			"langfuse.observation.metadata.feature": source,
-			"langfuse.observation.metadata.content_scope": this.captureContent && source !== "setup" ? "visible_turn" : "metadata_only",
+			"langfuse.observation.metadata.content_scope": captureText ? "visible_turn" : "metadata_only",
 		};
 		const name = source === "agent" ? (parentId ? "pi.subagent" : "pi.agent-turn") : `pi.${source}`;
 		const root = this.tracer.startSpan(name, {
 			attributes: { ...attributes, "langfuse.observation.type": "agent" },
 		}, parent ? trace.setSpan(ROOT_CONTEXT, parent.root) : ROOT_CONTEXT);
-		this.runs.set(id, { root, attributes, tools: new Map(),
-			...(this.captureContent && source !== "setup" ? { text: { context: [] } } : {}) });
+		const run: Run = { root, attributes, source, tools: new Map(), text: captureText ? { context: [] } : undefined };
+		this.runs.set(id, run);
+		if (source === "btw" && sideQuestion) this.captureUserMessage(run, sideQuestion);
 		return root.spanContext().traceId;
 	}
 
@@ -137,7 +145,7 @@ export class PiTracing {
 		// A retry can emit a finalized assistant response without a new RPC turn_start.
 		const span = generation?.span ?? this.child(run, "pi.model-call", "generation", message.timestamp);
 		run.generation = undefined;
-		if (run.text) this.captureAssistantMessage(run.text, span, message);
+		if (run.text) this.captureAssistantMessage(run.text, span, message, run.source);
 		const usage = message.usage;
 		span.setAttributes({
 			"gen_ai.operation.name": "chat",
@@ -205,9 +213,8 @@ export class PiTracing {
 		end(run.root, outcome);
 	}
 
-	private captureUserMessage(id: string, content: UserMessage["content"]): void {
-		const run = this.runs.get(id);
-		if (!run?.text) return;
+	private captureUserMessage(run: Run, content: UserMessage["content"]): void {
+		if (!run.text) return;
 		const message: MessageText = { role: "user", content: visibleMessageText(content) };
 		if (!message.content) return;
 		run.text.firstUser ??= message;
@@ -217,12 +224,13 @@ export class PiTracing {
 		run.root.setAttribute("langfuse.observation.input", JSON.stringify(input));
 	}
 
-	private captureAssistantMessage(text: ConversationText, span: Span, response: AssistantMessage): void {
+	private captureAssistantMessage(text: ConversationText, span: Span, response: AssistantMessage, source: Source): void {
 		let input = text.context;
 		if (text.latestUser && !input.includes(text.latestUser)) input = [text.latestUser, ...input.slice(-2)];
 		if (input.length) span.setAttribute("langfuse.observation.input", JSON.stringify(input));
+		if (source === "btw" && (response.stopReason === "error" || response.stopReason === "aborted")) return;
 		const output: MessageText = { role: "assistant", content: visibleMessageText(response.content) };
-		const tools = response.content.filter((part) => part.type === "toolCall").slice(0, 20);
+		const tools = source === "agent" ? response.content.filter((part) => part.type === "toolCall").slice(0, 20) : [];
 		if (tools.length) output.tool_calls = tools.map((part) => ({ id: this.toolId(part.id), type: "function",
 			function: { name: identifier(part.name), arguments: JSON.stringify({ captured: false }) } }));
 		if (!output.content && !output.tool_calls) return;

@@ -2929,6 +2929,11 @@ details.cl-think.is-open .cc-think-preview {
 }
 
 .cc-zoomable-img {
+	display: block;
+	max-width: 100%;
+	padding: 0;
+	border: 0;
+	background: transparent;
 	cursor: zoom-in;
 	border-radius: 9px;
 	transition: transform 180ms var(--ease-spring), box-shadow 180ms ease;
@@ -2939,70 +2944,35 @@ details.cl-think.is-open .cc-think-preview {
 	box-shadow: var(--elev-2);
 }
 
-.cc-lightbox-backdrop {
-	position: fixed;
-	inset: 0;
-	z-index: 120;
-	display: flex;
-	align-items: center;
-	justify-content: center;
-	padding: 28px;
-	background: rgba(15, 23, 42, 0.72);
-	backdrop-filter: blur(12px);
-	animation: cc-fade-up 180ms var(--ease-out-expo) both;
+.cc-zoomable-img > img {
+	margin: 0;
 }
 
-.cc-lightbox-stage {
-	position: relative;
-	display: flex;
-	flex-direction: column;
-	align-items: center;
-	gap: 10px;
-	max-width: min(92vw, 1120px);
-	max-height: 88vh;
-	animation: cc-modal-in 210ms var(--ease-spring) both;
+.cc-prompt-body > .cc-zoomable-img {
+	margin-top: 10px;
 }
 
-.cc-lightbox-stage > img {
+.cl-tool-body > .cc-zoomable-img {
+	max-width: calc(100% - 16px);
+	margin: 8px;
+}
+
+.modal.cc-image-preview-modal {
+	width: 1120px;
+}
+
+.cc-image-preview-stage {
+	display: grid;
+	place-items: center;
+	padding: 16px;
+}
+
+.cc-image-preview-stage > img {
+	display: block;
 	max-width: 100%;
-	max-height: calc(88vh - 44px);
+	max-height: calc(100dvh - 138px);
 	object-fit: contain;
-	border-radius: 12px;
-	box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
-	background: var(--cl-surface);
-}
-
-.cc-lightbox-bar {
-	display: inline-flex;
-	align-items: center;
-	gap: 12px;
-	padding: 5px 8px 5px 12px;
-	border-radius: 999px;
-	background: rgba(15, 23, 42, 0.78);
-	border: 1px solid rgba(255, 255, 255, 0.14);
-	color: #f8fafc;
-	font-size: 12px;
-}
-
-.cc-lightbox-bar > span {
-	display: inline-flex;
-	align-items: center;
-	gap: 6px;
-}
-
-.cc-lightbox-close {
-	display: inline-flex;
-	align-items: center;
-	justify-content: center;
-	width: 24px;
-	height: 24px;
-	border-radius: 50%;
-	color: #f8fafc;
-	background: rgba(255, 255, 255, 0.12);
-}
-
-.cc-lightbox-close:hover {
-	background: rgba(255, 255, 255, 0.24);
+	border-radius: var(--r-md);
 }
 
 /* 13.4 Composer Drag-Drop Magnetic Zone, Micro-Thumbnails & Telemetry HUD */
@@ -3592,6 +3562,17 @@ body.cc-resizing .cc-inspector-resize::after {
 	flex-wrap: wrap;
 	align-items: center;
 	gap: 6px;
+}
+
+.cc-pr-merge-method {
+	height: 27px;
+	padding-inline: 8px;
+	border: 1px solid var(--cl-line);
+	border-radius: 8px;
+	background: var(--cl-soft);
+	color: var(--cl-2);
+	font: inherit;
+	font-size: 12px;
 }
 
 .cc-pr-checks,

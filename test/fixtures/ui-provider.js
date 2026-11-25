@@ -28,6 +28,10 @@ export default function uiProvider(pi) {
 			const user = context.messages[index];
 			const prompt = typeof user?.content === "string" ? user.content : (user?.content.filter((block) => block.type === "text").map((block) => block.text).join("\n") ?? "");
 			const results = context.messages.slice(index + 1).filter((message) => message.role === "toolResult");
+			if (process.env.PI_DESKTOP_CONNECTION_TEST === "1" && prompt.includes("验证侧问面板")) {
+				slow.setResponses([fauxAssistantMessage("本地侧问回复。".repeat(8))]);
+				return slow.provider.streamSimple(model, context, streamOptions);
+			}
 			if (prompt.includes("停止生成验证")) {
 				slow.setResponses([fauxAssistantMessage("流式恢复验证：" + "正在检查项目结构与测试结果。".repeat(500))]);
 				return slow.provider.streamSimple(model, context, streamOptions);
@@ -44,6 +48,22 @@ export default function uiProvider(pi) {
 				const preserved = context.messages.some((message) => message.role === "user" &&
 					(typeof message.content === "string" ? message.content : message.content.map((part) => part.text ?? "").join("\n")).includes("PI_REFERENCE_FIXTURE"));
 				response = fauxAssistantMessage(preserved ? "仍能看到前一轮的文件引用。" : "上一轮文件引用缺失。");
+			} else if (prompt.startsWith("验证时间线增删行")) {
+				const original = Array.from({ length: 210 }, (_, i) => `line ${i + 1}`);
+				const exact = original.map((line, i) => i === 107 ? "replacement" : line);
+				const broad = exact.map((line, i) => i === 0 ? "new start" : i === 209 ? "new end" : line);
+				const text = (lines) => lines.join("\n") + "\n";
+				const path = "timeline-edit.txt";
+				const steps = [
+					fauxToolCall("write", { path: "timeline-write.txt", content: "new row one\nnew row two\nnew row three\n" }),
+					fauxToolCall("write", { path, content: text(original) }),
+					fauxToolCall("edit", { path, edits: [{ oldText: text(original), newText: text(exact) }] }),
+					fauxToolCall("edit", { path, edits: [{ oldText: text(exact), newText: text(broad) }] }),
+					fauxToolCall("read", { path: "timeline-image.png" }),
+				];
+				response = results.length < steps.length
+					? fauxAssistantMessage(steps[results.length], { stopReason: "toolUse" })
+					: fauxAssistantMessage("时间线验证已完成。");
 			} else if (prompt.includes("实现问候函数")) {
 				const steps = [
 					fauxAssistantMessage([

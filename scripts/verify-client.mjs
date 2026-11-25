@@ -20,6 +20,7 @@ const builtExecutable = join(
 // To test the installed copy, pass --executable "/Applications/Pi Desktop.app/Contents/MacOS/Pi Desktop".
 const executable = executableArgument >= 0 ? resolve(process.argv[executableArgument + 1]) : builtExecutable;
 const capture = process.argv.includes("--screenshots");
+const testArgs = process.platform === "darwin" ? ["--use-mock-keychain"] : [];
 async function until(check, label) {
 	const deadline = Date.now() + 20000;
 	while (Date.now() < deadline) {
@@ -35,11 +36,32 @@ console.log(`Verifying ${executable}`);
 const root = await mkdtemp(join(tmpdir(), "pi-client-ui-"));
 const project = join(root, "pi-client-demo");
 const agentDir = join(root, "agent");
+const cliFixtures = join(root, "bin");
+const shellFixture = join(cliFixtures, "fixture-shell");
 const exec = promisify(execFile);
 const gitEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
 await mkdir(join(project, "src"), { recursive: true });
 await mkdir(join(project, "test"));
 await mkdir(join(agentDir, "extensions"), { recursive: true });
+await mkdir(cliFixtures);
+// Preserve the fixture PATH when the packaged app captures the macOS login environment.
+await writeFile(shellFixture, `#!/bin/sh
+if [ "$1" = "-l" ] && [ "$2" = "-i" ] && [ "$3" = "-c" ]; then
+	exec /bin/sh -c "$4"
+fi
+exec "$PI_DESKTOP_FIXTURE_SHELL" "$@"
+`, { mode: 0o755 });
+const prFixture = JSON.stringify({
+	number: 123, title: "本地演示 PR", url: "https://example.invalid/pull/123", state: "OPEN",
+	isDraft: false, headRefName: "fixture", baseRefName: "main", autoMergeRequest: null, statusCheckRollup: [],
+});
+await writeFile(join(cliFixtures, "gh"), `#!/bin/sh
+case "$1 $2" in
+	"pr view") printf '%s\\n' '${prFixture}' ;;
+	"pr merge") printf '%s\\n' "$*" >> "\${0%/*}/gh-commands" ;;
+	*) exit 1 ;;
+esac
+`, { mode: 0o755 });
 await cp(join(repo, "test/fixtures/ui-provider.js"), join(agentDir, "extensions/ui-provider.js"));
 await writeFile(
 	join(agentDir, "settings.json"),
@@ -75,6 +97,9 @@ await exec(
 );
 const env = {
 	...process.env,
+	PATH: `${cliFixtures}:${process.env.PATH}`,
+	SHELL: process.platform === "darwin" ? shellFixture : process.env.SHELL,
+	PI_DESKTOP_FIXTURE_SHELL: process.env.SHELL || "/bin/sh",
 	ELECTRON_RUN_AS_NODE: undefined,
 	PI_CODING_AGENT_DIR: agentDir,
 	PI_DESKTOP_DATA_DIR: join(root, "desktop"),
@@ -93,7 +118,7 @@ let page;
 const checks = [];
 let previewServer;
 try {
-	application = await electron.launch({ executablePath: executable, args: [], env, timeout: 30000 });
+	application = await electron.launch({ executablePath: executable, args: testArgs, env, timeout: 30000 });
 	page = await application.firstWindow();
 	page.setDefaultTimeout(15000);
 	const pageErrors = [];
@@ -1152,6 +1177,58 @@ try {
 	checks.push("send queued text and images immediately, and withdraw into an existing draft");
 
 	await newChat();
+	await startStream();
+	const previousBounds = await application.evaluate(({ BrowserWindow }) => {
+		const win = BrowserWindow.getAllWindows()[0];
+		const bounds = win.getBounds();
+		win.setBounds({ width: 960, height: 650 });
+		return bounds;
+	});
+	const queueConversation = (await snapshot()).active.id;
+	for (let index = 1; index <= 10; index++) {
+		const result = await page.evaluate(({ id, text }) =>
+			window.pi.sendPrompt(id, { text, attachments: [] }, "followUp"), {
+			id: queueConversation,
+			text: [`第 ${index} 条补充指令`, "检查测试用例和结果", "记录输入输出和耗时", "保留本地结果"].join("\n"),
+		});
+		assert.equal(result.disposition, "queued");
+	}
+	const queueList = queue.getByRole("group", { name: "指令列表", exact: true });
+	const stopTask = page.getByRole("button", { name: "停止任务", exact: true });
+	await until(async () => await queueList.locator(".cc-queue-item").count() === 10, "all queued instructions");
+	assert.ok(await queueList.evaluate((list) => list.scrollHeight > list.clientHeight));
+	await queueList.focus();
+	await queueList.press("End");
+	await until(() => queueList.evaluate((list) => list.scrollTop > 0), "keyboard scrolling in the queue");
+	for (const control of [input, stopTask, queue.getByRole("button", { name: "停止并发送队列", exact: true })]) {
+		assert.ok(await control.evaluate((element) => {
+			const { top, bottom } = element.getBoundingClientRect();
+			return top >= 0 && bottom <= window.innerHeight;
+		}));
+	}
+	await queue.getByRole("button", { name: "撤回到输入框", exact: true }).click();
+	await queue.waitFor({ state: "hidden" });
+	await stopTask.click();
+	await idle();
+	await application.evaluate(({ BrowserWindow }, bounds) => BrowserWindow.getAllWindows()[0].setBounds(bounds), previousBounds);
+	checks.push("long queues scroll by keyboard while the narrow-window composer and stop actions stay visible");
+
+	await newChat();
+	await submit("检查本轮代码基线");
+	await idle();
+	const review = page.getByRole("button", { name: "质量鉴定", exact: true });
+	const clean = page.getByText("当前代码与需求开始时的快照一致。", { exact: true });
+	await clean.waitFor();
+	assert.equal(await review.isDisabled(), true);
+	const externalEdit = join(project, "src/grail-review-readiness-fixture.txt");
+	await writeFile(externalEdit, "External editor change\n");
+	await until(() => review.isEnabled(), "quality review becomes available after an external edit");
+	await rm(externalEdit);
+	await clean.waitFor();
+	assert.equal(await review.isDisabled(), true);
+	checks.push("quality review updates when external edits appear and return to the baseline");
+
+	await newChat();
 	await submit("持久草稿会话");
 	await idle();
 	await input.fill("重启后保留的草稿");
@@ -1169,6 +1246,7 @@ try {
 	await application.close();
 	application = await electron.launch({
 		executablePath: executable,
+		args: testArgs,
 		env: { ...env, PI_DESKTOP_WORKSPACE: undefined },
 		timeout: 30000,
 	});
@@ -1397,6 +1475,99 @@ try {
 	await sidebarWindow.evaluate((win, size) => win.setSize(...size), sidebarWindowSize);
 	await sidebarWindow.dispose();
 	checks.push("sidebar disclosures, discoverable session menu and scroll restoration after collapse");
+
+	await newChat();
+	await setPermissionMode("auto");
+	const statusAccordion = page.locator(".cc-conversation-status summary");
+	const sideQuestion = page.locator(".cc-btw-card");
+	const sideAnswer = sideQuestion.getByText(/^本地侧问回复。/);
+	await submit("/btw 验证侧问面板一");
+	await sideAnswer.waitFor();
+	await statusAccordion.click();
+	assert.equal(await statusAccordion.getAttribute("aria-expanded"), "false");
+	await submit("/btw 验证侧问面板二");
+	await sideQuestion.getByText("/btw 验证侧问面板二", { exact: true }).waitFor();
+	assert.equal(await statusAccordion.getAttribute("aria-expanded"), "true");
+	await statusAccordion.click();
+	await sideAnswer.waitFor({ state: "attached" });
+	assert.equal(await statusAccordion.getAttribute("aria-expanded"), "false");
+	await statusAccordion.click();
+	await sideQuestion.getByRole("button", { name: "关闭", exact: true }).click();
+	checks.push("/btw opens a collapsed conversation activity disclosure and respects manual collapse after submission");
+
+	const imagePath = join(project, "timeline-image.png");
+	await writeFile(imagePath, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==", "base64"));
+	await writeFile(join(project, "timeline-write.txt"), "old row one\nold row two\nold row three\nold row four\n");
+	await page.getByLabel("选择附件", { exact: true }).setInputFiles(imagePath);
+	await submit("验证时间线增删行");
+	await page.getByText("时间线验证已完成。", { exact: true }).waitFor();
+	await idle();
+	const timelineMessages = (await snapshot()).messages;
+	assert.deepEqual(timelineMessages.filter((message) => message.role === "toolResult").map((message) => message.isError),
+		[false, false, false, false, false]);
+	const writeSpotlight = page.locator(".cc-edit-spotlight-row").filter({ hasText: "timeline-write.txt" });
+	await writeSpotlight.getByText("已写入", { exact: true }).waitFor();
+	await writeSpotlight.getByText("3 行", { exact: true }).waitFor();
+	assert.equal(await writeSpotlight.locator(".cc-tool-diff-stat").count(), 0);
+	const updateSpotlights = page.locator(".cc-edit-spotlight-row").filter({ hasText: "已更新" });
+	const exactSpotlight = updateSpotlights.filter({ has: page.getByText("+1", { exact: true }) });
+	await exactSpotlight.getByText("-1", { exact: true }).waitFor();
+	const broadSpotlight = updateSpotlights.filter({ hasText: "差异预览" });
+	assert.equal(await broadSpotlight.locator(".cc-tool-diff-stat").count(), 0);
+	const broadDiff = broadSpotlight.locator("..");
+	await broadDiff.getByText("改动前（未逐行对比）", { exact: true }).waitFor();
+	await broadDiff.getByText("改动后（未逐行对比）", { exact: true }).waitFor();
+	assert.equal(await broadDiff.locator(".cc-diff-add, .cc-diff-del").count(), 0);
+	checks.push("transcript write counts and exact or bounded edit previews describe actual line changes");
+
+	const currentComposer = page.getByRole("textbox", { name: "输入任务", exact: true });
+	await currentComposer.fill("图片预览期间保留这份草稿");
+	const checkPreview = async (thumbnail) => {
+		await thumbnail.focus();
+		await page.keyboard.press("Enter");
+		const dialog = page.locator("dialog.cc-image-preview-modal[open]");
+		await dialog.waitFor();
+		const close = dialog.getByRole("button", { name: "关闭对话框", exact: true });
+		assert.ok(await close.evaluate((button) => button === document.activeElement));
+		await page.evaluate(() => document.querySelector('textarea[aria-label="输入任务"]').focus());
+		assert.ok(await close.evaluate((button) => button === document.activeElement));
+		for (let i = 0; i < 3; i++) {
+			await page.keyboard.press("Tab");
+			assert.ok(await dialog.evaluate((node) => node.contains(document.activeElement) || document.activeElement === document.body));
+		}
+		await page.keyboard.press("Escape");
+		await dialog.waitFor({ state: "detached" });
+		await until(() => thumbnail.evaluate((button) => button === document.activeElement), "restore thumbnail focus");
+		assert.equal(await currentComposer.inputValue(), "图片预览期间保留这份草稿");
+	};
+	await checkPreview(page.getByRole("button", { name: "放大预览：用户附件预览", exact: true }));
+	const timelineGroup = page.locator(".cc-tool-group-head").filter({ hasText: "编辑 4 个文件" });
+	await timelineGroup.click();
+	await page.locator(".cl-tool > .cc-tool-row").filter({ hasText: "timeline-image.png" }).click();
+	await checkPreview(page.getByRole("button", { name: "放大预览：读取 timeline-image.png", exact: true }));
+	assert.equal((await snapshot()).messages.length, timelineMessages.length);
+	checks.push("user and tool image previews are keyboard-operable, keep background focus inert and restore focus");
+
+	const prWindow = await application.browserWindow(page);
+	const prInitialSize = await prWindow.evaluate((win) => win.getSize());
+	await prWindow.evaluate((win) => win.setSize(980, 650));
+	await page.waitForFunction(() => window.innerWidth === 980);
+	await page.getByRole("button", { name: "代码修改", exact: true }).click();
+	await page.getByRole("button", { name: "整个工作区", exact: true }).click();
+	await page.locator(".workspace-review-git summary").click();
+	await page.getByRole("button", { name: "PR 与 CI", exact: true }).click();
+	await page.getByText("#123 本地演示 PR", { exact: true }).waitFor();
+	const mergeMethods = selectControl("自动合并方式");
+	assert.deepEqual(await mergeMethods.locator("option").allTextContents(), ["Squash", "Merge", "Rebase"]);
+	for (const method of ["merge", "rebase"]) {
+		await mergeMethods.selectOption(method);
+		await page.getByRole("button", { name: "开启自动合并", exact: true }).click();
+		await page.getByText(`已开启自动合并（${method}）。`, { exact: true }).waitFor();
+	}
+	assert.equal(await readFile(join(cliFixtures, "gh-commands"), "utf8"), "pr merge 123 --auto --merge\npr merge 123 --auto --rebase\n");
+	await prWindow.evaluate((win, size) => win.setSize(...size), prInitialSize);
+	await prWindow.dispose();
+	checks.push("native PR merge options work in a narrow Git inspector with no CI checks");
 
 	assert.deepEqual(pageErrors, []);
 	if (capture)

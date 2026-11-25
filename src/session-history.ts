@@ -189,9 +189,9 @@ export class SessionHistoryService {
 		return result;
 	}
 
-	async inspect(input: SessionHistoryInspectInput): Promise<SessionHistoryInspection> {
-		const content = await safeRead(resolve(input.sessionFile), resolve(this.options.dataDir, "sessions"));
-		const response = await this.helper({ type: "inspect", content, leafId: input.leafId });
+	async inspect(input: SessionHistoryInspectInput, signal?: AbortSignal): Promise<SessionHistoryInspection> {
+		const content = await safeRead(resolve(input.sessionFile), resolve(this.options.dataDir, "sessions"), signal);
+		const response = await this.helper({ type: "inspect", content, leafId: input.leafId }, signal);
 		if (response.type !== "inspect") throw new Error("Pi 会话树响应不匹配。");
 		return response.result;
 	}
@@ -214,11 +214,14 @@ export class SessionHistoryService {
 		}
 	}
 
-	private helper(request: SessionHistoryHelperRequest): Promise<SessionHistoryHelperResponse> {
+	private helper(request: SessionHistoryHelperRequest, signal?: AbortSignal): Promise<SessionHistoryHelperResponse> {
 		return new Promise((resolveResult, reject) => {
+			signal?.throwIfAborted();
 			const child = spawn(this.options.executable, [this.options.entry], {
 				env: { ...process.env, ...this.options.env, ELECTRON_RUN_AS_NODE: "1", PI_OFFLINE: "1" },
 				stdio: ["pipe", "pipe", "pipe"],
+				signal,
+				killSignal: "SIGKILL",
 			});
 			const stdout: Buffer[] = [];
 			let outputBytes = 0;
@@ -236,6 +239,7 @@ export class SessionHistoryService {
 			child.on("error", (error) => { failure = error; });
 			child.on("close", (code) => {
 				clearTimeout(timer);
+				if (signal?.aborted) { reject(signal.reason); return; }
 				if (failure) { reject(failure); return; }
 				if (code !== 0) { reject(new Error(`Pi 历史读取失败：${stderr.trim() || code}`)); return; }
 				try {
@@ -282,18 +286,20 @@ async function safeDirectory(path: string, root: string = path): Promise<string>
 	return join(canonicalRoot, ...segments);
 }
 
-async function safeRead(path: string, root: string): Promise<string> {
+async function safeRead(path: string, root: string, signal?: AbortSignal): Promise<string> {
+	signal?.throwIfAborted();
 	const original = resolve(path);
 	const base = await safeDirectory(resolve(root));
 	const parent = await safeDirectory(dirname(original), resolve(root));
 	const normalized = join(parent, basename(original));
-	const handle = await open(normalized, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+	const handle = await open(normalized, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0));
 	try {
 		const before = await handle.stat();
 		if (!before.isFile() || before.size > maximumFileBytes) throw new Error("历史必须是 64 MB 以内的普通文件。");
 		const bytes = Buffer.alloc(before.size + 1);
 		let length = 0;
 		while (length < bytes.length) {
+			signal?.throwIfAborted();
 			const read = await handle.read(bytes, length, bytes.length - length, null);
 			if (!read.bytesRead) break;
 			length += read.bytesRead;
@@ -301,6 +307,7 @@ async function safeRead(path: string, root: string): Promise<string> {
 		const after = await handle.stat();
 		const current = await lstat(normalized);
 		await safeDirectory(dirname(normalized), base);
+		signal?.throwIfAborted();
 		if (length !== before.size || before.size !== after.size || before.mtimeMs !== after.mtimeMs ||
 			current.isSymbolicLink() || current.ino !== after.ino || current.dev !== after.dev ||
 			await realpath(normalized) !== join(await realpath(base), relative(base, normalized)))

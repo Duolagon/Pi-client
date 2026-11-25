@@ -33,7 +33,7 @@ async function requestBody(request: IncomingMessage): Promise<string> {
 	return (request.headers["content-encoding"] === "gzip" ? gunzipSync(body) : body).toString("utf8");
 }
 
-async function createEndpoint() {
+async function createEndpoint(failOnRequest?: number) {
 	const traces: { body: string; authorization?: string; spans: WireSpan[] }[] = [];
 	const modelRequests: string[] = [];
 	const errors: unknown[] = [];
@@ -50,7 +50,7 @@ async function createEndpoint() {
 			assert.equal(request.url, "/chat/completions");
 			assert.equal(request.headers.authorization, `Bearer ${modelKey}`);
 			modelRequests.push(body);
-			if (modelRequests.length === 3) {
+			if (modelRequests.length === failOnRequest) {
 				response.writeHead(401, { "content-type": "application/json" })
 					.end(JSON.stringify({ error: { message: errorMarker, type: "authentication_error" } }));
 				return;
@@ -129,7 +129,7 @@ test("Langfuse uses opt-in host configuration and removes credentials from child
 test("DesktopService exports related turn, generation, and tool spans with usage and without request content", { timeout: 45_000 }, async (t) => {
 	const fixture = await createCoreFixture();
 	t.after(fixture.cleanup);
-	const endpoint = await createEndpoint();
+	const endpoint = await createEndpoint(3);
 	t.after(endpoint.close);
 	const tracing = createPiTracing({ LANGFUSE_PUBLIC_KEY: publicKey, LANGFUSE_SECRET_KEY: secretKey,
 		LANGFUSE_BASE_URL: endpoint.baseUrl }, () => assert.fail("Invalid test tracing configuration"));
@@ -207,5 +207,51 @@ test("DesktopService exports related turn, generation, and tool spans with usage
 		}
 	} finally {
 		await service.close();
+	}
+});
+
+test("DesktopService sends side question history to the model and exports only the visible exchange", { timeout: 45_000 }, async (t) => {
+	const fixture = await createCoreFixture();
+	t.after(fixture.cleanup);
+	const endpoint = await createEndpoint();
+	t.after(endpoint.close);
+	const tracing = createPiTracing({ LANGFUSE_PUBLIC_KEY: publicKey, LANGFUSE_SECRET_KEY: secretKey,
+		LANGFUSE_BASE_URL: endpoint.baseUrl, LANGFUSE_CAPTURE_CONTENT: "1" }, () => assert.fail("Invalid test tracing configuration"));
+	assert.ok(tracing);
+	const service = new DesktopService({
+		dataDir: fixture.dataDir,
+		executable: process.execPath,
+		entry: fixture.entry,
+		permissionExtension: resolve(import.meta.dirname, "../src/permission-extension.ts"),
+		env: { ...fixture.env, HOME: fixture.root },
+		initialProject: fixture.project,
+		providerBaseUrls: { deepseek: endpoint.baseUrl },
+		encrypt: (value) => Buffer.from(value).toString("base64"),
+		decrypt: (value) => Buffer.from(value, "base64").toString(),
+		tracing,
+	});
+	const question = "fixture side question";
+	try {
+		assert.equal((await service.initialize()).engineStatus, "ready");
+		const saved = await service.saveSettings({ permission: "ask", theme: "light", provider: "deepseek", apiKey: modelKey });
+		await prompt(service, userMarker);
+		const result = await service.askBtw(question, saved.active?.id);
+		assert.equal(result.answer, outputMarker);
+	} finally {
+		await service.close();
+	}
+	assert.deepEqual(endpoint.errors, []);
+	assert.equal(endpoint.modelRequests.length, 3);
+	assert.ok(endpoint.modelRequests[2].includes(userMarker));
+	assert.ok(endpoint.modelRequests[2].includes(question));
+	const spans = endpoint.traces.flatMap((item) => item.spans);
+	const root = spans.find((span) => span.name === "pi.btw");
+	assert.ok(root);
+	const children = spans.filter((span) => span.parentSpanId === root.spanId);
+	assert.deepEqual(children.map((span) => span.name), ["pi.model-call"]);
+	for (const span of [root, ...children]) {
+		assert.equal(attribute(span, "langfuse.observation.input"), JSON.stringify([{ role: "user", content: question }]));
+		assert.equal(attribute(span, "langfuse.observation.output"), JSON.stringify([{ role: "assistant", content: outputMarker }]));
+		assert.ok(!JSON.stringify(span).includes(userMarker));
 	}
 });

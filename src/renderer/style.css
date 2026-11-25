@@ -4921,10 +4921,16 @@ body.cc-resizing iframe {
 .cc-queue-head {
 	display: flex;
 	align-items: center;
+	flex-wrap: wrap;
 	justify-content: space-between;
 	gap: 10px;
 	font-size: var(--fs-sm);
 	color: var(--cl-amber);
+}
+.cc-queue-list {
+	max-height: min(144px, 18dvh);
+	overflow-y: auto;
+	overscroll-behavior-y: contain;
 }
 .cc-queue-item {
 	margin: 0;

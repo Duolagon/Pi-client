@@ -210,6 +210,23 @@ export function scriptEnvironment(env: NodeJS.ProcessEnv, cacheDir: string): Nod
 }
 
 const maxOutput = 64 * 1024;
+
+function declaredDependencies(manifest: unknown): string[] {
+	if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) return [];
+	return ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"].flatMap((field) => {
+		const entries = (manifest as Record<string, unknown>)[field];
+		return entries && typeof entries === "object" && !Array.isArray(entries) ? Object.keys(entries) : [];
+	});
+}
+
+function missingTestDependency(output: string, declared: ReadonlySet<string>): boolean {
+	if (/\b(?:AssertionError|ERR_ASSERTION)\b/.test(output)) return false;
+	for (const [, dependency] of output.matchAll(/Cannot find (?:package|module) ['"]([^'"\r\n]+)['"]/g)) {
+		if (declared.has(dependency) || /[/\\]node_modules[/\\]/.test(dependency)) return true;
+	}
+	return false;
+}
+
 /** Spawn without a shell; output keeps the tail, the process group dies on timeout or abort. */
 export function runProcess(
 	command: string,
@@ -255,6 +272,7 @@ export function runProcess(
 export async function runObjectiveChecks(options: {
 	project: string;
 	manifest: unknown;
+	inheritedManifests?: unknown[];
 	files: string[];
 	env: NodeJS.ProcessEnv;
 	sandboxProfile?: string;
@@ -267,6 +285,7 @@ export async function runObjectiveChecks(options: {
 	if (!scripts.some((item) => item.name === "test"))
 		return { status: "unavailable", reason: "package.json 没有可执行的 test 脚本。", runs: [] };
 	const manager = packageManager(options.files);
+	const dependencies = new Set([options.manifest, ...(options.inheritedManifests ?? [])].flatMap(declaredDependencies));
 	const runs: GrailCheckRun[] = [];
 	for (const { name, script } of scripts) {
 		options.signal.throwIfAborted();
@@ -287,6 +306,8 @@ export async function runObjectiveChecks(options: {
 		if (result.timedOut) return { status: "unavailable", reason: `${run.command} 超时。`, runs };
 		if (result.launchError) return { status: "unavailable", reason: `无法启动 ${run.command}：${result.launchError}`, runs };
 		if (result.exitCode === null) return { status: "unavailable", reason: `${run.command} 运行中断。`, runs };
+		if ((result.exitCode !== 0 || testSummary?.failed) && missingTestDependency(result.output, dependencies))
+			return { status: "unavailable", reason: `${run.command} 无法加载所需的测试依赖，请检查工作区依赖是否已安装。`, runs };
 		if (result.exitCode !== 0) {
 			if (result.exitCode === 126 || result.exitCode === 127 || /^\s*(?:sh|bash): .*: (?:command )?not found\s*$/m.test(result.output))
 				return { status: "unavailable", reason: `${run.command} 所需的命令不可用，请检查测试工具和依赖。`, runs };

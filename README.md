@@ -156,7 +156,7 @@ unset LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY LANGFUSE_BASE_URL
 
 默认只发送元数据。需要查看正文时，先退出客户端，再运行 `'/Applications/Pi Desktop.app/Contents/MacOS/Pi Desktop' --enable-langfuse-content`。用 `--disable-langfuse-content` 恢复仅元数据。一次性环境配置可以通过 `LANGFUSE_CAPTURE_CONTENT=1` 启用。
 
-开启后，Trace 记录当轮用户可见文本和助手回复，Generation 记录当轮已观测的消息、可见输出和工具名称，工具步骤记录完成状态。正文会去除常见凭据及内网 IP 并限制长度。附件、引用文件正文、隐藏推理、原始工具参数与结果保留在本机。外部 Agent 适配器内部的独立模型调用目前由各自的运行时管理。跨机器传输时使用 HTTPS。 [Langfuse OpenTelemetry 文档](https://langfuse.com/integrations/native/opentelemetry)
+开启后，常规对话的 Trace 记录当轮用户可见文本和助手回复，Generation 记录当轮已观测的消息、可见输出和工具名称，工具步骤记录完成状态。`/btw` 只记录用户输入的侧问和成功返回的答复。`/grail` 仅记录模型、用量、费用、耗时和状态等元数据。正文会去除常见凭据及内网 IP 并限制长度。附件、引用文件正文、隐藏推理、原始工具参数与结果保留在本机。外部 Agent 适配器内部的独立模型调用目前由各自的运行时管理。跨机器传输时使用 HTTPS。 [Langfuse OpenTelemetry 文档](https://langfuse.com/integrations/native/opentelemetry)
 
 ## 旧界面原型
 

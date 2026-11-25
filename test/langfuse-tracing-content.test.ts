@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { gunzipSync } from "node:zlib";
 import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
 import { wrapDesktopWorkspaceContext } from "../src/file-references.ts";
-import { createPiTracing } from "../src/langfuse-tracing.ts";
+import { createPiTracing, type PiTracing } from "../src/langfuse-tracing.ts";
 import type { DesktopEvent } from "../src/shared.ts";
 
 const userText = "fixture-visible-user-prompt";
@@ -36,7 +36,33 @@ function assistantMessage(content: AssistantMessage["content"], stopReason: Assi
 	};
 }
 
-async function collectRun(captureContent?: string): Promise<{ spans: WireSpan[]; body: string }> {
+function recordAgentTurn(tracing: PiTracing): void {
+	const observe = (event: DesktopEvent["event"]) => tracing.observe("fixture-run", event, "fixture-session");
+	const prompt: UserMessage = { role: "user", timestamp: Date.now(), content: [
+		{ type: "text", text: `${userText} ${fakeToken}` },
+		{ type: "text", text: wrapDesktopWorkspaceContext(workspaceText) },
+		{ type: "image", data: attachment, mimeType: "image/png" },
+	] };
+	const initial = assistantMessage([
+		{ type: "thinking", thinking },
+		{ type: "text", text: firstAnswer },
+		{ type: "toolCall", id: "local-tool-call", name: "read", arguments: { path: toolArgument } },
+	], "toolUse");
+	const final = assistantMessage([{ type: "text", text: finalAnswer }], "stop");
+	observe({ type: "agent_start" });
+	observe({ type: "turn_start" });
+	observe({ type: "message_start", message: prompt });
+	observe({ type: "message_end", message: prompt });
+	observe({ type: "message_end", message: initial });
+	observe({ type: "tool_execution_start", toolCallId: "local-tool-call", toolName: "read", args: { path: toolArgument } });
+	observe({ type: "tool_execution_end", toolCallId: "local-tool-call", toolName: "read", result: toolResult, isError: false });
+	observe({ type: "turn_start" });
+	observe({ type: "message_end", message: final });
+	observe({ type: "agent_end", messages: [prompt, initial, final], willRetry: false });
+	observe({ type: "agent_settled", aborted: false });
+}
+
+async function collectRun(captureContent?: string, record = recordAgentTurn): Promise<{ spans: WireSpan[]; body: string }> {
 	const bodies: string[] = [];
 	const spans: WireSpan[] = [];
 	const errors: unknown[] = [];
@@ -70,30 +96,8 @@ async function collectRun(captureContent?: string): Promise<{ spans: WireSpan[];
 			...(captureContent === undefined ? {} : { LANGFUSE_CAPTURE_CONTENT: captureContent }),
 		}, () => assert.fail("Invalid tracing fixture configuration"));
 		assert.ok(tracing);
-		const observe = (event: DesktopEvent["event"]) => tracing.observe("fixture-run", event, "fixture-session");
-		const prompt: UserMessage = { role: "user", timestamp: Date.now(), content: [
-			{ type: "text", text: `${userText} ${fakeToken}` },
-			{ type: "text", text: wrapDesktopWorkspaceContext(workspaceText) },
-			{ type: "image", data: attachment, mimeType: "image/png" },
-		] };
-		const initial = assistantMessage([
-			{ type: "thinking", thinking },
-			{ type: "text", text: firstAnswer },
-			{ type: "toolCall", id: "local-tool-call", name: "read", arguments: { path: toolArgument } },
-		], "toolUse");
-		const final = assistantMessage([{ type: "text", text: finalAnswer }], "stop");
 		try {
-			observe({ type: "agent_start" });
-			observe({ type: "turn_start" });
-			observe({ type: "message_start", message: prompt });
-			observe({ type: "message_end", message: prompt });
-			observe({ type: "message_end", message: initial });
-			observe({ type: "tool_execution_start", toolCallId: "local-tool-call", toolName: "read", args: { path: toolArgument } });
-			observe({ type: "tool_execution_end", toolCallId: "local-tool-call", toolName: "read", result: toolResult, isError: false });
-			observe({ type: "turn_start" });
-			observe({ type: "message_end", message: final });
-			observe({ type: "agent_end", messages: [prompt, initial, final], willRetry: false });
-			observe({ type: "agent_settled", aborted: false });
+			record(tracing);
 		} finally {
 			await tracing.close();
 		}
@@ -151,4 +155,50 @@ test("Langfuse captures recent visible messages when opted in and excludes priva
 	for (const text of [fakeToken, workspaceText, attachment, thinking, toolArgument, toolResult]) {
 		assert.ok(!body.includes(text), `Unexpected trace content: ${text}`);
 	}
+});
+
+test("Langfuse excludes Grail review context and limits side question traces to the visible exchange", { timeout: 20_000 }, async () => {
+	const hiddenHistory = "fixture-btw-hidden-conversation-history";
+	const hiddenGrailData = ["fixture-grail-private-diff", "fixture-grail-old-wish", "fixture-grail-blind-solution"];
+	const hiddenFailedReply = "fixture-btw-discarded-partial-answer";
+	const sideQuestion = "fixture-visible-side-question";
+	const sideAnswer = "fixture-visible-side-answer";
+	const { spans, body } = await collectRun("1", (tracing) => {
+		const grail = (event: DesktopEvent["event"]) => tracing.observe("grail-run", event, "fixture-session", undefined, undefined, "grail");
+		const btw = (event: DesktopEvent["event"]) => tracing.observe("side-run", event, "fixture-session", undefined, undefined, "btw", sideQuestion);
+		grail({ type: "agent_start" });
+		grail({ type: "turn_start" });
+		grail({ type: "message_end", message: { role: "user", timestamp: Date.now(), content: hiddenGrailData.join("\n") } });
+		grail({ type: "message_end", message: assistantMessage([{ type: "text", text: hiddenGrailData[2] }], "stop") });
+		grail({ type: "agent_settled", aborted: false });
+		btw({ type: "agent_start" });
+		btw({ type: "turn_start" });
+		btw({ type: "message_end", message: { role: "user", timestamp: Date.now(), content: `${hiddenHistory}\n${sideQuestion}` } });
+		btw({ type: "message_end", message: assistantMessage([{ type: "text", text: hiddenFailedReply }], "error") });
+		btw({ type: "turn_start" });
+		btw({ type: "message_end", message: assistantMessage([{ type: "text", text: sideAnswer }], "stop") });
+		btw({ type: "agent_settled", aborted: false });
+	});
+	const grail = spans.find((span) => span.name === "pi.grail");
+	const btw = spans.find((span) => span.name === "pi.btw");
+	assert.ok(grail && btw);
+	assert.equal(attribute(grail, "langfuse.observation.metadata.content_scope"), "metadata_only");
+	assert.equal(attribute(btw, "langfuse.observation.metadata.content_scope"), "visible_turn");
+	const grailGenerations = spans.filter((span) => span.parentSpanId === grail.spanId);
+	const btwGenerations = spans.filter((span) => span.parentSpanId === btw.spanId);
+	assert.equal(grailGenerations.length, 1);
+	assert.equal(btwGenerations.length, 2);
+	for (const span of [grail, ...grailGenerations]) {
+		assert.equal(attribute(span, input), undefined);
+		assert.equal(attribute(span, output), undefined);
+	}
+	for (const span of [...grailGenerations, ...btwGenerations]) {
+		assert.equal(attribute(span, "gen_ai.request.model"), "fixture-model");
+		assert.equal(attribute(span, "langfuse.observation.usage_details"), JSON.stringify({ input: 20, output: 10, input_cached_tokens: 0, input_cache_write_tokens: 0, total: 30 }));
+	}
+	for (const span of [btw, ...btwGenerations]) {
+		assert.equal(attribute(span, input), JSON.stringify([{ role: "user", content: sideQuestion }]));
+		assert.equal(attribute(span, output), attribute(span, "pi.outcome") === "error" ? undefined : JSON.stringify([{ role: "assistant", content: sideAnswer }]));
+	}
+	for (const hidden of [...hiddenGrailData, hiddenHistory, hiddenFailedReply]) assert.ok(!body.includes(hidden), `Unexpected trace content: ${hidden}`);
 });

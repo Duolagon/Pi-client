@@ -2,12 +2,15 @@
 // GRAIL_TEST_CONTROL names a file whose content picks the comparison outcome;
 // GRAIL_TEST_LOG receives one JSON line per request (step, cwd, prompt).
 import { appendFileSync, readFileSync } from "node:fs";
-import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { calculateCost, createAssistantMessageEventStream, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 
 const options = {
 	provider: "grail-test",
 	api: "grail-test-api",
-	models: [{ id: "grail-judge-1", name: "本地鉴定模型", reasoning: false }],
+	models: [
+		{ id: "grail-judge-1", name: "本地鉴定模型", reasoning: false, cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 } },
+		{ id: "grail-unpriced", name: "未设置价格的本地鉴定模型", reasoning: false },
+	],
 	tokensPerSecond: 4000,
 };
 const faux = fauxProvider(options);
@@ -58,7 +61,16 @@ export default function grailProvider(pi) {
 				}) + "\n```";
 			}
 			faux.setResponses([fauxAssistantMessage(text)]);
-			return faux.provider.streamSimple(model, context, streamOptions);
+			const source = faux.provider.streamSimple(model, context, streamOptions);
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				for await (const event of source) {
+					if (event.type === "done" && mode !== "zero-cost") calculateCost(model, event.message.usage);
+					stream.push(event);
+				}
+				stream.end(await source.result());
+			})();
+			return stream;
 		},
 	});
 }

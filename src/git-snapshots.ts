@@ -44,6 +44,11 @@ interface Manifest {
 	before: Record<string, Entry>;
 	after?: Record<string, Entry>;
 }
+interface ReviewDirectories {
+	selected: string;
+	objective?: string;
+}
+type ObjectiveSource = { repository: string; project: string } | { reason: string };
 const missing: Entry = { kind: "missing" };
 const excluded: Entry = { kind: "excluded" };
 
@@ -197,7 +202,9 @@ export class GitSnapshots {
 	}
 
 	/** Differences from a checkpoint's before-state to the current worktree (spanning later checkpoints). */
-	async diffToWorktree(project: string, id: string, reviewDirectory?: string, signal?: AbortSignal): Promise<GitCheckpointDiff> {
+	async diffToWorktree(
+		project: string, id: string, review?: ReviewDirectories, signal?: AbortSignal,
+	): Promise<GitCheckpointDiff & { objective?: ObjectiveSource }> {
 		const root = await this.projectRoot(project, signal);
 		return this.serialize(root, async () => {
 			signal?.throwIfAborted();
@@ -205,15 +212,55 @@ export class GitSnapshots {
 			const current = await this.capture(root, Object.keys(manifest.before), signal);
 			const files: GitCheckpointDiff["files"] = [];
 			const excluded = excludedPaths(manifest.before, current);
-			if (reviewDirectory && !excluded.size) await this.materializeEntries(root, reviewDirectory, current, signal);
 			for (const change of changes(manifest.before, current, excluded)) {
 				signal?.throwIfAborted();
 				if (!hasFileSide(change.beforeKind, change.afterKind)) continue;
 				const result = await this.fileDiff(change.path, manifest.before[change.path] ?? missing, current[change.path] ?? missing, signal);
 				files.push({ ...change, ...result });
 			}
-			return excluded.size ? { checkpointId: id, files, excludedFiles: excluded.size } : { checkpointId: id, files };
+			if (excluded.size) return { checkpointId: id, files, excludedFiles: excluded.size };
+			if (!review || !files.length) return { checkpointId: id, files };
+			await this.materializeEntries(root, review.selected, current, signal);
+			const objective = review.objective ? await this.freezeObjectiveSource(root, review.objective, current, signal) : undefined;
+			return { checkpointId: id, files, objective };
 		});
+	}
+
+	private async freezeObjectiveSource(
+		project: string, target: string, selected: Record<string, Entry>, signal?: AbortSignal,
+	): Promise<ObjectiveSource> {
+		try {
+			const { stdout } = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: project, timeout: 10000, signal });
+			const repository = await realpath(stdout.replace(/\r?\n$/, ""));
+			if (!inside(repository, project) || inside(repository, this.dataDir) || inside(repository, resolve(target)))
+				return { reason: "无法安全保存整个 Git 工作区供客观检查使用。" };
+			const prefix = relative(repository, project);
+			if (prefix) {
+				const sourcePaths = await this.snapshotPaths(repository, [], signal);
+				const selectedPrefix = `${prefix.split(sep).join("/")}/`;
+				for (const path of sourcePaths) if (path.startsWith(selectedPrefix)) sourcePaths.delete(path);
+				// Files outside the selected checkpoint exist only for this objective run.
+				const temporary = await mkdtemp(join(dirname(target), "objective-blobs-"));
+				try {
+					const siblings = new GitSnapshots(temporary);
+					await mkdir(join(siblings.dataDir, "blobs"), { recursive: true, mode: 0o700 });
+					const entries = await siblings.capturePaths(repository, sourcePaths, signal);
+					if (Object.values(entries).some((entry) => entry.kind === "excluded"))
+						return { reason: "有依赖的工作区文件超出快照容量，无法完整执行客观检查。" };
+					await siblings.materializeEntries(repository, target, entries, signal);
+				} finally {
+					await rm(temporary, { recursive: true, force: true });
+				}
+				const rebased = Object.fromEntries(Object.entries(selected).map(([path, entry]) => [`${selectedPrefix}${path}`, entry]));
+				await this.materializeEntries(repository, target, rebased, signal);
+			} else {
+				await this.materializeEntries(repository, target, selected, signal);
+			}
+			return { repository, project: join(target, prefix) };
+		} catch (error) {
+			signal?.throwIfAborted();
+			return { reason: `无法准备客观检查所需的工作区快照：${error instanceof Error ? error.message : String(error)}` };
+		}
 	}
 
 	/** Write a checkpoint's before-state files into an empty directory outside the project (read-only copy). */

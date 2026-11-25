@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { highlightCode } from "./highlight.tsx";
 
-import { parseUnifiedDiff, type DiffLine } from "./diff-lines.ts";
+import { computeLineDiff, parseUnifiedDiff, type DiffLine } from "./diff-lines.ts";
 
 export interface DiffReviewAnchor {
 	side: "old" | "new";
@@ -9,62 +9,6 @@ export interface DiffReviewAnchor {
 	text: string;
 	section?: string;
 	hunk?: number;
-}
-
-/** Compute a simple line-level diff between oldText and newText for inline Edit tool cards. */
-export function computeLineDiff(oldText: string, newText: string): { lines: DiffLine[]; additions: number; removals: number } {
-	const a = oldText.split("\n");
-	const b = newText.split("\n");
-	const m = a.length;
-	const n = b.length;
-
-	// For very large edits, fall back to simple del+add block to keep rendering fast.
-	if (m * n > 40000) {
-		const lines: DiffLine[] = [
-			...a.map((text, idx) => ({ type: "del" as const, text, oldNum: idx + 1 })),
-			...b.map((text, idx) => ({ type: "add" as const, text, newNum: idx + 1 })),
-		];
-		return { lines, additions: n, removals: m };
-	}
-
-	const dp: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
-	for (let i = m - 1; i >= 0; i--) {
-		for (let j = n - 1; j >= 0; j--) {
-			dp[i][j] = a[i] === b[j] ? 1 + dp[i + 1][j + 1] : Math.max(dp[i + 1][j], dp[i][j + 1]);
-		}
-	}
-
-	const lines: DiffLine[] = [];
-	let i = 0;
-	let j = 0;
-	let additions = 0;
-	let removals = 0;
-	while (i < m && j < n) {
-		if (a[i] === b[j]) {
-			lines.push({ type: "ctx", text: a[i], oldNum: i + 1, newNum: j + 1 });
-			i++;
-			j++;
-		} else if (dp[i + 1][j] >= dp[i][j + 1]) {
-			lines.push({ type: "del", text: a[i], oldNum: i + 1 });
-			removals++;
-			i++;
-		} else {
-			lines.push({ type: "add", text: b[j], newNum: j + 1 });
-			additions++;
-			j++;
-		}
-	}
-	while (i < m) {
-		lines.push({ type: "del", text: a[i], oldNum: i + 1 });
-		removals++;
-		i++;
-	}
-	while (j < n) {
-		lines.push({ type: "add", text: b[j], newNum: j + 1 });
-		additions++;
-		j++;
-	}
-	return { lines, additions, removals };
 }
 
 export function UnifiedDiffView({

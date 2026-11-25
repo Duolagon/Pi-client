@@ -155,8 +155,21 @@ test("objective checks require a passed test and distinguish missing evidence fr
 	assert.match(failedTest.reason!, /退出码 1/);
 	assert.equal(gradeVerdict({ objective: failedTest }).grade, "unfulfilled");
 
+	await writeFile(testFile, "import 'uninstalled-grail-test-dependency';\n");
+	const dependencyFields = { devDependencies: { "uninstalled-grail-test-dependency": "1.0.0" } };
+	const missingDependency = await run({ manifest: { ...manifest, ...dependencyFields } });
+	assert.equal(missingDependency.status, "unavailable");
+	assert.match(missingDependency.reason!, /无法加载所需的测试依赖/);
+	assert.equal(gradeVerdict({ objective: missingDependency }).grade, "unjudgeable");
+	assert.equal((await run({ inheritedManifests: [dependencyFields] })).status, "unavailable");
+	assert.equal((await run()).status, "fail");
+
+	await writeFile(testFile, "import './missing-project-source.mjs';\n");
+	assert.equal((await run()).status, "fail");
+
 	const wrappedManifest = { ...manifest, scripts: { test: "node --test || true" } };
 	await writeFile(join(project, "package.json"), JSON.stringify(wrappedManifest));
+	await writeFile(testFile, "import { test } from 'node:test';\ntest('failing example', () => { throw new Error('expected failure'); });\n");
 	const failedTestWithSuccessfulExit = await run({ manifest: wrappedManifest });
 	assert.equal(failedTestWithSuccessfulExit.runs[0].exitCode, 0);
 	assert.equal(failedTestWithSuccessfulExit.status, "fail");

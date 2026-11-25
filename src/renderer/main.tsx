@@ -254,6 +254,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [manualPlan, setManualPlan] = useState(false);
 	const planDraftEdited = useRef(false);
 	const [btwState, setBtwState] = useState<{ loading: boolean; question: string; answer?: string; error?: string; model?: string } | null>(null);
+	const [conversationStatusOpen, setConversationStatusOpen] = useState(false);
 	const [findOpen, setFindOpen] = useState(false);
 	const [findQuery, setFindQuery] = useState("");
 	const [findIndex, setFindIndex] = useState<number | null>(null);
@@ -451,7 +452,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		setGrail(null);
 		loadGrail(activeConversationId);
 	}, [activeConversationId, loadGrail]);
-	// A finished turn may have created the wish's first checkpoint, which enables the button.
+	// A finished turn may have created the wish's first checkpoint.
 	useEffect(() => {
 		if (!running) loadGrail(activeConversationRef.current);
 	}, [running, loadGrail]);
@@ -478,11 +479,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				if (decision === "play") setGrailReveal(true);
 				else if (decision === "defer") pendingReveal.current = event.conversationId;
 				loadGrail(event.conversationId);
-			} else if (event.type === "grail_sealed") loadGrail(event.conversationId);
+			} else if (event.type === "grail_sealed" || event.type === "grail_workspace_changed") loadGrail(event.conversationId);
 		});
 		const resume = () => {
-			if (!pendingReveal.current || !visible()) return;
-			if (pendingReveal.current === activeConversationRef.current) setGrailReveal(true);
+			if (!visible()) return;
+			loadGrail(activeConversationRef.current);
+			if (pendingReveal.current && pendingReveal.current === activeConversationRef.current) setGrailReveal(true);
 			pendingReveal.current = undefined;
 		};
 		window.addEventListener("focus", resume);
@@ -898,6 +900,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const runBtw = async (question: string) => {
 		const q = question.trim();
 		if (!q) return;
+		setConversationStatusOpen(true);
 		setBtwState({ loading: true, question: q });
 		try {
 			const res = await api.btw(q);
@@ -1350,6 +1353,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const lastCheckpoint = checkpointsByEntry.get(entryIds[lastUserIndex]);
 	const currentEntryId = entryIds[lastUserIndex];
 	const planSubmission = useMemo(() => submittedPlan(history.messages), [history.messages]);
+	const hasSecondaryStatus = Boolean(btwState || snapshot?.active?.goal?.active);
+	useEffect(() => {
+		if (!hasSecondaryStatus) setConversationStatusOpen(false);
+	}, [hasSecondaryStatus]);
+
 	if (!snapshot)
 		return (
 			<div className="cl-start">
@@ -2609,15 +2617,17 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											)}
 										</span>
 									</div>
-									{([
-										["下一工具步骤", snapshot.queuedPromptGroups?.steering ?? snapshot.queuedMessages ?? []],
-										["本轮结束后", snapshot.queuedPromptGroups?.followUp ?? []],
-									] as const).map(([label, messages]) => messages.length > 0 && (
-										<div className="cc-queue-group" key={label}>
-											<span>{label}</span>
-											{messages.map((value, index) => <p className="cc-queue-item" key={index}>{value}</p>)}
-										</div>
-									))}
+									<div className="cc-queue-list" role="group" aria-label="指令列表" tabIndex={0}>
+										{([
+											["下一工具步骤", snapshot.queuedPromptGroups?.steering ?? snapshot.queuedMessages ?? []],
+											["本轮结束后", snapshot.queuedPromptGroups?.followUp ?? []],
+										] as const).map(([label, messages]) => messages.length > 0 && (
+											<div className="cc-queue-group" key={label}>
+												<span>{label}</span>
+												{messages.map((value, index) => <p className="cc-queue-item" key={index}>{value}</p>)}
+											</div>
+										))}
+									</div>
 								</div>
 							)}
 						</SurfacePresence>
@@ -2827,7 +2837,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						{secondaryStatus && (
 							<AnimatedDetails
 								className="cc-conversation-status"
-								defaultOpen={Boolean(btwState)}
+								open={conversationStatusOpen}
+								onToggleOpen={setConversationStatusOpen}
 								summary={
 									<>
 										会话动态 <span>{secondaryStatus}</span>
@@ -3042,7 +3053,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								input.setSelectionRange(input.value.length, input.value.length);
 							});
 						}}
-						onWorkspaceMutated={() => void app.refresh()}
+						onWorkspaceMutated={() => {
+							loadGrail(activeConversationRef.current);
+							void app.refresh();
+						}}
 						onNotice={(msg) => app.setNotice(msg)}
 					/>
 				) : previewUrl ? (
