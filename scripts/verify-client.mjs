@@ -1627,25 +1627,30 @@ try {
 	await liveTool.click();
 	await writeFile(join(project, "release-tool-card.flag"), "go\n");
 	await idle();
-	const wideTable = page.getByRole("table").filter({ hasText: "本地命令" });
+	const wideTable = page.locator(".cl-scroll").getByRole("table").filter({ hasText: "本地命令" });
 	await wideTable.waitFor();
 	assert.equal(await wideTable.getByRole("columnheader").count(), 28);
 	await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-	const tableGeometry = await wideTable.evaluate((table) => {
-		const scroller = table.parentElement;
-		const transcript = table.closest(".cl-scroll");
-		const previous = scroller.scrollLeft;
-		scroller.scrollLeft = 32;
-		const metrics = {
-			tableOffset: scroller.scrollLeft,
-			tableContentWidth: scroller.scrollWidth,
-			tableViewportWidth: scroller.clientWidth,
-			transcriptContentWidth: transcript.scrollWidth,
-			transcriptViewportWidth: transcript.clientWidth,
-		};
-		scroller.scrollLeft = previous;
-		return metrics;
-	});
+	let tableGeometry;
+	await until(async () => {
+		tableGeometry = await wideTable.evaluate((table) => {
+			const scroller = table.parentElement;
+			const transcript = table.closest(".cl-scroll");
+			if (!table.isConnected || !scroller || !transcript) return null;
+			const previous = scroller.scrollLeft;
+			scroller.scrollLeft = 32;
+			const metrics = {
+				tableOffset: scroller.scrollLeft,
+				tableContentWidth: scroller.scrollWidth,
+				tableViewportWidth: scroller.clientWidth,
+				transcriptContentWidth: transcript.scrollWidth,
+				transcriptViewportWidth: transcript.clientWidth,
+			};
+			scroller.scrollLeft = previous;
+			return metrics;
+		});
+		return tableGeometry !== null;
+	}, "wide table mounted within the transcript");
 	assert.ok(tableGeometry.tableOffset > 0 &&
 		tableGeometry.transcriptContentWidth <= tableGeometry.transcriptViewportWidth + 1,
 		`Wide tables should scroll without spreading the conversation. ${JSON.stringify(tableGeometry)}`);
