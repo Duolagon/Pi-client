@@ -1,4 +1,4 @@
-import { memoryLimit, projectMemoryContext, projectReferenceContext, userMemoryContext } from "./project-memory.ts";
+import { memoryLimit, projectMemoryContext, projectMemoryHeading, projectReferenceContext, userMemoryContext } from "./project-memory.ts";
 import { staleTodoReminder } from "./todo-reminder.ts";
 import { isDesktopWorkspaceContext, wrapDesktopWorkspaceContext } from "./file-references.ts";
 import { get as getHttp } from "node:http";
@@ -15,6 +15,7 @@ import { connectionDefaults, connectionMode } from "./model-connections.ts";
 import { providerModels } from "./provider-presets.ts";
 import { BALANCE_PROVIDER_NAMES, balanceFor, fetchBalance, formatBalance, validBalanceTarget } from "./provider-balance.ts";
 import { evaluatePermission, loadRuntimePermissionPolicy, observedWorkspaceReadPath, redactSearchOutput } from "./permission-policy.ts";
+import type { RuntimePermissionPolicy } from "./permission-types.ts";
 import { isStatusOnlyRequest } from "./remote-operation.ts";
 import { formatWebSearchResults, injectDeepSeekBuiltinSearch, isDeepSeekModel, searchWithDeepSeekApi } from "./web-search.ts";
 import { planRelativePath } from "./plan-path.ts";
@@ -23,6 +24,8 @@ import { HooksService } from "./hooks-service.ts";
 import type { HookEventName } from "./hook-types.ts";
 import { isVerifyCommand } from "./verification-command.ts";
 import { ESCALATION_MESSAGE_TYPE, FALLBACK_MESSAGE_TYPE, sanitizeFallbackModel } from "./model-routing.ts";
+import { readToolOutputPage, ToolOutputBudget } from "./tool-output-archive.ts";
+import { modelOutputPageBytes, toolOutputIdPattern, toolOutputReference } from "./tool-output-types.ts";
 export { ESCALATION_MESSAGE_TYPE, FALLBACK_MESSAGE_TYPE } from "./model-routing.ts";
 
 function shellQuote(value: string): string {
@@ -396,6 +399,54 @@ export default function permissions(pi: ExtensionAPI) {
 	const connections = JSON.parse(process.env.PI_DESKTOP_CONNECTIONS ?? "{}") as Partial<Record<Provider, Connection>>;
 	const limitConnectionOutput = process.env.PI_DESKTOP_CONNECTION_TEST === "1";
 	const testingConnection = limitConnectionOutput || process.env.PI_DESKTOP_GRAIL_REVIEW === "1";
+	const outputRoot = process.env.PI_DESKTOP_TOOL_OUTPUT_ROOT;
+	const outputOwner = process.env.PI_DESKTOP_TOOL_OUTPUT_OWNER;
+	const outputBudget = !testingConnection && outputRoot && outputOwner ? new ToolOutputBudget(outputRoot, outputOwner) : undefined;
+	if (outputBudget && outputRoot && outputOwner) {
+		pi.on("turn_start", () => outputBudget.reset());
+		pi.registerTool({
+			name: "ReadToolOutput",
+			label: "ReadToolOutput",
+			description: "Read a page of a prior tool's archived text in the current conversation. Use the ID shown in that tool result. Offset is a UTF-8 byte position; follow the returned next offset for more.",
+			parameters: {
+				type: "object", additionalProperties: false, required: ["id"], properties: {
+					id: { type: "string", pattern: toolOutputIdPattern.source },
+					offset: { type: "integer", minimum: 0, maximum: 8 * 1024 * 1024 },
+					limit: { type: "integer", minimum: 4, maximum: modelOutputPageBytes },
+				},
+			} as ToolDefinition["parameters"],
+			exposure: "model-only",
+			defaultActive: true,
+			executionMode: "sequential",
+			async execute(_callId, rawInput, signal, _onUpdate, ctx) {
+				const input = rawInput as { id: string; offset?: number; limit?: number };
+				const branch = ctx.sessionManager.getBranch();
+				const artifactIndex = branch.findLastIndex((entry) => {
+					if (entry.type !== "message" || entry.message.role !== "toolResult") return false;
+					const reference = toolOutputReference(entry.message.details);
+					return reference?.id === input.id && reference.conversationId === outputOwner;
+				});
+				const artifact = branch[artifactIndex];
+				if (artifact?.type !== "message" || artifact.message.role !== "toolResult")
+					throw new Error("此工具输出不在当前会话分支中。");
+				const sourceId = artifact.message.toolCallId;
+				const sourceTool = artifact.message.toolName;
+				const source = branch.slice(0, artifactIndex)
+					.flatMap((entry) => entry.type === "message" && entry.message.role === "assistant" ? entry.message.content : [])
+					.findLast((part) => part.type === "toolCall" && part.id === sourceId && part.name === sourceTool);
+				if (!source || source.type !== "toolCall") throw new Error("找不到对应的工具调用。");
+				const decision = await evaluatePermission(await loadRuntimePermissionPolicy(), { toolName: source.name, input: source.arguments });
+				if (decision.action === "deny") throw new Error(decision.reason);
+				const limit = Math.min(input.limit ?? modelOutputPageBytes, outputBudget.remaining);
+				if (limit < 4) return { content: [{ type: "text", text: "This round's tool output budget is exhausted. Read this offset again in the next round." }], details: {} };
+				signal?.throwIfAborted();
+				const page = await readToolOutputPage(outputRoot, outputOwner, input.id, input.offset, limit);
+				outputBudget.remaining -= Buffer.byteLength(page.text);
+				const footer = page.nextOffset !== null ? `\n\n[Next byte offset: ${page.nextOffset}]` : "";
+				return { content: [{ type: "text", text: page.text + footer }], details: {} };
+			},
+		});
+	}
 	const forkChild = process.env.PI_DESKTOP_FORK_CHILD === "1";
 	const isChild = process.env.PI_DESKTOP_CHILD === "1" || process.env.PI_DESKTOP_READ_ONLY_CHILD === "1";
 	let activeTodoWriteItems: Array<{ id: string; content: string; status: string; estimatedSeconds?: number }> = [];
@@ -794,25 +845,53 @@ export default function permissions(pi: ExtensionAPI) {
 		registerConnection(provider as Provider, connection);
 	registerOutputStyle(pi, process.env.PI_DESKTOP_OUTPUT_STYLE_FILE);
 	const memoryRoot = process.env.PI_DESKTOP_MEMORY_ROOT;
+	const canonicalMemoryRoot = memoryRoot ? realpath(memoryRoot).catch(() => memoryRoot) : undefined;
 	const userMemoryFile = process.env.PI_DESKTOP_USER_MEMORY_FILE;
 	const seenRules = new Set<string>();
+	const rulesInRequest = new Set<string>();
+	const ruleBlocks = new Map<string, string[]>();
+	const deferredRuleReads = new Set<string>();
+	const readRuleCalls = new Map<string, { path: string; text: string }>();
 	let scopedBudget = memoryLimit;
 	let scopedQueue = Promise.resolve();
-	const scopedContext = (prompt: string, paths: string[] = []) => {
-		if (!memoryRoot) return Promise.resolve("");
+	const canReadProjectPath = (policy: RuntimePermissionPolicy, path: string) => evaluatePermission(policy, {
+		toolName: "read", input: { path },
+	}).then(({ action }) => action === "allow", () => false);
+	const scopedContext = (policy: RuntimePermissionPolicy, prompt: string, paths: string[] = [], beforeWrite = false) => {
+		if (!canonicalMemoryRoot) return Promise.resolve({ text: "", unread: [] as string[] });
 		const context = scopedQueue.then(async () => {
-			const scoped = await projectMemoryContext(memoryRoot, prompt, undefined, paths, "", {
-				mode: "scoped", seenRules, limit: scopedBudget,
+			const root = await canonicalMemoryRoot;
+			const unread: string[] = [];
+			const prior = new Set(seenRules);
+			const text = await projectMemoryContext(root, prompt, undefined, paths, "", {
+				mode: "scoped", seenRules, limit: scopedBudget, allowed: (path) => canReadProjectPath(policy, join(root, path)),
+				...(beforeWrite ? { onRule: (path: string) => { if (!rulesInRequest.has(path)) unread.push(path); } } : {}),
 			});
-			scopedBudget -= Buffer.byteLength(scoped);
-			return scoped;
+			if (text) ruleBlocks.set(text, [...seenRules].filter((path) => !prior.has(path)));
+			scopedBudget -= Buffer.byteLength(text);
+			for (const path of unread) if (!seenRules.has(path)) deferredRuleReads.add(path);
+			return { text, unread };
 		});
 		scopedQueue = context.then(() => {}, () => {});
 		return context;
 	};
+	const fileWriteRuleFeedback = async (policy: RuntimePermissionPolicy, tool: string, targets: string[] | undefined) => {
+		if (!memoryRoot || !targets?.length || !["write", "edit", "NotebookEdit"].includes(tool)) return;
+		const { text, unread } = await scopedContext(policy, "", targets, true);
+		if (unread.length) return {
+			block: true,
+			reason: text
+				? `写入尚未执行。先按以下项目规则检查这项改动，再重试。\n\n${text}`
+				: `写入尚未执行。重试前请查看本批返回的项目规则，未随结果提供的规则请完整读取：${unread.join("、")}。若文件超出当前读取预算，请在新回合只处理此目录。`,
+		};
+	};
 	if (memoryRoot || userMemoryFile) {
 		pi.on("before_agent_start", async (event) => {
 			seenRules.clear();
+			rulesInRequest.clear();
+			ruleBlocks.clear();
+			deferredRuleReads.clear();
+			readRuleCalls.clear();
 			scopedBudget = memoryLimit;
 			const [user, project] = await Promise.all([
 				userMemoryFile ? userMemoryContext(userMemoryFile, event.systemPrompt) : "",
@@ -826,6 +905,26 @@ export default function permissions(pi: ExtensionAPI) {
 		});
 	}
 	if (memoryRoot) {
+		// Track what is in the model's next request, not what another tool in the
+		// same batch just discovered. Compaction can also remove old tool results.
+		pi.on("context", ({ messages }) => {
+			if (!ruleBlocks.size && !readRuleCalls.size) return;
+			rulesInRequest.clear();
+			const delivered = messages.flatMap((message) => {
+				if (message.role !== "user" && message.role !== "toolResult") return [];
+				const text = textFromBlocks(message.content);
+				if (message.role === "toolResult") {
+					const rule = readRuleCalls.get(message.toolCallId);
+					if (rule && !message.isError && text.includes(rule.text)) rulesInRequest.add(rule.path);
+				}
+				return text.includes(projectMemoryHeading) ? [text] : [];
+			});
+			for (const [block, paths] of ruleBlocks) {
+				if (delivered.some((text) => text.includes(block))) for (const path of paths) rulesInRequest.add(path);
+			}
+			seenRules.clear();
+			for (const path of rulesInRequest) seenRules.add(path);
+		});
 		// Finalized native user messages include queued inputs and are persisted before the model call.
 		pi.on("message_end", async ({ message }) => {
 			if (message.role !== "user") return;
@@ -836,13 +935,10 @@ export default function permissions(pi: ExtensionAPI) {
 			const prompt = textFromBlocks(original);
 			if (!prompt.includes("@")) return;
 			const policy = await loadRuntimePermissionPolicy().catch(() => undefined);
-			const [references, rules] = await Promise.all([
-				policy
-					? projectReferenceContext(memoryRoot, prompt, async (path) => (await evaluatePermission(policy, {
-						toolName: "read", input: { path },
-					}).catch(() => undefined))?.action === "allow")
-					: "",
-				scopedContext(prompt),
+			if (!policy) return;
+			const [references, { text: rules }] = await Promise.all([
+				projectReferenceContext(memoryRoot, prompt, (path) => canReadProjectPath(policy, path)),
+				scopedContext(policy, prompt),
 			]);
 			const context = [references, rules].filter(Boolean).join("\n\n");
 			if (context) return { message: { ...message, content: [...original, { type: "text" as const, text: wrapDesktopWorkspaceContext(context) }] } };
@@ -1348,6 +1444,8 @@ export default function permissions(pi: ExtensionAPI) {
 			// dontAsk never opens an approval dialog, including prompts a hook asked for.
 			if (effectiveAction === "ask" && policy.dontAsk)
 				return { block: true, reason: `dontAsk 模式自动拒绝未预授权的操作：${confirmReason}` };
+			const localRules = await fileWriteRuleFeedback(policy, event.toolName, decision.targets);
+			if (localRules) return localRules;
 			if (effectiveAction === "ask") {
 				const allowed = await ctx.ui.confirm(
 					`允许执行 ${event.toolName}${decision.remoteMutation ? "（远端写入，仅本次）" : ""}？`,
@@ -1355,9 +1453,12 @@ export default function permissions(pi: ExtensionAPI) {
 				);
 				if (!allowed) return { block: true, reason: "用户未批准此操作。" };
 				// An approval dialog can stay open while the host revokes this tool or adds a deny rule.
-				const latest = await evaluatePermission(await loadRuntimePermissionPolicy(), event);
+				const latestPolicy = await loadRuntimePermissionPolicy();
+				const latest = await evaluatePermission(latestPolicy, event);
 				if (latest.action === "deny") return { block: true, reason: latest.reason };
 				if (latest.remoteMutation && statusOnlyTurn()) return { block: true, reason: statusBlockReason };
+				const latestRules = await fileWriteRuleFeedback(latestPolicy, event.toolName, latest.targets);
+				if (latestRules) return latestRules;
 			}
 			const sandboxProfile = process.env.PI_DESKTOP_SANDBOX_PROFILE;
 			if (sandboxProfile && event.toolName === "bash" && typeof (event.input as { command?: unknown })?.command === "string") {
@@ -1379,9 +1480,21 @@ export default function permissions(pi: ExtensionAPI) {
 			const path = observedWorkspaceReadPath(event.input.path, process.cwd());
 			if (path) recorded = { details: { ...(event.details && typeof event.details === "object" ? event.details : {}), desktopReadPath: path } };
 		}
-		const pathRules = !event.isError && ["read", "write", "edit"].includes(event.toolName) && typeof event.input.path === "string"
-			? await scopedContext("", [event.input.path]).catch(() => "")
-			: "";
+		let pathRules = "";
+		if (canonicalMemoryRoot && !event.isError && event.toolName === "read" && typeof event.input.path === "string") {
+			const policy = await loadRuntimePermissionPolicy().catch(() => undefined);
+			const decision = policy ? await evaluatePermission(policy, event).catch(() => undefined) : undefined;
+			if (policy && decision && decision.action !== "deny" && decision.targets?.length) {
+				const root = await canonicalMemoryRoot;
+				const truncation = (event.details as { truncation?: unknown } | undefined)?.truncation;
+				if ((event.input.offset === undefined || event.input.offset === 1) && event.input.limit === undefined && !truncation) {
+					const path = observedWorkspaceReadPath(decision.targets[0], root);
+					const text = textFromBlocks(event.content);
+					if (path && text && deferredRuleReads.has(path)) readRuleCalls.set(event.toolCallId, { path, text });
+				}
+				pathRules = await scopedContext(policy, "", decision.targets).then(({ text }) => text, () => "");
+			}
+		}
 		let redacted: typeof event.content | undefined;
 		if (!event.isError && ["grep", "find", "ls"].includes(event.toolName)) {
 			try {
@@ -1422,14 +1535,8 @@ export default function permissions(pi: ExtensionAPI) {
 		const directoryHint = event.isError && event.toolName === "read" && /\bEISDIR\b/.test(textFromBlocks(event.content)) &&
 			pi.getActiveTools().includes("ls") ? "Use ls with the same path to list this directory." : undefined;
 		const additions = [pathRules, directoryHint, postTodoReminder].filter(Boolean).join("\n\n");
-		const content = additions ? [...event.content, { type: "text" as const, text: additions }] : event.content;
-		const changed = () => {
-			if (!redacted && !additions) return recorded;
-			return { ...recorded, content };
-		};
-		if (testingConnection) return changed();
 		const errorText = event.isError ? textFromBlocks(event.content).slice(0, 4000) : undefined;
-		const hook = await callHost("/hook", {
+		const hook = testingConnection ? undefined : await callHost("/hook", {
 			phase: "post",
 			toolName: event.toolName,
 			toolCallId: event.toolCallId,
@@ -1438,15 +1545,22 @@ export default function permissions(pi: ExtensionAPI) {
 			isError: event.isError,
 			...(errorText !== undefined ? { error: errorText } : {}),
 		}).catch(() => undefined);
-		if (!hook) return changed();
-		if (hook.blocked && !event.isError) {
-			const reason = typeof hook.reason === "string" ? hook.reason : "PostToolUse Hook 报告检查失败。";
-			return { ...recorded, content: [...content, { type: "text" as const, text: `\n\n[Hook Blocked] ${reason}` }], isError: true };
-		}
-		if (!hook.suppressOutput && typeof hook.additionalContext === "string" && hook.additionalContext.trim()) {
-			return { ...recorded, content: [...content, { type: "text" as const, text: `\n\n[Hook Context]\n${hook.additionalContext.trim()}` }] };
-		}
-		return changed();
+		const blocked = Boolean(hook?.blocked && !event.isError);
+		const hookText = blocked ? `\n\n[Hook Blocked] ${typeof hook?.reason === "string" ? hook.reason : "PostToolUse Hook 报告检查失败。"}` :
+			!hook?.suppressOutput && typeof hook?.additionalContext === "string" && hook.additionalContext.trim()
+				? `\n\n[Hook Context]\n${hook.additionalContext.trim()}` : undefined;
+		// Nested code-mode results stay in the calling tool. Budget its final output instead.
+		const archived = event.parentToolCallId || event.toolName === "ReadToolOutput" ? undefined :
+			await outputBudget?.archive(event.toolName, event.content, event.details);
+		if (!redacted && !additions && !hookText && !archived) return recorded;
+		const content = [...(archived?.content ?? event.content)];
+		if (additions) content.push({ type: "text", text: additions });
+		if (hookText) content.push({ type: "text", text: hookText });
+		const details = recorded?.details ?? event.details;
+		return { ...recorded, content,
+			...(archived?.reference ? { details: { ...(details && typeof details === "object" ? details : {}), desktopToolOutput: archived.reference } } : {}),
+			...(blocked ? { isError: true } : {}),
+		};
 	});
 }
 

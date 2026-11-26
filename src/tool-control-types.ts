@@ -85,7 +85,7 @@ export type DeliverCustomType = (typeof DELIVER_CUSTOM_TYPES)[number];
 /** A background child's run usage and the model it ran on. */
 export interface NotificationUsage { provider: string; model: string; usage: ToolUsage }
 export type ToolControlRequest =
-	| { requestId: string; operation: "list" | "apply" }
+	| { requestId: string; operation: "list" | "apply" | "context" }
 	| {
 		requestId: string;
 		operation: "notify";
@@ -120,7 +120,7 @@ export type ToolControlRequest =
  */
 export type NotificationDisposition = "sent" | "queued" | "duplicate" | "deferred";
 export type ToolControlResponse =
-	| { requestId: string; ok: true; tools: DesktopToolInfo[]; delivery?: NotificationDisposition }
+	| { requestId: string; ok: true; tools: DesktopToolInfo[]; delivery?: NotificationDisposition; compaction?: { provider: string; model: string; reserveTokens: number } }
 	| { requestId: string; ok: false; error: string };
 export const NOTIFICATION_KEY_PATTERN = /^[A-Za-z0-9._-]{1,240}:[1-9][0-9]{0,6}$/;
 
@@ -130,7 +130,7 @@ export function validateControlRequest(value: unknown, requestId: string, maxByt
 	if (request.requestId !== requestId || typeof request.operation !== "string") throw new Error("Invalid tool control request");
 	const keys = Object.keys(request);
 	const only = (allowed: string[]) => { if (keys.some((key) => !allowed.includes(key))) throw new Error("Invalid tool control request"); };
-	if (request.operation === "list" || request.operation === "apply") {
+	if (request.operation === "list" || request.operation === "apply" || request.operation === "context") {
 		only(["requestId", "operation"]);
 		return { requestId, operation: request.operation };
 	}

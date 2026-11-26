@@ -21,15 +21,16 @@ function promptText(context) {
 	return typeof message?.content === "string" ? message.content : (message?.content ?? []).map((block) => block.text ?? "").join("\n");
 }
 
-function firstAdded(prompt) {
+function addedCitations(prompt) {
+	const citations = new Map();
 	let file;
 	for (const line of prompt.split("\n")) {
 		const header = /^### (.+)$/.exec(line);
 		if (header) file = header[1];
 		const added = /^\+ (\d+) \| /.exec(line);
-		if (file && added) return { file, side: "+", line: Number(added[1]) };
+		if (file && added && !citations.has(file)) citations.set(file, { file, side: "+", line: Number(added[1]) });
 	}
-	return undefined;
+	return [...citations.values()];
 }
 
 export default function grailProvider(pi) {
@@ -46,17 +47,25 @@ export default function grailProvider(pi) {
 			try {
 				mode = readFileSync(process.env.GRAIL_TEST_CONTROL, "utf8").trim();
 			} catch {}
+			const engineCheck = prompt.includes("修复 Alpha 和 Beta 两个模块的导出值");
 			let text = "{}";
 			if (step === "blind")
-				text = JSON.stringify({ rootCause: "缺少 add", cutPoint: "src/add.mjs", files: ["src/add.mjs"], sizeEstimate: "3 行", hardSpots: ["负数"], tests: ["add 测试"] });
+				text = JSON.stringify(engineCheck ? {
+					rootCause: "两个模块都还在导出占位值。",
+					cutPoint: "只修改两个模块各自的导出。",
+					files: ["packages/alpha/feature.mjs", "packages/beta/feature.mjs"],
+					sizeEstimate: "各改一行",
+					hardSpots: ["在各自目录确认规则"],
+					tests: ["分别运行 Alpha 和 Beta 的测试"],
+				} : { rootCause: "缺少 add", cutPoint: "src/add.mjs", files: ["src/add.mjs"], sizeEstimate: "3 行", hardSpots: ["负数"], tests: ["add 测试"] });
 			if (step === "comparison") {
-				const cite = firstAdded(prompt);
+				const citations = addedCitations(prompt).slice(0, engineCheck ? 2 : 1);
 				text = "```json\n" + JSON.stringify({
 					findings: criteria.map((criterion) => ({
 						criterion,
 						pass: !(mode === "granted" && criterion === "lessCode"),
 						note: criterion === "lessCode" && mode === "granted" ? "可以直接返回表达式，少写两行。" : "符合",
-						citations: cite ? [cite] : [],
+						citations,
 					})).concat([{ criterion: "edge", pass: false, note: "没有引用，应被丢弃", citations: [] }]),
 				}) + "\n```";
 			}

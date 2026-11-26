@@ -244,6 +244,9 @@ export function PermissionDialog({
 								</button>
 							)}
 							<button
+								type="button"
+								autoFocus={!inline}
+								data-autofocus={!inline || undefined}
 								disabled={pending}
 								onClick={() => void answer({ type: "extension_ui_response", id: request.id, confirmed: false })}
 								className="secondary-button"
@@ -252,6 +255,7 @@ export function PermissionDialog({
 							</button>
 							{inferredTool && allowSelector && (
 								<button
+									type="button"
 									disabled={pending}
 									onClick={() => void alwaysAllow()}
 									className="secondary-button"
@@ -265,7 +269,7 @@ export function PermissionDialog({
 								</button>
 							)}
 							<button
-								autoFocus={!inline} data-autofocus={!inline || undefined}
+								type="button"
 								disabled={pending}
 								onClick={() => void answer({ type: "extension_ui_response", id: request.id, confirmed: true })}
 								className="primary-button"
@@ -279,6 +283,7 @@ export function PermissionDialog({
 					<div className="live-options">
 						{(request.options ?? []).map((option) => (
 							<button
+								type="button"
 								disabled={pending}
 								key={option}
 								className="secondary-button"
@@ -287,7 +292,7 @@ export function PermissionDialog({
 								{option}
 							</button>
 						))}
-						<button disabled={pending} onClick={cancel}>
+						<button type="button" className="secondary-button" disabled={pending} onClick={cancel}>
 							取消
 						</button>
 					</div>

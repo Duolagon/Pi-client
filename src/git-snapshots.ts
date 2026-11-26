@@ -28,6 +28,7 @@ import type {
 	GitRestoreResult,
 	GitSnapshotChange,
 } from "./git-types.ts";
+import type { GrailEvidenceSource } from "./shared.ts";
 
 const exec = promisify(execFile);
 export const MAX_CHECKPOINT_FILE_BYTES = 64 * 1024 * 1024;
@@ -48,9 +49,18 @@ interface ReviewDirectories {
 	selected: string;
 	objective?: string;
 }
-type ObjectiveSource = { repository: string; project: string } | { reason: string };
+type ObjectiveSource = { repository: string; project: string; testedTree: string; projectPath: string } | { reason: string };
 const missing: Entry = { kind: "missing" };
 const excluded: Entry = { kind: "excluded" };
+
+function sourceFingerprint(entries: Record<string, Entry>): string {
+	const hash = createHash("sha256");
+	for (const path of Object.keys(entries).sort()) {
+		const entry = entries[path];
+		if (entry.kind !== "missing") hash.update(JSON.stringify([path, entry]) + "\n");
+	}
+	return hash.digest("hex");
+}
 
 /** Persist worktree snapshots without changing the Git index, HEAD, or stash. */
 export class GitSnapshots {
@@ -204,11 +214,12 @@ export class GitSnapshots {
 	/** Differences from a checkpoint's before-state to the current worktree (spanning later checkpoints). */
 	async diffToWorktree(
 		project: string, id: string, review?: ReviewDirectories, signal?: AbortSignal,
-	): Promise<GitCheckpointDiff & { objective?: ObjectiveSource }> {
+	): Promise<GitCheckpointDiff & { objective?: ObjectiveSource; evidence?: GrailEvidenceSource }> {
 		const root = await this.projectRoot(project, signal);
 		return this.serialize(root, async () => {
 			signal?.throwIfAborted();
 			const manifest = await this.load(root, id);
+			const revision = review ? await this.head(root, signal) : undefined;
 			const current = await this.capture(root, Object.keys(manifest.before), signal);
 			const files: GitCheckpointDiff["files"] = [];
 			const excluded = excludedPaths(manifest.before, current);
@@ -222,7 +233,14 @@ export class GitSnapshots {
 			if (!review || !files.length) return { checkpointId: id, files };
 			await this.materializeEntries(root, review.selected, current, signal);
 			const objective = review.objective ? await this.freezeObjectiveSource(root, review.objective, current, signal) : undefined;
-			return { checkpointId: id, files, objective };
+			const evidence: GrailEvidenceSource = {
+				checkpointId: id,
+				baselineTree: sourceFingerprint(manifest.before),
+				selectedTree: sourceFingerprint(current),
+				revision,
+				...(objective && "testedTree" in objective ? { testedTree: objective.testedTree, project: objective.projectPath } : {}),
+			};
+			return { checkpointId: id, files, objective, evidence };
 		});
 	}
 
@@ -235,6 +253,7 @@ export class GitSnapshots {
 			if (!inside(repository, project) || inside(repository, this.dataDir) || inside(repository, resolve(target)))
 				return { reason: "无法安全保存整个 Git 工作区供客观检查使用。" };
 			const prefix = relative(repository, project);
+			let frozen = selected;
 			if (prefix) {
 				const sourcePaths = await this.snapshotPaths(repository, [], signal);
 				const selectedPrefix = `${prefix.split(sep).join("/")}/`;
@@ -248,15 +267,17 @@ export class GitSnapshots {
 					if (Object.values(entries).some((entry) => entry.kind === "excluded"))
 						return { reason: "有依赖的工作区文件超出快照容量，无法完整执行客观检查。" };
 					await siblings.materializeEntries(repository, target, entries, signal);
+					frozen = entries;
 				} finally {
 					await rm(temporary, { recursive: true, force: true });
 				}
 				const rebased = Object.fromEntries(Object.entries(selected).map(([path, entry]) => [`${selectedPrefix}${path}`, entry]));
 				await this.materializeEntries(repository, target, rebased, signal);
+				Object.assign(frozen, rebased);
 			} else {
 				await this.materializeEntries(repository, target, selected, signal);
 			}
-			return { repository, project: join(target, prefix) };
+			return { repository, project: join(target, prefix), testedTree: sourceFingerprint(frozen), projectPath: prefix.split(sep).join("/") || "." };
 		} catch (error) {
 			signal?.throwIfAborted();
 			return { reason: `无法准备客观检查所需的工作区快照：${error instanceof Error ? error.message : String(error)}` };
@@ -453,9 +474,9 @@ export class GitSnapshots {
 		return join(this.dataDir, hash(Buffer.from(project)));
 	}
 
-	private async head(project: string): Promise<string | undefined> {
+	private async head(project: string, signal?: AbortSignal): Promise<string | undefined> {
 		try {
-			return (await exec("git", ["rev-parse", "--verify", "HEAD"], { cwd: project, timeout: 10000 })).stdout.trim();
+			return (await exec("git", ["rev-parse", "--verify", "HEAD"], { cwd: project, timeout: 10000, signal })).stdout.trim();
 		} catch (error) {
 			if ((error as { code?: number }).code === 128) return undefined;
 			throw error;

@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { Bot, HelpCircle } from "lucide-react";
+import { Bot, Check, HelpCircle } from "lucide-react";
 import type { ExternalApprovalRequest, ExternalApprovalResponse, ExternalTask } from "../external-types.ts";
 import { externalQuestionFields } from "./external-questions.ts";
 import { SelectPopover } from "./SelectPopover.tsx";
@@ -66,13 +66,31 @@ export function ExternalApprovalCard({
 							<fieldset key={field.id} disabled={pending} className="cc-external-field">
 								<legend>{field.label}</legend>
 								{field.description && <p className="subtle-note">{field.description}</p>}
-								{field.multiple ? field.options.map((option) => (
-									<label key={option.value} className="live-setting-toggle cc-external-check">
-										<input type="checkbox" checked={Array.isArray(answer) && answer.includes(option.value)}
-											onChange={(event) => selectMultiple(field.id, option.value, event.target.checked)} />
-										<span>{option.label}</span>
-									</label>
-								)) : field.options.length ? (
+								{field.multiple ? (
+									<div className="cc-ask-options">
+										{field.options.map((option) => {
+											const checked = Array.isArray(answer) && answer.includes(option.value);
+											return (
+												<button
+													key={option.value}
+													type="button"
+													role="checkbox"
+													aria-checked={checked}
+													disabled={pending}
+													className={`cc-ask-opt ${checked ? "active" : ""}`.trim()}
+													onClick={() => selectMultiple(field.id, option.value, !checked)}
+												>
+													<span className={`cc-ask-check multi ${checked ? "checked" : ""}`.trim()} aria-hidden="true">
+														{checked && <Check size={11} strokeWidth={2.6} />}
+													</span>
+													<span className="cc-ask-copy">
+														<strong>{option.label}</strong>
+													</span>
+												</button>
+											);
+										})}
+									</div>
+								) : field.options.length ? (
 									<SelectPopover
 										ariaLabel={field.label}
 										field

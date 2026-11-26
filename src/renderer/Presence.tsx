@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
+import { useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 
 export function prefersReducedMotion(): boolean {
 	return typeof window !== "undefined" && Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
@@ -210,7 +210,17 @@ function SurfaceMount({
 }
 
 /** Retains the actual panel through exit so its layout can reverse from the current frame. */
-export function Presence({ show, className, children }: { show: boolean; className: string; children: ReactNode }) {
+export function Presence({
+	show,
+	className,
+	style,
+	children,
+}: {
+	show: boolean;
+	className: string;
+	style?: CSSProperties;
+	children: ReactNode;
+}) {
 	const [mounted, setMounted] = useState(show);
 	const lastChildren = useRef<ReactNode>(null);
 	useLayoutEffect(() => {
@@ -235,7 +245,7 @@ export function Presence({ show, className, children }: { show: boolean; classNa
 	}, [show, mounted]);
 	if (!show && !mounted) return null;
 	return (
-		<div className={className} data-open={show} inert={!show} aria-hidden={!show || undefined}>
+		<div className={className} style={style} data-open={show} inert={!show} aria-hidden={!show || undefined}>
 			{show ? children : lastChildren.current}
 		</div>
 	);

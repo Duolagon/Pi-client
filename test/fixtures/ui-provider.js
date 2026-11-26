@@ -28,6 +28,13 @@ export default function uiProvider(pi) {
 			const user = context.messages[index];
 			const prompt = typeof user?.content === "string" ? user.content : (user?.content.filter((block) => block.type === "text").map((block) => block.text).join("\n") ?? "");
 			const results = context.messages.slice(index + 1).filter((message) => message.role === "toolResult");
+			if (prompt.includes("Additional focus: 验证压缩状态")) {
+				const summary = prompt.startsWith("# Conversation")
+					? "本地演示续接摘要。保留当前回合已经完成的工作。"
+					: "本地演示压缩摘要。保留了用户的原始要求、任务执行进展和下一步验证。";
+				slow.setResponses([fauxAssistantMessage(summary)]);
+				return slow.provider.streamSimple(model, context, streamOptions);
+			}
 			if (process.env.PI_DESKTOP_CONNECTION_TEST === "1" && prompt.includes("验证侧问面板")) {
 				slow.setResponses([fauxAssistantMessage("本地侧问回复。".repeat(8))]);
 				return slow.provider.streamSimple(model, context, streamOptions);

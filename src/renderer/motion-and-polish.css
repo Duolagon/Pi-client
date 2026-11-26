@@ -164,8 +164,7 @@
 	animation: cc-shimmer-sweep 1.85s linear infinite;
 }
 
-:root[data-theme="dark"] .cc-shimmer-text,
-:root[data-theme="grail"] .cc-shimmer-text {
+:root[data-theme="dark"] .cc-shimmer-text {
 	background: linear-gradient(
 		90deg,
 		#94a3b8 0%,
@@ -175,6 +174,23 @@
 		#60a5fa 55%,
 		#94a3b8 72%,
 		#94a3b8 100%
+	);
+	background-size: 240% 100%;
+	-webkit-background-clip: text;
+	background-clip: text;
+	color: transparent;
+}
+
+:root[data-theme="grail"] .cc-shimmer-text {
+	background: linear-gradient(
+		90deg,
+		#9aa5d4 0%,
+		#9aa5d4 28%,
+		#f2c96b 45%,
+		#fff9e6 50%,
+		#8ea2ff 56%,
+		#9aa5d4 72%,
+		#9aa5d4 100%
 	);
 	background-size: 240% 100%;
 	-webkit-background-clip: text;
@@ -210,17 +226,24 @@ body.cc-resizing .live-app {
 }
 .cc-terminal-track {
 	--terminal-height: clamp(180px, 34vh, 360px);
+	position: relative;
 	flex: none;
 	block-size: 0;
 	min-width: 0;
 	overflow: clip;
 	transition: block-size 200ms ease;
 }
+body.cc-resizing .cc-terminal-track {
+	transition: none !important;
+}
 .cc-terminal-track[data-open="true"] {
 	block-size: var(--terminal-height);
 }
 .cc-terminal-track > .terminal-panel {
 	height: var(--terminal-height);
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
 }
 @starting-style {
 	.cc-terminal-track[data-open="true"] {
@@ -365,6 +388,8 @@ button:not(:disabled):active {
 .cl-msg-user {
 	display: flex;
 	justify-content: flex-end;
+	align-items: center;
+	gap: 8px;
 	animation: cc-fade-up 240ms var(--ease-out-expo) both;
 }
 
@@ -1120,7 +1145,24 @@ button:not(:disabled):active {
 	overflow: auto;
 }
 
-@container composer (max-width: 695px) {
+@container composer (max-width: 630px) {
+	.cl-composer-box .cc-sandbox-pill {
+		padding-inline: 6px;
+	}
+	.cl-composer-box .cc-sandbox-pill > span {
+		display: none;
+	}
+	.cl-composer-box .cc-sandbox-wrap {
+		position: static;
+	}
+	.cl-composer-box .cc-sandbox-popover {
+		left: auto;
+		right: 0;
+		width: min(360px, 100%);
+	}
+}
+
+@container composer (max-width: 475px) {
 	.cc-dock-toolbar {
 		display: grid;
 		grid-template-columns: minmax(0, 1fr);
@@ -1141,20 +1183,15 @@ button:not(:disabled):active {
 	}
 }
 
-@container composer (max-width: 470px) or (width > 695px) {
-	.cl-composer-box .cc-sandbox-pill {
-		padding-inline: 6px;
+@container composer (max-width: 580px) {
+	.cl-composer.is-running .cc-dock-toolbar {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		gap: 4px;
 	}
-	.cl-composer-box .cc-sandbox-pill > span {
-		display: none;
-	}
-	.cl-composer-box .cc-sandbox-wrap {
-		position: static;
-	}
-	.cl-composer-box .cc-sandbox-popover {
-		left: auto;
-		right: 0;
-		width: min(360px, 100%);
+	.cl-composer.is-running .cc-dock-left,
+	.cl-composer.is-running .cc-dock-right {
+		min-height: 30px;
 	}
 }
 
@@ -1649,9 +1686,10 @@ button:not(:disabled):active {
 	flex-shrink: 0;
 }
 
-/* Fuse ambient status strips (Todos, Subagents, Conversation Status) into a seamless top tray */
-.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status) {
+/* Fuse ambient status strips (Todos, Subagents, Conversation Status, Grail bar) into a seamless top tray */
+.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status, .cc-grail-bar) {
 	width: var(--chat-width);
+	max-width: none;
 	margin-inline: auto;
 	margin-bottom: 0;
 	border-radius: 0;
@@ -1661,26 +1699,47 @@ button:not(:disabled):active {
 	box-shadow: none;
 }
 
-.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status):first-child,
-.cc-composer-dock-stack > :not(:is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status)) + :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status) {
+.cc-composer-dock-stack > .cc-grail-bar {
+	padding: 5px 12px;
+	min-height: 32px;
+	font-size: 12px;
+	gap: 8px;
+}
+
+.cc-composer-dock-stack > .cc-grail-bar > .cc-grail-start {
+	height: 23px;
+	padding: 0 9px;
+	border-radius: 6px;
+	font-size: 11.5px;
+	font-weight: 550;
+	background: var(--cl-surface);
+}
+
+.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status, .cc-grail-bar):first-child,
+.cc-composer-dock-stack > :not(:is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status, .cc-grail-bar)) + :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status, .cc-grail-bar) {
 	border-top-left-radius: 14px;
 	border-top-right-radius: 14px;
 }
 
-.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status) + :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status) {
+.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status, .cc-grail-bar) + :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status, .cc-grail-bar) {
 	border-top: 1px solid var(--cl-line-soft);
 }
 
-/* Pull the bottom-most tray strip flush behind the top curve of .cl-composer-box */
-.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status):has(+ .cl-composer) {
-	margin-bottom: -12px;
-	padding-bottom: 13px;
+/* Fuse the bottom-most tray strip cleanly into .cl-composer-box with zero translucent overlap bleed */
+.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status, .cc-grail-bar):has(+ .cl-composer) {
+	margin-bottom: 0;
+	padding-bottom: 6px;
 }
 
-.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status):has(+ .cl-composer) + .cl-composer {
+.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status, .cc-grail-bar):has(+ .cl-composer) + .cl-composer {
 	padding-top: 0;
 	position: relative;
 	z-index: 2;
+}
+
+.cc-composer-dock-stack > :is(.cc-pinned-todos, .cc-subagent-panel, .cc-conversation-status, .cc-grail-bar):has(+ .cl-composer) + .cl-composer > .cl-composer-box {
+	border-top-left-radius: 0;
+	border-top-right-radius: 0;
 }
 
 /* Inline Approval & AskUserQuestion polish */
@@ -2911,19 +2970,50 @@ details.cl-think.is-open .cc-think-preview {
 	animation: cc-caret-blink 0.95s ease-in-out infinite;
 }
 
-.cl-user-bubble .cc-user-actions {
+.cl-msg-user {
+	align-items: flex-start;
+	gap: 8px;
+}
+
+.cl-msg-user > .cl-user-bubble {
+	min-width: 0;
+	max-width: min(78%, calc(100% - 88px));
+}
+
+@media (max-width: 520px) {
+	.cl-msg-user > .cl-user-bubble {
+		max-width: calc(100% - 76px);
+	}
+}
+
+.cl-msg-user > .cc-user-actions {
+	margin-top: 6px;
+	display: inline-flex;
+	align-items: center;
+	gap: 2px;
+	padding: 2px;
+	border-radius: 8px;
+	background: color-mix(in srgb, var(--cl-surface) 92%, transparent);
+	border: 1px solid var(--cl-line-soft);
+	box-shadow: var(--elev-1);
 	opacity: 0;
-	transform: translateY(2px);
+	pointer-events: none;
+	transform: translateX(4px);
 	transition: opacity 150ms ease, transform 160ms var(--ease-spring);
 }
 
-.cl-user-bubble:hover .cc-user-actions,
-.cl-user-bubble:focus-within .cc-user-actions {
+.cl-msg-user:hover > .cc-user-actions,
+.cl-msg-user:focus-within > .cc-user-actions {
 	opacity: 1;
-	transform: translateY(0);
+	pointer-events: auto;
+	transform: translateX(0);
 }
 
-.cl-user-bubble .cc-user-actions button.is-copied {
+.cl-msg-user > .cc-user-actions button {
+	color: var(--cl-2);
+}
+
+.cl-msg-user > .cc-user-actions button.is-copied {
 	color: var(--cl-green);
 	animation: cc-copy-pop 240ms var(--ease-pop) both;
 }
@@ -3006,7 +3096,7 @@ details.cl-think.is-open .cc-think-preview {
 	padding: 7px 14px;
 	border-radius: 999px;
 	background: var(--cl-clay);
-	color: #ffffff;
+	color: var(--cl-on-accent, #ffffff);
 	font-size: 12.5px;
 	font-weight: 600;
 	box-shadow: var(--elev-2);
@@ -3393,12 +3483,12 @@ button.cc-review-line::after {
 	height: 15px;
 	border-radius: 4.5px;
 	background: var(--cl-clay);
-	color: #ffffff;
+	color: var(--cl-on-accent, #ffffff);
 	font-size: 11px;
 	line-height: 15px;
 	text-align: center;
 	font-weight: 700;
-	box-shadow: 0 1px 4px rgba(37, 99, 235, 0.36);
+	box-shadow: 0 1px 4px color-mix(in srgb, var(--cl-clay) 42%, transparent);
 	transition: opacity 130ms ease, transform 180ms var(--ease-pop);
 	pointer-events: none;
 }
@@ -3565,14 +3655,27 @@ body.cc-resizing .cc-inspector-resize::after {
 }
 
 .cc-pr-merge-method {
-	height: 27px;
-	padding-inline: 8px;
+	appearance: none;
+	-webkit-appearance: none;
+	height: 28px;
+	padding: 0 24px 0 9px;
 	border: 1px solid var(--cl-line);
 	border-radius: 8px;
-	background: var(--cl-soft);
-	color: var(--cl-2);
+	background-color: var(--cl-soft);
+	background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+	background-repeat: no-repeat;
+	background-position: right 7px center;
+	color: var(--cl-1);
 	font: inherit;
 	font-size: 12px;
+	font-weight: 500;
+	cursor: pointer;
+	transition: border-color 140ms ease, background-color 140ms ease;
+}
+
+.cc-pr-merge-method:hover:not(:disabled) {
+	background-color: var(--cl-hover);
+	border-color: color-mix(in srgb, var(--cl-clay) 40%, var(--cl-line));
 }
 
 .cc-pr-checks,
@@ -3836,11 +3939,539 @@ body.cc-resizing .cc-inspector-resize::after {
 	animation: cc-spin-loop 0.85s linear infinite;
 }
 
-.secondary-button.is-copied {
+.secondary-button.is-copied,
+.cc-mini-btn.is-copied {
 	color: var(--cl-green) !important;
 	border-color: color-mix(in srgb, var(--cl-green) 35%, var(--cl-line)) !important;
 	background: var(--cl-green-soft) !important;
 	animation: cc-copy-pop 240ms var(--ease-pop) both;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   14. Deep Detail Polish: Archived Viewer, Session Branch Tree, Resizable
+       Terminal, Unified 32px Inline Form Controls & Narrow Sidebar Harmony
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* 14.1 ArchivedToolOutput compact inline pagination bar (docked seamlessly inside .cl-tool-body) */
+.cc-archive-viewer {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	padding: 8px 12px;
+	background: color-mix(in srgb, var(--cl-soft) 68%, var(--cl-surface));
+}
+
+.cl-tool-body > :not(.cc-archive-viewer) + .cc-archive-viewer {
+	border-top: 1px solid var(--cl-line-soft);
+}
+
+.cc-archive-bar {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	flex-wrap: wrap;
+	gap: 8px;
+}
+
+.cc-archive-viewer > pre {
+	margin: 0 !important;
+	padding: 8px 10px !important;
+	border-radius: 7px;
+	border: 1px solid var(--cl-line-soft);
+	background: var(--cl-surface);
+}
+
+.cc-archive-meta {
+	display: inline-flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 6px;
+	font-size: 12px;
+	color: var(--cl-2);
+	font-variant-numeric: tabular-nums;
+}
+
+.cc-archive-actions {
+	display: inline-flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 5px;
+	margin-left: auto;
+}
+
+.cc-archive-viewer > pre.is-loading {
+	opacity: 0.55;
+	transition: opacity 150ms ease;
+}
+
+.cc-archive-error {
+	margin: 0;
+}
+
+/* 14.2 SessionsDialog semantic branch tree with continuous geometric connector rails */
+.cc-inline-switch {
+	margin-bottom: 0 !important;
+	padding: 0 4px !important;
+	align-items: center !important;
+}
+
+.cc-session-tree-list {
+	gap: 4px;
+}
+
+.cc-tree-node {
+	position: relative;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	min-height: 38px;
+	padding: 6px 10px;
+	border-radius: 9px;
+	border: 1px solid var(--cl-line-soft);
+	background: var(--cl-surface);
+	transition: background 130ms ease, border-color 130ms ease, box-shadow 130ms ease;
+}
+
+.cc-tree-node:hover {
+	background: var(--cl-hover);
+	border-color: var(--cl-line);
+}
+
+.cc-tree-node.in-lineage {
+	border-color: color-mix(in srgb, var(--cl-clay) 20%, var(--cl-line-soft));
+	box-shadow: inset 2px 0 0 color-mix(in srgb, var(--cl-clay) 46%, transparent);
+}
+
+.cc-tree-node.active {
+	background: var(--cl-clay-soft);
+	border-color: color-mix(in srgb, var(--cl-clay) 38%, var(--cl-line));
+	box-shadow: inset 3px 0 0 var(--cl-clay);
+}
+
+.cc-leaf-tag {
+	background: color-mix(in srgb, var(--cl-clay) 16%, var(--cl-soft)) !important;
+	color: var(--cl-clay) !important;
+	font-weight: 600;
+}
+
+.cc-tree-rails {
+	display: inline-flex;
+	align-self: stretch;
+	align-items: stretch;
+	flex-shrink: 0;
+	margin: -6px 2px -6px -2px;
+	pointer-events: none;
+}
+
+.cc-tree-rail {
+	position: relative;
+	width: 16px;
+	flex-shrink: 0;
+	--rail-color: color-mix(in srgb, var(--cl-3) 48%, var(--cl-line));
+}
+
+.cc-tree-node.in-lineage .cc-tree-rail {
+	--rail-color: color-mix(in srgb, var(--cl-clay) 62%, var(--cl-line));
+}
+
+/* Continuous vertical trunk bridging across the 4px inter-row gap */
+.cc-tree-rail.is-line::before {
+	content: "";
+	position: absolute;
+	left: 7px;
+	top: -3px;
+	bottom: -3px;
+	width: 1.5px;
+	background: var(--rail-color);
+}
+
+/* Middle branch split (├─): full vertical trunk + horizontal arm */
+.cc-tree-rail.is-mid::before {
+	content: "";
+	position: absolute;
+	left: 7px;
+	top: -3px;
+	bottom: -3px;
+	width: 1.5px;
+	background: var(--rail-color);
+}
+
+.cc-tree-rail.is-mid::after {
+	content: "";
+	position: absolute;
+	left: 7px;
+	top: 50%;
+	width: 8px;
+	height: 1.5px;
+	background: var(--rail-color);
+}
+
+/* Last branch elbow (└─): top half + rounded corner into horizontal arm */
+.cc-tree-rail.is-last::before {
+	content: "";
+	position: absolute;
+	left: 7px;
+	top: -3px;
+	height: calc(50% + 4px);
+	width: 8px;
+	border-left: 1.5px solid var(--rail-color);
+	border-bottom: 1.5px solid var(--rail-color);
+	border-bottom-left-radius: 5px;
+}
+
+/* Continuation node inside a branch: subtle vertical thread + node dot */
+.cc-tree-rail.is-cont::before {
+	content: "";
+	position: absolute;
+	left: 7px;
+	top: -3px;
+	bottom: 50%;
+	width: 1.5px;
+	background: color-mix(in srgb, var(--rail-color) 65%, transparent);
+}
+
+.cc-tree-rail.is-cont::after {
+	content: "";
+	position: absolute;
+	left: 5.25px;
+	top: calc(50% - 2.5px);
+	width: 5px;
+	height: 5px;
+	border-radius: 50%;
+	background: var(--rail-color);
+}
+
+/* ControlsDialog zero-layout-shift header & tactile switch pills */
+.cc-controls-head-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+}
+
+.cc-controls-head-row > .cc-modal-tabs {
+	flex: 1;
+	min-width: 0;
+}
+
+.cc-controls-sync-pill {
+	font-size: 11.5px;
+	font-weight: 500;
+	padding: 2px 8px;
+	border-radius: 999px;
+	border: 1px solid var(--cl-line-soft);
+	white-space: nowrap;
+	flex-shrink: 0;
+}
+
+.cc-switch-pill {
+	display: inline-flex;
+	align-items: center;
+	gap: 7px;
+	height: 28px;
+	padding: 0 9px 0 6px !important;
+	border-radius: 999px !important;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-soft);
+	color: var(--cl-2);
+	font-size: 12px;
+	font-weight: 550;
+	transition: background 150ms ease, border-color 150ms ease, color 150ms ease;
+}
+
+.cc-switch-pill .cc-switch-track {
+	position: relative;
+	width: 26px;
+	height: 15px;
+	border-radius: 999px;
+	background: color-mix(in srgb, var(--cl-3) 38%, var(--cl-line));
+	transition: background 160ms ease;
+	flex-shrink: 0;
+}
+
+.cc-switch-pill .cc-switch-thumb {
+	position: absolute;
+	top: 2px;
+	left: 2px;
+	width: 11px;
+	height: 11px;
+	border-radius: 50%;
+	background: #ffffff;
+	box-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
+	transition: transform 180ms var(--ease-spring);
+}
+
+.cc-switch-pill.on {
+	background: var(--cl-green-soft);
+	border-color: color-mix(in srgb, var(--cl-green) 34%, var(--cl-line));
+	color: var(--cl-green);
+}
+
+.cc-switch-pill.on .cc-switch-track {
+	background: var(--cl-green);
+}
+
+.cc-switch-pill.on .cc-switch-thumb {
+	transform: translateX(11px);
+}
+
+.cc-mini-btn.danger.is-armed {
+	background: var(--cl-red) !important;
+	border-color: var(--cl-red) !important;
+	color: #ffffff !important;
+	font-weight: 600;
+}
+
+.cc-tree-node-main {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex: 1;
+	min-width: 0;
+}
+
+.cc-tree-branch-glyph {
+	font-family: var(--mono);
+	font-size: 12px;
+	color: var(--cl-clay);
+	flex-shrink: 0;
+}
+
+.cc-tree-role-badge {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	height: 21px;
+	padding: 0 7px;
+	border-radius: 6px;
+	font-size: 11px;
+	font-weight: 600;
+	flex-shrink: 0;
+	background: var(--cl-soft);
+	color: var(--cl-2);
+}
+
+.cc-tree-role-badge.role-user {
+	background: var(--cl-clay-soft);
+	color: var(--cl-clay);
+}
+
+.cc-tree-role-badge.role-compaction,
+.cc-tree-role-badge.role-branch {
+	background: var(--cl-green-soft);
+	color: var(--cl-green);
+}
+
+.cc-tree-node-text {
+	flex: 1;
+	min-width: 0;
+	font-size: 12.5px;
+	color: var(--cl-1);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.cc-tree-node.kind-meta .cc-tree-node-text {
+	color: var(--cl-3);
+	font-family: var(--mono);
+	font-size: 11.5px;
+}
+
+.cc-tree-node-time {
+	font-family: var(--mono);
+	font-size: 11px;
+	color: var(--cl-3);
+	font-variant-numeric: tabular-nums;
+	flex-shrink: 0;
+}
+
+/* 14.3 Workspace review empty state card */
+.cc-review-empty {
+	margin: 24px 12px;
+	padding: 24px 18px;
+	border-radius: 12px;
+	border: 1px dashed var(--cl-line);
+	background: var(--cl-soft);
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 8px;
+	text-align: center;
+}
+
+.cc-review-empty > svg {
+	color: var(--cl-3);
+}
+
+.cc-review-empty > strong {
+	font-size: 13px;
+	color: var(--cl-1);
+}
+
+.cc-review-empty > p {
+	margin: 0;
+	font-size: 12px;
+	color: var(--cl-3);
+}
+
+/* 14.4 Resizable Terminal Panel & Theme-Fitted InteractiveTerminal */
+.cc-terminal-resize {
+	position: absolute;
+	top: 0;
+	left: 0;
+	right: 0;
+	height: 6px;
+	z-index: 12;
+	cursor: ns-resize;
+}
+
+.cc-terminal-resize::before {
+	content: "";
+	position: absolute;
+	left: 50%;
+	top: 1px;
+	transform: translateX(-50%) scaleX(0.6);
+	width: 36px;
+	height: 3.5px;
+	border-radius: 99px;
+	background: var(--cl-clay);
+	opacity: 0;
+	transition: opacity 150ms ease, transform 180ms var(--ease-spring);
+}
+
+.cc-terminal-resize:hover::before,
+.cc-terminal-resize:focus-visible::before,
+body.cc-resizing .cc-terminal-resize::before {
+	opacity: 0.9;
+	transform: translateX(-50%) scaleX(1);
+}
+
+.terminal-panel > .cc-interactive-terminal {
+	flex: 1;
+	min-height: 0;
+	height: auto !important;
+	padding: 6px 10px;
+	background: var(--cl-soft);
+}
+
+:root[data-theme="dark"] .terminal-panel > .cc-interactive-terminal {
+	background: #13161b;
+}
+
+:root[data-theme="grail"] .terminal-panel > .cc-interactive-terminal {
+	background: #090e22;
+}
+
+.terminal-panel > .terminal-output {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	background: var(--cl-bg);
+}
+
+.terminal-panel > .terminal-output > pre {
+	flex: 1;
+	min-height: 0;
+	margin: 0;
+	padding: 10px 14px;
+	overflow: auto;
+	font-family: var(--mono);
+	font-size: 12px;
+	line-height: 1.55;
+	color: var(--cl-2);
+}
+
+.terminal-panel > .terminal-output > form {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 7px 14px;
+	border-top: 1px solid var(--cl-line-soft);
+	background: var(--cl-soft);
+}
+
+.terminal-panel > .terminal-output > form > label {
+	font-family: var(--mono);
+	font-size: 12px;
+	font-weight: 700;
+	color: var(--cl-clay);
+	user-select: none;
+}
+
+.terminal-panel > .terminal-output > form > input {
+	flex: 1;
+	min-width: 0;
+	border: 0;
+	background: transparent;
+	font-family: var(--mono);
+	font-size: 12.5px;
+	color: var(--cl-1);
+}
+
+/* 14.5 Unified 32px Inline Form SelectPopover & RemoteJobsPanel layout */
+:is(.cc-rule-form, .cc-hook-form, .cc-task-start, .cc-skill-form-row, .cc-modal-scope) .cc-select-trigger {
+	height: 32px;
+	padding: 0 10px;
+	border-radius: 9px;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-surface);
+	color: var(--cl-1);
+	font-size: 12.5px;
+}
+
+:is(.cc-rule-form, .cc-hook-form, .cc-task-start, .cc-skill-form-row, .cc-modal-scope) .cc-select-trigger:hover:not(:disabled),
+:is(.cc-rule-form, .cc-hook-form, .cc-task-start, .cc-skill-form-row, .cc-modal-scope) .cc-select-popover.is-open .cc-select-trigger {
+	border-color: color-mix(in srgb, var(--cl-clay) 45%, var(--cl-line));
+	background: var(--cl-surface);
+}
+
+.cc-perm-sync-toggle {
+	margin-bottom: 4px !important;
+	align-items: center !important;
+}
+
+.cc-remote-job-field {
+	display: grid;
+	gap: 5px;
+	min-width: 0;
+	font-size: var(--fs-sm);
+	color: var(--cl-2);
+}
+
+.cc-remote-job-field .cc-select-popover.is-field {
+	margin-top: 0;
+}
+
+.cc-remote-job-field .cc-select-popover.is-field .cc-select-trigger,
+.cc-remote-job-form input:not([type="checkbox"]) {
+	height: 34px;
+	border-radius: 9px;
+}
+
+.cc-remote-job-form .cc-remote-job-credentials {
+	margin-bottom: 0 !important;
+	align-items: center !important;
+}
+
+/* 14.6 Grail composer sandbox pill & narrow sidebar action spacing */
+:root[data-theme="grail"] .cl-composer-box .cc-sandbox-pill {
+	border-color: transparent;
+	background: transparent;
+}
+
+:root[data-theme="grail"] .cl-composer-box .cc-sandbox-pill:hover:not(:disabled),
+:root[data-theme="grail"] .cl-composer-box .cc-sandbox-pill.open {
+	background: rgba(142, 162, 255, 0.14);
+	border-color: rgba(142, 162, 255, 0.36);
+}
+
+@media (max-width: 1120px) {
+	.cl-side-action kbd {
+		display: none;
+	}
 }
 
 @media (max-width: 720px) {

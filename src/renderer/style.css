@@ -2841,7 +2841,7 @@ body {
 }
 .cc-remote-jobs-heading > .cc-tool-ctrl-actions { flex: none; }
 .cc-preflight-upload { position: relative; }
-.cc-preflight-upload:focus-within { outline: 2px solid var(--cl-accent); outline-offset: 2px; }
+.cc-preflight-upload:focus-within { outline: 2px solid var(--cl-clay); outline-offset: 2px; }
 .cc-preflight-upload input { position: absolute; inset: 0; width: 100%; opacity: 0; cursor: pointer; }
 .cc-preflight-notes { margin: 6px 0 0; padding-inline-start: 18px; font-size: var(--fs-sm); color: var(--cl-2); }
 .cc-remote-job-form {
@@ -5285,6 +5285,10 @@ body.cc-resizing iframe {
 	border-radius: 6px;
 	font-size: var(--fs-xs, 11px);
 	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+.cc-grail-evidence-source code {
+	overflow-wrap: anywhere;
 }
 .cc-grail-blind {
 	display: grid;

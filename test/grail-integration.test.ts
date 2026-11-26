@@ -42,7 +42,7 @@ async function setup(nested = false) {
 		testFixture += 'import { expected } from "../../shared/index.mjs";\nimport { expected as linked } from "grail-shared";\n';
 		testFixture += 'test("add", () => { writeFileSync("grail-local-artifact", "test"); assert.equal(expected, 3); assert.equal(add(1, 2), expected); assert.equal(linked, expected); });\n';
 	} else {
-		testFixture += 'test("add", () => { writeFileSync("grail-local-artifact", "test"); assert.equal(add(1, 2), 3); });\n';
+		testFixture += 'test("add", () => { writeFileSync("grail-local-artifact", "test"); console.log("test-output".repeat(7_000)); console.log("PRIVATE_GRAIL_LOG_MARKER"); assert.equal(add(1, 2), 3); });\n';
 	}
 	await writeFile(
 		join(project, "test", "add.test.mjs"),
@@ -114,7 +114,22 @@ test("Grail judgement: grail, 愿望达成, failing test, cancel and seal, never
 		await assert.rejects(access(join(fixture.project, "grail-local-artifact")), { code: "ENOENT" });
 		assert.equal(first.grade, "grail", JSON.stringify(first.reasons) + (first.steps.objective?.runs[0]?.output ?? ""));
 		assert.equal(first.steps.objective?.status, "pass");
-		assert.ok((first.steps.objective?.runs[0].testCount ?? 0) >= 1);
+		assert.deepEqual(first.steps.objective.checks?.map(({ status }) => status), ["pass", "pass", "pass"]);
+		const testRun = first.steps.objective.runs[0];
+		assert.equal(testRun.command, "npm run test");
+		assert.equal(testRun.scriptBody, "node --test");
+		assert.equal(testRun.exitCode, 0);
+		assert.ok((testRun.passedCount ?? 0) >= 1);
+		assert.ok((testRun.outputBytes ?? 0) > 64 * 1024);
+		assert.equal(testRun.outputTruncated, true);
+		assert.ok(Buffer.byteLength(testRun.output) <= 64 * 1024);
+		assert.match(testRun.output, /PRIVATE_GRAIL_LOG_MARKER/);
+		const source = first.evidence!.source;
+		assert.match(source.revision ?? "", /^[a-f0-9]{40}$/);
+		assert.match(source.baselineTree, /^[a-f0-9]{64}$/);
+		assert.notEqual(source.baselineTree, source.selectedTree);
+		assert.equal(source.selectedTree, source.testedTree);
+		assert.equal(source.project, ".");
 		assert.equal(first.steps.comparison?.dropped, 1);
 		assert.deepEqual(first.requirement, ["read-write-bash 实现 add"]);
 		assert.ok(first.files.some((file) => file.path === "src/add.mjs"));
@@ -127,18 +142,23 @@ test("Grail judgement: grail, 愿望达成, failing test, cancel and seal, never
 		assert.doesNotMatch(blind.prompt, /a \+ b/);
 		assert.notEqual(resolve(blind.cwd), resolve(fixture.project));
 		assert.match(calls.find((call) => call.step === "comparison")!.prompt, /a \+ b/);
+		assert.match(calls.find((call) => call.step === "comparison")!.prompt, /"command":"npm run test","exitCode":0/);
+		assert.ok(calls.every((call) => !call.prompt.includes("PRIVATE_GRAIL_LOG_MARKER")));
 		assert.notEqual(resolve(calls.find((call) => call.step === "comparison")!.cwd), resolve(fixture.project));
 
 		await writeFile(control, "granted");
 		const second = await judge();
 		assert.equal(second.grade, "granted");
 		assert.equal(second.previousGrade, "grail");
+		assert.deepEqual(second.evidence?.source, source);
 		assert.ok(second.reasons.some((reason) => reason.includes("少写两行")));
 
 		await writeFile(join(fixture.project, "src", "add.mjs"), "export function add(a, b) {\n\treturn a - b;\n}\n");
 		const third = await judge();
 		assert.equal(third.grade, "unfulfilled");
 		assert.equal(third.steps.objective?.status, "fail");
+		assert.equal(third.evidence?.source.revision, source.revision);
+		assert.notEqual(third.evidence?.source.testedTree, source.testedTree);
 		assert.equal(third.steps.blind, undefined);
 		assert.ok(third.steps.objective!.runs[0].output.length > 0);
 
@@ -223,6 +243,9 @@ test("nested Git project tests selected changes against frozen siblings and reje
 		assert.equal(result.grade, "grail", JSON.stringify(result.reasons) + (result.steps.objective?.runs[0]?.output ?? ""));
 		assert.deepEqual(result.requirement, ["Define add using both operands.", "Preserve the sum for negative operands."]);
 		assert.deepEqual(result.steps.objective?.runs.map(({ name }) => name), ["test", "check", "lint"]);
+		assert.equal(result.evidence?.source.project, "packages/app");
+		assert.match(result.evidence?.source.testedTree ?? "", /^[a-f0-9]{64}$/);
+		assert.notEqual(result.evidence?.source.selectedTree, result.evidence?.source.testedTree);
 		assert.deepEqual(result.files.map(({ path }) => path), ["src/add.mjs"]);
 		const blob = (content: string) => join(fixture.dataDir, "checkpoints", "git-snapshots", "blobs", createHash("sha256").update(content).digest("hex"));
 		await access(blob("export function add(a, b) {\n\treturn a + b;\n}\n"));

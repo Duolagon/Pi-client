@@ -235,6 +235,10 @@ await window.pi.tasks.viewing(task.id, true); // 详情打开时上报；关闭�
 
 Pi 的 Bash 退出码由工具结构化结果写入会话消息的 `details.exitCode`，旧记录仍可显示工具报告的成功或失败。客户端对照后续编辑和可能写入项目的命令标记检查是否过期。「在终端重跑」将命令放入终端输入框，等待用户执行。
 
+Pi 内置 Agent 每次模型调用使用 24 KiB 的工具正文预算。超出预算的工具文本在消息中保留简短预览。模型可通过 `ReadToolOutput` 分页回读当前分支中仍有权限查看的记录。用户可以在对应工具卡片点「查看完整输出」，它通过 `pi.readToolOutput(conversationId, id, offset?)` 读取本机会话归档。单份记录最多保留 8 MiB，容量不足时旧记录会过期，客户端会标记只保留了部分内容的记录。
+
+「质量鉴定」在隔离快照上执行客观检查。「查看鉴定快照」列出检查点、源码指纹和 Git HEAD。「客观检查」逐项显示实际命令、退出码、测试数量和未执行的原因，可展开查看保留的输出。报告通过现有 `pi.grail.state` 和 `pi.grail.onEvent` 提供。
+
 计划审批使用本会话成功提交的计划，或用户显式选用的计划草稿。批准前读取文件确认基准版本，保存后检查执行权限和文件内容，然后把已批准的正文随执行请求发给 Pi。
 
 `pi.pullRequest(conversationId, number?)` 使用 `gh` 读取 PR 和 CI 状态。 `pi.createDraftPullRequest(conversationId, { branch, title, body, base? })` 在用户提交表单后从已推送的当前分支创建草稿 PR。
@@ -242,6 +246,8 @@ Pi 的 Bash 退出码由工具结构化结果写入会话消息的 `details.exit
 `pi.checkPreview(url, mobile)` 在隔离的 Chromium 会话中访问回环地址并返回 HTTP 状态、标题、耗时和浏览器错误。验证窗口允许同源的 GET、HEAD 和 OPTIONS 请求。
 
 `pi.inspectCode(conversationId, path, { line, column }?)` 在已信任项目启动适配的本地语言服务器。返回的行列从 1 开始，定义只能跳转到项目内文件。 `pi.writeMemoryFile("本机项目记忆", content)` 写入应用数据区，正文上限 24 KiB。项目规则和本机项目记忆会进入受信任项目的模型上下文。
+
+受信任项目中，文件引用和文件工具按目标路径发现子目录的 `AGENTS.md`、`AGENTS.override.md`、`CLAUDE.md` 及本地规则。命中的规则文件须符合当前会话的读取权限。结构化文件工具首次直接写入时，如果当前模型请求尚未看到对应规则，工具会返回规则并要求模型按规则重试。
 
 ## Git 检查点
 
@@ -355,6 +361,8 @@ Pi 引擎来自精确锁定的 `@earendil-works/pi-coding-agent@1.5.2` 与 `@ear
 本机开发构建需要 Node.js 22.19.0 或更新版本、Git 和 C 编译器；最终应用携带 Node 运行时与已编译 helper。独立测试使用临时仓库、真实 Pi 进程与本地脚本化模型，不读取真实密钥或调用付费 API。
 
 首次开发启动前执行 `node node_modules/electron/install.js`，再运行 `npm run start`。`npm run package`／`npm run dist:mac` 由 electron-builder 自行下载打包使用的 Electron 运行时。
+
+打包 macOS 应用后，可执行 `node scripts/verify-engine-enhancements.mjs --screenshots` 来验证跨目录规则、长日志回读和质量鉴定。验证使用临时 Git 项目和本地脚本化模型。
 
 `test/packaged-backend-smoke.ts` 可用 esbuild 打包为独立脚本，再由目标 `.app/Contents/MacOS/Pi Desktop` 以 `ELECTRON_RUN_AS_NODE=1` 执行。参数依次为目标 `Contents/Resources` 和 `test/fixtures/faux-provider.js` 的绝对路径。已从 `/tmp` 验收打包后的两路 Pi 运行时、自动检查点与恢复、Worktree 清理后存档读取，以及包内原生 PTY，未启动或修改前端。
 

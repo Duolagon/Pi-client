@@ -64,17 +64,29 @@ export function WorkspacePanel({
 		saveReviewView(viewKey, update(readReviewView(viewKey)));
 		renderView((value) => value + 1);
 	};
-	const scope = view.scope ?? (checkpointId ? "turn" : "workspace");
+	const [entries, setEntries] = useState<FileEntry[]>([]);
+	const [workspace, setWorkspace] = useState<Workspace | null>(null);
+	const [checkpoint, setCheckpoint] = useState<GitCheckpoint>();
+	const [loadedCheckpointId, setLoadedCheckpointId] = useState<string>();
+	const [loaded, setLoaded] = useState<{ requestId: string; path: string; text: string }>();
+	const checkpointLoaded = !checkpointId || loadedCheckpointId === checkpointId;
+	const activeCheckpoint = checkpoint?.id === checkpointId ? checkpoint : undefined;
+	const filteredTurnFiles = activeCheckpoint?.changes.filter((entry) =>
+		entry.beforeKind === "file" || entry.afterKind === "file" || entry.beforeKind === "symlink" || entry.afterKind === "symlink") ?? [];
+	const autoFallbackToWorkspace =
+		view.scope === undefined &&
+		Boolean(checkpointId) &&
+		checkpointLoaded &&
+		Boolean(activeCheckpoint) &&
+		filteredTurnFiles.length === 0 &&
+		(workspace?.changes.length ?? 0) > 0;
+	const scope = view.scope ?? (checkpointId && !autoFallbackToWorkspace ? "turn" : "workspace");
 	const turnReview = pane === "changes" && scope === "turn";
 	const turnPosition = view.turn.checkpointId === checkpointId ? view.turn : defaultPosition;
 	const position = turnReview ? turnPosition : view.workspace;
 	const selectedPath = pane === "files" ? view.files.path : position.path;
 	const nameStart = (selectedPath?.lastIndexOf("/") ?? -1) + 1;
 	const source = turnReview ? checkpointId : workspaceSource;
-	const [entries, setEntries] = useState<FileEntry[]>([]);
-	const [workspace, setWorkspace] = useState<Workspace | null>(null);
-	const [checkpoint, setCheckpoint] = useState<GitCheckpoint>();
-	const [loaded, setLoaded] = useState<{ requestId: string; path: string; text: string }>();
 	const [commitMessage, setCommitMessage] = useState("");
 	const [mutating, setMutating] = useState(false);
 	const [sending, setSending] = useState(false);
@@ -104,9 +116,6 @@ export function WorkspacePanel({
 	}, [view.draft?.id]);
 	const requestId = JSON.stringify([viewKey, pane, source, selectedPath, refresh, turnReview ? 0 : revision]);
 	const content = loaded?.requestId === requestId ? loaded : undefined;
-	const activeCheckpoint = checkpoint?.id === checkpointId ? checkpoint : undefined;
-	const filteredTurnFiles = activeCheckpoint?.changes.filter((entry) =>
-		entry.beforeKind === "file" || entry.afterKind === "file" || entry.beforeKind === "symlink" || entry.afterKind === "symlink") ?? [];
 	const stagedChanges = workspace?.changes.filter((entry) => entry.staged) ?? [];
 	const unstagedChanges = workspace?.changes.filter((entry) => entry.unstaged || !entry.staged) ?? [];
 	const reviewPaths = turnReview ? filteredTurnFiles.map((entry) => entry.path) : workspace?.changes.map((entry) => entry.path) ?? [];
@@ -146,32 +155,38 @@ export function WorkspacePanel({
 	}, [pane, conversationId, view.files.directory, revision, refresh]);
 
 	useEffect(() => {
-		if (pane !== "changes" || turnReview) return;
+		if (pane !== "changes") return;
 		let current = true;
-		setListError("");
+		if (!turnReview) setListError("");
 		const getWorkspace = conversationId ? window.pi.tasks.workspace(conversationId) : window.pi.workspace();
 		void getWorkspace.then((result) => {
 			if (current) setWorkspace(result);
 		}).catch((cause) => {
-			if (current) setListError(errorMessage(cause));
+			if (current && !turnReview) setListError(errorMessage(cause));
 		});
 		return () => { current = false; };
 	}, [pane, turnReview, conversationId, revision, refresh]);
 
 	useEffect(() => {
-		if (!turnReview || !checkpointId) return;
+		if (!checkpointId) {
+			setCheckpoint(undefined);
+			return;
+		}
+		if (pane !== "changes" || (view.scope !== undefined && view.scope !== "turn")) return;
 		let current = true;
 		setListError("");
 		void window.pi.git.list(conversationId).then((items) => {
 			if (!current) return;
 			const exact = items.find((item) => item.id === checkpointId && item.finishedAt !== undefined);
 			setCheckpoint(exact);
-			if (!exact) setListError("找不到本轮已完成的检查点。");
+			if (!exact && view.scope === "turn") setListError("找不到本轮已完成的检查点。");
 		}).catch((cause) => {
-			if (current) setListError(errorMessage(cause));
+			if (current && view.scope === "turn") setListError(errorMessage(cause));
+		}).finally(() => {
+			if (current) setLoadedCheckpointId(checkpointId);
 		});
 		return () => { current = false; };
-	}, [turnReview, checkpointId, conversationId, refresh]);
+	}, [pane, view.scope, checkpointId, conversationId, refresh]);
 
 	const firstTurnFile = filteredTurnFiles[0]?.path;
 	useEffect(() => {
@@ -537,7 +552,29 @@ export function WorkspacePanel({
 											</div>
 										);
 									})}
-									{activeCheckpoint && !filteredTurnFiles.length && <p className="subtle-note">本轮没有可审查的文件改动。</p>}
+									{(!checkpointId || (checkpointLoaded && !filteredTurnFiles.length)) && (
+										<div className="cc-empty-state cc-review-empty">
+											<FileCode2 size={20} aria-hidden="true" />
+											<strong>{checkpointId ? "本轮没有可审查的文件改动。" : "当前轮次尚未产生检查点改动。"}</strong>
+											{workspace && workspace.changes.length > 0 ? (
+												<>
+													<p>当前工作区共有 {workspace.changes.length} 个未提交改动文件。</p>
+													<button
+														type="button"
+														className="secondary-button"
+														onClick={() => {
+															setListError("");
+															updateView((current) => ({ ...current, scope: "workspace" }));
+														}}
+													>
+														查看整个工作区改动 ({workspace.changes.length})
+													</button>
+												</>
+											) : (
+												<p>可切换到「整个工作区」查看全部未提交状态。</p>
+											)}
+										</div>
+									)}
 								</>
 							) : (
 								<>
@@ -545,7 +582,13 @@ export function WorkspacePanel({
 									{stagedChanges.map((change) => renderWorkspaceFile(change, true))}
 									{unstagedChanges.length > 0 && <div className="cc-change-section">未暂存与未跟踪 ({unstagedChanges.length})</div>}
 									{unstagedChanges.map((change) => renderWorkspaceFile(change, false))}
-									{workspace?.isGit && !workspace.changes.length && <p className="subtle-note">工作区没有未提交的修改。</p>}
+									{workspace?.isGit && !workspace.changes.length && (
+										<div className="cc-empty-state cc-review-empty">
+											<Check size={20} aria-hidden="true" />
+											<strong>工作区没有未提交的修改。</strong>
+											<p>所有已跟踪文件与当前 Git HEAD 一致。</p>
+										</div>
+									)}
 								</>
 							)}
 						</div>
@@ -703,8 +746,8 @@ export function WorkspacePanel({
 						{error ? <div className="live-error" role="alert">{error}</div>
 							: !discardVersion && <p className="subtle-note" role="status">正在确认当前文件状态…</p>}
 						<div>
-							<button type="button" className="cc-mini-btn" disabled={mutating} onClick={() => { open(discard.path); setDiscard(undefined); }}>查看差异</button>
-							<button type="button" className="cc-mini-btn" disabled={mutating} onClick={() => { setError(""); setDiscard(undefined); }}>取消</button>
+							<button type="button" className="secondary-button" disabled={mutating} onClick={() => { open(discard.path); setDiscard(undefined); }}>查看差异</button>
+							<button type="button" className="secondary-button" disabled={mutating} onClick={() => { setError(""); setDiscard(undefined); }}>取消</button>
 							<button type="button" className="primary-button" disabled={mutating || !discardVersion} onClick={() => void discardFile()}>
 								{mutating ? "正在处理…" : discard.status === "??" ? "移到废纸篓" : "确认还原"}
 							</button>

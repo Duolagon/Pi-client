@@ -248,13 +248,60 @@ test("ContextInspector, SkillRegistry, Claude permission sync and Seatbelt build
 	}
 });
 
+test("context report keeps post-compaction usage unknown until the provider reports the new context", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-context-after-compact-"));
+	try {
+		await writeFile(join(root, "AGENTS.md"), "# Project guide\n");
+		const request = { project: root, agentDir: root, home: root, tools: [], messages: [] };
+		const stats = {
+			sessionFile: undefined, sessionId: "compact-test", userMessages: 6, assistantMessages: 6,
+			toolCalls: 0, toolResults: 0, totalMessages: 12,
+			tokens: { input: 450_000, output: 10_000, cacheRead: 80_000, cacheWrite: 0, total: 540_000 },
+			cost: 0.1,
+		};
+		const pending = await buildContextReport({
+			...request,
+			stats: { ...stats, contextUsage: { contextWindow: 128_000, tokens: null, percent: null } },
+		});
+		assert.equal(pending.contextWindow, 128_000);
+		assert.equal(pending.totalTokens, null);
+		assert.equal(pending.percent, null);
+		assert.equal(pending.remainingTokens, null);
+		assert.equal(pending.conversationTokens, null);
+		assert.equal(pending.inputTokens, 450_000);
+		assert.equal(pending.cacheReadTokens, 80_000);
+		assert.equal(pending.cost, 0.1);
+		assert.deepEqual(pending.optimizationTips, []);
+
+		const absent = await buildContextReport({ ...request, stats });
+		assert.equal(absent.totalTokens, null);
+		const refreshed = await buildContextReport({
+			...request,
+			stats: { ...stats, contextUsage: { contextWindow: 128_000, tokens: 32_000, percent: 25 } },
+		});
+		assert.equal(refreshed.totalTokens, 32_000);
+		assert.equal(refreshed.percent, 25);
+		assert.equal(refreshed.remainingTokens, 96_000);
+		assert.equal(refreshed.conversationTokens, 32_000);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 test("DesktopService and IPC expose plan files, context report, hooks, skills, btw and claude rule sync", { timeout: 30000 }, async () => {
 	const fixture = await createCoreFixture();
+	const settingsFile = join(fixture.agentDir, "settings.json");
+	const agentSettings = JSON.parse(await readFile(settingsFile, "utf8"));
+	await writeFile(settingsFile, JSON.stringify({
+		...agentSettings,
+		compaction: { enabled: true, reserveTokens: 12_000, modelOverrides: { "desktop-test/desktop-test-1": { reserveTokens: 8_000 } } },
+	}));
 	const service = new DesktopService({
 		dataDir: fixture.dataDir,
 		executable: process.execPath,
 		entry: fixture.entry,
 		permissionExtension: extension,
+		toolControlExtension: resolve(dirname(extension), "tool-control-extension.ts"),
 		env: { ...fixture.env, HOME: fixture.root },
 		initialProject: fixture.project,
 	});
@@ -279,6 +326,9 @@ test("DesktopService and IPC expose plan files, context report, hooks, skills, b
 		await invoke("pi:workspace:write-memory-file", ".claude/rules/testing.md", "Run node --test.");
 		const report = await invoke<ContextBreakdown>("pi:workspace:context-report");
 		assert.ok(report.sources.some((s) => s.relativePath === ".claude/rules/testing.md" && s.exists));
+		assert.equal(report.autoCompactionEnabled, true);
+		assert.equal(report.contextWindow, 128_000);
+		assert.equal(report.compactionThreshold, 120_000);
 		await invoke<ContextBreakdown>("pi:workspace:delete-memory-rule", ".claude/rules/testing.md");
 
 		const hooks = await invoke<HookEntry[]>("pi:hooks:save", { event: "PreToolUse", matcher: "bash", command: "exit 0", scope: "project", project: snap.active!.project });

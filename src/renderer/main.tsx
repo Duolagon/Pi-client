@@ -228,11 +228,19 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [query, setQuery] = useState("");
 	const [searchIndex, setSearchIndex] = useState(0);
 	const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+	const [viewportHeight, setViewportHeight] = useState(() => window.innerHeight);
 	const [inspectorWidth, setInspectorWidth] = useState(() => savedInspectorWidth("pi.inspectorWidth", 400));
 	const [reviewWidth, setReviewWidth] = useState(() => savedInspectorWidth("pi.reviewInspectorWidth", 500));
+	const [terminalHeight, setTerminalHeight] = useState(() => {
+		const stored = Number(localStorage.getItem("pi.terminalHeight"));
+		return Number.isFinite(stored) && stored >= 160 ? stored : 0;
+	});
 	const { pane, setPane, previewUrl, setPreviewUrl, terminalOpen, setTerminalOpen, focusReview, toggleReviewFocus } = useSessionWorkspace(snapshot?.active?.id);
 	useEffect(() => {
-		const resize = () => setViewportWidth(window.innerWidth);
+		const resize = () => {
+			setViewportWidth(window.innerWidth);
+			setViewportHeight(window.innerHeight);
+		};
 		window.addEventListener("resize", resize);
 		return () => window.removeEventListener("resize", resize);
 	}, []);
@@ -1409,11 +1417,16 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		});
 	};
 	const inPlanMode = activePermMode === "plan";
-	const showGrailStatus = Boolean(snapshot.active && grail?.conversationId === snapshot.active.id && (hasTranscript || grail.hasDiff || grail.running || grail.verdicts.length));
+	const showGrailStatus = Boolean(
+		snapshot.active &&
+			grail?.conversationId === snapshot.active.id &&
+			(grail.hasDiff || grail.running || grail.verdicts.length > 0),
+	);
 	const showPlanApproval = inPlanMode && !running && !changing;
 	const planReady = Boolean(planState && planDraft.trim() &&
 		(manualPlan || (planSubmission && planState.exists && planState.content === planSubmission.content)));
 	const activePhase = snapshot.active && app.runPhases[snapshot.active.id];
+	const compaction = app.compactionCompletion;
 	const waitingForInput = app.requests.length > 0;
 	const activeRequest = app.requests[0];
 	const approvalExpanded = Boolean(activeRequest && activeRequest.id !== deferredApproval);
@@ -2309,6 +2322,20 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						</div>
 					)}
 				</SurfacePresence>
+				<SurfacePresence show={Boolean(compaction && activePhase !== "compacting")} direction="banner" group="compaction-banner">
+					{(compactionRef) => compaction && activeConversationId ? (
+						<div ref={compactionRef} className="cl-banner" role="status">
+							<span>
+								{compaction.reason === "manual" ? "手动压缩上下文已完成" : "自动压缩上下文已完成"}
+								{` · 压缩前 ${compaction.tokensBefore.toLocaleString()} tokens`}
+								{compaction.estimatedTokensAfter !== undefined && ` · 压缩后约 ${compaction.estimatedTokensAfter.toLocaleString()} tokens`}
+							</span>
+							<button type="button" aria-label="关闭压缩提示" onClick={() => app.dismissCompaction(activeConversationId)}>
+								<X size={14} />
+							</button>
+						</div>
+					) : null}
+				</SurfacePresence>
 				<SurfacePresence
 					show={Boolean(snapshot.trust?.required && !snapshot.trust.decision && !trustLater[snapshot.trust.project])}
 					direction="banner"
@@ -2996,6 +3023,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									(t) => t.parentConversationId === snapshot.active?.id && (t.status === "running" || t.status === "queued"),
 								).length;
 								const childSuffix = activeChildren > 0 ? `${activeChildren} 个子任务运行中` : undefined;
+									if (running && activePhase === "compacting" && !waitingForInput) {
+										return { active: true, label: runLabels.compacting, detail: childSuffix };
+									}
 								if (activeTodo && latestTodos.length > 0) {
 									return {
 										active: running || activeChildren > 0,
@@ -3032,7 +3062,68 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							</>
 						)}
 					</div>
-					<Presence show={terminalOpen} className="cc-terminal-track">
+					<Presence
+						show={terminalOpen}
+						className="cc-terminal-track"
+						style={
+							terminalHeight > 0
+								? ({
+										"--terminal-height": `${Math.round(Math.min(Math.max(160, viewportHeight - 200), Math.max(160, terminalHeight)))}px`,
+									} as CSSProperties)
+								: undefined
+						}
+					>
+						{terminalOpen && (
+							<div
+								className="cc-terminal-resize"
+								role="separator"
+								aria-orientation="horizontal"
+								aria-label="调整终端面板高度"
+								tabIndex={0}
+								title="上下拖动调整终端高度，双击恢复默认"
+								onDoubleClick={() => {
+									setTerminalHeight(0);
+									localStorage.removeItem("pi.terminalHeight");
+								}}
+								onKeyDown={(event) => {
+									if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+									event.preventDefault();
+									const base = terminalHeight > 0 ? terminalHeight : Math.round(Math.min(360, Math.max(180, viewportHeight * 0.34)));
+									const maxH = Math.max(160, viewportHeight - 200);
+									const next = Math.round(Math.min(maxH, Math.max(160, base + (event.key === "ArrowUp" ? 28 : -28))));
+									setTerminalHeight(next);
+									localStorage.setItem("pi.terminalHeight", String(next));
+								}}
+								onPointerDown={(event) => {
+									event.preventDefault();
+									const handle = event.currentTarget;
+									const track = handle.parentElement;
+									const panelEl = track?.querySelector(".terminal-panel");
+									const fallbackH = terminalHeight > 0 ? terminalHeight : Math.round(Math.min(360, Math.max(180, viewportHeight * 0.34)));
+									const measuredH = panelEl ? panelEl.getBoundingClientRect().height : (track ? track.getBoundingClientRect().height : 0);
+									const startHeight = measuredH >= 120 ? measuredH : fallbackH;
+									const maxH = Math.max(160, viewportHeight - 200);
+									handle.setPointerCapture(event.pointerId);
+									document.body.classList.add("cc-resizing");
+									const startY = event.clientY;
+									let latest = startHeight;
+									const move = (e: PointerEvent) => {
+										latest = Math.round(Math.min(maxH, Math.max(160, startHeight + (startY - e.clientY))));
+										setTerminalHeight(latest);
+									};
+									const up = () => {
+										handle.removeEventListener("pointermove", move);
+										handle.removeEventListener("pointerup", up);
+										handle.removeEventListener("pointercancel", up);
+										document.body.classList.remove("cc-resizing");
+										localStorage.setItem("pi.terminalHeight", String(latest));
+									};
+									handle.addEventListener("pointermove", move);
+									handle.addEventListener("pointerup", up);
+									handle.addEventListener("pointercancel", up);
+								}}
+							/>
+						)}
 						<TerminalPanel
 							key={snapshot.active?.id}
 							focusId={focusedTerminal?.conversationId === snapshot.active?.id ? focusedTerminal?.terminalId : undefined}

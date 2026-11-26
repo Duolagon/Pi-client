@@ -23,13 +23,13 @@ export interface ContextMemorySource {
 }
 
 export interface ContextBreakdown {
-	contextWindow: number;
-	totalTokens: number;
-	percent: number;
-	remainingTokens: number;
+	contextWindow: number | null;
+	totalTokens: number | null;
+	percent: number | null;
+	remainingTokens: number | null;
 	estimatedInstructionsTokens: number;
 	estimatedToolsTokens: number;
-	conversationTokens: number;
+	conversationTokens: number | null;
 	cacheReadTokens: number;
 	cacheWriteTokens: number;
 	inputTokens: number;
@@ -40,7 +40,8 @@ export interface ContextBreakdown {
 	deferredToolNames: string[];
 	mcpToolsCount: number;
 	messageCount: number;
-	autoCompactionEnabled: boolean;
+	autoCompactionEnabled: boolean | null;
+	compactionThreshold: number | null;
 	autoRetryEnabled: boolean;
 	optimizationTips: string[];
 	sources: ContextMemorySource[];
@@ -169,6 +170,7 @@ export async function buildContextReport(params: {
 	projectTrusted?: boolean;
 	stats?: SessionStats;
 	state?: RpcSessionState;
+	compactionReserveTokens?: number;
 	tools: DesktopToolInfo[];
 	messages: Message[];
 }): Promise<ContextBreakdown> {
@@ -220,14 +222,14 @@ export async function buildContextReport(params: {
 	const estimatedInstructionsTokens = estimateTokens(nativeInstructions) + estimateTokens(desktopInstructions);
 	const estimatedToolsTokens = activeTools.reduce((sum, t) => sum + estimateTokens(t.description + JSON.stringify(t.parameters ?? {})), 0);
 
-	const ctxUsage = stats?.contextUsage && typeof stats.contextUsage === "object"
-		? (stats.contextUsage as { percent?: number; tokens?: number; contextWindow?: number })
-		: undefined;
-	const contextWindow = ctxUsage?.contextWindow ?? state?.model?.contextWindow ?? 128000;
-	const totalTokens = ctxUsage?.tokens ?? stats?.tokens.total ?? 0;
-	const percent = ctxUsage?.percent ?? (contextWindow > 0 ? Math.min(100, (totalTokens / contextWindow) * 100) : 0);
-	const remainingTokens = Math.max(0, contextWindow - totalTokens);
-	const conversationTokens = Math.max(0, totalTokens - Math.min(totalTokens, estimatedInstructionsTokens + estimatedToolsTokens));
+	const ctxUsage = stats?.contextUsage;
+	const contextWindow = ctxUsage?.contextWindow ?? state?.model?.contextWindow ?? null;
+	// The runtime leaves usage unknown immediately after compaction. The billing
+	// total sums every request and cannot stand in for the current model context.
+	const totalTokens = ctxUsage?.tokens ?? null;
+	const percent = ctxUsage?.percent ?? null;
+	const remainingTokens = totalTokens === null || contextWindow === null ? null : Math.max(0, contextWindow - totalTokens);
+	const conversationTokens = totalTokens === null ? null : Math.max(0, totalTokens - estimatedInstructionsTokens - estimatedToolsTokens);
 
 	const inputTokens = stats?.tokens.input ?? 0;
 	const cacheReadTokens = stats?.tokens.cacheRead ?? 0;
@@ -238,15 +240,18 @@ export async function buildContextReport(params: {
 		: 0;
 
 	const tips: string[] = [];
-	if (percent >= 75) tips.push("上下文占用已超过 75%，建议执行 /compact 压缩早期对话或指定聚焦指令。");
+	if (percent !== null && percent >= 75) tips.push("上下文占用已达 75%，可以用 /compact 手动压缩早期对话。");
 	if (mcpToolsCount >= 15) tips.push(`当前已向模型暴露 ${mcpToolsCount} 个 MCP 工具 Schema，可在“工具与 MCP”中按需关闭暂不用的服务器/工具。`);
 	if (estimatedInstructionsTokens >= 4000) tips.push("项目记忆与规则文件合计约占较多 Token，建议将路径专用约定拆分到 .claude/rules/*.md（附 paths 过滤）。");
 	if (!sources.some((s) => (s.relativePath === "AGENTS.md" || s.relativePath === "CLAUDE.md") && s.exists)) {
 		tips.push("项目尚无 AGENTS.md 或 CLAUDE.md，可使用 /init 让 Pi 自动扫描并生成项目规范指南。");
 	}
-	if (!tips.length) tips.push("上下文结构健康：指令精简、工具数量合理。");
+	if (!tips.length && totalTokens !== null) tips.push("上下文结构健康：指令精简、工具数量合理。");
 
-	const autoCompactionEnabled = Boolean((state as { autoCompactionEnabled?: boolean } | undefined)?.autoCompactionEnabled ?? true);
+	const autoCompactionEnabled = state?.autoCompactionEnabled ?? null;
+	const compactionThreshold = contextWindow !== null && params.compactionReserveTokens !== undefined
+		? contextWindow - params.compactionReserveTokens
+		: null;
 	const autoRetryEnabled = Boolean((state as { autoRetryEnabled?: boolean } | undefined)?.autoRetryEnabled ?? true);
 
 	return {
@@ -268,6 +273,7 @@ export async function buildContextReport(params: {
 		mcpToolsCount,
 		messageCount: messages.length,
 		autoCompactionEnabled,
+		compactionThreshold,
 		autoRetryEnabled,
 		optimizationTips: tips,
 		sources,

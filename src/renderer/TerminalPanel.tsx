@@ -12,6 +12,15 @@ function stripAnsi(input: string): string {
 	return input.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07/g, "");
 }
 
+function formatTerminalPath(raw?: string): string {
+	if (!raw) return "";
+	const homeShort = raw.replace(/^\/Users\/[^/]+/, "~");
+	if (homeShort.length <= 40) return homeShort;
+	const parts = homeShort.split("/").filter(Boolean);
+	if (parts.length <= 2) return homeShort;
+	return `…/${parts.slice(-2).join("/")}`;
+}
+
 export function TerminalPanel({
 	conversationId,
 	focusId,
@@ -53,6 +62,7 @@ export function TerminalPanel({
 	const shellHistory = useRef<string[]>([]);
 	const historyAt = useRef(-1);
 	const [ptyInput, setPtyInput] = useState("");
+	const [xtermView, setXtermView] = useState(true);
 	const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
 	const [activeId, setActiveId] = useState<string | null>(null);
 	const [ptyOutputs, setPtyOutputs] = useState<Record<string, string>>({});
@@ -189,7 +199,7 @@ export function TerminalPanel({
 						</button>
 					</SlidingTabList>
 				</span>
-				<span className="terminal-demo" title={project}>{project}</span>
+				<span className="terminal-demo" title={project}>{formatTerminalPath(project)}</span>
 				<div className="cc-term-actions">
 					{conversationId && <>
 						<button type="button" className={`cc-mini-btn ${sshForm ? "active" : ""}`} disabled={readOnly || creating} onClick={() => { setPackageForm(false); setSshForm(!sshForm); }}>
@@ -219,6 +229,16 @@ export function TerminalPanel({
 					)}
 					{mode === "pty" && (
 						<>
+							{activePty && !activePty.label && (
+								<button
+									type="button"
+									className={`cc-mini-btn ${!xtermView ? "active" : ""}`.trim()}
+									onClick={() => setXtermView((v) => !v)}
+									title="在全真 xterm 终端与纯文本流视图之间切换"
+								>
+									{xtermView ? "纯文本视图" : "全真终端"}
+								</button>
+							)}
 							<button type="button" className="cc-mini-btn" disabled={readOnly || creating} onClick={() => void createPty()} title="新建 PTY" aria-label="新建 PTY">
 								<Plus size={13} />
 							</button>
@@ -294,7 +314,7 @@ export function TerminalPanel({
 						/>
 					</form>
 				</div>
-			) : activePty?.label ? (
+			) : activePty && (activePty.label || xtermView) ? (
 				<InteractiveTerminal key={activePty.id} id={activePty.id} readOnly={readOnly || activePty.status === "exited"} fail={fail} />
 			) : (
 				<div className="terminal-output" ref={shellRef} onScroll={updateFollowOutput}>

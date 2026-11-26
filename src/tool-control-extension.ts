@@ -2,7 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition, ToolInfo } from "@earendil-works/pi-coding-agent";
 import {
 	agentIsolationValues, agentModelValues, asModelToolResult, batchedToolNames, deferredSpecialistTools, delegatingToolNames, desktopModelToolNames, validateControlRequest,
@@ -29,7 +29,7 @@ const NOTIFICATION_WAKE = "desktop_task_notification_wake";
 /** Name of the structured system prompt section that lists agent types (see Pi's section names). */
 export const AGENT_LISTING_SECTION = "agent_types";
 const nativeTools = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"]);
-const safeChildTools = new Set(["read", "grep", "find", "ls", "AgentExecutors", "TaskOutput", "TaskStop", "TaskList", "WorktreeList", "TodoGet", "TodoList", "LSP"]);
+const safeChildTools = new Set(["read", "grep", "find", "ls", "AgentExecutors", "TaskOutput", "TaskStop", "TaskList", "WorktreeList", "TodoGet", "TodoList", "LSP", "ReadToolOutput"]);
 const worktreeMutationTools = new Set(["WorktreeCreate", "WorktreeMerge", "WorktreeRemove"]);
 const cronChildBlockedTools = new Set<string>(cronToolNames);
 const teamTools = new Set<string>(teamToolNames);
@@ -750,7 +750,15 @@ export default function toolControl(pi: ExtensionAPI): void {
 					return;
 				}
 				const settings = request.operation === "apply" ? await apply() : await config();
-				await respond({ requestId, ok: true, tools: inventory(settings) });
+				let compaction: { provider: string; model: string; reserveTokens: number } | undefined;
+				const model = ctx.model;
+				if (request.operation === "context" && model) {
+					try {
+						const effective = SettingsManager.inMemory({ compaction: pi.getSettings().compaction });
+						compaction = { provider: model.provider, model: model.id, reserveTokens: effective.getCompactionReserveTokens(model) };
+					} catch { /* Unavailable compaction settings must not hide the tool inventory. */ }
+				}
+				await respond({ requestId, ok: true, tools: inventory(settings), compaction });
 			} catch (error) {
 				await respond({ requestId, ok: false, error: error instanceof Error ? error.message : "Tool control failed" });
 			}

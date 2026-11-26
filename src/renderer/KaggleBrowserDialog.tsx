@@ -30,7 +30,7 @@ export function KaggleBrowserDialog({ open, close }: { open: (url: string) => Pr
 						placeholder="https://www.kaggle.com/code/用户名/笔记本名" onChange={(event) => setUrl(event.currentTarget.value)} />
 				</label>
 				<p className="subtle-note">在 Pi 的浏览器窗口中登录 Kaggle。回到当前会话后，可以让 Pi 查看 Notebook 状态和输出，或确认后运行全部单元格。</p>
-				{error && <p className="kaggle-browser-error" role="alert">{error}</p>}
+				{error && <div className="live-error kaggle-browser-error" role="alert">{error}</div>}
 				<div className="dialog-actions">
 					<button type="button" className="secondary-button" onClick={close}>取消</button>
 					<button type="submit" className="primary-button" disabled={loading || !url.trim()}>{loading ? "正在打开…" : "打开 Notebook"}</button>

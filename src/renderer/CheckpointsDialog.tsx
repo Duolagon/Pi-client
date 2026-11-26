@@ -213,7 +213,7 @@ export function CheckpointsDialog({
 										<p>此操作会恢复以下 {confirm.paths.length} 个文件的工作区内容，保留 Git 暂存区和会话历史。检查点之后新增的文件会被移除。</p>
 										<ul>{confirm.paths.map((path) => <li key={path}><code>{path}</code></li>)}</ul>
 										<div className="cc-rewind-confirm-actions">
-											<button type="button" className="cc-mini-btn" disabled={restoring} onClick={() => setConfirm(undefined)}>取消</button>
+											<button type="button" className="secondary-button" disabled={restoring} onClick={() => setConfirm(undefined)}>取消</button>
 											<button type="button" className="primary-button" disabled={!canRestore} onClick={() => void restore()}>
 												{restoring ? "正在恢复…" : `确认恢复 ${confirm.paths.length} 个文件`}
 											</button>

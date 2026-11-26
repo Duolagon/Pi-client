@@ -15,6 +15,8 @@ import { highlightCode } from "./highlight.tsx";
 import { collectVerificationEvidence, scoreTurn, type QualityVerdict, type VerificationCheck } from "./quality-verdict.ts";
 import { OmenGlyph } from "./GrailIcons.tsx";
 import { isDesktopWorkspaceContext } from "../file-references.ts";
+import { toolOutputReference } from "../tool-output-types.ts";
+import { ArchivedToolOutput } from "./ArchivedToolOutput.tsx";
 
 export interface TodoItem {
 	id: string;
@@ -456,8 +458,26 @@ export function TranscriptView({
 									.filter((block, part) => !(message.role === "user" && part > 0 && isDesktopWorkspaceContext(block.text)))
 									.map((block) => block.text)
 									.join("\n");
+					const hasUserActions = Boolean(
+						plainUserText.trim() || (entryId && onForkPrompt) || (entryId && onRewindPrompt && checkpointId),
+					);
 					return (
 						<div className="cl-msg cl-msg-user" key={`user-${message.timestamp}-${index}`}>
+							{hasUserActions && (
+								<div className="cc-user-actions">
+									<CopyUserButton text={plainUserText} />
+									{entryId && onForkPrompt && (
+										<button type="button" title="从此处分叉对话" aria-label="从此处分叉对话" onClick={() => onForkPrompt(entryId)}>
+											<GitFork size={12} />
+										</button>
+									)}
+									{entryId && onRewindPrompt && checkpointId && (
+										<button type="button" title="回滚到此检查点" aria-label="回滚到此检查点" onClick={() => onRewindPrompt(checkpointId)}>
+											<RotateCcw size={12} />
+										</button>
+									)}
+								</div>
+							)}
 							<div className="cl-user-bubble">
 								<span className="cc-prompt-chevron" aria-hidden="true">
 									&gt;
@@ -481,19 +501,6 @@ export function TranscriptView({
 										)
 									)}
 								</div>
-								<div className="cc-user-actions">
-									<CopyUserButton text={plainUserText} />
-									{entryId && onForkPrompt && (
-										<button type="button" title="从此处分叉对话" onClick={() => onForkPrompt(entryId)}>
-											<GitFork size={12} />
-										</button>
-									)}
-									{entryId && onRewindPrompt && checkpointId && (
-										<button type="button" title="回滚到此检查点" onClick={() => onRewindPrompt(checkpointId)}>
-											<RotateCcw size={12} />
-										</button>
-									)}
-								</div>
 							</div>
 						</div>
 					);
@@ -514,8 +521,14 @@ export function TranscriptView({
 							summary={
 								<>
 									<span className="cc-dot ok" />
-									<span className="cc-tool-verb">Compact</span>
-									<span className="cl-tool-name cl-tool-name-free">上下文已压缩摘要</span>
+									{message.role === "compactionSummary" ? (
+										<>
+											<span className="cc-tool-verb">压缩</span>
+											<span className="cl-tool-name cl-tool-name-free">上下文摘要 · 压缩前 {message.tokensBefore.toLocaleString()} tokens</span>
+										</>
+									) : (
+										<span className="cl-tool-name cl-tool-name-free">分支摘要</span>
+									)}
 									<ChevronRight size={13} className="cl-tool-chevron" />
 								</>
 							}
@@ -1347,6 +1360,7 @@ function ToolCard({
 	onOpenFile?: OpenFileHandler;
 	onZoomImage?: (image: ImagePreview) => void;
 }) {
+	const archivedOutput = toolOutputReference(result?.details);
 	const output = result
 		? result.content
 				.filter((block) => block.type === "text")
@@ -1499,20 +1513,36 @@ function ToolCard({
 							/>
 						);
 					})}
-					{info.lineContent ? (
-						<CodeLines content={info.lineContent.content} startLine={info.lineContent.startLine} />
-					) : output ? (
-						<pre className={name === "bash" ? "cc-bash-out" : ""}>{output}</pre>
-					) : !images.length && status !== "running" ? (
-						<pre className="cl-tool-args">{JSON.stringify(args, null, 2)}</pre>
-					) : null}
+					{(() => {
+						const displayOutput = output
+							? output.replace(
+									/\n?\n?\[Tool output (?:archived: [0-9a-f]+\. Use ReadToolOutput with id to read (?:retained|complete) text\.|was shortened to fit the round budget\.[^\]]*)\]\s*$/,
+									"",
+								)
+							: output;
+						return info.lineContent ? (
+							<CodeLines content={info.lineContent.content} startLine={info.lineContent.startLine} />
+						) : displayOutput ? (
+							<pre className={name === "bash" ? "cc-bash-out" : ""}>{displayOutput}</pre>
+						) : !images.length && !archivedOutput && status !== "running" ? (
+							<pre className="cl-tool-args">{JSON.stringify(args, null, 2)}</pre>
+						) : null;
+					})()}
 					{output && args != null && (
 						<AnimatedDetails className="cc-tool-args-details" summary="参数">
 							<pre className="cl-tool-args">{JSON.stringify(args, null, 2)}</pre>
 						</AnimatedDetails>
 					)}
+					{archivedOutput && <ArchivedToolOutput key={archivedOutput.id} reference={archivedOutput} />}
 				</div>
 			</SmoothCollapse>
+			{archivedOutput && Boolean((info.editPairs && info.editPairs.length > 0) || info.todos) && (
+				<SmoothCollapse open={isOpen}>
+					<div className="cl-tool-body">
+						<ArchivedToolOutput key={archivedOutput.id} reference={archivedOutput} />
+					</div>
+				</SmoothCollapse>
+			)}
 		</div>
 	);
 }

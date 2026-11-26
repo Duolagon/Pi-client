@@ -426,17 +426,44 @@ export interface GrailCheckRun {
 	script: string;
 	/** Display form, e.g. "npm run test". */
 	command: string;
+	/** Script body from the frozen package.json, capped for display. */
+	scriptBody?: string;
 	exitCode: number | null;
 	timedOut: boolean;
-	/** Last 64 KB of combined stdout/stderr. */
+	/** Last 64 KiB of combined stdout/stderr. */
 	output: string;
+	outputBytes?: number;
+	outputTruncated?: boolean;
+	durationMs?: number;
+	signal?: string;
+	sandboxed?: boolean;
 	testCount?: number;
+	passedCount?: number;
+	failedCount?: number;
+	skippedCount?: number;
 	errorCount?: number;
+}
+export interface GrailCheckOutcome {
+	name: GrailCheckName;
+	status: "pass" | "fail" | "unavailable" | "skipped";
+	reason?: string;
 }
 export interface GrailObjectiveResult {
 	status: "pass" | "fail" | "unavailable";
 	reason?: string;
 	runs: GrailCheckRun[];
+	checks?: GrailCheckOutcome[];
+}
+export interface GrailEvidenceSource {
+	checkpointId: string;
+	baselineTree: string;
+	selectedTree: string;
+	/** Git HEAD at capture, for reference. Uncommitted changes are identified by the tree fingerprints. */
+	revision?: string;
+	/** Includes sibling project sources when testing a subdirectory of a Git repository. */
+	testedTree?: string;
+	/** Project path relative to the frozen repository. */
+	project?: string;
 }
 export interface GrailDistortionHit {
 	file: string;
@@ -497,6 +524,7 @@ export interface GrailVerdict {
 	grade: GrailGrade;
 	reasons: string[];
 	steps: GrailStepResults;
+	evidence?: { source: GrailEvidenceSource };
 	/** Requirement given to the reviewer: the wish's user messages. */
 	requirement: string[];
 	files: { path: string; status: string }[];
@@ -752,6 +780,7 @@ export interface DesktopAPI {
 	searchFiles(conversationId: string, query: string): Promise<FileEntry[]>;
 	checkFileReferences(conversationId: string, paths: string[]): Promise<FileReferenceAvailability[]>;
 	readFile(path: string): Promise<{ path: string; content: string }>;
+	readToolOutput(conversationId: string, id: string, offset?: number): Promise<import("./tool-output-types.ts").ToolOutputPage>;
 	workspace(): Promise<Workspace>;
 	createDraftPullRequest(conversationId: string, draft: DraftPullRequest): Promise<{ url: string; number: number }>;
 	pullRequest(conversationId: string, number?: number): Promise<PullRequestStatus | null>;

@@ -41,7 +41,7 @@ export function phaseFromEvent(previous: RunPhase | undefined, event: DesktopEve
 		case "auto_retry_start": return "retrying";
 		case "auto_retry_end": return event.success ? "running" : "failed";
 		case "compaction_start": return "compacting";
-		case "compaction_end": return event.errorMessage ? "failed" : event.willRetry ? "running" : "completed";
+		case "compaction_end": return event.errorMessage ? "failed" : event.aborted ? "stopped" : event.willRetry ? "running" : "completed";
 		case "tool_execution_start": return toolPhase(event.toolName, event.args);
 		case "tool_execution_end": return "running";
 		case "message_end": return event.message.role === "assistant" && event.message.stopReason === "error" ? "failed" : previous;

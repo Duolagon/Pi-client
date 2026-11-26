@@ -71,6 +71,12 @@ export function ControlsDialog({
 	const [ruleCmd, setRuleCmd] = useState("");
 	const [syncMsg, setSyncMsg] = useState("");
 	const [savingLocalCompute, setSavingLocalCompute] = useState(false);
+	const [armedDeleteId, setArmedDeleteId] = useState<string | null>(null);
+	useEffect(() => {
+		if (!armedDeleteId) return;
+		const timer = window.setTimeout(() => setArmedDeleteId(null), 3200);
+		return () => window.clearTimeout(timer);
+	}, [armedDeleteId]);
 
 	// Hook form
 	const [hookEvent, setHookEvent] = useState<HookEventName>("PreToolUse");
@@ -322,23 +328,30 @@ export function ControlsDialog({
 	return (
 		<Modal title="工具、MCP 与权限规则" close={close} wide>
 			<div className="simple-dialog">
-				<SlidingTabList className="cc-modal-tabs" role="tablist">
-					<button type="button" role="tab" aria-selected={tab === "tools"} onClick={() => setTab("tools")}>
-						<Wrench size={14} /> 工具与 MCP ({tools.length})
-					</button>
-					<button type="button" role="tab" aria-selected={tab === "permissions"} onClick={() => setTab("permissions")}>
-						<ShieldCheck size={14} /> 权限规则 ({perms?.rules.length ?? 0})
-					</button>
-					<button type="button" role="tab" aria-selected={tab === "hooks"} onClick={() => setTab("hooks")}>
-						<Webhook size={14} /> Hooks ({hooks.length})
-					</button>
-					<button type="button" role="tab" aria-selected={tab === "skills"} onClick={() => setTab("skills")}>
-						<BookMarked size={14} /> Skills ({skills.length})
-					</button>
-					<button type="button" role="tab" aria-selected={tab === "executors"} onClick={() => setTab("executors")}>
-						<Cpu size={14} /> 外部执行器 ({executors.filter((e) => e.available).length}/{executors.length})
-					</button>
-				</SlidingTabList>
+				<div className="cc-controls-head-row">
+					<SlidingTabList className="cc-modal-tabs" role="tablist">
+						<button type="button" role="tab" aria-selected={tab === "tools"} onClick={() => setTab("tools")}>
+							<Wrench size={14} /> 工具与 MCP ({tools.length})
+						</button>
+						<button type="button" role="tab" aria-selected={tab === "permissions"} onClick={() => setTab("permissions")}>
+							<ShieldCheck size={14} /> 权限规则 ({perms?.rules.length ?? 0})
+						</button>
+						<button type="button" role="tab" aria-selected={tab === "hooks"} onClick={() => setTab("hooks")}>
+							<Webhook size={14} /> Hooks ({hooks.length})
+						</button>
+						<button type="button" role="tab" aria-selected={tab === "skills"} onClick={() => setTab("skills")}>
+							<BookMarked size={14} /> Skills ({skills.length})
+						</button>
+						<button type="button" role="tab" aria-selected={tab === "executors"} onClick={() => setTab("executors")}>
+							<Cpu size={14} /> 外部执行器 ({executors.filter((e) => e.available).length}/{executors.length})
+						</button>
+					</SlidingTabList>
+					{loading && (
+						<span className="cc-controls-sync-pill cc-shimmer-text" role="status" aria-live="polite">
+							同步中…
+						</span>
+					)}
+				</div>
 
 				{(tab === "tools" || tab === "permissions") && (
 					<div className="cc-modal-scope">
@@ -356,8 +369,6 @@ export function ControlsDialog({
 						/>
 					</div>
 				)}
-
-				{loading && <p className="subtle-note">正在加载…</p>}
 
 				<div key={tab} className="cc-tab-panel">
 				{tab === "tools" && (
@@ -393,14 +404,25 @@ export function ControlsDialog({
 										)}
 										<button
 											type="button"
-											className={`cc-toggle-btn ${tool.enabled ? "on" : "off"}`}
+											role="switch"
+											aria-checked={tool.enabled}
+											className={`cc-toggle-btn cc-switch-pill ${tool.enabled ? "on" : "off"}`}
 											onClick={() => void toggleTool(tool, !tool.enabled)}
 										>
-											{tool.enabled ? "已启用" : "已停用"}
+											<span className="cc-switch-track" aria-hidden="true">
+												<span className="cc-switch-thumb" />
+											</span>
+											<span>{tool.enabled ? "已启用" : "已停用"}</span>
 										</button>
 									</div>
 								</div>
 							))}
+							{loading && !tools.length && (
+								<div className="cc-skeleton-stack" aria-hidden="true">
+									<span className="cc-skeleton-card" />
+									<span className="cc-skeleton-card" />
+								</div>
+							)}
 							{!loading && !filteredTools.length && <p className="subtle-note">没有匹配的工具。</p>}
 						</div>
 					</div>
@@ -409,7 +431,7 @@ export function ControlsDialog({
 				{tab === "permissions" && perms && (
 					<div className="cc-controls-body">
 						{project && conversationId && (
-							<label className="cc-perm-sync-bar">
+							<label className="live-setting-toggle cc-perm-sync-toggle">
 								<input type="checkbox" checked={perms.effective.blockLocalCompute === true}
 									disabled={savingLocalCompute}
 									onChange={(event) => void setLocalComputeBlocked(event.target.checked)} />
@@ -461,9 +483,18 @@ export function ControlsDialog({
 										)}
 									</span>
 									<span className="cc-source-tag">{rule.scope}</span>
-									<button type="button" className="cc-mini-btn danger" aria-label={`删除规则 ${rule.id}`} onClick={() => void removeRule(rule.id)}>
-										<Trash2 size={13} />
-									</button>
+									{armedDeleteId === `rule:${rule.id}` ? (
+										<div className="cc-tool-ctrl-actions">
+											<button type="button" className="cc-mini-btn" onClick={() => setArmedDeleteId(null)}>取消</button>
+											<button type="button" className="cc-mini-btn danger" onClick={() => { setArmedDeleteId(null); void removeRule(rule.id); }}>
+												确认删除
+											</button>
+										</div>
+									) : (
+										<button type="button" className="cc-mini-btn danger" aria-label={`删除规则 ${rule.id}`} onClick={() => setArmedDeleteId(`rule:${rule.id}`)}>
+											<Trash2 size={13} />
+										</button>
+									)}
 								</div>
 							))}
 							{!perms.rules.length && <p className="subtle-note">暂无自定义权限规则，当前按默认模式（{perms.effective.mode}）执行。</p>}
@@ -538,9 +569,18 @@ export function ControlsDialog({
 									</span>
 									<span className="cc-source-tag muted">{item.scope}</span>
 									{item.editable && (
-										<button type="button" className="cc-mini-btn danger" aria-label={`删除 Hook ${item.id}`} onClick={() => void deleteHook(item)}>
-											<Trash2 size={13} />
-										</button>
+										armedDeleteId === `hook:${item.id}` ? (
+											<div className="cc-tool-ctrl-actions">
+												<button type="button" className="cc-mini-btn" onClick={() => setArmedDeleteId(null)}>取消</button>
+												<button type="button" className="cc-mini-btn danger" onClick={() => { setArmedDeleteId(null); void deleteHook(item); }}>
+													确认删除
+												</button>
+											</div>
+										) : (
+											<button type="button" className="cc-mini-btn danger" aria-label={`删除 Hook ${item.id}`} onClick={() => setArmedDeleteId(`hook:${item.id}`)}>
+												<Trash2 size={13} />
+											</button>
+										)
 									)}
 								</div>
 							))}
@@ -586,8 +626,23 @@ export function ControlsDialog({
 										<p className="cc-tool-ctrl-desc">{item.description}</p>
 									</div>
 									{item.editable && (
-										<button type="button" className="cc-mini-btn danger" aria-label={`删除 Skill ${item.name}`} onClick={() => void deleteSkill(item)}>
+										<button
+											type="button"
+											className={`cc-mini-btn danger ${armedDeleteId === `skill:${item.id}` ? "is-armed" : ""}`.trim()}
+											aria-label={armedDeleteId === `skill:${item.id}` ? `确认删除 Skill ${item.name}` : `删除 Skill ${item.name}`}
+											title={armedDeleteId === `skill:${item.id}` ? "再次点击确认删除此 Skill 文件" : "删除 Skill"}
+											onClick={() => {
+												const key = `skill:${item.id}`;
+												if (armedDeleteId !== key) {
+													setArmedDeleteId(key);
+													return;
+												}
+												setArmedDeleteId(null);
+												void deleteSkill(item);
+											}}
+										>
 											<Trash2 size={13} />
+											{armedDeleteId === `skill:${item.id}` && <span>确认删除</span>}
 										</button>
 									)}
 								</div>
@@ -619,10 +674,15 @@ export function ControlsDialog({
 										<div className="cc-tool-ctrl-actions">
 											<button
 												type="button"
-												className={`cc-toggle-btn ${exec.enabled ? "on" : "off"}`}
+												role="switch"
+												aria-checked={exec.enabled}
+												className={`cc-toggle-btn cc-switch-pill ${exec.enabled ? "on" : "off"}`}
 												onClick={() => void toggleExecutor(exec)}
 											>
-												{exec.enabled ? "已启用" : "已停用"}
+												<span className="cc-switch-track" aria-hidden="true">
+													<span className="cc-switch-thumb" />
+												</span>
+												<span>{exec.enabled ? "已启用" : "已停用"}</span>
 											</button>
 										</div>
 									</div>

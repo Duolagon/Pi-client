@@ -45,6 +45,7 @@ export async function createCoreFixture() {
 		dataDir,
 		env,
 		entry: fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent/rpc-entry")),
-		cleanup: () => rm(root, { recursive: true, force: true }),
+		// A child or Git helper can still be finalizing files when the service exits.
+		cleanup: () => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 40 }),
 	};
 }

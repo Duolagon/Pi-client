@@ -71,7 +71,7 @@ await writeFile(
 		defaultModel: "desktop-demo-1",
 		thinkingLevel: "off",
 		retry: { enabled: false },
-		compaction: { enabled: false },
+		compaction: { enabled: false, keepRecentTokens: 1 },
 	}),
 );
 await writeFile(join(project, "src/greeting.mjs"), 'export function greet(name) {\n  return "";\n}\n');
@@ -804,10 +804,16 @@ try {
 
 	await page.getByRole("button", { name: "终端", exact: true }).click();
 	await page.getByRole("tab", { name: /^交互 PTY/ }).click();
-	await page.getByRole("textbox", { name: "PTY 输入", exact: true }).waitFor();
-	await page.getByRole("textbox", { name: "PTY 输入", exact: true }).fill("echo UI_PTY_PANEL_OK");
-	await page.getByRole("textbox", { name: "PTY 输入", exact: true }).press("Enter");
+	const xtermTextarea = page.locator(".terminal-panel .xterm-helper-textarea");
+	await xtermTextarea.waitFor({ state: "attached" });
+	await xtermTextarea.focus();
+	await page.keyboard.type("echo UI_PTY_PANEL_OK");
+	await page.keyboard.press("Enter");
+	await page.locator(".terminal-panel .xterm-rows").filter({ hasText: "UI_PTY_PANEL_OK" }).waitFor();
+	await page.getByRole("button", { name: "纯文本视图", exact: true }).click();
 	await page.locator(".terminal-output").filter({ hasText: "UI_PTY_PANEL_OK" }).waitFor();
+	await page.getByRole("button", { name: "全真终端", exact: true }).click();
+	await page.locator(".terminal-panel .xterm-rows").waitFor();
 	await page.getByRole("button", { name: "关闭终端", exact: true }).click();
 	checks.push("Claude Code UI modals, autocomplete and PTY panel");
 
@@ -971,6 +977,8 @@ try {
 	await page.getByText("/e2e-skill", { exact: true }).waitFor();
 	assert.match(await readFile(join(project, ".pi", "skills", "e2e-skill", "SKILL.md"), "utf8"), /name: e2e-skill/);
 	await page.getByRole("button", { name: "删除 Skill e2e-skill", exact: true }).click();
+	await page.getByRole("button", { name: "确认删除 Skill e2e-skill", exact: true }).click();
+	await until(async () => (await page.getByText("/e2e-skill", { exact: true }).count()) === 0, "e2e-skill deleted");
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
 	await openMore("项目记忆与状态");
@@ -1397,15 +1405,12 @@ try {
 	await submit("检查本轮代码基线");
 	await idle();
 	const review = page.getByRole("button", { name: "质量鉴定", exact: true });
-	const clean = page.getByText("当前代码与需求开始时的快照一致。", { exact: true });
-	await clean.waitFor();
-	assert.equal(await review.isDisabled(), true);
+	await review.waitFor({ state: "hidden" });
 	const externalEdit = join(project, "src/grail-review-readiness-fixture.txt");
 	await writeFile(externalEdit, "External editor change\n");
 	await until(() => review.isEnabled(), "quality review becomes available after an external edit");
 	await rm(externalEdit);
-	await clean.waitFor();
-	assert.equal(await review.isDisabled(), true);
+	await review.waitFor({ state: "hidden" });
 	checks.push("quality review updates when external edits appear and return to the baseline");
 
 	await newChat();
@@ -1798,6 +1803,47 @@ try {
 	await prWindow.evaluate((win, size) => win.setSize(...size), prInitialSize);
 	await prWindow.dispose();
 	checks.push("native PR merge options work in a narrow Git inspector with no CI checks");
+
+	await page.getByRole("button", { name: "代码修改", exact: true }).click();
+	await newChat();
+	const fixtureReply = page.getByText("已收到补充指令，客户端与 Pi 引擎连接正常。", { exact: true });
+	for (const [index, message] of ["保留上下文压缩前的早期需求。", "这条指令留在近期上下文中。"].entries()) {
+		await submit(message);
+		await fixtureReply.nth(index).waitFor();
+		await idle();
+	}
+	await submit("/compact 验证压缩状态");
+	await page.locator(".cc-dock-state-label").filter({ hasText: "正在压缩上下文" }).waitFor();
+	const completion = page.getByRole("status").filter({ hasText: "手动压缩上下文已完成" });
+	await completion.waitFor();
+	assert.match(await completion.innerText(), /压缩前 [\d,]+ tokens · 压缩后约 [\d,]+ tokens/);
+	await idle();
+	await page.getByRole("button", { name: /Ctx 待更新/ }).click();
+	const telemetry = page.getByRole("region", { name: "会话遥测明细", exact: true });
+	await telemetry.locator(".cc-telemetry-meter-row").getByText(/^待更新/).waitFor();
+	assert.equal(await telemetry.locator(".cc-telemetry-bar").count(), 0);
+	await page.keyboard.press("Escape");
+	await completion.getByRole("button", { name: "关闭压缩提示", exact: true }).click();
+	await completion.waitFor({ state: "hidden" });
+	await page.reload();
+	await ready();
+	const summary = page.getByText(/^上下文摘要 · 压缩前/);
+	const summaryCard = page.locator(".cl-tool.done").filter({ has: summary });
+	await summary.click();
+	await summaryCard.getByText("本地演示压缩摘要。保留了用户的原始要求、任务执行进展和下一步验证。", { exact: true }).waitFor();
+	await submit("/context");
+	const contextDialog = page.getByRole("dialog", { name: "项目记忆与会话状态", exact: true });
+	const contextMeter = contextDialog.locator('[aria-label="上下文分段占用条"]');
+	await contextDialog.getByText("上下文占用待更新", { exact: true }).waitFor();
+	assert.equal(await contextMeter.count(), 0);
+	await contextDialog.getByRole("button", { name: "关闭对话框", exact: true }).click();
+	await submit("压缩后的下一条任务。");
+	await idle();
+	await page.getByRole("button", { name: /Ctx \d+%/ }).waitFor();
+	await submit("/context");
+	await contextMeter.waitFor();
+	await contextDialog.getByRole("button", { name: "关闭对话框", exact: true }).click();
+	checks.push("real SDK compaction shows progress, a completion estimate, and a persisted summary while context usage waits for the next reply");
 
 	assert.deepEqual(pageErrors, []);
 	if (capture)

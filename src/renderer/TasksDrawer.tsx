@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import { ArrowDownToLine, Check, Circle, Clock, Eye, GitBranch, GitMerge, ListTodo, LoaderCircle, Play, Send, Square, Trash2, Users, Workflow } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
-import { useConfirmation } from "./ConfirmationDialog.tsx";
 import { TranscriptView } from "./TranscriptView.tsx";
 import { ExternalApprovalCard } from "./ExternalApprovalCard.tsx";
+import { PermissionDialog } from "./PermissionDialog.tsx";
 import { CheckpointsDialog } from "./CheckpointsDialog.tsx";
 import { SlidingTabList } from "./SegmentedTabs.tsx";
 import { SelectPopover } from "./SelectPopover.tsx";
@@ -33,8 +33,13 @@ export function TasksDrawer({
 	onNotice: (msg: string) => void;
 	fail: (error: unknown) => void;
 }) {
-	const { confirm, confirmation } = useConfirmation();
 	const [tab, setTab] = useState<"tasks" | "remote" | "todos" | "cron" | "workflows" | "teams" | "worktrees">("tasks");
+	const [armedAction, setArmedAction] = useState<string | null>(null);
+	useEffect(() => {
+		if (!armedAction) return;
+		const timer = window.setTimeout(() => setArmedAction(null), 3200);
+		return () => window.clearTimeout(timer);
+	}, [armedAction]);
 	const [remoteJobs, setRemoteJobs] = useState<RemoteJobRecord[]>([]);
 	const [tasks, setTasks] = useState<DesktopTask[]>([]);
 	const [externalTasks, setExternalTasks] = useState<ExternalTask[]>([]);
@@ -49,7 +54,6 @@ export function TasksDrawer({
 	const [retainedWorktreePath, setRetainedWorktreePath] = useState<string>();
 	const [detailTranscript, setDetailTranscript] = useState<Transcript | null>(null);
 	const [detailPendingUI, setDetailPendingUI] = useState<RpcExtensionUIRequest[]>([]);
-	const [approvalInputs, setApprovalInputs] = useState<Record<string, string>>({});
 	const [detailSeq, setDetailSeq] = useState(0);
 	const [clockNow, setClockNow] = useState(() => Date.now());
 	const hasActiveItems =
@@ -359,12 +363,11 @@ export function TasksDrawer({
 	const backgroundCount = backgroundChildren + backgroundMonitors;
 	const stopAllBackground = async () => {
 		if (!conversationId || !backgroundCount) return;
-		if (!await confirm({
-			title: `停止 ${backgroundCount} 项后台任务`,
-			message: "这会停止当前会话所有回合中的子 Agent、后台命令和监听。已完成的修改会保留。",
-			confirmLabel: "停止全部",
-			destructive: true,
-		})) return;
+		if (armedAction !== "stop-all") {
+			setArmedAction("stop-all");
+			return;
+		}
+		setArmedAction(null);
 		setBusy(true);
 		try {
 			const { stopped } = await window.pi.tasks.stopAll(conversationId);
@@ -422,12 +425,12 @@ export function TasksDrawer({
 								<span>当前会话有 {backgroundCount} 项活跃后台任务。</span>
 								<button
 									type="button"
-									className="cc-mini-btn danger"
+									className={`cc-mini-btn danger ${armedAction === "stop-all" ? "is-armed" : ""}`.trim()}
 									title="停止当前会话的全部后台任务（Ctrl+X Ctrl+K）"
 									disabled={busy}
 									onClick={() => void stopAllBackground()}
 								>
-									<Square size={12} /> 停止全部后台任务
+									<Square size={12} /> {armedAction === "stop-all" ? `确认停止 (${backgroundCount})` : "停止全部后台任务"}
 								</button>
 							</div>
 						)}
@@ -482,111 +485,20 @@ export function TasksDrawer({
 										</button>
 									</div>
 								</div>
-								{detailPendingUI.map((req) => (
-									<div key={req.id} className="cc-task-approval">
-										<span>
-											待审批 ({req.method})：{"title" in req ? req.title : "需要你的输入"}
-											{"message" in req && req.message ? ` — ${req.message.slice(0, 160)}` : ""}
-										</span>
-										<div>
-											{req.method === "confirm" && (
-												<>
-													<button
-														type="button"
-														className="secondary-button"
-														onClick={() =>
-															void window.pi.tasks
-																.respond(detailTask.id, { type: "extension_ui_response", id: req.id, confirmed: false })
-																.then(() => setDetailPendingUI((prev) => prev.filter((item) => item.id !== req.id)))
-																.catch(fail)
-														}
-													>
-														拒绝
-													</button>
-													<button
-														type="button"
-														className="primary-button"
-														onClick={() =>
-															void window.pi.tasks
-																.respond(detailTask.id, { type: "extension_ui_response", id: req.id, confirmed: true })
-																.then(() => setDetailPendingUI((prev) => prev.filter((item) => item.id !== req.id)))
-																.catch(fail)
-														}
-													>
-														允许
-													</button>
-												</>
-											)}
-											{req.method === "select" && (
-												<>
-													{req.options.map((opt) => (
-														<button
-															key={opt}
-															type="button"
-															className="secondary-button"
-															onClick={() =>
-																void window.pi.tasks
-																	.respond(detailTask.id, { type: "extension_ui_response", id: req.id, value: opt })
-																	.then(() => setDetailPendingUI((prev) => prev.filter((item) => item.id !== req.id)))
-																	.catch(fail)
-															}
-														>
-															{opt}
-														</button>
-													))}
-													<button
-														type="button"
-														className="secondary-button"
-														onClick={() =>
-															void window.pi.tasks
-																.respond(detailTask.id, { type: "extension_ui_response", id: req.id, cancelled: true })
-																.then(() => setDetailPendingUI((prev) => prev.filter((item) => item.id !== req.id)))
-																.catch(fail)
-														}
-													>
-														取消
-													</button>
-												</>
-											)}
-											{(req.method === "input" || req.method === "editor") && (
-												<>
-													<input
-														placeholder={"placeholder" in req ? req.placeholder : "输入回复…"}
-														value={approvalInputs[req.id] ?? ("prefill" in req && req.prefill ? req.prefill : "")}
-														onChange={(e) => setApprovalInputs((prev) => ({ ...prev, [req.id]: e.target.value }))}
-													/>
-													<button
-														type="button"
-														className="secondary-button"
-														onClick={() =>
-															void window.pi.tasks
-																.respond(detailTask.id, { type: "extension_ui_response", id: req.id, cancelled: true })
-																.then(() => setDetailPendingUI((prev) => prev.filter((item) => item.id !== req.id)))
-																.catch(fail)
-														}
-													>
-														取消
-													</button>
-													<button
-														type="button"
-														className="primary-button"
-														onClick={() =>
-															void window.pi.tasks
-																.respond(detailTask.id, {
-																	type: "extension_ui_response",
-																	id: req.id,
-																	value: approvalInputs[req.id] ?? ("prefill" in req && req.prefill ? req.prefill : ""),
-																})
-																.then(() => setDetailPendingUI((prev) => prev.filter((item) => item.id !== req.id)))
-																.catch(fail)
-														}
-													>
-														提交
-													</button>
-												</>
-											)}
-										</div>
-									</div>
+								{detailPendingUI.map((req, idx) => (
+									<PermissionDialog
+										key={req.id}
+										inline
+										request={req}
+										conversationId={detailTask.id}
+										project={detailTask.workingDirectory}
+										queuePosition={detailPendingUI.length > 1 ? { index: idx + 1, total: detailPendingUI.length } : undefined}
+										respond={async (response) => {
+											await window.pi.tasks.respond(detailTask.id, response);
+											setDetailPendingUI((prev) => prev.filter((item) => item.id !== req.id));
+										}}
+										fail={fail}
+									/>
 								))}
 								<div className="cc-task-transcript">
 									<TranscriptView transcript={detailTranscript} />
@@ -867,11 +779,19 @@ export function TasksDrawer({
 									<div className="cc-tool-ctrl-actions">
 										<button
 											type="button"
-											className="cc-mini-btn danger"
+											className={`cc-mini-btn danger ${armedAction === `cron:${job.id}` ? "is-armed" : ""}`.trim()}
 											disabled={busy}
-											onClick={() => void window.pi.cron.delete(job.id, conversationId).then(refresh).catch(fail)}
+											onClick={() => {
+												const key = `cron:${job.id}`;
+												if (armedAction !== key) {
+													setArmedAction(key);
+													return;
+												}
+												setArmedAction(null);
+												void window.pi.cron.delete(job.id, conversationId).then(refresh).catch(fail);
+											}}
 										>
-											<Trash2 size={12} /> 删除
+											<Trash2 size={12} /> {armedAction === `cron:${job.id}` ? "确认删除" : "删除"}
 										</button>
 									</div>
 								</div>
@@ -944,11 +864,19 @@ export function TasksDrawer({
 										<div className="cc-tool-ctrl-actions">
 											<button
 												type="button"
-												className="cc-mini-btn danger"
+												className={`cc-mini-btn danger ${armedAction === `team:${team.name}` ? "is-armed" : ""}`.trim()}
 												disabled={busy}
-												onClick={() => void window.pi.teams.delete(conversationId, team.name).then(refresh).catch(fail)}
+												onClick={() => {
+													const key = `team:${team.name}`;
+													if (armedAction !== key) {
+														setArmedAction(key);
+														return;
+													}
+													setArmedAction(null);
+													void window.pi.teams.delete(conversationId, team.name).then(refresh).catch(fail);
+												}}
 											>
-												<Trash2 size={12} /> 解散团队
+												<Trash2 size={12} /> {armedAction === `team:${team.name}` ? "确认解散" : "解散团队"}
 											</button>
 										</div>
 									)}
@@ -1018,7 +946,6 @@ export function TasksDrawer({
 				)}
 				</div>
 			</div>
-			{confirmation}
 		</Modal>
 	);
 }

@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { ArrowUpRight, Plus, RefreshCw, X } from "lucide-react";
 import type { RemoteJobRecord } from "../remote-job-types.ts";
 import { inspectKaggleMetadata } from "../kaggle-preflight.ts";
+import { SelectPopover } from "./SelectPopover.tsx";
 
 const statusLabels = {
 	unknown: "尚未确认",
@@ -98,17 +99,24 @@ export function RemoteJobsPanel({ conversationId, jobs, fail }: {
 			)}
 			{adding && (
 				<form className="cc-remote-job-form" onSubmit={track}>
-					<label>
+					<div className="cc-remote-job-field">
 						<span>跟踪类型</span>
-						<select value={kind} onChange={(event) => {
-							setKind(event.target.value === "submission" ? "submission" : "notebook");
-							setResource("");
-							setIdentifier("");
-						}}>
-							<option value="notebook">Notebook 运行</option>
-							<option value="submission">比赛提交</option>
-						</select>
-					</label>
+						<SelectPopover
+							ariaLabel="跟踪类型"
+							field
+							direction="down"
+							value={kind}
+							options={[
+								{ value: "notebook", label: "Notebook 运行" },
+								{ value: "submission", label: "比赛提交" },
+							]}
+							onChange={(val) => {
+								setKind(val === "submission" ? "submission" : "notebook");
+								setResource("");
+								setIdentifier("");
+							}}
+						/>
+					</div>
 					<label>
 						<span>{notebook ? "Notebook 标识" : "比赛标识"}</span>
 						<input value={resource} onChange={(event) => setResource(event.target.value)}
@@ -119,12 +127,12 @@ export function RemoteJobsPanel({ conversationId, jobs, fail }: {
 						<input inputMode="numeric" value={identifier} onChange={(event) => setIdentifier(event.target.value)}
 							pattern="[1-9][0-9]*" required maxLength={16} />
 					</label>
-					<label className="cc-remote-job-credentials">
+					<label className="live-setting-toggle cc-remote-job-credentials">
 						<input type="checkbox" checked={projectCredentials} onChange={(event) => setProjectCredentials(event.target.checked)} />
 						<span>使用项目的 .secrets/kaggle_token</span>
 					</label>
 					<div className="cc-tool-ctrl-actions">
-						<button type="button" className="cc-mini-btn" disabled={busy === "track"} onClick={() => setAdding(false)}>取消</button>
+						<button type="button" className="secondary-button" disabled={busy === "track"} onClick={() => setAdding(false)}>取消</button>
 						<button type="submit" className="primary-button" disabled={Boolean(busy)}>开始跟踪</button>
 					</div>
 				</form>

@@ -6,6 +6,9 @@ import { readDraft, writeDraft } from "./draft-storage.ts";
 import { phaseFromEvent, phaseFromSnapshot, type RunPhase } from "./run-status.ts";
 import { applyEvent, transcript, type Transcript } from "./messages.ts";
 
+type CompactionEnd = Extract<DesktopEvent["event"], { type: "compaction_end" }>;
+type CompactionCompletion = Pick<CompactionEnd, "reason"> & Pick<NonNullable<CompactionEnd["result"]>, "tokensBefore" | "estimatedTokensAfter">;
+
 export function useDesktop(api: DesktopAPI) {
 	const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
 	const [history, setHistory] = useState<Transcript>(() => transcript([]));
@@ -16,6 +19,13 @@ export function useDesktop(api: DesktopAPI) {
 	const appendTerminal = (id: string, delta: string) => setTerminalOutput((output) => ({ ...output, [id]: ((output[id] ?? "") + delta).slice(-200000) }));
 	const [error, setError] = useState("");
 	const [notice, setNotice] = useState("");
+	const [compactionCompletions, setCompactionCompletions] = useState<Record<string, CompactionCompletion>>({});
+	const dismissCompaction = (id: string) => setCompactionCompletions((previous) => {
+		if (!previous[id]) return previous;
+		const next = { ...previous };
+		delete next[id];
+		return next;
+	});
 	const [draft, putDraft] = useState(emptyDraft);
 	const [draftLoading, setDraftLoading] = useState(false);
 	const [activity, setActivity] = useState<Record<string, SessionActivity>>({});
@@ -168,6 +178,11 @@ export function useDesktop(api: DesktopAPI) {
 			});
 		}
 		if (!replay && event.type === "bash_execution_update") appendTerminal(conversationId, event.delta);
+		if (!replay && event.type === "compaction_start") dismissCompaction(conversationId);
+		if (!replay && event.type === "compaction_end" && event.result && !event.aborted && !event.errorMessage) {
+			const { tokensBefore, estimatedTokensAfter } = event.result;
+			setCompactionCompletions((previous) => ({ ...previous, [conversationId]: { reason: event.reason, tokensBefore, estimatedTokensAfter } }));
+		}
 		if (conversationId !== activeId.current) return;
 		if (sequence !== undefined) {
 			if (sequence <= appliedSequence.current) return;
@@ -356,6 +371,8 @@ export function useDesktop(api: DesktopAPI) {
 		terminal: snapshot?.active?.id ? terminalOutput[snapshot.active.id] ?? "" : "",
 		error,
 		notice,
+		compactionCompletion: snapshot?.active ? compactionCompletions[snapshot.active.id] : undefined,
+		dismissCompaction,
 		draft: draft.text,
 		attachments: draft.attachments,
 		draftLoading,

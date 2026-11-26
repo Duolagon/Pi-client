@@ -414,6 +414,11 @@ function installHandlers() {
 		return service.checkFileReferences(string(id, "会话 ID", 200), paths.map((path) => string(path, "文件路径", 4096)));
 	});
 	handle("pi:read-file", (path) => service.readFile(string(path, "文件路径")));
+	handle("pi:tool-output:read", (conversation, id, offset) => {
+		if (offset !== undefined && (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0))
+			throw new Error("工具输出分页参数无效。");
+		return service.readToolOutput(string(conversation, "会话 ID", 128), string(id, "工具输出 ID", 32), offset);
+	});
 	handle("pi:workspace", () => service.workspace());
 	handle("pi:workspace:create-draft-pr", (id, input) => {
 		const draft = object(input);

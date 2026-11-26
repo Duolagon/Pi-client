@@ -145,12 +145,11 @@ export function StatusLine({
 	}, [hudOpen]);
 
 	const stats = snapshot.stats;
-	const contextUsageObj =
-		stats?.contextUsage && typeof stats.contextUsage === "object"
-			? (stats.contextUsage as { percent?: number | null; tokens?: number; contextWindow?: number })
-			: undefined;
-	const contextPct = contextUsageObj?.percent ?? undefined;
+	const contextUsage = stats?.contextUsage;
+	const contextPct = contextUsage?.percent ?? undefined;
+	const contextPending = contextUsage?.tokens === null;
 	const model = snapshot.state?.model;
+	const contextWindow = contextUsage?.contextWindow ?? model?.contextWindow;
 	const provider = desktopProvider(model?.provider);
 	const balanceEnabled =
 		snapshot.settings.statusBalance !== false && Boolean(provider && snapshot.settings.configuredProviders.includes(provider));
@@ -158,7 +157,7 @@ export function StatusLine({
 	const modelName = model ? model.name || model.id : undefined;
 	const visibleModelName = hideModel ? undefined : modelName;
 	const tokens = stats?.tokens;
-	const showUsage = Boolean(stats && (stats.tokens.total > 0 || contextPct !== undefined));
+	const showUsage = Boolean(contextPending || contextPct !== undefined || (tokens && tokens.total > 0));
 	const interactive = Boolean(onOpenContext || onOpenStats || tokens || balance);
 	const showIdleCtxRing = hideModel && !showUsage && Boolean(snapshot.active && interactive);
 	if (!visibleModelName && !showUsage && !gitBranch && !balance && !showIdleCtxRing) return null;
@@ -187,9 +186,10 @@ export function StatusLine({
 						<span>Ctx {Math.round(displayCtxPct)}%</span>
 					</span>
 				)}
-				{showUsage && contextPct === undefined && tokens && (
+				{contextPending && <span className="cc-status-item cc-status-ctx">Ctx 待更新</span>}
+				{showUsage && !contextPending && contextPct === undefined && tokens && (
 					<span className="cc-status-item">
-						{Math.round(tokens.total / 1000)}k tok
+						累计 {Math.round(tokens.total / 1000)}k tok
 					</span>
 				)}
 				{stats && stats.cost > 0 && (
@@ -220,16 +220,18 @@ export function StatusLine({
 							<div className="cc-telemetry-meter-row">
 								<span>上下文窗口</span>
 								<strong>
-									{(contextPct ?? 0).toFixed(1)}%
-									{contextUsageObj?.contextWindow ? ` · ${Math.round(contextUsageObj.contextWindow / 1000)}k` : ""}
+									{contextPct !== undefined ? `${contextPct.toFixed(1)}%` : contextPending ? "待更新" : "暂无用量"}
+									{contextWindow ? ` · ${Math.round(contextWindow / 1000)}k` : ""}
 								</strong>
 							</div>
-							<div className="cc-telemetry-bar">
-								<div
-									className={`cc-telemetry-bar-fill ${(contextPct ?? 0) >= 85 ? "danger" : (contextPct ?? 0) >= 65 ? "warn" : ""}`}
-									style={{ width: `${Math.max(2, Math.min(100, contextPct ?? 0))}%` }}
-								/>
-							</div>
+							{contextPct !== undefined && (
+								<div className="cc-telemetry-bar">
+									<div
+										className={`cc-telemetry-bar-fill ${contextPct >= 85 ? "danger" : contextPct >= 65 ? "warn" : ""}`}
+										style={{ width: `${Math.max(2, Math.min(100, contextPct))}%` }}
+									/>
+								</div>
+							)}
 						</div>
 						<div className="cc-telemetry-grid">
 							<div>

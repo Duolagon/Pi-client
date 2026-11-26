@@ -15,6 +15,7 @@ import {
 	parseTestCount,
 	parseTscErrors,
 	runObjectiveChecks,
+	runProcess,
 	scanDistortions,
 	scriptEnvironment,
 	GRAIL_CRITERIA,
@@ -135,16 +136,20 @@ test("objective checks require a passed test and distinguish missing evidence fr
 	assert.equal(onlySkipped.runs[0].testCount, 1);
 	assert.match(onlySkipped.reason!, /全部跳过/);
 	assert.equal(onlySkipped.status, "unavailable");
+	assert.equal(onlySkipped.checks?.[0].status, "skipped");
+	assert.equal(onlySkipped.runs[0].skippedCount, 1);
 
 	await writeFile(testFile, "import { test } from 'node:test';\ntest('passing example', () => {});\n");
 	const missingChecks = await run();
 	assert.equal(missingChecks.status, "unavailable");
 	assert.match(missingChecks.reason!, /类型检查.*lint/);
 	assert.equal(missingChecks.runs[0].exitCode, 0);
+	assert.deepEqual(missingChecks.checks?.map(({ status }) => status), ["pass", "skipped", "skipped"]);
 
 	const unavailableRunner = await run({ env: { ...env, PATH: project } });
 	assert.equal(unavailableRunner.status, "unavailable");
 	assert.match(unavailableRunner.reason!, /无法启动/);
+	assert.equal(unavailableRunner.checks?.[0].status, "unavailable");
 	const timedOut = await run({ deadline: Date.now() + 2 });
 	assert.equal(timedOut.status, "unavailable");
 	assert.match(timedOut.reason!, /超时/);
@@ -173,6 +178,7 @@ test("objective checks require a passed test and distinguish missing evidence fr
 	const failedTestWithSuccessfulExit = await run({ manifest: wrappedManifest });
 	assert.equal(failedTestWithSuccessfulExit.runs[0].exitCode, 0);
 	assert.equal(failedTestWithSuccessfulExit.status, "fail");
+	assert.equal(failedTestWithSuccessfulExit.checks?.[0].status, "fail");
 	assert.match(failedTestWithSuccessfulExit.reason!, /1 个失败/);
 });
 
@@ -186,6 +192,22 @@ test("script environment strips credentials and host context", () => {
 	for (const key of ["OPENAI_API_KEY", "GITHUB_TOKEN", "PI_DESKTOP_KEY_OPENAI", "AWS_PROFILE", "NODE_TEST_CONTEXT", "DB_PASSWORD"]) assert.equal(env[key], undefined, key);
 	assert.equal(env.CI, "1");
 	assert.equal(env.npm_config_cache, "/tmp/cache");
+});
+
+test("command evidence records a bounded UTF-8 output tail and actual exit details", async () => {
+	const result = await runProcess(process.execPath, ["-e", `
+		process.stdout.write("early marker\\n" + "日志".repeat(14000));
+		process.stdout.write("\\nlast marker\\n");
+		process.exitCode = 7;
+	`], { cwd: tmpdir(), env: process.env, timeoutMs: 5_000, signal: new AbortController().signal });
+	assert.equal(result.exitCode, 7);
+	assert.equal(result.timedOut, false);
+	assert.equal(result.outputTruncated, true);
+	assert.ok(result.outputBytes > 64 * 1024);
+	assert.ok(Buffer.byteLength(result.output) <= 64 * 1024);
+	assert.ok(!result.output.includes("\uFFFD"));
+	assert.ok(!result.output.includes("early marker"));
+	assert.ok(result.output.endsWith("last marker\n"));
 });
 
 test("blind solution parsing requires every point and accepts fenced JSON", () => {

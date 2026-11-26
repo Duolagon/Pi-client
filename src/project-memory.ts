@@ -1,6 +1,6 @@
 import { constants as fs } from "node:fs";
 import { createHash } from "node:crypto";
-import { open, readdir, stat } from "node:fs/promises";
+import { lstat, open, readdir, stat } from "node:fs/promises";
 import { dirname, join, matchesGlob, relative, resolve, sep } from "node:path";
 import { managedDirectory, managedFile } from "./managed-path.ts";
 import { fileReferences, isReferenceablePath } from "./file-references.ts";
@@ -8,12 +8,14 @@ import { fileReferences, isReferenceablePath } from "./file-references.ts";
 export const privateMemoryLabel = "本机项目记忆";
 export const memoryLimit = 24 * 1024;
 export const truncatedInstruction = "[已截断，参见原文件以查看完整内容。]";
+export const projectMemoryHeading = "# Pi Desktop 项目上下文";
 
 export function memoryName(project: string): string {
 	return createHash("sha256").update(project).digest("hex") + ".md";
 }
 
-async function readProjectSource(root: string, path: string, limit: number, truncate: boolean): Promise<{ content: string; truncated: boolean } | undefined> {
+async function readProjectSource(root: string, path: string, limit: number, truncate: boolean,
+	allowed?: (path: string) => Promise<boolean>): Promise<{ content: string; truncated: boolean } | undefined> {
 	const parts = path.split("/");
 	try {
 		const target = await managedFile(root, parts.slice(0, -1), parts.at(-1)!, false);
@@ -22,6 +24,7 @@ async function readProjectSource(root: string, path: string, limit: number, trun
 		try {
 			const info = await file.stat();
 			if (!info.isFile() || (!truncate && info.size > limit)) return;
+			if (allowed && !await allowed(path)) return;
 			const buffer = Buffer.alloc(limit + 1);
 			const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
 			if (buffer.subarray(0, bytesRead).includes(0)) return;
@@ -87,18 +90,31 @@ export async function rulePaths(root: string, start: string): Promise<string[]> 
 	} catch { return []; }
 }
 
+interface ProjectMemoryOptions {
+	mode?: "base" | "scoped";
+	seenRules?: Set<string>;
+	limit?: number;
+	allowed?: (path: string) => Promise<boolean>;
+	onRule?: (path: string) => void;
+}
+
 export async function projectMemoryContext(
 	root: string,
 	prompt: string,
 	privateFile?: string,
 	toolPaths: string[] = [],
 	currentSystem = "",
-	options: { mode?: "base" | "scoped"; seenRules?: Set<string>; limit?: number } = {},
+	options: ProjectMemoryOptions = {},
 ): Promise<string> {
 	const parts: string[] = [];
 	const visited = new Set<string>();
-	let remaining = options.limit ?? memoryLimit;
-	const promptPaths = references(prompt).map((path) => projectRelative(root, "", path)).filter((path): path is string => Boolean(path));
+	let visitLimit = 80;
+	let remaining = (options.limit ?? memoryLimit) - Buffer.byteLength(projectMemoryHeading);
+	const promptPaths: string[] = [];
+	for (const reference of references(prompt)) {
+		const path = projectRelative(root, "", reference);
+		if (path && (!options.allowed || await options.allowed(path))) promptPaths.push(path);
+	}
 	const relevant = [...promptPaths, ...toolPaths.map((path) => projectRelative(root, "", path)).filter((path): path is string => Boolean(path))];
 	const append = (label: string, body: string, truncated = false): boolean => {
 		if (!body.trim() || remaining < 128) return false;
@@ -110,21 +126,24 @@ export async function projectMemoryContext(
 		remaining -= Buffer.byteLength(text);
 		return true;
 	};
-	const visit = async (path: string, depth: number, include: boolean, rule = false): Promise<void> => {
-		if (visited.has(path) || depth > 5 || visited.size >= 80 || remaining < 128) return;
+	const visit = async (path: string, depth: number, ruleBase?: string, rootRule = false): Promise<void> => {
+		if (visited.has(path) || depth > 5 || visited.size >= visitLimit || (remaining < 128 && !options.onRule)) return;
 		visited.add(path);
-		const source = await readProjectSource(root, path, memoryLimit, true);
+		const source = await readProjectSource(root, path, memoryLimit, true, options.allowed);
 		if (!source) return;
-		const { body, patterns } = rule ? scopedRule(source.content) : { body: source.content, patterns: [] };
-		if (rule && (options.mode === "base" && patterns.length || options.mode === "scoped" && !patterns.length)) return;
-		if (patterns.length && !patterns.some((pattern) => relevant.some((path) => matchesGlob(path, pattern)))) return;
-		if (options.seenRules?.has(path)) return;
-		if (include && !currentSystem.includes(body.trim()) && append(path, body, source.truncated))
+		const { body, patterns } = ruleBase !== undefined ? scopedRule(source.content) : { body: source.content, patterns: [] };
+		if (rootRule && (options.mode === "base" && patterns.length || options.mode === "scoped" && !patterns.length)) return;
+		if (patterns.length && !patterns.some((pattern) => relevant.some((path) => {
+			const scopedPath = ruleBase ? path.startsWith(`${ruleBase}/`) && path.slice(ruleBase.length + 1) : path;
+			return scopedPath && matchesGlob(scopedPath, pattern);
+		}))) return;
+		if (body.trim() && !currentSystem.includes(body.trim())) options.onRule?.(path);
+		if (!options.seenRules?.has(path) && !currentSystem.includes(body.trim()) && append(path, body, source.truncated))
 			options.seenRules?.add(path);
 		if (/\.md$/i.test(path)) {
 			for (const target of references(body)) {
 				const resolved = projectRelative(root, dirname(path), target);
-				if (resolved) await visit(resolved, depth + 1, true);
+				if (resolved) await visit(resolved, depth + 1);
 			}
 		}
 	};
@@ -140,14 +159,32 @@ export async function projectMemoryContext(
 		const overridden = await stat(join(root, "AGENTS.override.md")).then((info) => info.isFile(), () => false);
 		for (const path of ["AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md"]) {
 			if (path === "AGENTS.md" && overridden) continue;
-			await visit(path, 0, true);
+			await visit(path, 0);
 		}
 	}
 	for (const folder of [".claude/rules", ".pi/rules"]) {
-		for (const path of await rulePaths(root, folder)) await visit(path, 0, true, true);
+		for (const path of await rulePaths(root, folder)) await visit(path, 0, "", true);
 	}
-	if (!options.mode) for (const path of promptPaths) await visit(path, 0, true);
-	return parts.length ? `# Pi Desktop 项目上下文${parts.join("")}` : "";
+	if (options.mode !== "base") {
+		visitLimit += visited.size;
+		const directories = new Set<string>();
+		for (const path of relevant) {
+			const segments = path.split("/").slice(0, -1);
+			for (let depth = 1; depth <= segments.length; depth++) directories.add(segments.slice(0, depth).join("/"));
+		}
+		for (const dir of directories) {
+			if (visited.size >= visitLimit || (remaining < 128 && !options.onRule)) break;
+			const override = `${dir}/AGENTS.override.md`;
+			const overridden = await lstat(join(root, override)).then((info) => info.isFile(), () => false);
+			await visit(overridden ? override : `${dir}/AGENTS.md`, 0);
+			for (const path of [`${dir}/CLAUDE.md`, `${dir}/.claude/CLAUDE.md`, `${dir}/CLAUDE.local.md`]) await visit(path, 0);
+			for (const folder of [`${dir}/.claude/rules`, `${dir}/.pi/rules`]) {
+				for (const path of await rulePaths(root, folder)) await visit(path, 0, dir);
+			}
+		}
+	}
+	if (!options.mode) for (const path of promptPaths) await visit(path, 0);
+	return parts.length ? projectMemoryHeading + parts.join("") : "";
 }
 
 /** Snapshot explicit references from a single user message, independently of instruction files. */

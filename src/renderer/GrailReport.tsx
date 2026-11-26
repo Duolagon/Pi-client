@@ -1,10 +1,52 @@
 import type { CSSProperties } from "react";
 import { Modal } from "../prototype/ui.tsx";
-import { GRAIL_CRITERIA, type GrailVerdict } from "../shared.ts";
+import { GRAIL_CRITERIA, type GrailCheckOutcome, type GrailObjectiveResult, type GrailVerdict } from "../shared.ts";
 import { betterApproach, citationText, comparisonText, formatCost, gradeTone, type GrailWording } from "./grail-view.ts";
 import { AnimatedDetails } from "./SmoothCollapse.tsx";
 
 const CHECK_LABEL = { test: "测试", check: "类型检查", lint: "Lint" } as const;
+const CHECK_STATUS = { pass: "通过", fail: "未通过", unavailable: "无法确认", skipped: "未执行" } as const;
+
+function GrailChecks({ objective }: { objective: GrailObjectiveResult }) {
+	const runs = new Map(objective.runs.map((run) => [run.name, run]));
+	const checks: { name: GrailCheckOutcome["name"]; status?: GrailCheckOutcome["status"]; reason?: string }[] =
+		objective.checks ?? objective.runs.map(({ name }) => ({ name }));
+	const sharedReason = checks.length > 0 && checks.every((check) => check.reason === objective.reason);
+	return (
+		<section>
+			<h4>客观检查</h4>
+			{objective.reason && (sharedReason || !checks.some((check) => check.reason === objective.reason)) && <p className="subtle-note">{objective.reason}</p>}
+			{checks.length > 0 && <ul className="cc-grail-checks">
+				{checks.map(({ name, status, reason }) => {
+					const run = runs.get(name);
+					const summary = status === "skipped" && (run?.skippedCount ?? 0) > 0 ? "全部跳过"
+						: status ? CHECK_STATUS[status] : "已记录";
+					return (
+						<li key={name} className={status}>
+							<strong>{CHECK_LABEL[name]} · {summary}</strong>
+							{run && <>
+								{" · "}<code>{run.command}</code> · {run.timedOut ? "超时" : `退出码 ${run.exitCode ?? "无"}`}
+								{run.signal && ` · ${run.signal}`}
+								{run.durationMs !== undefined && ` · ${(run.durationMs / 1000).toFixed(1)} 秒`}
+								{run.testCount !== undefined && ` · ${run.testCount} 个测试`}
+								{run.passedCount !== undefined && ` · 通过 ${run.passedCount} 个`}
+								{run.failedCount ? ` · 失败 ${run.failedCount} 个` : ""}
+								{run.skippedCount ? ` · 跳过 ${run.skippedCount} 个` : ""}
+								{run.errorCount ? ` · ${run.errorCount} 条类型错误` : ""}
+							</>}
+						{reason && !sharedReason && <p className="subtle-note">{reason}</p>}
+						{run && (run.output || run.scriptBody) && <AnimatedDetails summary="查看命令输出">
+								{run.scriptBody && <p className="subtle-note">快照中的项目脚本 <code>{run.scriptBody}</code></p>}
+								{run.outputTruncated && <p className="subtle-note">输出共 {Math.ceil((run.outputBytes ?? 0) / 1024)} KiB，记录末尾 64 KiB。</p>}
+							{run.output && <pre tabIndex={0} aria-label="命令输出">{run.output}</pre>}
+							</AnimatedDetails>}
+						</li>
+					);
+				})}
+			</ul>}
+		</section>
+	);
+}
 
 /** Badge for one verdict; clicking it opens the report. */
 export function GrailBadge({ verdict, wording, onOpen }: { verdict: GrailVerdict; wording: GrailWording; onOpen: () => void }) {
@@ -42,6 +84,7 @@ export function GrailReportDialog({
 	const { objective, distortion, blind, comparison } = verdict.steps;
 	const previous = comparisonText(verdict, wording);
 	const better = betterApproach(verdict);
+	const evidence = verdict.evidence?.source;
 	return (
 		<Modal title={wording.report} close={close} wide>
 			<div className="simple-dialog cc-grail-report">
@@ -60,6 +103,19 @@ export function GrailReportDialog({
 						))}
 					</ul>
 				)}
+				{objective && <GrailChecks objective={objective} />}
+				{evidence && <AnimatedDetails summary="查看鉴定快照" className="cc-grail-evidence-source">
+					<dl className="cc-grail-blind">
+						<dt>Git HEAD</dt><dd><code>{evidence.revision ?? "无提交"}</code></dd>
+						<dt>检查点</dt><dd><code>{evidence.checkpointId}</code></dd>
+						<dt>原始源码</dt><dd><code>{evidence.baselineTree}</code></dd>
+						<dt>复核源码</dt><dd><code>{evidence.selectedTree}</code></dd>
+						{evidence.testedTree && <>
+							<dt>客观检查源码</dt><dd><code>{evidence.testedTree}</code></dd>
+							<dt>检查目录</dt><dd><code>{evidence.project}</code></dd>
+						</>}
+					</dl>
+				</AnimatedDetails>}
 				{better && (
 					<section>
 						<h4>评审指出的更好写法</h4>
@@ -123,24 +179,6 @@ export function GrailReportDialog({
 								<li key={index}>
 									<code>{citationText(hit)}</code> {hit.rule}{hit.review ? " · 待评审" : ""}
 									<pre>{hit.text}</pre>
-								</li>
-							))}
-						</ul>
-					</section>
-				)}
-				{objective && (
-					<section>
-						<h4>客观检查</h4>
-						{objective.reason && <p className="subtle-note">{objective.reason}</p>}
-						<ul className="cc-grail-checks">
-							{objective.runs.map((run) => (
-								<li key={run.name} className={run.exitCode === 0 && !run.timedOut ? "pass" : "fail"}>
-									<strong>
-										{CHECK_LABEL[run.name]} · <code>{run.command}</code> ·{" "}
-										{run.timedOut ? "超时" : `退出码 ${run.exitCode ?? "无"}`}
-										{run.testCount !== undefined ? ` · ${run.testCount} 个测试` : ""}
-									</strong>
-									{(run.exitCode !== 0 || run.timedOut) && run.output && <pre>{run.output.slice(-4000)}</pre>}
 								</li>
 							))}
 						</ul>

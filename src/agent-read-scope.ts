@@ -4,7 +4,7 @@ import { exceedsLength } from "./delegation-limits.ts";
 
 export const MAX_AGENT_SCOPE_PATHS = 32;
 export const MAX_AGENT_SCOPE_PATH_LENGTH = 1024;
-export const scopedReadToolNames: ReadonlySet<string> = new Set(["read", "grep", "find", "ls", "LSP"]);
+export const scopedReadToolNames: ReadonlySet<string> = new Set(["read", "grep", "find", "ls", "LSP", "ReadToolOutput"]);
 
 /** A scope lists specific project-relative files or directories, never globs or an entire workspace. */
 export function validateAgentScopePaths(value: unknown): string[] {

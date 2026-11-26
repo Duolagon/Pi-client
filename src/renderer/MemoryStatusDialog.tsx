@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Archive, BookOpen, Info, Layers, Plus, Save, Sparkles, Trash2 } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
 import { SlidingTabList } from "./SegmentedTabs.tsx";
@@ -44,16 +44,30 @@ export function MemoryStatusDialog({
 	const [newRuleName, setNewRuleName] = useState("");
 	const [loading, setLoading] = useState(true);
 	const [saving, setSaving] = useState(false);
+	const [confirmRuleDelete, setConfirmRuleDelete] = useState(false);
 	const [compactInstructions, setCompactInstructions] = useState("");
 	const [tools, setTools] = useState<DesktopToolInfo[]>([]);
 	const [hoveredSeg, setHoveredSeg] = useState<"inst" | "tools" | "conv" | null>(null);
+	const [reportRevision, setReportRevision] = useState(0);
+	const loadedConversation = useRef<string | undefined>(undefined);
+	const activeId = snapshot.active?.id;
+	const stats = snapshot.stats;
+	const ctxUsage = stats?.contextUsage;
+	const model = snapshot.state?.model;
+	const liveContext = tab === "context" ? ctxUsage : undefined;
+	const liveModel = tab === "context" ? model : undefined;
 
-	const refreshReport = async () => {
-		if (!snapshot.active) return;
+	const refreshReport = async (conversationId: string, isCurrent: () => boolean) => {
+		if (loadedConversation.current === conversationId) {
+			const ctx = await window.pi.contextReport();
+			if (isCurrent()) setReport(ctx);
+			return;
+		}
 		const [ctx, toolList] = await Promise.all([
 			window.pi.contextReport().catch(() => null),
-			window.pi.tools.list(snapshot.active.id).catch(() => []),
+			window.pi.tools.list(conversationId).catch(() => []),
 		]);
+		if (!isCurrent()) return;
 		if (ctx) {
 			setReport(ctx);
 			setSources(ctx.sources);
@@ -67,6 +81,7 @@ export function MemoryStatusDialog({
 			}
 		} else {
 			const fallback = await window.pi.readMemory();
+			if (!isCurrent()) return;
 			const mapped: ContextMemorySource[] = fallback.map((m) => ({
 				id: m.file,
 				relativePath: m.file,
@@ -87,16 +102,27 @@ export function MemoryStatusDialog({
 			}
 		}
 		setTools(toolList);
+		loadedConversation.current = conversationId;
 	};
 
 	useEffect(() => {
-		void refreshReport().catch(fail).finally(() => setLoading(false));
-	}, [snapshot.active?.id]);
+		if (!activeId) return;
+		let current = true;
+		if (loadedConversation.current !== activeId) {
+			setReport(null);
+			setLoading(true);
+		}
+		void refreshReport(activeId, () => current)
+			.catch((error) => { if (current) fail(error); })
+			.finally(() => { if (current) setLoading(false); });
+		return () => { current = false; };
+	}, [activeId, liveModel?.provider, liveModel?.id, liveContext?.contextWindow, liveContext?.tokens, reportRevision]);
 
 	const activeSource = sources.find((s) => s.relativePath === activePath);
 
 	const switchSource = (rel: string) => {
 		setActivePath(rel);
+		setConfirmRuleDelete(false);
 		const found = sources.find((item) => item.relativePath === rel);
 		setDraft(found?.content ?? "");
 	};
@@ -158,21 +184,28 @@ export function MemoryStatusDialog({
 		}
 	};
 
-	const stats = snapshot.stats;
-	const ctxUsage =
-		stats?.contextUsage && typeof stats.contextUsage === "object"
-			? (stats.contextUsage as { percent?: number; tokens?: number; contextWindow?: number })
-			: undefined;
 	const restricted = snapshot.settings.permission === "read" || snapshot.settings.permission === "plan";
 	const canEdit = !loading && !saving && !restricted && Boolean(activeSource?.editable);
 	const mcpCount = tools.filter((t) => t.source === "mcp").length;
 	const activeToolsCount = tools.filter((t) => t.enabled && t.modelVisible).length;
 	const deferredToolNames = report?.deferredToolNames ?? tools.filter((tool) => tool.deferred).map((tool) => tool.name);
 
-	const totalWindow = report?.contextWindow ?? ctxUsage?.contextWindow ?? 128000;
-	const pctInstructions = report ? Math.min(100, (report.estimatedInstructionsTokens / Math.max(1, totalWindow)) * 100) : 0;
-	const pctTools = report ? Math.min(100 - pctInstructions, (report.estimatedToolsTokens / Math.max(1, totalWindow)) * 100) : 0;
-	const pctConv = report ? Math.min(100 - pctInstructions - pctTools, (report.conversationTokens / Math.max(1, totalWindow)) * 100) : 0;
+	const totalWindow = ctxUsage?.contextWindow ?? report?.contextWindow ?? model?.contextWindow ?? null;
+	const totalTokens = ctxUsage ? ctxUsage.tokens : report?.totalTokens ?? null;
+	const contextPercent = ctxUsage ? ctxUsage.percent : report?.percent ?? null;
+	const remainingTokens = totalTokens !== null && totalWindow !== null ? Math.max(0, totalWindow - totalTokens) : null;
+	const estimatedInstructions = report?.estimatedInstructionsTokens ?? 0;
+	const estimatedTools = report?.estimatedToolsTokens ?? 0;
+	const conversationTokens = totalTokens === null ? null : Math.max(0, totalTokens - estimatedInstructions - estimatedTools);
+	const pctInstructions = totalWindow && totalTokens !== null ? Math.min(totalTokens, estimatedInstructions) / totalWindow * 100 : 0;
+	const pctTools = totalWindow && totalTokens !== null ? Math.min(Math.max(0, totalTokens - estimatedInstructions), estimatedTools) / totalWindow * 100 : 0;
+	const pctConv = totalWindow && conversationTokens !== null ? conversationTokens / totalWindow * 100 : 0;
+	const autoCompactionEnabled = report?.autoCompactionEnabled ?? snapshot.state?.autoCompactionEnabled ?? null;
+	const compactionThreshold = report?.compactionThreshold ?? null;
+	const waitingForUsage = totalTokens === null && (ctxUsage?.tokens === null || snapshot.messages.some((message) => message.role === "compactionSummary"));
+	const usageLabel = contextPercent !== null && totalTokens !== null && totalWindow !== null
+		? `上下文占用 ${Math.round(contextPercent)}%（${totalTokens.toLocaleString()} / ${totalWindow.toLocaleString()} tokens）`
+		: waitingForUsage ? "上下文占用待更新" : "暂无上下文用量";
 
 	return (
 		<Modal title="项目记忆与会话状态" close={close} wide>
@@ -237,9 +270,28 @@ export function MemoryStatusDialog({
 								<Plus size={12} /> 新建规则
 							</button>
 							{activePath.includes("/rules/") && activeSource?.exists && (
-								<button type="button" className="cc-mini-btn danger" disabled={saving || restricted} onClick={() => void deleteRule()}>
-									<Trash2 size={12} /> 删除此规则
-								</button>
+								confirmRuleDelete ? (
+									<>
+										<button type="button" className="cc-mini-btn" disabled={saving} onClick={() => setConfirmRuleDelete(false)}>
+											取消
+										</button>
+										<button
+											type="button"
+											className="cc-mini-btn danger"
+											disabled={saving || restricted}
+											onClick={() => {
+												setConfirmRuleDelete(false);
+												void deleteRule();
+											}}
+										>
+											确认删除规则
+										</button>
+									</>
+								) : (
+									<button type="button" className="cc-mini-btn danger" disabled={saving || restricted} onClick={() => setConfirmRuleDelete(true)}>
+										<Trash2 size={12} /> 删除此规则
+									</button>
+								)
 							)}
 						</div>
 						{activeSource && activeSource.imports.length > 0 && (
@@ -291,35 +343,37 @@ export function MemoryStatusDialog({
 					<div className="cc-controls-body">
 						<div className="cc-context-meter-wrap">
 							<div className="cc-context-head">
-								<strong>
-									上下文占用 {report ? `${Math.round(report.percent)}%` : "-"}（
-									{(report?.totalTokens ?? ctxUsage?.tokens ?? 0).toLocaleString()} / {totalWindow.toLocaleString()} tokens）
-								</strong>
-								<span>可用余量 {(report?.remainingTokens ?? 0).toLocaleString()} tokens</span>
+								<strong>{usageLabel}</strong>
+								{remainingTokens !== null
+									? <span>可用余量 {remainingTokens.toLocaleString()} tokens</span>
+									: totalWindow !== null && <span>窗口 {totalWindow.toLocaleString()} tokens</span>}
 							</div>
-							<div className={`cc-context-bar ${hoveredSeg ? `has-hover hover-${hoveredSeg}` : ""}`.trim()} aria-label="上下文分段占用条">
-								<div
-									className="cc-ctx-seg inst"
-									style={{ width: `${Math.max(1, pctInstructions)}%` }}
-									title="指令与记忆文件"
-									onMouseEnter={() => setHoveredSeg("inst")}
-									onMouseLeave={() => setHoveredSeg(null)}
-								/>
-								<div
-									className="cc-ctx-seg tools"
-									style={{ width: `${Math.max(1, pctTools)}%` }}
-									title="激活工具与 MCP Schema"
-									onMouseEnter={() => setHoveredSeg("tools")}
-									onMouseLeave={() => setHoveredSeg(null)}
-								/>
-								<div
-									className="cc-ctx-seg conv"
-									style={{ width: `${Math.max(0, pctConv)}%` }}
-									title="对话与工具输出"
-									onMouseEnter={() => setHoveredSeg("conv")}
-									onMouseLeave={() => setHoveredSeg(null)}
-								/>
-							</div>
+							{waitingForUsage && <span className="subtle-note">模型下次回复后会更新占用量。</span>}
+							{totalTokens !== null && (
+								<div className={`cc-context-bar ${hoveredSeg ? `has-hover hover-${hoveredSeg}` : ""}`.trim()} aria-label="上下文分段占用条">
+									<div
+										className="cc-ctx-seg inst"
+										style={{ width: `${pctInstructions}%` }}
+										title="指令与记忆文件"
+										onMouseEnter={() => setHoveredSeg("inst")}
+										onMouseLeave={() => setHoveredSeg(null)}
+									/>
+									<div
+										className="cc-ctx-seg tools"
+										style={{ width: `${pctTools}%` }}
+										title="激活工具与 MCP Schema"
+										onMouseEnter={() => setHoveredSeg("tools")}
+										onMouseLeave={() => setHoveredSeg(null)}
+									/>
+									<div
+										className="cc-ctx-seg conv"
+										style={{ width: `${pctConv}%` }}
+										title="对话与工具输出"
+										onMouseEnter={() => setHoveredSeg("conv")}
+										onMouseLeave={() => setHoveredSeg(null)}
+									/>
+								</div>
+							)}
 							<div className="cc-context-legend">
 								<span
 									className={hoveredSeg === "inst" ? "is-active" : undefined}
@@ -343,7 +397,7 @@ export function MemoryStatusDialog({
 									onMouseEnter={() => setHoveredSeg("conv")}
 									onMouseLeave={() => setHoveredSeg(null)}
 								>
-									<i className="conv" /> 对话消息 ({report?.conversationTokens ?? 0} tok)
+									<i className="conv" /> 对话消息 {conversationTokens !== null ? `(${conversationTokens.toLocaleString()} tok)` : "（待统计）"}
 								</span>
 								<span>缓存命中率：{report?.cacheHitPercent ?? 0}%</span>
 							</div>
@@ -353,8 +407,9 @@ export function MemoryStatusDialog({
 							<label className="live-setting-toggle">
 								<input
 									type="checkbox"
-									checked={report?.autoCompactionEnabled ?? true}
-									onChange={(e) => void onToggleAutoCompaction?.(e.target.checked).then(() => refreshReport())}
+									checked={autoCompactionEnabled === true}
+									disabled={autoCompactionEnabled === null || !onToggleAutoCompaction}
+									onChange={(e) => void onToggleAutoCompaction?.(e.target.checked).then(() => setReportRevision((current) => current + 1)).catch(fail)}
 								/>
 								自动上下文压缩（autoCompaction）
 							</label>
@@ -362,11 +417,14 @@ export function MemoryStatusDialog({
 								<input
 									type="checkbox"
 									checked={report?.autoRetryEnabled ?? true}
-									onChange={(e) => void onToggleAutoRetry?.(e.target.checked).then(() => refreshReport())}
+									onChange={(e) => void onToggleAutoRetry?.(e.target.checked).then(() => setReportRevision((current) => current + 1)).catch(fail)}
 								/>
 								瞬态错误自动重试（autoRetry）
 							</label>
 						</div>
+						{autoCompactionEnabled && compactionThreshold !== null && (
+							<span className="subtle-note">按容量自动压缩在占用超过 {compactionThreshold.toLocaleString()} tokens 时触发。</span>
+						)}
 
 						<div className="cc-compact-row">
 							<input
@@ -413,9 +471,9 @@ export function MemoryStatusDialog({
 							</div>
 							<div className="cc-status-card">
 								<span>上下文使用</span>
-								<strong>{ctxUsage?.percent !== undefined ? `${Math.round(ctxUsage.percent)}%` : "-"}</strong>
+									<strong>{contextPercent !== null ? `${Math.round(contextPercent)}%` : "待统计"}</strong>
 								<small>
-									{ctxUsage?.tokens !== undefined ? `${ctxUsage.tokens} / ${ctxUsage.contextWindow ?? "?"} tokens` : "等待统计"}
+										{totalTokens !== null && totalWindow !== null ? `${totalTokens.toLocaleString()} / ${totalWindow.toLocaleString()} tokens` : "等待统计"}
 								</small>
 							</div>
 							<div className="cc-status-card">

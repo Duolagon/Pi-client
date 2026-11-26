@@ -1,10 +1,12 @@
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { parseFallbackModelUpdate } from "./model-routing.ts";
 import { GRAIL_CRITERIA } from "./shared.ts";
 import type {
 	GrailBlindResult,
 	GrailBlindSolution,
 	GrailCheckName,
+	GrailCheckOutcome,
 	GrailCheckRun,
 	GrailCitation,
 	GrailComparisonResult,
@@ -19,6 +21,7 @@ import type {
 export { GRAIL_CRITERIA };
 const criteria = Object.keys(GRAIL_CRITERIA) as GrailCriterion[];
 const requiredCriteria = ["requirement", "broken", "removable", "missing", "flawless"] as const;
+const objectiveCheckNames = ["test", "check", "lint"] as const;
 
 export interface DiffLine {
 	file: string;
@@ -130,16 +133,18 @@ export function scanDistortions(lines: DiffLine[]): GrailDistortionHit[] {
 }
 
 /** Runner totals include skipped tests. Only a passing test proves that a check actually ran. */
-function parseTestSummary(output: string): { total: number; passed?: number; failed?: number } | undefined {
+function parseTestSummary(output: string): { total: number; passed?: number; failed?: number; skipped?: number } | undefined {
 	const text = output.replace(/\x1b\[[0-9;]*m/g, "");
 	const node = [...text.matchAll(/^\s*(?:#|ℹ)\s*tests\s+(\d+)\s*$/gm)];
 	if (node.length) {
 		const pass = [...text.matchAll(/^\s*(?:#|ℹ)\s*pass\s+(\d+)\s*$/gm)];
 		const fail = [...text.matchAll(/^\s*(?:#|ℹ)\s*fail\s+(\d+)\s*$/gm)];
+		const skip = [...text.matchAll(/^\s*(?:#|ℹ)\s*skipped\s+(\d+)\s*$/gm)];
 		const total = node.reduce((sum, match) => sum + Number(match[1]), 0);
 		const passed = pass.length === node.length ? pass.reduce((sum, match) => sum + Number(match[1]), 0) : undefined;
 		const failed = fail.length ? fail.reduce((sum, match) => sum + Number(match[1]), 0) : undefined;
-		return { total, passed, failed };
+		const skipped = skip.length === node.length ? skip.reduce((sum, match) => sum + Number(match[1]), 0) : undefined;
+		return { total, passed, failed, skipped };
 	}
 	const jest = /^\s*Tests:\s+([^\r\n]*?)(\d+)\s+total/m.exec(text);
 	const vitest = /^\s*Tests\s+([^\r\n]*?)\((\d+)\)\s*$/m.exec(text);
@@ -148,6 +153,7 @@ function parseTestSummary(output: string): { total: number; passed?: number; fai
 		total: Number(summary[2]),
 		passed: Number(/\b(\d+)\s+passed\b/.exec(summary[1])?.[1] ?? 0),
 		failed: Number(/\b(\d+)\s+failed\b/.exec(summary[1])?.[1] ?? 0),
+		skipped: Number(/\b(\d+)\s+skipped\b/.exec(summary[1])?.[1] ?? 0),
 	};
 	const passing = /^\s*(\d+)\s+passing\b/m.exec(text);
 	if (passing) {
@@ -155,7 +161,8 @@ function parseTestSummary(output: string): { total: number; passed?: number; fai
 		const pending = /^\s*(\d+)\s+pending\b/m.exec(text);
 		const passed = Number(passing[1]);
 		const failed = Number(failing?.[1] ?? 0);
-		return { total: passed + failed + Number(pending?.[1] ?? 0), passed, failed };
+		const skipped = Number(pending?.[1] ?? 0);
+		return { total: passed + failed + skipped, passed, failed, skipped };
 	}
 	return undefined;
 }
@@ -232,14 +239,26 @@ export function runProcess(
 	command: string,
 	args: string[],
 	options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; signal: AbortSignal },
-): Promise<{ exitCode: number | null; timedOut: boolean; output: string; launchError?: string }> {
+): Promise<{
+	exitCode: number | null; timedOut: boolean; output: string; outputBytes: number;
+	outputTruncated: boolean; durationMs: number; signal?: string; launchError?: string;
+}> {
 	return new Promise((resolve) => {
 		options.signal.throwIfAborted();
-		let output = "";
+		const startedAt = Date.now();
+		let output: Buffer = Buffer.alloc(0);
+		let outputBytes = 0;
 		let timedOut = false;
 		let launchError: string | undefined;
-		const append = (chunk: Buffer | string) => {
-			output = (output + chunk.toString()).slice(-maxOutput);
+		const append = (text: string) => {
+			if (!text) return;
+			const chunk = Buffer.from(text);
+			outputBytes += chunk.length;
+			if (chunk.length >= maxOutput) output = chunk.subarray(-maxOutput);
+			else {
+				const remaining = maxOutput - chunk.length;
+				output = Buffer.concat([output.subarray(-remaining), chunk]);
+			}
 		};
 		const child = spawn(command, args, { cwd: options.cwd, env: options.env, shell: false, detached: true, stdio: ["ignore", "pipe", "pipe"] });
 		const kill = () => {
@@ -254,21 +273,37 @@ export function runProcess(
 			kill();
 		}, Math.max(1, options.timeoutMs));
 		options.signal.addEventListener("abort", kill, { once: true });
-		child.stdout.on("data", append);
-		child.stderr.on("data", append);
+		const stdout = new StringDecoder("utf8");
+		const stderr = new StringDecoder("utf8");
+		child.stdout.on("data", (chunk: Buffer) => append(stdout.write(chunk)));
+		child.stderr.on("data", (chunk: Buffer) => append(stderr.write(chunk)));
 		child.once("error", (error) => {
 			launchError = error.message;
-			append(`\n${launchError}`);
 		});
-		child.once("close", (code) => {
+		child.once("close", (code, signal) => {
 			clearTimeout(timer);
 			options.signal.removeEventListener("abort", kill);
-			resolve({ exitCode: code, timedOut, output, launchError });
+			append(stdout.end());
+			append(stderr.end());
+			let start = 0;
+			while (start < output.length && (output[start] & 0xc0) === 0x80) start++;
+			resolve({
+				exitCode: code, timedOut, output: output.subarray(start).toString(), outputBytes,
+				outputTruncated: outputBytes > output.length, durationMs: Date.now() - startedAt,
+				signal: signal ?? undefined, launchError,
+			});
 		});
 	});
 }
 
 /** Step 5.1: collect test, type-check and lint evidence from the project's own scripts. */
+export function skipObjectiveChecks(reason: string): GrailObjectiveResult {
+	return {
+		status: "unavailable", reason, runs: [],
+		checks: objectiveCheckNames.map((name) => ({ name, status: "skipped", reason })),
+	};
+}
+
 export async function runObjectiveChecks(options: {
 	project: string;
 	manifest: unknown;
@@ -280,54 +315,75 @@ export async function runObjectiveChecks(options: {
 	signal: AbortSignal;
 }): Promise<GrailObjectiveResult> {
 	if (options.manifest === undefined)
-		return { status: "unavailable", reason: "第一版只支持 Node/TypeScript 项目：项目根目录没有 package.json。", runs: [] };
+		return skipObjectiveChecks("客观检查需要 Node/TypeScript 项目的 package.json。");
 	const scripts = detectScripts(options.manifest);
-	if (!scripts.some((item) => item.name === "test"))
-		return { status: "unavailable", reason: "package.json 没有可执行的 test 脚本。", runs: [] };
+	const declared = new Set(scripts.map(({ name }) => name));
+	const labels = { test: "test", check: "类型检查（check/typecheck）", lint: "lint" };
+	const checks: GrailCheckOutcome[] = objectiveCheckNames.map((name) => ({
+		name,
+		status: "skipped",
+		reason: declared.has(name) ? "前序检查未完成。" : `package.json 没有可执行的 ${labels[name]} 脚本。`,
+	}));
 	const manager = packageManager(options.files);
 	const dependencies = new Set([options.manifest, ...(options.inheritedManifests ?? [])].flatMap(declaredDependencies));
 	const runs: GrailCheckRun[] = [];
+	const finish = (status: GrailObjectiveResult["status"], reason?: string): GrailObjectiveResult => ({ status, reason, runs, checks });
+	if (!declared.has("test")) return finish("unavailable", checks[0].reason);
 	for (const { name, script } of scripts) {
 		options.signal.throwIfAborted();
+		const check = checks.find((item) => item.name === name)!;
+		const stop = (status: Exclude<GrailCheckOutcome["status"], "pass">, reason: string): GrailObjectiveResult => {
+			Object.assign(check, { status, reason });
+			return finish(status === "fail" ? "fail" : "unavailable", reason);
+		};
 		const displayCommand = `${manager} run ${script}`;
 		const timeoutMs = options.deadline - Date.now();
-		if (timeoutMs <= 0) return { status: "unavailable", reason: `鉴定已超时，未运行 ${displayCommand}。`, runs };
+		if (timeoutMs <= 0) return stop("skipped", `鉴定已超时，未运行 ${displayCommand}。`);
 		const args = ["run", script];
 		const [command, argv] = options.sandboxProfile
 			? ["/usr/bin/sandbox-exec", ["-f", options.sandboxProfile, manager, ...args]]
 			: [manager, args];
-		const result = await runProcess(command, argv, { cwd: options.project, env: options.env, timeoutMs, signal: options.signal });
+		const { launchError, ...result } = await runProcess(command, argv, { cwd: options.project, env: options.env, timeoutMs, signal: options.signal });
 		options.signal.throwIfAborted();
-		const run: GrailCheckRun = { name, script, command: displayCommand, exitCode: result.exitCode, timedOut: result.timedOut, output: result.output };
+		const scriptDefinition = (options.manifest as { scripts: Record<string, string> }).scripts[script];
+		const scriptBody = scriptDefinition.length > 4096 ? `${scriptDefinition.slice(0, 4096)}…` : scriptDefinition;
+		const run: GrailCheckRun = { name, script, command: displayCommand, scriptBody, ...result, sandboxed: Boolean(options.sandboxProfile) };
 		const testSummary = name === "test" ? parseTestSummary(result.output) : undefined;
-		if (testSummary) run.testCount = testSummary.total;
+		if (testSummary) {
+			run.testCount = testSummary.total;
+			run.passedCount = testSummary.passed;
+			run.failedCount = testSummary.failed;
+			run.skippedCount = testSummary.skipped;
+		}
 		if (name === "check") run.errorCount = parseTscErrors(result.output);
 		runs.push(run);
-		if (result.timedOut) return { status: "unavailable", reason: `${run.command} 超时。`, runs };
-		if (result.launchError) return { status: "unavailable", reason: `无法启动 ${run.command}：${result.launchError}`, runs };
-		if (result.exitCode === null) return { status: "unavailable", reason: `${run.command} 运行中断。`, runs };
+		if (result.timedOut) return stop("unavailable", `${run.command} 超时。`);
+		if (launchError) return stop("unavailable", `无法启动 ${run.command}：${launchError}`);
+		if (result.exitCode === null) return stop("unavailable", `${run.command} 运行中断。`);
 		if ((result.exitCode !== 0 || testSummary?.failed) && missingTestDependency(result.output, dependencies))
-			return { status: "unavailable", reason: `${run.command} 无法加载所需的测试依赖，请检查工作区依赖是否已安装。`, runs };
+			return stop("unavailable", `${run.command} 无法加载所需的测试依赖，请检查工作区依赖是否已安装。`);
 		if (result.exitCode !== 0) {
 			if (result.exitCode === 126 || result.exitCode === 127 || /^\s*(?:sh|bash): .*: (?:command )?not found\s*$/m.test(result.output))
-				return { status: "unavailable", reason: `${run.command} 所需的命令不可用，请检查测试工具和依赖。`, runs };
-			return { status: "fail", reason: `${run.command} 退出码 ${result.exitCode}。`, runs };
+				return stop("unavailable", `${run.command} 所需的命令不可用，请检查测试工具和依赖。`);
+			return stop("fail", `${run.command} 退出码 ${result.exitCode}。`);
 		}
 		if (name === "test") {
 			if (testSummary?.failed)
-				return { status: "fail", reason: `测试结果报告了 ${testSummary.failed} 个失败。`, runs };
+				return stop("fail", `测试结果报告了 ${testSummary.failed} 个失败。`);
 			if (testSummary?.passed === undefined || testSummary.passed > testSummary.total)
-				return { status: "unavailable", reason: "无法从测试输出确认实际通过的测试数量。", runs };
-			if (testSummary.passed === 0)
-				return { status: "unavailable", reason: "没有任何测试实际通过。零测试及全部跳过均无法作为通过证据。", runs };
+				return stop("unavailable", "无法从测试输出确认实际通过的测试数量。");
+			if (testSummary.passed === 0) {
+				const allSkipped = testSummary.total > 0 && testSummary.skipped === testSummary.total;
+				return stop(allSkipped ? "skipped" : "unavailable", "没有任何测试实际通过。零测试及全部跳过均无法作为通过证据。");
+			}
 		}
+		check.status = "pass";
+		delete check.reason;
 	}
-	const missingChecks = (["check", "lint"] as const).filter((name) => !scripts.some((item) => item.name === name));
-	if (missingChecks.length) {
-		const labels = { check: "类型检查（check/typecheck）", lint: "lint" };
-		return { status: "unavailable", reason: `package.json 缺少可执行脚本：${missingChecks.map((name) => labels[name]).join("、")}。`, runs };
-	}
-	return { status: "pass", runs };
+	const missingChecks = (["check", "lint"] as const).filter((name) => !declared.has(name));
+	if (missingChecks.length)
+		return finish("unavailable", `package.json 缺少可执行脚本：${missingChecks.map((name) => labels[name]).join("、")}。`);
+	return finish("pass");
 }
 
 /** First JSON object in model text, from a fenced block or the outermost braces. */
@@ -390,7 +446,10 @@ export function parseBlindSolution(output: string): GrailBlindResult {
 }
 
 /** Step 5.4 prompt: requirement, blind solution and the numbered diff; every conclusion must cite. */
-export function buildComparisonPrompt(requirement: string[], solution: GrailBlindSolution, diff: string): string {
+export function buildComparisonPrompt(requirement: string[], solution: GrailBlindSolution, diff: string, objective?: GrailObjectiveResult): string {
+	const objectiveEvidence = objective?.runs.map(({ command, exitCode, passedCount, failedCount, skippedCount }) => ({
+		command, exitCode, passedCount, failedCount, skippedCount,
+	}));
 	return [
 		"【圣杯对照】你是独立的资深评审。给你用户要求、一份独立写出的盲解要点，以及实际交付的 diff。逐条判定下面每一项标准。",
 		"标准（criterion: 含义）：",
@@ -405,6 +464,11 @@ export function buildComparisonPrompt(requirement: string[], solution: GrailBlin
 		"",
 		"盲解要点：",
 		JSON.stringify(solution, null, 2),
+		...(objectiveEvidence?.length ? [
+			"",
+			"客观检查执行记录（仅证明这些命令已运行，仍需用 diff 判断覆盖范围）：",
+			JSON.stringify(objectiveEvidence),
+		] : []),
 		"",
 		"实际 diff（行首 + / - 后的数字是行号）：",
 		diff,

@@ -177,6 +177,7 @@ const api: DesktopAPI = {
 	searchFiles: (id, query) => ipcRenderer.invoke("pi:search-files", id, query),
 	checkFileReferences: (id, paths) => ipcRenderer.invoke("pi:check-file-references", id, paths),
 	readFile: (path) => ipcRenderer.invoke("pi:read-file", path),
+	readToolOutput: (conversationId, id, offset) => ipcRenderer.invoke("pi:tool-output:read", conversationId, id, offset),
 	workspace: () => ipcRenderer.invoke("pi:workspace"),
 	createDraftPullRequest: (id, draft) => ipcRenderer.invoke("pi:workspace:create-draft-pr", id, draft),
 	pullRequest: (id, number) => ipcRenderer.invoke("pi:pull-request", id, number),

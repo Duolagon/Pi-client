@@ -37,8 +37,8 @@ function content(message: Message): string {
 	if (!("content" in message)) return "";
 	return typeof message.content === "string" ? message.content : message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
 }
-function assistantText(snapshot: Snapshot, marker: string): string | undefined {
-	return snapshot.messages.filter((message) => message.role === "assistant").map(content).findLast((text) => text.includes(marker));
+function assistantText(messages: Message[], marker: string): string | undefined {
+	return messages.filter((message) => message.role === "assistant").map(content).findLast((text) => text.includes(marker));
 }
 function notifications(snapshot: Snapshot, taskId: string): Array<{ turn: number; status: string }> {
 	return snapshot.messages.flatMap((message) => {
@@ -75,9 +75,11 @@ async function setup() {
 	} catch (error) { await service.close(); await fixture.cleanup(); throw error; }
 }
 async function say(service: DesktopService, message: string, marker: string): Promise<string> {
+	const previousMessages = (await service.snapshot()).messages.length;
 	await service.command({ type: "prompt", message });
-	const snapshot = await until(() => service.snapshot(), (value) => Boolean(assistantText(value, marker)) && !value.state?.isStreaming, marker);
-	return assistantText(snapshot, marker)!;
+	const snapshot = await until(() => service.snapshot(), (value) => !value.state?.isStreaming &&
+		Boolean(assistantText(value.messages.slice(previousMessages), marker)), marker);
+	return assistantText(snapshot.messages.slice(previousMessages), marker)!;
 }
 const child = async (service: DesktopService, name: string): Promise<DesktopTask> =>
 	(await service.listTasks()).find((task) => task.name === name)!;

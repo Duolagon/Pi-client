@@ -17,7 +17,7 @@ import type {
 
 const readingTools = new Set(["read", "grep", "find", "ls"]);
 const editTools = new Set(["edit", "write", "NotebookEdit"]);
-const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite", "TodoCreate", "TodoGet", "TodoUpdate", "TodoList", "CronList", "BashOutput", "KillShell", "StructuredOutput", "AskUserQuestion", "ExitPlanMode", "LSP", "ToolSearch"]);
+const harmlessDesktopTools = new Set(["AgentExecutors", "TaskOutput", "TaskList", "TaskStop", "WorktreeList", "TodoWrite", "TodoCreate", "TodoGet", "TodoUpdate", "TodoList", "CronList", "BashOutput", "KillShell", "StructuredOutput", "AskUserQuestion", "ExitPlanMode", "LSP", "ToolSearch", "ReadToolOutput"]);
 const pathTools = new Set([...readingTools, "edit", "write", "NotebookEdit"]);
 const wrappers = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", ".", "env", "sudo", "doas", "exec", "command", "xargs"]);
 /** Pass-through process wrappers that Claude Code strips before matching command rules. */
@@ -641,7 +641,8 @@ export async function evaluatePermission(
 		? (call.input as Record<string, unknown>)
 		: {};
 	let scopedTarget: string | undefined;
-	if (policy.readScope) {
+	// ReadToolOutput checks branch ownership and re-evaluates the source tool's scope before reading.
+	if (policy.readScope && call.toolName !== "ReadToolOutput") {
 		const outline = call.toolName === "LSP" && input.operation === "workspaceOutline";
 		if (!scopedReadToolNames.has(call.toolName) || (call.toolName === "LSP" && !outline))
 			return { action: "deny", reason: "此子 Agent 仅可读取和搜索指定范围的项目文件。" };

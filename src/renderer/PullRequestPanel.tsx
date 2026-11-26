@@ -158,7 +158,7 @@ export function PullRequestPanel({ conversationId, branch, readOnly }: { convers
 								<button className="primary-button" type="submit" disabled={creating || readOnly || !draftTitle.trim()}>
 									{creating ? "创建中…" : "创建 GitHub 草稿 PR"}
 								</button>
-								<button className="cc-mini-btn" type="button" disabled={creating} onClick={() => setShowDraft(false)}>取消</button>
+								<button className="secondary-button" type="button" disabled={creating} onClick={() => setShowDraft(false)}>取消</button>
 							</div>
 						</form>
 					</SmoothCollapse>

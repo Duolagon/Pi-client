@@ -28,6 +28,7 @@ import {
 	runObjectiveChecks,
 	scanDistortions,
 	scriptEnvironment,
+	skipObjectiveChecks,
 	validGrailMaxCost,
 	validGrailTimeout,
 } from "./grail-judge.ts";
@@ -178,6 +179,7 @@ import { readClaudeProjectPermissionsDetailed, writeClaudeProjectPermissions } f
 import { createForkedSessionSnapshot, findSessionFileById } from "./session-fork.ts";
 import type { BtwResult, ClaudePermissionsSyncResult, ConversationMetaPatch, DoctorCheck, DoctorReport, OutputStyleInfo, PlanFileState, PullRequestMergeMethod, SandboxStatus, UsageStatsReport } from "./shared.ts";
 import { ExternalAgents } from "./external-agents.ts";
+import { readToolOutputPage, toolOutputDirectory } from "./tool-output-archive.ts";
 import { CodexAdapter } from "./external-codex.ts";
 import { ClaudeAdapter } from "./external-claude.ts";
 import { KimiAdapter } from "./external-kimi.ts";
@@ -1614,10 +1616,15 @@ export class DesktopService {
 		await this.operation;
 		const conv = this.conversation(conversationId);
 		const runtime = this.runtimes.get(conv.id);
-		const tools = runtime?.controls && runtime.engineStatus === "ready"
-			? await this.controlRequest(runtime, "list").catch(() => [])
-			: [];
 		const snapshot = await this.buildSnapshot(conv.id);
+		const context = runtime?.controls && runtime.engineStatus === "ready"
+			? await this.controlCall(runtime, { operation: "context" }).catch(() => undefined)
+			: undefined;
+		const tools = Array.isArray(context?.tools) ? context.tools as DesktopToolInfo[] : [];
+		const compaction = context?.compaction as { provider?: unknown; model?: unknown; reserveTokens?: unknown } | undefined;
+		const model = snapshot.state?.model;
+		const reserve = compaction && model && compaction.provider === model.provider && compaction.model === model.id
+			? compaction.reserveTokens : undefined;
 		const autoRetryEnabled = await this.readAutoRetrySetting(conv.project);
 		return buildContextReport({
 			project: conv.project,
@@ -1627,6 +1634,7 @@ export class DesktopService {
 			projectTrusted: this.projectTrusted(this.trustProjectFor(conv.project)),
 			stats: snapshot.stats,
 			state: snapshot.state ? ({ ...snapshot.state, autoRetryEnabled } as typeof snapshot.state) : snapshot.state,
+			compactionReserveTokens: typeof reserve === "number" && Number.isSafeInteger(reserve) && reserve >= 0 ? reserve : undefined,
 			tools,
 			messages: snapshot.messages,
 		});
@@ -2098,6 +2106,10 @@ export class DesktopService {
 			try { await this.trashSessionFile(this.grailFile(id)); }
 			catch (error) {
 				this.diagnostic("warn", "grail.trash.failed", id, error instanceof Error ? error.message : String(error));
+			}
+			try { await this.trashSessionFile(toolOutputDirectory(join(this.options.dataDir, "tool-output"), id)); }
+			catch (error) {
+				this.diagnostic("warn", "output.trash.failed", id, error instanceof Error ? error.message : String(error));
 			}
 			if (this.store.activeId === id) {
 				const next =
@@ -3575,6 +3587,11 @@ export class DesktopService {
 		return this.languages.inspect(project, path, at);
 	}
 
+	async readToolOutput(conversationId: string, id: string, offset?: number) {
+		await this.operation;
+		return readToolOutputPage(join(this.options.dataDir, "tool-output"), this.conversation(conversationId).id, id, offset);
+	}
+
 	async readFile(path: string, conversationId?: string): Promise<{ path: string; content: string }> {
 		const target = await this.scopedPath(path, conversationId);
 		const info = await stat(target);
@@ -4515,6 +4532,7 @@ export class DesktopService {
 		const requirement = checkpoint ? await this.grailRequirements(conversation, since, run.startedAt, signal) : [];
 		const steps: GrailStepResults = {};
 		let files: GrailVerdict["files"] = [];
+		let evidence: GrailVerdict["evidence"];
 		const finish = (): GrailVerdict => ({
 			id: run.id,
 			conversationId: conversation.id,
@@ -4523,13 +4541,17 @@ export class DesktopService {
 			finishedAt: Date.now(),
 			...gradeVerdict(steps),
 			steps,
+			evidence,
 			requirement,
 			files,
 			model: model ? { provider: model.provider, id: model.id } : undefined,
 			costUsd: Math.round(budget.spent * 10000) / 10000,
 		});
 		step("diff");
-		const unjudgeable = (reason: string): GrailVerdict => ({ ...finish(), grade: "unjudgeable", reasons: [reason] });
+		const unjudgeable = (reason: string): GrailVerdict => {
+			steps.objective = skipObjectiveChecks(reason);
+			return { ...finish(), grade: "unjudgeable", reasons: [reason] };
+		};
 		if (!checkpoint) return unjudgeable(reason ?? "当前需求没有 Git 检查点。");
 		if (!requirement.length) return unjudgeable("这个愿望里没有用户需求消息。");
 		if (requirement.reduce((size, message) => size + message.length, 0) > 200_000) return unjudgeable("需求原文过长，无法完整鉴定。请封存并用更小的需求范围重新鉴定。");
@@ -4540,6 +4562,7 @@ export class DesktopService {
 			selected: workspace, objective: trusted ? objectiveRoot : undefined,
 		}, signal);
 		signal.throwIfAborted();
+		if (diff.evidence) evidence = { source: diff.evidence };
 		files = diff.files.map((file) => ({ path: file.path, status: file.status }));
 		if (diff.excludedFiles) return unjudgeable("有文件超出 Git 快照容量，无法完整鉴定改动。");
 		if (!diff.files.length) return unjudgeable("这个愿望没有代码改动。");
@@ -4558,10 +4581,10 @@ export class DesktopService {
 
 		step("objective");
 		if (!trusted)
-			steps.objective = { status: "unavailable", reason: "项目被标记为不信任，不执行项目脚本。", runs: [] };
+			steps.objective = skipObjectiveChecks("项目被标记为不信任，不执行项目脚本。");
 		else if (diff.objective && "project" in diff.objective)
 			steps.objective = await this.grailObjective(diff.objective, objectiveRoot, scratch, deadline, signal);
-		else steps.objective = { status: "unavailable", reason: diff.objective?.reason ?? "客观检查工作区不可用。", runs: [] };
+		else steps.objective = skipObjectiveChecks(diff.objective?.reason ?? "客观检查工作区不可用。");
 		signal.throwIfAborted();
 		if (steps.objective.status !== "pass") return finish();
 
@@ -4591,7 +4614,7 @@ export class DesktopService {
 
 		step("comparison");
 		try {
-			const prompt = buildComparisonPrompt(requirement, steps.blind.solution!, annotated.text);
+			const prompt = buildComparisonPrompt(requirement, steps.blind.solution!, annotated.text, steps.objective);
 			steps.comparison = parseComparison(await this.grailModelRun(workspace, model, prompt, budget, deadline, signal, conversation.id), lines);
 		} catch (error) {
 			if (signal.aborted) throw error;
@@ -4613,7 +4636,7 @@ export class DesktopService {
 			const reason = (error as NodeJS.ErrnoException).code === "ENOENT"
 				? "第一版只支持 Node/TypeScript 项目：项目根目录没有 package.json。"
 				: "package.json 无法解析。";
-			return { status: "unavailable", reason, runs: [] };
+			return skipObjectiveChecks(reason);
 		}
 		try {
 			let files: string[] = [];
@@ -4672,7 +4695,7 @@ export class DesktopService {
 			});
 		} catch (error) {
 			signal.throwIfAborted();
-			return { status: "unavailable", reason: `无法准备客观检查环境：${error instanceof Error ? error.message : String(error)}`, runs: [] };
+			return skipObjectiveChecks(`无法准备客观检查环境：${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 
@@ -7072,6 +7095,8 @@ export class DesktopService {
 			if (this.store.settings.minBalance) env.PI_DESKTOP_MIN_BALANCE = String(this.store.settings.minBalance);
 			const task = this.store.tasks.find((item) => item.conversationId === conversation.id);
 			const delegated = task?.parentConversationId ? task : undefined;
+			env.PI_DESKTOP_TOOL_OUTPUT_ROOT = join(this.options.dataDir, "tool-output");
+			env.PI_DESKTOP_TOOL_OUTPUT_OWNER = conversation.id;
 			const scopedRead = Boolean(delegated?.scopePaths);
 			const webSearchEnabled = this.store.settings.webSearchEnabled !== false && !scopedRead;
 			env.PI_DESKTOP_WEB_SEARCH_ENABLED = webSearchEnabled ? "1" : "0";
