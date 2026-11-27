@@ -34,13 +34,13 @@ test("werewolf uses host receipts and keeps unaddressed acceptance and invented 
 	assert.ok(buildWerewolfPrompt(input).includes(JSON.stringify(input)));
 });
 
-test("werewolf opt-in, per-reply state and planned evidence survive a new service", async () => {
+test("werewolf defaults to enabled and preserves reports and opt-outs across restarts", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-werewolf-state-"));
 	const service = new WerewolfService(dir);
 	try {
 		const input = { requirements: ["运行 node --test"], reply: "node --test 的退出码为 0。", receipts: [{ id: "one", command: "node --test", exitCode: 0 }] };
 		const messages: string[] = [];
-		service.subscribe((state) => messages.push(state.reviews.at(-1)?.status ?? "enabled"));
+		service.subscribe((state) => messages.push(state.reviews.at(-1)?.status ?? "empty"));
 		let planned = 0;
 		const materialize = async () => "snapshot-1";
 		const plan = async () => {
@@ -48,18 +48,20 @@ test("werewolf opt-in, per-reply state and planned evidence survive a new servic
 			return JSON.stringify({ claims: [{ quote: input.reply, description: "命令回执", receipt: { id: "one", expectedExitCode: 0 } }] });
 		};
 		const reply = { entryId: "assistant-entry", timestamp: 10, checkpointId: "cp1" };
-		await service.start("conversation", reply, input, materialize, plan);
-		assert.equal(planned, 0);
-		await service.setEnabled("conversation", true);
+		assert.equal((await service.state("conversation")).enabled, true);
 		await Promise.all([service.start("conversation", reply, input, materialize, plan),
 			service.start("conversation", reply, input, materialize, plan)]);
 		assert.equal(planned, 1);
-		assert.deepEqual(messages, ["enabled", "pending", "verified"]);
+		assert.deepEqual(messages, ["pending", "verified"]);
 		const saved = await readFile(join(dir, "werewolf", "conversation.json"), "utf8");
 		assert.ok(saved.includes("snapshot-1"));
+		await service.setEnabled("conversation", false);
 		const restarted = new WerewolfService(dir);
+		assert.equal((await restarted.state("conversation")).enabled, false);
 		assert.deepEqual(await restarted.state("conversation"), await service.state("conversation"));
-		assert.deepEqual((await restarted.state("another")).reviews, []);
+		await restarted.start("conversation", { ...reply, entryId: "next-assistant-entry" }, input, materialize, plan);
+		assert.equal(planned, 1);
+		assert.deepEqual(await restarted.state("another"), { conversationId: "another", enabled: true, reviews: [] });
 		await restarted.close();
 	} finally {
 		await service.close();

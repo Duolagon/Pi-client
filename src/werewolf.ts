@@ -148,7 +148,7 @@ export class WerewolfService {
 	}
 
 	private async read(conversationId: string): Promise<WerewolfState> {
-		const empty: WerewolfState = { conversationId, enabled: false, reviews: [] };
+		const empty: WerewolfState = { conversationId, enabled: true, reviews: [] };
 		const stored = await readFile(this.file(conversationId), "utf8").catch((error: NodeJS.ErrnoException) => {
 			if (error.code === "ENOENT") return undefined;
 			throw error;

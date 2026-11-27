@@ -96,6 +96,11 @@ export async function verifyWerewolf(executable, screenshot, inspect = false) {
 			await page.getByRole("textbox", { name: "输入任务", exact: true }).fill(text);
 			await page.getByRole("button", { name: "发送任务", exact: true }).click();
 		};
+		assert.equal((await page.evaluate((id) => window.pi.werewolf.state(id), conversationId)).enabled, true);
+		await page.getByRole("button", { name: "更多工具", exact: true }).click();
+		await page.getByRole("menuitem", { name: "停用狼人核验", exact: true }).click();
+		await waitFor(() => page.evaluate(async (id) => !(await window.pi.werewolf.state(id)).enabled, conversationId), "werewolf opt-out");
+		await page.reload();
 		assert.equal((await page.evaluate((id) => window.pi.werewolf.state(id), conversationId)).enabled, false);
 		await submit(oldMessage);
 		await page.locator("article.cl-msg-ai").getByText("旧轮已记录。", { exact: true }).waitFor();
@@ -140,7 +145,7 @@ export async function verifyWerewolf(executable, screenshot, inspect = false) {
 			await new Promise((resolve) => process.stdin.once("data", resolve));
 			process.stdin.pause();
 		}
-		return "werewolf opt-in, independent evidence probe, report and reload on the originating assistant reply";
+		return "werewolf default, persistent opt-out, independent evidence probe, and report on the originating reply";
 	} catch (cause) {
 		const footers = await page?.locator(".cl-ai-meta").allTextContents().catch(() => []);
 		const reviewStates = await page?.evaluate(async (id) => ({
