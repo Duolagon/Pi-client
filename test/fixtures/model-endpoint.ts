@@ -8,7 +8,7 @@ export interface ModelRequest {
 }
 
 /** Serve disposable model protocols over loopback without external credentials or requests. */
-export async function createModelEndpoint() {
+export async function createModelEndpoint(replyTo?: (request: ModelRequest) => string | Promise<string>) {
 	const requests: ModelRequest[] = [];
 	let failure: string | undefined;
 	let text = "WIRE_OK";
@@ -27,7 +27,8 @@ export async function createModelEndpoint() {
 			return;
 		}
 		const path = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
-		requests.push({ path, headers: request.headers, body: parsed as Record<string, unknown> });
+		const modelRequest: ModelRequest = { path, headers: request.headers, body: parsed as Record<string, unknown> };
+		requests.push(modelRequest);
 		notifyRequest();
 		if (stalled) return;
 		if (failure) {
@@ -35,6 +36,7 @@ export async function createModelEndpoint() {
 			response.end(JSON.stringify({ error: { type: "authentication_error", message: failure } }));
 			return;
 		}
+		const content = replyTo ? await replyTo(modelRequest) : text;
 		response.writeHead(200, { "content-type": "text/event-stream" });
 		if (path === "/v1/messages") {
 			for (const event of [
@@ -43,7 +45,7 @@ export async function createModelEndpoint() {
 					message: { id: "msg_desktop_test", usage: { input_tokens: 1, output_tokens: 0 } },
 				},
 				{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-				{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+				{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: content } },
 				{ type: "content_block_stop", index: 0 },
 				{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
 				{ type: "message_stop" },
@@ -55,7 +57,7 @@ export async function createModelEndpoint() {
 				id: "msg_desktop_test",
 				role: "assistant",
 				status: "completed",
-				content: [{ type: "output_text", text, annotations: [] }],
+				content: [{ type: "output_text", text: content, annotations: [] }],
 			};
 			for (const event of [
 				{ type: "response.created", response: { id: "resp_desktop_test" } },
@@ -66,7 +68,7 @@ export async function createModelEndpoint() {
 				response.write(`data: ${JSON.stringify(event)}\n\n`);
 		} else if (path === "/v1/chat/completions" || path === "/chat/completions") {
 			for (const chunk of [
-				{ id: "chatcmpl_desktop_test", choices: [{ index: 0, delta: { content: text } }] },
+				{ id: "chatcmpl_desktop_test", choices: [{ index: 0, delta: { content } }] },
 				{
 					id: "chatcmpl_desktop_test",
 					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],

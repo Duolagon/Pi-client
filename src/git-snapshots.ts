@@ -295,6 +295,18 @@ export class GitSnapshots {
 		});
 	}
 
+	/** Rebuild the files from the sealed end of a turn, even if the live project has moved on. */
+	async materializeAfter(project: string, id: string, conversationId: string, target: string, signal?: AbortSignal): Promise<string> {
+		const root = await this.queryRoot(project);
+		return this.serialize(root, async () => {
+			const { after, checkpoint } = await this.load(root, id, conversationId);
+			if (!after) throw new Error("该回复没有已封存的代码快照。");
+			if (checkpoint.excludedFiles) throw new Error("代码快照有文件超出容量，无法完整核验。");
+			await this.materializeEntries(root, target, after, signal);
+			return sourceFingerprint(after);
+		});
+	}
+
 	private async materializeEntries(root: string, target: string, entries: Record<string, Entry>, signal?: AbortSignal): Promise<void> {
 		if (inside(root, resolve(target))) throw new Error("快照副本必须位于项目目录之外。");
 		for (const [path, entry] of Object.entries(entries).sort(([a], [b]) => a.localeCompare(b))) {

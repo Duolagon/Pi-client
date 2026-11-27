@@ -156,6 +156,12 @@ const api: DesktopAPI = {
 		seal: (conversationId) => ipcRenderer.invoke("pi:grail:seal", conversationId),
 		onEvent: (listener) => listen("pi:grail:event", listener),
 	},
+	werewolf: {
+		state: (conversationId) => ipcRenderer.invoke("pi:werewolf:state", conversationId),
+		setEnabled: (conversationId, enabled) => ipcRenderer.invoke("pi:werewolf:enabled", conversationId, enabled),
+		replay: (conversationId, reviewId, claimId) => ipcRenderer.invoke("pi:werewolf:replay", conversationId, reviewId, claimId),
+		onEvent: (listener) => listen("pi:werewolf:event", listener),
+	},
 	snapshot: () => ipcRenderer.invoke("pi:snapshot"),
 	openProject: () => ipcRenderer.invoke("pi:open-project"),
 	selectProject: (path) => ipcRenderer.invoke("pi:select-project", path),

@@ -621,6 +621,14 @@ function installHandlers() {
 		return state;
 	});
 	handle("pi:grail:seal", (id) => service.sealGrailWish(string(id, "会话 ID", 200)));
+	handle("pi:werewolf:state", (id) => service.werewolfState(string(id, "会话 ID", 200)));
+	handle("pi:werewolf:enabled", (id, enabled) => {
+		if (typeof enabled !== "boolean") throw new Error("狼人核验开关格式错误。");
+		return service.setWerewolfEnabled(string(id, "会话 ID", 200), enabled);
+	});
+	handle("pi:werewolf:replay", (id, review, claim) => service.replayWerewolfEvidence(
+		string(id, "会话 ID", 200), string(review, "核验 ID", 200), string(claim, "声明 ID", 40),
+	));
 	handle("pi:doctor", () => service.doctor());
 	handle("pi:usage-stats", (input) => {
 		if (input === undefined || input === null) return service.usageStats({});
@@ -865,6 +873,9 @@ void app.whenReady().then(async () => {
 	});
 	service.subscribeGrail((event) => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:grail:event", event);
+	});
+	service.subscribeWerewolf((state) => {
+		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:werewolf:event", state);
 	});
 	service.subscribeWorkflows((event) => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:workflow:event", event);

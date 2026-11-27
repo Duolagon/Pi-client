@@ -1,4 +1,5 @@
 import type { ComposerDraft } from "./composer-draft.ts";
+import type { DesktopWerewolfAPI } from "./werewolf-types.ts";
 import type {
 	JsonAgentSessionEvent,
 	RpcCommand,
@@ -787,6 +788,7 @@ export interface DesktopAPI {
 	teams: DesktopTeamsAPI;
 	workflow: DesktopWorkflowAPI;
 	grail: DesktopGrailAPI;
+	werewolf: DesktopWerewolfAPI;
 	snapshot(): Promise<Snapshot>;
 	openProject(): Promise<Snapshot | null>;
 	selectProject(path: string): Promise<Snapshot>;

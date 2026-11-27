@@ -135,6 +135,12 @@ const navigation = await window.pi.sessions.navigate({ conversationId, targetId:
 
 `pi.searchConversations(query)` 查询会话当前分支的历史，返回 `{ matches, partial }`。分支文件不可读取或达到扫描上限时，`partial` 为 `true`；空查询取消当前扫描。
 
+## 狼人核验
+
+「更多工具」和命令面板可为当前会话启用狼人核验，默认关闭。启用后，Pi 在带 Git 检查点的用户回合正常结束时，使用已封存的工作区和当前回合的输入做验收，报告随原生回复保存。核验使用配置的复核模型或当前模型设计探针，有独立超时并根据模型返回的用量检查费用预算。脚本执行需要受信任项目和可用的只读沙箱。
+
+`pi.werewolf.state(conversationId)` 查询报告，`setEnabled(conversationId, enabled)` 切换状态，`onEvent(listener)` 订阅状态变化。`replay(conversationId, reviewId, claimId)` 在原代码指纹上复现已记录的行为探针，无需调用模型。证据可引用原记录、源码摘录或沙箱中的导出函数执行；源码摘录和无法证明适用范围的执行保留为待核验。
+
 ## 导入已有 Pi CLI 历史
 
 ```ts

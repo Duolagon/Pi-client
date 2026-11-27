@@ -2,39 +2,48 @@ import type { SessionEntriesResult } from "../session-types.ts";
 import type { GitCheckpoint } from "../git-types.ts";
 import type { Message } from "../shared.ts";
 
-type UserMessage = Extract<Message, { role: "user" }>;
+type AnchoredRole = "user" | "assistant";
+type AnchoredMessage = Extract<Message, { role: AnchoredRole }>;
 
-function sameUserMessage(message: UserMessage, candidate: UserMessage): boolean {
+function sameMessage(message: AnchoredMessage, candidate: AnchoredMessage): boolean {
 	if (message.timestamp !== candidate.timestamp) return false;
 	return JSON.stringify(message.content) === JSON.stringify(candidate.content);
 }
 
 /** Pair the visible transcript with Pi's active native branch, including repeated prompts. */
-export function matchUserEntries(messages: Message[], session: SessionEntriesResult): Record<number, string> {
+function matchMessageEntries(messages: Message[], session: SessionEntriesResult, role: AnchoredRole): Record<number, string> {
 	const entries = new Map(session.entries.map((entry) => [entry.id, entry]));
-	const users: { id: string; message: UserMessage }[] = [];
+	const branch: { id: string; message: AnchoredMessage }[] = [];
 	const visited = new Set<string>();
 	for (let id = session.leafId; id;) {
 		if (visited.has(id)) return {};
 		visited.add(id);
 		const entry = entries.get(id);
 		if (!entry) return {};
-		if (entry.type === "message" && entry.message.role === "user") users.push({ id, message: entry.message });
+		if (entry.type === "message" && entry.message.role === role) branch.push({ id, message: entry.message });
 		id = entry.parentId;
 	}
-	users.reverse();
-	const visible = messages.flatMap((message, index) => message.role === "user" ? [{ message, index }] : []);
-	const offset = users.length - visible.length;
+	branch.reverse();
+	const visible = messages.flatMap((message, index) => message.role === role ? [{ message, index }] : []);
+	const offset = branch.length - visible.length;
 	if (offset < 0) return {};
 	const pairs: Record<number, string> = {};
 	// Compaction can omit a prefix of the native history. Anchor to the active leaf and validate each pair.
 	for (let i = 0; i < visible.length; i++) {
-		const user = visible[i];
-		const native = users[offset + i];
-		if (!sameUserMessage(user.message, native.message)) return {};
-		pairs[user.index] = native.id;
+		const entry = visible[i];
+		const native = branch[offset + i];
+		if (!sameMessage(entry.message, native.message)) return {};
+		pairs[entry.index] = native.id;
 	}
 	return pairs;
+}
+
+export function matchUserEntries(messages: Message[], session: SessionEntriesResult): Record<number, string> {
+	return matchMessageEntries(messages, session, "user");
+}
+
+export function matchAssistantEntries(messages: Message[], session: SessionEntriesResult): Record<number, string> {
+	return matchMessageEntries(messages, session, "assistant");
 }
 
 export function checkpointByEntry(checkpoints: GitCheckpoint[]): Map<string, GitCheckpoint> {

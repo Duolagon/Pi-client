@@ -1,0 +1,145 @@
+.cc-werewolf-badge,
+.cc-werewolf-summary {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	color: var(--cl-2);
+}
+
+.cc-werewolf-report {
+	display: grid;
+	gap: 12px;
+}
+
+.cc-werewolf-report > p {
+	margin: 0;
+}
+
+.cc-werewolf-badge {
+	border: 1px solid var(--cl-line);
+	border-radius: 999px;
+	min-height: 24px;
+	padding: 1px 8px;
+	font: inherit;
+}
+
+.cc-werewolf-badge:hover {
+	background: var(--cl-hover);
+}
+
+.cl-ai-meta:has(> .cc-werewolf-badge) {
+	flex-wrap: wrap;
+}
+
+.cc-werewolf-badge:focus-visible {
+	outline: 2px solid var(--cl-clay);
+	outline-offset: 2px;
+}
+
+.cc-werewolf-badge small {
+	padding-inline-start: 5px;
+	border-inline-start: 1px solid var(--cl-line);
+	font: inherit;
+}
+
+.cc-werewolf-badge.contradicted,
+.cc-werewolf-summary.contradicted,
+.cc-werewolf-claims h3 .contradicted {
+	color: var(--cl-red);
+}
+
+.cc-werewolf-badge.verified,
+.cc-werewolf-summary.verified,
+.cc-werewolf-claims h3 .verified {
+	color: var(--cl-green);
+}
+
+.cc-werewolf-summary {
+	flex-wrap: wrap;
+	gap: 8px;
+}
+
+.cc-werewolf-summary :is(code, small) {
+	color: var(--cl-3);
+}
+
+.cc-werewolf-metrics {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(min(125px, 100%), 1fr));
+	gap: 8px;
+	margin: 0;
+}
+
+.cc-werewolf-metrics > div,
+.cc-werewolf-claims li {
+	min-width: 0;
+	border: 1px solid var(--cl-line);
+	border-radius: 8px;
+	padding: 10px 12px;
+}
+
+.cc-werewolf-metrics dt {
+	color: var(--cl-3);
+	font-size: var(--fs-xs);
+}
+
+.cc-werewolf-metrics dd {
+	margin: 4px 0 0;
+	font-weight: 600;
+	font-variant-numeric: tabular-nums;
+}
+
+.cc-werewolf-claims {
+	display: grid;
+	gap: 8px;
+	list-style: none;
+	margin: 0;
+	padding: 0;
+}
+
+.cc-werewolf-claims h3 {
+	font: inherit;
+	font-weight: 600;
+	overflow-wrap: anywhere;
+	margin: 0;
+}
+
+.cc-werewolf-evidence:empty {
+	display: none;
+}
+
+.cc-werewolf-evidence {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr);
+	gap: 6px 10px;
+	margin: 8px 0 0;
+}
+
+.cc-werewolf-evidence dt {
+	color: var(--cl-3);
+}
+
+.cc-werewolf-evidence dd {
+	margin: 0;
+	min-width: 0;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+.cc-werewolf-evidence pre,
+.cc-werewolf-replay pre {
+	margin: 0;
+	max-height: 150px;
+	overflow: auto;
+	white-space: pre-wrap;
+	font-size: var(--fs-xs);
+}
+
+.cc-werewolf-replay {
+	margin-top: 10px;
+}
+
+.cc-werewolf-replay > :is(p, div) {
+	margin-top: 8px;
+	overflow-wrap: anywhere;
+}

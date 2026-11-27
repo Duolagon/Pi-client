@@ -16,6 +16,10 @@ import { promisify } from "node:util";
 import { AgentProcess } from "./rpc.ts";
 import type { PiTracing } from "./langfuse-tracing.ts";
 import { GitSnapshots, MAX_CHECKPOINT_FILE_BYTES } from "./git-snapshots.ts";
+import { WerewolfService, type WerewolfReceipt } from "./werewolf.ts";
+import type { WerewolfState } from "./werewolf-types.ts";
+import { executeWerewolfProbe, parseWerewolfProbe } from "./werewolf-probes.ts";
+import { isVerifyCommand } from "./verification-command.ts";
 import {
 	annotateDiff,
 	buildBlindPrompt,
@@ -441,6 +445,7 @@ export class DesktopService {
 	};
 	private runtimes = new Map<string, SessionRuntime>();
 	private git: GitSnapshots;
+	private werewolf: WerewolfService;
 	private terminals: TerminalService;
 	private worktrees: WorktreeService;
 	private history: SessionHistoryService;
@@ -505,6 +510,7 @@ export class DesktopService {
 
 	constructor(options: ServiceOptions) {
 		this.options = options;
+		this.werewolf = new WerewolfService(options.dataDir);
 		this.languages = new LanguageService(options.env);
 		this.toolSettings = new ToolSettingsStore(options.dataDir);
 		this.agents = new AgentRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
@@ -4411,6 +4417,115 @@ export class DesktopService {
 		return result.path;
 	}
 
+	subscribeWerewolf(listener: (state: WerewolfState) => void): () => void {
+		return this.werewolf.subscribe(listener);
+	}
+
+	async werewolfState(conversationId: string): Promise<WerewolfState> {
+		await this.operation;
+		return this.werewolf.state(this.conversation(conversationId).id);
+	}
+
+	async setWerewolfEnabled(conversationId: string, enabled: boolean): Promise<WerewolfState> {
+		await this.operation;
+		return this.werewolf.setEnabled(this.conversation(conversationId).id, enabled);
+	}
+
+	async replayWerewolfEvidence(conversationId: string, reviewId: string, claimId: string) {
+		await this.operation;
+		const conversation = this.conversation(conversationId);
+		if (!this.isProjectTrusted(conversation.project)) throw new Error("请先信任项目，再复现核验用例。");
+		const state = await this.werewolf.state(conversation.id);
+		const review = state.reviews.find((item) => item.id === reviewId);
+		const claim = review?.claims.find((item) => item.id === claimId);
+		if (!review?.checkpointId || !review.revision || !claim?.evidence?.reproduction)
+			throw new Error("找不到该用例及对应的代码快照。");
+		const parse = () => {
+			try { return parseWerewolfProbe(JSON.parse(claim.evidence!.reproduction!)); }
+			catch { return undefined; }
+		};
+		const probe = parse();
+		if (probe?.kind !== "behavior") throw new Error("该证据引用原始执行记录。");
+		const snapshot = await mkdtemp(join(tmpdir(), "pi-werewolf-replay-"));
+		try {
+			const signal = AbortSignal.timeout(35_000);
+			const fingerprint = await this.git.materializeAfter(conversation.project, review.checkpointId, conversation.id, snapshot, signal);
+			if (fingerprint !== review.revision) throw new Error("快照与原核验版本不同。");
+			const { status, ...evidence } = await executeWerewolfProbe(snapshot, probe, signal);
+			return { status, evidence };
+		} finally {
+			await rm(snapshot, { recursive: true, force: true });
+		}
+	}
+
+	private async startWerewolfReview(runtime: SessionRuntime, checkpoint: GitCheckpoint): Promise<void> {
+		if (this.closed || !checkpoint.userEntryId || !runtime.agent ||
+			!(await this.werewolf.state(runtime.conversationId)).enabled) return;
+		const conversation = this.conversation(runtime.conversationId);
+		const native = await runtime.agent.request<SessionEntriesResult>({ type: "get_entries" });
+		const byId = new Map(native.entries.map((entry) => [entry.id, entry]));
+		const branch: SessionEntriesResult["entries"] = [];
+		for (let id = native.leafId; id;) {
+			const entry = byId.get(id);
+			if (!entry) return;
+			branch.push(entry);
+			byId.delete(id);
+			id = entry.parentId;
+		}
+		branch.reverse();
+		const from = branch.findIndex((entry) => entry.id === checkpoint.userEntryId);
+		if (from < 0) return;
+		const reply = branch.findLast((entry) => entry.type === "message" && entry.message.role === "assistant" &&
+			entry.message.stopReason === "stop");
+		if (!reply || reply.type !== "message" || reply.message.role !== "assistant" || branch.indexOf(reply) <= from) return;
+		const replyText = reply.message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n").trim();
+		if (!replyText) return;
+		const prefix = branch.slice(0, branch.indexOf(reply));
+		if (prefix.findLastIndex((entry) => entry.type === "message" && entry.message.role === "user") < from) return;
+		const requirements = prefix.slice(from).flatMap((entry) => {
+			if (entry.type !== "message" || entry.message.role !== "user") return [];
+			const content = entry.message.content;
+			const text = typeof content === "string" ? visiblePromptText(content) : content.flatMap((block, index) =>
+				block.type === "text" && !(index > 0 && isDesktopWorkspaceContext(block.text)) ? [block.text] : []).join("\n");
+			return text.trim() ? [text.slice(0, 8000)] : [];
+		}).slice(-8);
+		if (!requirements.length) return;
+		const commands = new Map<string, string>();
+		const receipts: WerewolfReceipt[] = [];
+		for (const item of prefix.slice(from)) {
+			if (item.type !== "message") continue;
+			const message = item.message;
+			if (message.role === "assistant") {
+				for (const block of message.content) {
+					if (block.type === "toolCall" && block.name.toLowerCase() === "bash" &&
+						typeof block.arguments.command === "string" && block.arguments.command.length <= 400 &&
+						isVerifyCommand(block.arguments.command)) commands.set(block.id, block.arguments.command);
+				}
+			} else if (message.role === "toolResult") {
+				const command = commands.get(message.toolCallId);
+				const details = message.details as { exitCode?: unknown; background?: unknown } | undefined;
+				if (command && details?.background !== true && Number.isInteger(details?.exitCode))
+					receipts.push({ id: message.toolCallId, command, exitCode: details!.exitCode as number });
+			}
+		}
+		const routed = this.store.settings.modelRouting?.review;
+		const model = routed && runtime.models.some((item) => item.provider === routed.provider && item.id === routed.id)
+			? routed : runtime.state?.model;
+		const trusted = this.isProjectTrusted(conversation.project);
+		const replyAnchor = { entryId: reply.id, timestamp: reply.message.timestamp, checkpointId: checkpoint.id };
+		void this.werewolf.start(conversation.id, replyAnchor,
+			{ requirements, reply: replyText.slice(0, 32000), receipts: receipts.slice(-40) },
+			(target, signal) => this.git.materializeAfter(conversation.project, checkpoint.id, conversation.id, target, signal),
+			async ({ prompt, snapshot, signal }) => {
+				if (!trusted) throw new Error("请先信任项目，再自动验收该项目的代码。");
+				if (!model?.provider || !model.id) throw new Error("当前没有可用的核验模型。");
+				return this.grailModelRun(snapshot, model, prompt, { spent: 0, max: 0.03 }, Date.now() + 75_000,
+					signal, conversation.id, "werewolf");
+			},
+		).catch((error) => this.diagnostic("warn", "werewolf.review.failed", conversation.id,
+			error instanceof Error ? error.message : String(error)));
+	}
+
 	subscribeGrail(listener: (event: GrailEvent) => void): () => void {
 		this.grailListeners.add(listener);
 		return () => this.grailListeners.delete(listener);
@@ -4821,6 +4936,7 @@ export class DesktopService {
 		deadline: number,
 		signal: AbortSignal,
 		conversationId: string,
+		purpose: "grail" | "werewolf" = "grail",
 	): Promise<string> {
 		const assertCanReview = () => {
 			signal.throwIfAborted();
@@ -4828,7 +4944,7 @@ export class DesktopService {
 			if (budget.spent >= budget.max) throw new Error(`鉴定费用额度已用完（上限 $${budget.max}）。`);
 		};
 		assertCanReview();
-		const traceId = this.options.tracing ? randomUUID() : "";
+		const traceId = purpose === "grail" && this.options.tracing ? randomUUID() : "";
 		const env: NodeJS.ProcessEnv = {
 			...process.env,
 			...this.options.env,
@@ -4876,6 +4992,7 @@ export class DesktopService {
 					"--no-prompt-templates",
 					"--no-context-files",
 					"--no-approve",
+					...(purpose === "werewolf" ? ["--no-extensions"] : []),
 					"--extension",
 					this.options.permissionExtension ?? join(runtimeDir, "permission-extension.mjs"),
 					"--provider",
@@ -4886,7 +5003,7 @@ export class DesktopService {
 				env,
 				onEvent: (event) => {
 					// The host determines the outcome after checking budget and validating the response.
-					if (event.type !== "agent_settled" && event.type !== "desktop_error")
+					if (traceId && event.type !== "agent_settled" && event.type !== "desktop_error")
 						this.options.tracing?.observe(traceId, event, conversationId, undefined, undefined, "grail");
 					if (event.type === "message_end" && event.message.role === "assistant") {
 						last = event.message;
@@ -4939,7 +5056,7 @@ export class DesktopService {
 		} finally {
 			if (onAbort) signal.removeEventListener("abort", onAbort);
 			await agent?.stop();
-			this.options.tracing?.finishRun(traceId, signal.reason?.name === "AbortError" ? "aborted" : signal.aborted ? "error" : outcome);
+			if (traceId) this.options.tracing?.finishRun(traceId, signal.reason?.name === "AbortError" ? "aborted" : signal.aborted ? "error" : outcome);
 			await rm(controls, { recursive: true, force: true });
 		}
 	}
@@ -6638,6 +6755,7 @@ export class DesktopService {
 
 	async close(): Promise<void> {
 		this.closed = true;
+		await this.werewolf.close();
 		this.searchAbort?.abort();
 		this.remoteJobs.dispose();
 		this.languages.close();
@@ -6893,6 +7011,7 @@ export class DesktopService {
 	private async finishRuntime(runtime: SessionRuntime, aborted: boolean, error?: string): Promise<void> {
 		this.clearTaskProgressTimer(runtime);
 		try {
+			let sealedCheckpoint: GitCheckpoint | undefined;
 			if (runtime.checkpointId) {
 				const checkpointId = runtime.checkpointId;
 				const anchor = runtime.checkpointUserAnchor;
@@ -6910,10 +7029,13 @@ export class DesktopService {
 					}
 				}
 				const conversation = this.conversation(runtime.conversationId);
-				await this.git.finish(conversation.project, checkpointId, { conversationId: conversation.id, userEntryId });
+				sealedCheckpoint = await this.git.finish(conversation.project, checkpointId, { conversationId: conversation.id, userEntryId });
 			}
 			await this.syncState(runtime).catch(() => {});
 			await this.saveSessionLeaf(runtime).catch(() => {});
+			if (sealedCheckpoint && !aborted && !error && runtime.workingTurn?.active === false)
+				await this.startWerewolfReview(runtime, sealedCheckpoint).catch((cause) =>
+					this.diagnostic("warn", "werewolf.capture.failed", runtime.conversationId, cause instanceof Error ? cause.message : String(cause)));
 			this.conversation(runtime.conversationId).updatedAt = Date.now();
 			const task = this.store.tasks.find((item) => item.conversationId === runtime.conversationId);
 			if (task?.parentConversationId && !runtime.metaWritten) {

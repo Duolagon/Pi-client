@@ -13,6 +13,9 @@ import { CodeLines, InlineEditDiff } from "./DiffView.tsx";
 import { summarizeLineChanges, type LineChangeCounts } from "./diff-lines.ts";
 import { highlightCode, inferLangFromPath } from "./highlight.tsx";
 import { collectVerificationEvidence, scoreTurn, type QualityVerdict, type VerificationCheck } from "./quality-verdict.ts";
+import type { WerewolfReview } from "../werewolf-types.ts";
+import { WerewolfBadge, WerewolfReportDialog, type ReplayWerewolfClaim } from "./WerewolfReport.tsx";
+import { werewolfReviewForReply } from "./werewolf-view.ts";
 import { OmenGlyph } from "./GrailIcons.tsx";
 import { isDesktopWorkspaceContext } from "../file-references.ts";
 import { toolOutputReference } from "../tool-output-types.ts";
@@ -423,6 +426,9 @@ export function TranscriptView({
 	onForkPrompt,
 	onEditPrompt,
 	entryIds,
+	assistantEntryIds,
+	werewolfReviews,
+	onReplayWerewolf,
 	checkpointIds,
 	backgroundMonitors,
 	approvalTool,
@@ -443,6 +449,9 @@ export function TranscriptView({
 	onForkPrompt?: (entryId: string) => void;
 	onEditPrompt?: (entryId: string) => void;
 	entryIds?: Record<number, string>;
+	assistantEntryIds?: Record<number, string>;
+	werewolfReviews?: readonly WerewolfReview[];
+	onReplayWerewolf?: ReplayWerewolfClaim;
 	checkpointIds?: Record<string, string>;
 	backgroundMonitors?: readonly MonitorRecord[];
 	approvalTool?: string;
@@ -454,6 +463,8 @@ export function TranscriptView({
 	findAnchorKey?: string;
 }) {
 	const [lightbox, setLightbox] = useState<ImagePreview | null>(null);
+	const [werewolfReportId, setWerewolfReportId] = useState<string>();
+	const werewolfReport = werewolfReviews?.find((review) => review.id === werewolfReportId);
 	const [unitWindowLimit, setUnitWindowLimit] = useState(64);
 	const scrollAnchorRef = useRef<{ el: HTMLElement; prevHeight: number; prevTop: number } | null>(null);
 	useLayoutEffect(() => {
@@ -655,6 +666,8 @@ export function TranscriptView({
 				const firstIndex = messageIndices.get(unit.messages[0]) ?? -1;
 				const lastIndex = messageIndices.get(last) ?? -1;
 				const isStreaming = state.streamingIndex !== null && state.streamingIndex >= firstIndex && state.streamingIndex <= lastIndex;
+				const werewolfReview = !isStreaming && werewolfReviews?.length
+					? werewolfReviewForReply(werewolfReviews, last.timestamp, assistantEntryIds?.[lastIndex]) : undefined;
 				const errorMessage = [...unit.messages].reverse().find((message) => message.errorMessage)?.errorMessage;
 				const aborted = unit.messages.some((message) => message.stopReason === "aborted");
 				const usage = last.usage;
@@ -724,9 +737,9 @@ export function TranscriptView({
 								</ul>
 							</AnimatedDetails>
 						)}
-						{!isStreaming && last.model && (
+						{!isStreaming && (last.model || werewolfReview) && (
 							<footer className="cl-ai-meta">
-								<span>{last.model}</span>
+								{last.model && <span>{last.model}</span>}
 								{usage && (usage.input > 0 || usage.output > 0) && (
 									<span>
 										{formatTokens(usage.input)} in · {formatTokens(usage.output)} out
@@ -740,12 +753,14 @@ export function TranscriptView({
 										<span className="cc-omen-label">{verdict.label}</span>
 									</span>
 								)}
+								{werewolfReview && <WerewolfBadge review={werewolfReview} onOpen={() => setWerewolfReportId(werewolfReview.id)} />}
 								<CopyTurnButton text={turnText} />
 							</footer>
 						)}
 					</article>
 				);
 			})}
+			{werewolfReport && <WerewolfReportDialog key={werewolfReport.id} review={werewolfReport} onReplay={onReplayWerewolf} close={() => setWerewolfReportId(undefined)} />}
 			{lightbox && (
 				<Modal title={lightbox.alt} className="cc-image-preview-modal" close={() => setLightbox(null)}>
 					<div className="cc-image-preview-stage">

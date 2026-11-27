@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { _electron as electron } from "playwright";
 import { verifyCommitDraft } from "./verify-commit-draft.mjs";
+import { verifyWerewolf } from "./verify-werewolf.mjs";
 import { verifyWorkspaceNavigation } from "./verify-workspace-navigation.mjs";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -1939,6 +1940,7 @@ try {
 
 	checks.push(...await verifyWorkspaceNavigation({ page, root, agentDir, cliFixtures, ready, workspaceScreenshots }));
 	checks.push(await verifyCommitDraft(executable));
+	if (process.platform === "darwin") checks.push(await verifyWerewolf(executable, workspaceScreenshots ? join(workspaceScreenshots, "werewolf-evidence.png") : undefined));
 
 	assert.deepEqual(pageErrors, []);
 	if (capture)

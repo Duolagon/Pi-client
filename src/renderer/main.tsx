@@ -108,12 +108,13 @@ import { SlidingTabList } from "./SegmentedTabs.tsx";
 import "./grail-theme.css";
 import "./task-flow.css";
 import "./motion-and-polish.css";
-import { checkpointByEntry, matchUserEntries, submittedPlan } from "./turn-state.ts";
+import { checkpointByEntry, matchAssistantEntries, matchUserEntries, submittedPlan } from "./turn-state.ts";
 import { runLabels } from "./run-status.ts";
 import { TaskAttention, type AttentionItem } from "./TaskAttention.tsx";
 import { fileReferences, formatFileReference } from "../file-references.ts";
 import { useSessionWorkspace } from "./session-workspace.ts";
 import { useBackgroundShells } from "./useBackgroundShells.ts";
+import { useWerewolf } from "./useWerewolf.ts";
 import type { GitCheckpoint } from "../git-types.ts";
 import type { SessionEntriesResult } from "../session-types.ts";
 
@@ -460,6 +461,14 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [grailReveal, setGrailReveal] = useState(false);
 	const pendingReveal = useRef<string | undefined>(undefined);
 	const activeConversationId = snapshot?.active?.id;
+	const { state: werewolf, toggle: toggleWerewolf, toggling: togglingWerewolf } = useWerewolf(api.werewolf, activeConversationId);
+	const werewolfToggleLabel = werewolf?.enabled ? "停用狼人核验" : "启用狼人核验";
+	const werewolfHelp = "在有 Git 检查点的回复结束后独立核对关键承诺，会额外调用核验模型。";
+	const changeWerewolf = () => {
+		void toggleWerewolf().then((next) => {
+			if (next) setFlash(next.enabled ? "已为当前会话启用狼人核验" : "已为当前会话停用狼人核验");
+		}).catch(app.fail);
+	};
 	const activeConversationRef = useRef(activeConversationId);
 	activeConversationRef.current = activeConversationId;
 	const kaggleSelection = activeConversationId ? kaggleSelections[activeConversationId] : undefined;
@@ -1485,6 +1494,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	};
 	const currentTurnData = turnData?.conversationId === snapshot?.active?.id ? turnData : undefined;
 	const entryIds = useMemo(() => currentTurnData ? matchUserEntries(history.messages, currentTurnData.entries) : {}, [history.messages, currentTurnData]);
+	const assistantEntryIds = useMemo(() => currentTurnData && werewolf?.reviews.length ? matchAssistantEntries(history.messages, currentTurnData.entries) : undefined,
+		[history.messages, currentTurnData, werewolf?.reviews.length]);
 	const checkpointsByEntry = useMemo(() => checkpointByEntry(currentTurnData?.checkpoints ?? []), [currentTurnData]);
 	const checkpointIds = useMemo(() => Object.fromEntries(Array.from(checkpointsByEntry, ([entry, point]) => [entry, point.id])), [checkpointsByEntry]);
 	const lastUserIndex = history.messages.findLastIndex((message) => message.role === "user");
@@ -1629,6 +1640,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		{ id: "plan", label: inPlanMode ? "退出 Plan 计划模式" : "进入 Plan 计划模式", keywords: "plan mode readonly", disabled: blocked, run: () => void togglePlanMode() },
 		{ id: "rewind", label: "检查点与代码回滚 (/rewind)", keywords: "git checkpoint restore", disabled: !snapshot.active, run: () => { openCheckpoint(); } },
 		{ id: "tasks", label: "后台任务、子 Agent 与 Worktree (/tasks)", keywords: "subagent external codex claude kimi antigravity agy", run: () => { setTaskInitialId(undefined); setTasksOpen(true); } },
+		{ id: "werewolf", label: werewolfToggleLabel, keywords: `werewolf audit verifier verification 幻觉 独立验收 ${werewolfHelp}`, disabled: !werewolf || togglingWerewolf, run: changeWerewolf },
 		{ id: "agents", label: "Agents 与子 Agent (/agents)", keywords: "agents subagent custom reviewer", run: () => setAgentsOpen(true) },
 		{ id: "mcp", label: "MCP 服务器管理 (/mcp)", keywords: "mcp servers oauth", run: () => setMcpOpen(true) },
 		{ id: "hooks", label: "生命周期 Hooks 管理 (/hooks)", keywords: "hooks pretooluse posttooluse", run: () => setControlsTab("hooks") },
@@ -2284,6 +2296,21 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								<div ref={moreMenuNodeRef} className="cc-more-menu" role="menu" aria-label="更多工具菜单">
 									<div className="cc-more-group">
 										<div className="cc-more-label">工作区与会话</div>
+										{api.werewolf && <button
+											type="button"
+											role="menuitem"
+											className="cc-more-item"
+											disabled={!werewolf || togglingWerewolf}
+											title={werewolfHelp}
+											aria-description={werewolfHelp}
+											onClick={() => {
+												setMoreMenuOpen(false);
+												changeWerewolf();
+											}}
+										>
+											<ShieldCheck size={14} aria-hidden="true" />
+											<span>{werewolfToggleLabel}</span>
+										</button>}
 										<button
 											type="button"
 											role="menuitem"
@@ -2702,6 +2729,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											onStopTask={(id, kind) => void stopSubagent(id, kind)}
 											onOpenFile={openInEditor}
 											entryIds={entryIds}
+											assistantEntryIds={assistantEntryIds}
+											werewolfReviews={werewolf?.reviews}
+											onReplayWerewolf={activeConversationId && api.werewolf?.replay ? (reviewId, claimId) => api.werewolf.replay(activeConversationId, reviewId, claimId) : undefined}
 											checkpointIds={checkpointIds}
 											approvalTool={approvalTool}
 											forceExpandAll={findOpen}
