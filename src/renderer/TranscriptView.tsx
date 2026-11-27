@@ -14,7 +14,7 @@ import { summarizeLineChanges, type LineChangeCounts } from "./diff-lines.ts";
 import { highlightCode, inferLangFromPath } from "./highlight.tsx";
 import { collectVerificationEvidence, scoreTurn, type QualityVerdict, type VerificationCheck } from "./quality-verdict.ts";
 import type { WerewolfReview } from "../werewolf-types.ts";
-import { WerewolfBadge, WerewolfReportDialog, type ReplayWerewolfClaim } from "./WerewolfReport.tsx";
+import { WerewolfBadge, WerewolfCalloutStrip, WerewolfReportDialog, type ReplayWerewolfClaim } from "./WerewolfReport.tsx";
 import { werewolfReviewForReply } from "./werewolf-view.ts";
 import { OmenGlyph } from "./GrailIcons.tsx";
 import { isDesktopWorkspaceContext } from "../file-references.ts";
@@ -429,6 +429,9 @@ export function TranscriptView({
 	assistantEntryIds,
 	werewolfReviews,
 	onReplayWerewolf,
+	onConfrontWerewolf,
+	openWerewolfId,
+	onOpenWerewolfChange,
 	checkpointIds,
 	backgroundMonitors,
 	approvalTool,
@@ -452,6 +455,9 @@ export function TranscriptView({
 	assistantEntryIds?: Record<number, string>;
 	werewolfReviews?: readonly WerewolfReview[];
 	onReplayWerewolf?: ReplayWerewolfClaim;
+	onConfrontWerewolf?: (prompt: string) => void;
+	openWerewolfId?: string;
+	onOpenWerewolfChange?: (id?: string) => void;
 	checkpointIds?: Record<string, string>;
 	backgroundMonitors?: readonly MonitorRecord[];
 	approvalTool?: string;
@@ -463,7 +469,12 @@ export function TranscriptView({
 	findAnchorKey?: string;
 }) {
 	const [lightbox, setLightbox] = useState<ImagePreview | null>(null);
-	const [werewolfReportId, setWerewolfReportId] = useState<string>();
+	const [internalWerewolfId, setInternalWerewolfId] = useState<string>();
+	const werewolfReportId = openWerewolfId !== undefined ? openWerewolfId : internalWerewolfId;
+	const setWerewolfReportId = (next?: string) => {
+		setInternalWerewolfId(next);
+		onOpenWerewolfChange?.(next);
+	};
 	const werewolfReport = werewolfReviews?.find((review) => review.id === werewolfReportId);
 	const [unitWindowLimit, setUnitWindowLimit] = useState(64);
 	const scrollAnchorRef = useRef<{ el: HTMLElement; prevHeight: number; prevTop: number } | null>(null);
@@ -686,7 +697,12 @@ export function TranscriptView({
 					.join("\n\n");
 				const isLatestTurn = index === allUnits.findLastIndex((u) => u.kind === "turn");
 				return (
-					<article className="cl-msg cl-msg-ai" key={`turn-${last.timestamp}-${index}`} data-transcript-unit={unitKey(unit, index)}>
+					<article
+						className="cl-msg cl-msg-ai"
+						key={`turn-${last.timestamp}-${index}`}
+						data-transcript-unit={unitKey(unit, index)}
+						data-werewolf-review-id={werewolfReview?.id}
+					>
 						{groupTurnItems(
 							unit.messages.flatMap((message, part) =>
 								turnItems({
@@ -737,6 +753,13 @@ export function TranscriptView({
 								</ul>
 							</AnimatedDetails>
 						)}
+						{!isStreaming && werewolfReview?.status === "contradicted" && (
+							<WerewolfCalloutStrip
+								review={werewolfReview}
+								onOpenReport={() => setWerewolfReportId(werewolfReview.id)}
+								onConfront={onConfrontWerewolf}
+							/>
+						)}
 						{!isStreaming && (last.model || werewolfReview) && (
 							<footer className="cl-ai-meta">
 								{last.model && <span>{last.model}</span>}
@@ -760,7 +783,17 @@ export function TranscriptView({
 					</article>
 				);
 			})}
-			{werewolfReport && <WerewolfReportDialog key={werewolfReport.id} review={werewolfReport} onReplay={onReplayWerewolf} close={() => setWerewolfReportId(undefined)} />}
+			{werewolfReport && (
+				<WerewolfReportDialog
+					key={werewolfReport.id}
+					review={werewolfReport}
+					onReplay={onReplayWerewolf}
+					onConfront={onConfrontWerewolf}
+					onOpenCheckpoint={onRewindPrompt}
+					onOpenFile={onOpenFile}
+					close={() => setWerewolfReportId(undefined)}
+				/>
+			)}
 			{lightbox && (
 				<Modal title={lightbox.alt} className="cc-image-preview-modal" close={() => setLightbox(null)}>
 					<div className="cc-image-preview-stage">

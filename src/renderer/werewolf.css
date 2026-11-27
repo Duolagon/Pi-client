@@ -1,30 +1,144 @@
+/* ── Werewolf Evidence Tribunal & Night-Watch Radar ── */
+
+:root {
+	--ww-crimson: #d93848;
+	--ww-crimson-soft: rgba(217, 56, 72, 0.10);
+	--ww-crimson-line: rgba(217, 56, 72, 0.28);
+	--ww-emerald: #188659;
+	--ww-emerald-soft: rgba(24, 134, 89, 0.10);
+	--ww-emerald-line: rgba(24, 134, 89, 0.26);
+	--ww-indigo: #4f5bd5;
+	--ww-indigo-soft: rgba(79, 91, 213, 0.10);
+	--ww-indigo-line: rgba(79, 91, 213, 0.26);
+	--ww-amber: #b86e14;
+	--ww-amber-soft: rgba(184, 110, 20, 0.11);
+	--ww-amber-line: rgba(184, 110, 20, 0.28);
+}
+
+:root[data-theme="dark"] {
+	--ww-crimson: #f26472;
+	--ww-crimson-soft: rgba(242, 100, 114, 0.13);
+	--ww-crimson-line: rgba(242, 100, 114, 0.34);
+	--ww-emerald: #41c48d;
+	--ww-emerald-soft: rgba(65, 196, 141, 0.12);
+	--ww-emerald-line: rgba(65, 196, 141, 0.30);
+	--ww-indigo: #8492ff;
+	--ww-indigo-soft: rgba(132, 146, 255, 0.14);
+	--ww-indigo-line: rgba(132, 146, 255, 0.32);
+	--ww-amber: #e9a23b;
+	--ww-amber-soft: rgba(233, 162, 59, 0.13);
+	--ww-amber-line: rgba(233, 162, 59, 0.32);
+}
+
+:root[data-theme="grail"] {
+	--ww-crimson: #ff6b82;
+	--ww-crimson-soft: rgba(255, 107, 130, 0.15);
+	--ww-crimson-line: rgba(255, 107, 130, 0.40);
+	--ww-emerald: #5ee2ad;
+	--ww-emerald-soft: rgba(94, 226, 173, 0.13);
+	--ww-emerald-line: rgba(94, 226, 173, 0.34);
+	--ww-indigo: #9eb0ff;
+	--ww-indigo-soft: rgba(158, 176, 255, 0.16);
+	--ww-indigo-line: rgba(158, 176, 255, 0.38);
+	--ww-amber: #f2c96b;
+	--ww-amber-soft: rgba(242, 201, 107, 0.14);
+	--ww-amber-line: rgba(242, 201, 107, 0.36);
+}
+
+@keyframes ww-orbit-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+@keyframes ww-badge-shimmer {
+	0% {
+		background-position: 200% 0;
+	}
+	100% {
+		background-position: -200% 0;
+	}
+}
+
+@keyframes ww-tarot-enter {
+	from {
+		opacity: 0;
+		transform: perspective(560px) rotateY(-18deg) translateY(6px) scale(0.96);
+	}
+	to {
+		opacity: 1;
+		transform: perspective(560px) rotateY(0deg) translateY(0) scale(1);
+	}
+}
+
+@keyframes ww-card-rise {
+	from {
+		opacity: 0;
+		transform: translateY(6px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+@keyframes ww-spotlight-pulse {
+	0% {
+		box-shadow: 0 0 0 0 var(--ww-indigo-line);
+	}
+	35% {
+		box-shadow: 0 0 0 4px var(--ww-indigo-line), 0 8px 28px -10px var(--ww-indigo-soft);
+	}
+	100% {
+		box-shadow: 0 0 0 0 transparent;
+	}
+}
+
+.cc-ww-icon {
+	flex-shrink: 0;
+}
+
+.cc-ww-orbit {
+	transform-origin: 12px 12px;
+	animation: ww-orbit-spin 2.8s linear infinite;
+}
+
+article.cl-msg-ai[data-ww-spotlight="true"] {
+	border-radius: 12px;
+	animation: ww-spotlight-pulse 1.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* ── 1. Inline Turn Verdict Seal Badge ── */
 .cc-werewolf-badge,
 .cc-werewolf-summary {
 	display: inline-flex;
 	align-items: center;
-	gap: 5px;
+	gap: 5.5px;
 	color: var(--cl-2);
 }
 
-.cc-werewolf-report {
-	display: grid;
-	gap: 12px;
-}
-
-.cc-werewolf-report > p {
-	margin: 0;
-}
-
 .cc-werewolf-badge {
+	position: relative;
 	border: 1px solid var(--cl-line);
 	border-radius: 999px;
 	min-height: 24px;
-	padding: 1px 8px;
+	padding: 2px 9px;
+	background: var(--cl-surface);
 	font: inherit;
+	font-size: 11.5px;
+	font-weight: 550;
+	cursor: pointer;
+	transition: transform 150ms var(--ease), border-color 150ms var(--ease), background 150ms var(--ease), box-shadow 150ms var(--ease);
 }
 
 .cc-werewolf-badge:hover {
+	transform: translateY(-0.5px);
 	background: var(--cl-hover);
+	box-shadow: var(--elev-1);
+}
+
+.cc-werewolf-badge:active {
+	transform: scale(0.98);
 }
 
 .cl-ai-meta:has(> .cc-werewolf-badge) {
@@ -37,21 +151,487 @@
 }
 
 .cc-werewolf-badge small {
-	padding-inline-start: 5px;
-	border-inline-start: 1px solid var(--cl-line);
+	padding-inline-start: 6px;
+	margin-inline-start: 1px;
+	border-inline-start: 1px solid currentColor;
+	opacity: 0.85;
 	font: inherit;
+	font-variant-numeric: tabular-nums;
 }
 
-.cc-werewolf-badge.contradicted,
-.cc-werewolf-summary.contradicted,
-.cc-werewolf-claims h3 .contradicted {
-	color: var(--cl-red);
+.cc-werewolf-badge.pending {
+	color: var(--ww-indigo);
+	border-color: var(--ww-indigo-line);
+	background: linear-gradient(
+		110deg,
+		var(--ww-indigo-soft) 25%,
+		color-mix(in srgb, var(--ww-indigo) 20%, var(--cl-surface)) 50%,
+		var(--ww-indigo-soft) 75%
+	);
+	background-size: 220% 100%;
+	animation: ww-badge-shimmer 2.6s linear infinite;
 }
 
-.cc-werewolf-badge.verified,
-.cc-werewolf-summary.verified,
-.cc-werewolf-claims h3 .verified {
-	color: var(--cl-green);
+.cc-werewolf-badge.contradicted {
+	color: var(--ww-crimson);
+	border-color: var(--ww-crimson-line);
+	background: var(--ww-crimson-soft);
+}
+
+.cc-werewolf-badge.contradicted:hover {
+	background: color-mix(in srgb, var(--ww-crimson-soft) 80%, var(--cl-surface));
+	border-color: var(--ww-crimson);
+}
+
+.cc-werewolf-badge.verified {
+	color: var(--ww-emerald);
+	border-color: var(--ww-emerald-line);
+	background: var(--ww-emerald-soft);
+}
+
+.cc-werewolf-badge.verified:hover {
+	border-color: var(--ww-emerald);
+}
+
+.cc-werewolf-badge.unverified {
+	color: var(--ww-amber);
+	border-color: var(--ww-amber-line);
+	background: var(--ww-amber-soft);
+}
+
+/* ── 2. Contradiction Alert Strip on AI Turn ── */
+.cc-werewolf-callout {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin: 10px 0 6px;
+	padding: 9px 12px;
+	border-radius: 10px;
+	border: 1px solid var(--ww-crimson-line);
+	background: linear-gradient(90deg, var(--ww-crimson-soft), color-mix(in srgb, var(--ww-crimson-soft) 35%, var(--cl-surface)));
+	animation: ww-card-rise 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.cc-werewolf-callout-icon {
+	width: 28px;
+	height: 28px;
+	border-radius: 8px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+	color: var(--ww-crimson);
+	background: color-mix(in srgb, var(--ww-crimson) 14%, var(--cl-surface));
+	border: 1px solid var(--ww-crimson-line);
+}
+
+.cc-werewolf-callout-body {
+	min-width: 0;
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+}
+
+.cc-werewolf-callout-body strong {
+	font-size: 12.5px;
+	font-weight: 620;
+	color: var(--ww-crimson);
+}
+
+.cc-werewolf-callout-body p {
+	margin: 0;
+	font-size: 12px;
+	color: var(--cl-2);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.cc-werewolf-callout-actions {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	flex-shrink: 0;
+}
+
+.cc-ww-confront-btn {
+	color: var(--ww-crimson) !important;
+	border-color: var(--ww-crimson-line) !important;
+	background: var(--cl-surface) !important;
+	font-weight: 560;
+}
+
+.cc-ww-confront-btn:hover {
+	border-color: var(--ww-crimson) !important;
+	background: var(--ww-crimson-soft) !important;
+}
+
+/* ── 3. Topbar Night-Watch Radar & Session Dossier Popover ── */
+.cc-werewolf-radar-wrap {
+	position: relative;
+	display: inline-flex;
+	-webkit-app-region: no-drag;
+}
+
+.cc-werewolf-radar-btn {
+	height: 28px;
+	padding: 0 8px;
+	gap: 5px;
+	border-radius: 999px;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-surface);
+	font-size: 12px;
+	color: var(--cl-2);
+}
+
+.cc-werewolf-radar-btn.tone-pending {
+	color: var(--ww-indigo);
+	border-color: var(--ww-indigo-line);
+	background: var(--ww-indigo-soft);
+}
+
+.cc-werewolf-radar-btn.tone-contradicted {
+	color: var(--ww-crimson);
+	border-color: var(--ww-crimson-line);
+	background: var(--ww-crimson-soft);
+}
+
+.cc-werewolf-radar-btn.tone-verified {
+	color: var(--ww-emerald);
+	border-color: var(--ww-emerald-line);
+}
+
+.cc-werewolf-radar-btn.tone-off {
+	opacity: 0.68;
+}
+
+.cc-werewolf-radar-btn .cc-top-count.danger {
+	background: var(--ww-crimson);
+	color: #fff;
+}
+
+.cc-werewolf-radar-btn .cc-top-count.ok {
+	background: var(--ww-emerald-soft);
+	color: var(--ww-emerald);
+}
+
+.live-app.has-inspector .cc-ww-radar-label {
+	display: none;
+}
+
+@media (max-width: 1220px) {
+	.cc-ww-radar-label {
+		display: none;
+	}
+}
+
+.cc-werewolf-popover {
+	position: absolute;
+	top: calc(100% + 8px);
+	right: 0;
+	width: min(356px, calc(100vw - 24px));
+	padding: 14px;
+	border-radius: 14px;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-surface);
+	box-shadow: var(--elev-3);
+	z-index: 60;
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+
+.cc-ww-pop-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+}
+
+.cc-ww-pop-title {
+	display: flex;
+	align-items: center;
+	gap: 9px;
+	color: var(--ww-indigo);
+}
+
+.cc-ww-pop-title div {
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+}
+
+.cc-ww-pop-title strong {
+	font-size: 13.5px;
+	font-weight: 650;
+	color: var(--cl-text);
+}
+
+.cc-ww-pop-title small {
+	font-size: 11.5px;
+	color: var(--cl-3);
+}
+
+.cc-ww-switch {
+	position: relative;
+	width: 38px;
+	height: 22px;
+	padding: 2px;
+	border-radius: 999px;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-soft);
+	cursor: pointer;
+	flex-shrink: 0;
+	transition: background 160ms var(--ease), border-color 160ms var(--ease);
+}
+
+.cc-ww-switch.on {
+	background: var(--ww-indigo);
+	border-color: var(--ww-indigo);
+}
+
+.cc-ww-switch-thumb {
+	display: block;
+	width: 16px;
+	height: 16px;
+	border-radius: 50%;
+	background: #fff;
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+	transition: transform 170ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.cc-ww-switch.on .cc-ww-switch-thumb {
+	transform: translateX(16px);
+}
+
+.cc-ww-pop-stats {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	gap: 7px;
+}
+
+.cc-ww-stat-box {
+	padding: 8px 10px;
+	border-radius: 9px;
+	border: 1px solid var(--cl-line-soft);
+	background: var(--cl-soft);
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.cc-ww-stat-box span {
+	font-size: 11px;
+	color: var(--cl-3);
+}
+
+.cc-ww-stat-box strong {
+	font-size: 14px;
+	font-weight: 650;
+	font-variant-numeric: tabular-nums;
+	color: var(--cl-text);
+}
+
+.cc-ww-stat-box.crimson strong {
+	color: var(--ww-crimson);
+}
+
+.cc-ww-stat-box.emerald strong {
+	color: var(--ww-emerald);
+}
+
+.cc-ww-stat-box.indigo strong {
+	color: var(--ww-indigo);
+}
+
+.cc-ww-pop-list {
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
+	max-height: 240px;
+	overflow-y: auto;
+}
+
+.cc-ww-pop-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 7px 9px;
+	border-radius: 9px;
+	border: 1px solid var(--cl-line-soft);
+	background: color-mix(in srgb, var(--cl-soft) 45%, var(--cl-surface));
+}
+
+.cc-ww-pop-row.contradicted {
+	border-color: var(--ww-crimson-line);
+	background: color-mix(in srgb, var(--ww-crimson-soft) 55%, var(--cl-surface));
+}
+
+.cc-ww-pop-row.contradicted .cc-ww-pop-icon {
+	color: var(--ww-crimson);
+}
+
+.cc-ww-pop-row.verified .cc-ww-pop-icon {
+	color: var(--ww-emerald);
+}
+
+.cc-ww-pop-row.pending .cc-ww-pop-icon {
+	color: var(--ww-indigo);
+}
+
+.cc-ww-pop-info {
+	min-width: 0;
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+}
+
+.cc-ww-pop-info strong {
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--cl-text);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.cc-ww-pop-info small {
+	font-size: 11px;
+	color: var(--cl-3);
+	font-variant-numeric: tabular-nums;
+}
+
+.cc-ww-pop-actions {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	flex-shrink: 0;
+}
+
+.cc-ww-pop-empty {
+	margin: 0;
+	padding: 10px 12px;
+	border-radius: 9px;
+	background: var(--cl-soft);
+	font-size: 12px;
+	line-height: 1.5;
+	color: var(--cl-3);
+}
+
+/* ── 4. Werewolf Evidence Tribunal Modal ── */
+.cc-werewolf-report {
+	display: grid;
+	gap: 14px;
+	overflow-y: auto;
+	max-height: min(76vh, 720px);
+	padding-right: 2px;
+}
+
+.cc-werewolf-report > * {
+	min-width: 0;
+}
+
+.cc-werewolf-report > p {
+	margin: 0;
+}
+
+.cc-werewolf-hero {
+	display: flex;
+	align-items: center;
+	gap: 16px;
+	padding: 14px 16px;
+	border-radius: 13px;
+	border: 1px solid var(--cl-line);
+	background: linear-gradient(135deg, var(--cl-soft), var(--cl-surface));
+	position: relative;
+}
+
+.cc-werewolf-hero.status-contradicted {
+	border-color: var(--ww-crimson-line);
+	background: radial-gradient(circle at 12% 50%, var(--ww-crimson-soft), transparent 62%), var(--cl-surface);
+}
+
+.cc-werewolf-hero.status-verified {
+	border-color: var(--ww-emerald-line);
+	background: radial-gradient(circle at 12% 50%, var(--ww-emerald-soft), transparent 62%), var(--cl-surface);
+}
+
+.cc-werewolf-hero.status-pending {
+	border-color: var(--ww-indigo-line);
+	background: radial-gradient(circle at 12% 50%, var(--ww-indigo-soft), transparent 62%), var(--cl-surface);
+}
+
+/* Identity Tarot Crest Card */
+.cc-werewolf-tarot {
+	width: 68px;
+	height: 86px;
+	border-radius: 10px;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-surface);
+	box-shadow: var(--elev-1);
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: space-between;
+	padding: 6px 4px;
+	flex-shrink: 0;
+	animation: ww-tarot-enter 360ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.cc-werewolf-tarot.status-contradicted {
+	color: var(--ww-crimson);
+	border-color: var(--ww-crimson-line);
+	background: linear-gradient(180deg, var(--ww-crimson-soft), var(--cl-surface));
+}
+
+.cc-werewolf-tarot.status-verified {
+	color: var(--ww-emerald);
+	border-color: var(--ww-emerald-line);
+	background: linear-gradient(180deg, var(--ww-emerald-soft), var(--cl-surface));
+}
+
+.cc-werewolf-tarot.status-pending {
+	color: var(--ww-indigo);
+	border-color: var(--ww-indigo-line);
+	background: linear-gradient(180deg, var(--ww-indigo-soft), var(--cl-surface));
+}
+
+.cc-werewolf-tarot.status-unverified {
+	color: var(--ww-amber);
+	border-color: var(--ww-amber-line);
+	background: linear-gradient(180deg, var(--ww-amber-soft), var(--cl-surface));
+}
+
+.cc-ww-tarot-role {
+	font-size: 8.5px;
+	font-weight: 700;
+	letter-spacing: 0.1em;
+	opacity: 0.78;
+}
+
+.cc-ww-tarot-crest {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.cc-ww-tarot-stamp {
+	font-size: 10.5px;
+	font-weight: 700;
+	padding: 1px 6px;
+	border-radius: 999px;
+	border: 1px solid currentColor;
+	line-height: 1.3;
+}
+
+.cc-werewolf-hero-main {
+	min-width: 0;
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
 }
 
 .cc-werewolf-summary {
@@ -59,49 +639,314 @@
 	gap: 8px;
 }
 
-.cc-werewolf-summary :is(code, small) {
-	color: var(--cl-3);
+.cc-werewolf-summary strong {
+	font-size: 15px;
+	font-weight: 650;
 }
 
+.cc-werewolf-summary.contradicted {
+	color: var(--ww-crimson);
+}
+
+.cc-werewolf-summary.verified {
+	color: var(--ww-emerald);
+}
+
+.cc-werewolf-summary.pending {
+	color: var(--ww-indigo);
+}
+
+.cc-werewolf-summary :is(code, small) {
+	color: var(--cl-3);
+	font-size: 12px;
+}
+
+.cc-werewolf-summary code {
+	padding: 1px 6px;
+	border-radius: 5px;
+	border: 1px solid var(--cl-line-soft);
+	background: var(--cl-soft);
+}
+
+.cc-werewolf-hero-desc {
+	margin: 0;
+	font-size: 12.5px;
+	color: var(--cl-2);
+	line-height: 1.45;
+}
+
+.cc-werewolf-hero-links {
+	display: flex;
+	gap: 8px;
+	margin-top: 2px;
+}
+
+.cc-ww-error-banner {
+	padding: 9px 12px;
+	border-radius: 9px;
+	border: 1px solid var(--ww-amber-line);
+	background: var(--ww-amber-soft);
+	color: var(--ww-amber);
+	font-size: 12.5px;
+}
+
+/* ── 5. Metrics Cards & Ring Gauges ── */
 .cc-werewolf-metrics {
 	display: grid;
-	grid-template-columns: repeat(auto-fit, minmax(min(125px, 100%), 1fr));
-	gap: 8px;
+	grid-template-columns: repeat(auto-fit, minmax(min(175px, 100%), 1fr));
+	gap: 10px;
 	margin: 0;
 }
 
-.cc-werewolf-metrics > div,
-.cc-werewolf-claims li {
+.cc-werewolf-metrics > div {
 	min-width: 0;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
 	border: 1px solid var(--cl-line);
-	border-radius: 8px;
-	padding: 10px 12px;
+	border-radius: 11px;
+	padding: 11px 14px;
+	background: var(--cl-surface);
+}
+
+.cc-werewolf-metrics > div.is-alert {
+	border-color: var(--ww-crimson-line);
+	background: color-mix(in srgb, var(--ww-crimson-soft) 42%, var(--cl-surface));
+}
+
+.cc-ww-metric-copy {
+	min-width: 0;
 }
 
 .cc-werewolf-metrics dt {
 	color: var(--cl-3);
-	font-size: var(--fs-xs);
+	font-size: 11.5px;
+	font-weight: 500;
 }
 
 .cc-werewolf-metrics dd {
 	margin: 4px 0 0;
-	font-weight: 600;
+	font-size: 15px;
+	font-weight: 650;
 	font-variant-numeric: tabular-nums;
+	color: var(--cl-text);
 }
 
-.cc-werewolf-claims {
-	display: grid;
+.cc-werewolf-metrics > div.is-alert dd {
+	color: var(--ww-crimson);
+}
+
+.cc-ww-ring {
+	flex-shrink: 0;
+	transform: rotate(-90deg);
+}
+
+.cc-ww-ring-track {
+	fill: none;
+	stroke: var(--cl-line-soft);
+	stroke-width: 3.4;
+}
+
+.cc-ww-ring-fill {
+	fill: none;
+	stroke: currentColor;
+	stroke-width: 3.4;
+	stroke-linecap: round;
+	stroke-dasharray: var(--ring-c);
+	stroke-dashoffset: var(--ring-offset);
+	transition: stroke-dashoffset 480ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.cc-ww-ring.tone-crimson {
+	color: var(--ww-crimson);
+}
+
+.cc-ww-ring.tone-emerald {
+	color: var(--ww-emerald);
+}
+
+.cc-ww-ring.tone-indigo {
+	color: var(--ww-indigo);
+}
+
+.cc-ww-ring.tone-amber {
+	color: var(--ww-amber);
+}
+
+/* ── 6. Distribution Bar & Filter Toolbar ── */
+.cc-ww-dist-section {
+	display: flex;
+	flex-direction: column;
+	gap: 9px;
+}
+
+.cc-ww-dist-bar {
+	display: flex;
+	height: 6px;
+	border-radius: 999px;
+	overflow: hidden;
+	background: var(--cl-soft);
+	gap: 2px;
+}
+
+.cc-ww-dist-bar .seg {
+	height: 100%;
+	border-radius: 999px;
+	transition: flex-grow 320ms var(--ease);
+}
+
+.cc-ww-dist-bar .seg.verified {
+	background: var(--ww-emerald);
+}
+
+.cc-ww-dist-bar .seg.contradicted {
+	background: var(--ww-crimson);
+}
+
+.cc-ww-dist-bar .seg.gap {
+	background: var(--ww-amber);
+}
+
+.cc-ww-dist-bar .seg.unverified {
+	background: var(--cl-3);
+	opacity: 0.45;
+}
+
+.cc-ww-toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
 	gap: 8px;
+}
+
+.cc-ww-toolbar > p {
+	margin: 0;
+}
+
+.cc-ww-filter-tabs {
+	align-self: flex-start;
+}
+
+/* ── 7. Forensic Claim Cards ── */
+.cc-werewolf-claims {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
 	list-style: none;
 	margin: 0;
 	padding: 0;
 }
 
+.cc-ww-claim-card {
+	min-width: 0;
+	border: 1px solid var(--cl-line);
+	border-left-width: 3.5px;
+	border-radius: 11px;
+	padding: 12px 14px;
+	background: var(--cl-surface);
+	animation: ww-card-rise 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+	animation-delay: calc(min(var(--claim-i, 0), 6) * 28ms);
+}
+
+.cc-ww-claim-card.cat-contradicted {
+	border-left-color: var(--ww-crimson);
+	border-color: var(--ww-crimson-line);
+	border-left-width: 3.5px;
+	background: linear-gradient(90deg, color-mix(in srgb, var(--ww-crimson-soft) 45%, var(--cl-surface)), var(--cl-surface) 38%);
+}
+
+.cc-ww-claim-card.cat-gap {
+	border-left-color: var(--ww-amber);
+}
+
+.cc-ww-claim-card.cat-verified {
+	border-left-color: var(--ww-emerald);
+}
+
+.cc-ww-claim-card.cat-unverified {
+	border-left-color: var(--cl-line);
+}
+
+.cc-ww-claim-head {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 10px;
+}
+
 .cc-werewolf-claims h3 {
 	font: inherit;
+	font-size: 13.5px;
 	font-weight: 600;
+	line-height: 1.45;
 	overflow-wrap: anywhere;
 	margin: 0;
+	color: var(--cl-text);
+}
+
+.cc-ww-claim-pill {
+	display: inline-flex;
+	align-items: center;
+	padding: 1px 7px;
+	border-radius: 999px;
+	font-size: 11.5px;
+	font-weight: 650;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-soft);
+	color: var(--cl-2);
+}
+
+.cc-ww-claim-pill.contradicted {
+	color: var(--ww-crimson);
+	border-color: var(--ww-crimson-line);
+	background: var(--ww-crimson-soft);
+}
+
+.cc-ww-claim-pill.verified {
+	color: var(--ww-emerald);
+	border-color: var(--ww-emerald-line);
+	background: var(--ww-emerald-soft);
+}
+
+.cc-ww-claim-pill.is-gap {
+	color: var(--ww-amber);
+	border-color: var(--ww-amber-line);
+	background: var(--ww-amber-soft);
+}
+
+.cc-ww-item-confront {
+	flex-shrink: 0;
+	color: var(--ww-crimson) !important;
+	border-color: var(--ww-crimson-line) !important;
+}
+
+/* Readable AST Probe Formula Chip */
+.cc-ww-probe-formula {
+	display: inline-flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+	margin-top: 8px;
+	padding: 4px 9px;
+	border-radius: 7px;
+	border: 1px solid var(--ww-indigo-line);
+	background: var(--ww-indigo-soft);
+	max-width: 100%;
+}
+
+.cc-ww-probe-kind {
+	font-size: 10.5px;
+	font-weight: 650;
+	color: var(--ww-indigo);
+}
+
+.cc-ww-probe-formula code {
+	font-family: var(--font-mono);
+	font-size: 11.5px;
+	color: var(--cl-text);
+	overflow-wrap: anywhere;
 }
 
 .cc-werewolf-evidence:empty {
@@ -111,12 +956,15 @@
 .cc-werewolf-evidence {
 	display: grid;
 	grid-template-columns: auto minmax(0, 1fr);
-	gap: 6px 10px;
-	margin: 8px 0 0;
+	gap: 7px 12px;
+	margin: 10px 0 0;
+	font-size: 12.5px;
 }
 
 .cc-werewolf-evidence dt {
 	color: var(--cl-3);
+	font-weight: 500;
+	padding-top: 1px;
 }
 
 .cc-werewolf-evidence dd {
@@ -124,22 +972,164 @@
 	min-width: 0;
 	white-space: pre-wrap;
 	overflow-wrap: anywhere;
+	color: var(--cl-text);
+}
+
+.cc-ww-quote-val q {
+	display: inline-block;
+	padding: 3px 9px;
+	border-radius: 2px 6px 6px 2px;
+	background: var(--cl-soft);
+	border-left: 2.5px solid var(--cl-clay);
+	color: var(--cl-text);
+}
+
+.cc-ww-expected-val,
+.cc-ww-actual-val {
+	font-family: var(--font-mono);
+	font-size: 12px;
+	padding: 2px 7px;
+	border-radius: 5px;
+	background: var(--cl-soft);
+	justify-self: start;
+}
+
+.cc-ww-expected-val {
+	color: var(--ww-emerald);
+	background: var(--ww-emerald-soft);
+}
+
+.cc-ww-actual-val.is-mismatch {
+	color: var(--ww-crimson);
+	background: var(--ww-crimson-soft);
+	font-weight: 600;
+}
+
+.cc-ww-actual-val.is-match {
+	color: var(--ww-emerald);
+	background: var(--ww-emerald-soft);
+}
+
+.cc-ww-source-link {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	padding: 1px 6px;
+	border-radius: 5px;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-soft);
+	color: var(--cl-text);
+	cursor: pointer;
+	font: inherit;
+}
+
+.cc-ww-source-link:hover {
+	border-color: var(--cl-clay);
+	color: var(--cl-clay);
 }
 
 .cc-werewolf-evidence pre,
 .cc-werewolf-replay pre {
 	margin: 0;
+	padding: 8px 10px;
+	border-radius: 7px;
+	border: 1px solid var(--cl-line-soft);
+	background: var(--cl-soft);
 	max-height: 150px;
 	overflow: auto;
 	white-space: pre-wrap;
+	font-family: var(--font-mono);
 	font-size: var(--fs-xs);
 }
 
+/* ── 8. Interactive Evidence Replay Runner ── */
 .cc-werewolf-replay {
 	margin-top: 10px;
+	padding-top: 10px;
+	border-top: 1px dashed var(--cl-line-soft);
 }
 
-.cc-werewolf-replay > :is(p, div) {
+.cc-ww-replay-btn {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.cc-ww-replay-error {
+	margin: 8px 0 0;
+	color: var(--ww-crimson);
+	font-size: 12px;
+}
+
+.cc-ww-replay-result {
 	margin-top: 8px;
+	padding: 9px 12px;
+	border-radius: 9px;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-soft);
 	overflow-wrap: anywhere;
+}
+
+.cc-ww-replay-result.status-contradicted {
+	border-color: var(--ww-crimson-line);
+	background: var(--ww-crimson-soft);
+}
+
+.cc-ww-replay-result.status-contradicted strong {
+	color: var(--ww-crimson);
+}
+
+.cc-ww-replay-result.status-verified {
+	border-color: var(--ww-emerald-line);
+	background: var(--ww-emerald-soft);
+}
+
+.cc-ww-replay-result.status-verified strong {
+	color: var(--ww-emerald);
+}
+
+.cc-ww-replay-result p {
+	margin: 4px 0 6px;
+	font-size: 12px;
+	color: var(--cl-2);
+}
+
+.cc-ww-dialog-foot {
+	padding-top: 6px;
+	border-top: 1px solid var(--cl-line-soft);
+}
+
+.cc-ww-confront-all {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+
+/* Grail theme luxury starlight & crimson-moon overrides */
+:root[data-theme="grail"] .cc-werewolf-popover,
+:root[data-theme="grail"] .cc-werewolf-hero,
+:root[data-theme="grail"] .cc-ww-claim-card {
+	backdrop-filter: blur(12px);
+}
+
+:root[data-theme="grail"] .cc-werewolf-tarot {
+	box-shadow: 0 8px 24px -10px rgba(8, 10, 24, 0.72), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.cc-ww-orbit,
+	.cc-werewolf-badge.pending,
+	.cc-werewolf-tarot,
+	.cc-ww-claim-card,
+	.cc-werewolf-callout,
+	article.cl-msg-ai[data-ww-spotlight="true"] {
+		animation: none !important;
+	}
+	.cc-werewolf-badge,
+	.cc-ww-ring-fill,
+	.cc-ww-dist-bar .seg,
+	.cc-ww-switch,
+	.cc-ww-switch-thumb {
+		transition: none !important;
+	}
 }

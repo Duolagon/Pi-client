@@ -115,6 +115,8 @@ import { fileReferences, formatFileReference } from "../file-references.ts";
 import { useSessionWorkspace } from "./session-workspace.ts";
 import { useBackgroundShells } from "./useBackgroundShells.ts";
 import { useWerewolf } from "./useWerewolf.ts";
+import { WerewolfRadarControl } from "./WerewolfReport.tsx";
+import { MoonWatchIcon } from "./WerewolfIcons.tsx";
 import type { GitCheckpoint } from "../git-types.ts";
 import type { SessionEntriesResult } from "../session-types.ts";
 
@@ -462,12 +464,29 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const pendingReveal = useRef<string | undefined>(undefined);
 	const activeConversationId = snapshot?.active?.id;
 	const { state: werewolf, toggle: toggleWerewolf, toggling: togglingWerewolf } = useWerewolf(api.werewolf, activeConversationId);
+	const [activeWerewolfReportId, setActiveWerewolfReportId] = useState<string>();
+	const [werewolfExpandAll, setWerewolfExpandAll] = useState(false);
+	useEffect(() => {
+		setActiveWerewolfReportId(undefined);
+		setWerewolfExpandAll(false);
+	}, [activeConversationId]);
 	const werewolfToggleLabel = werewolf?.enabled ? "停用狼人核验" : "启用狼人核验";
 	const werewolfHelp = "在有 Git 检查点的回复结束后独立核对关键承诺，会额外调用核验模型。";
 	const changeWerewolf = () => {
 		void toggleWerewolf().then((next) => {
 			if (next) setFlash(next.enabled ? "已为当前会话启用狼人核验" : "已为当前会话停用狼人核验");
 		}).catch(app.fail);
+	};
+	const confrontWerewolfPrompt = (promptText: string) => {
+		if (!promptText.trim()) return;
+		app.setDraft(app.draft.trim() ? `${app.draft.trim()}\n\n${promptText}` : promptText);
+		app.setNotice("已将破绽证据填入输入框，可直接发送要求修正。");
+		requestAnimationFrame(() => {
+			const input = composerInputRef.current;
+			if (!input) return;
+			input.focus();
+			input.setSelectionRange(input.value.length, input.value.length);
+		});
 	};
 	const activeConversationRef = useRef(activeConversationId);
 	activeConversationRef.current = activeConversationId;
@@ -2243,6 +2262,31 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								)}
 							</button>
 						</div>
+						{snapshot.active && api.werewolf && (
+							<WerewolfRadarControl
+								state={werewolf}
+								toggling={togglingWerewolf}
+								disabled={changing}
+								onToggle={changeWerewolf}
+								onJumpToReview={(rev) => {
+									setWerewolfExpandAll(true);
+									requestAnimationFrame(() => {
+										const el = document.querySelector<HTMLElement>(`[data-werewolf-review-id="${CSS.escape(rev.id)}"]`);
+										if (!el) return;
+										const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+										el.scrollIntoView({ behavior: reduced ? "instant" : "smooth", block: "center" });
+										el.dataset.wwSpotlight = "true";
+										window.setTimeout(() => {
+											if (el.dataset.wwSpotlight === "true") delete el.dataset.wwSpotlight;
+										}, 1400);
+									});
+								}}
+								onOpenReview={(rev) => {
+									setWerewolfExpandAll(true);
+									setActiveWerewolfReportId(rev.id);
+								}}
+							/>
+						)}
 						<button
 							type="button"
 							className={`cc-theme-pill ${isGrail ? "grail" : ""}`}
@@ -2308,7 +2352,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 												changeWerewolf();
 											}}
 										>
-											<ShieldCheck size={14} aria-hidden="true" />
+											<MoonWatchIcon size={14} />
 											<span>{werewolfToggleLabel}</span>
 										</button>}
 										<button
@@ -2732,9 +2776,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											assistantEntryIds={assistantEntryIds}
 											werewolfReviews={werewolf?.reviews}
 											onReplayWerewolf={activeConversationId && api.werewolf?.replay ? (reviewId, claimId) => api.werewolf.replay(activeConversationId, reviewId, claimId) : undefined}
+											onConfrontWerewolf={confrontWerewolfPrompt}
+											openWerewolfId={activeWerewolfReportId}
+											onOpenWerewolfChange={setActiveWerewolfReportId}
 											checkpointIds={checkpointIds}
 											approvalTool={approvalTool}
-											forceExpandAll={findOpen}
+											forceExpandAll={findOpen || werewolfExpandAll}
 											findAnchorKey={findAnchorKey}
 											onRewindPrompt={(checkpointId) => openCheckpoint(checkpointId)}
 											onForkPrompt={(entryId) => {
