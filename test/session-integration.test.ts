@@ -6,6 +6,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import type { SessionEntry, SessionTreeNode } from "@earendil-works/pi-coding-agent";
 import { DesktopService, type ServiceOptions } from "../src/backend.ts";
+import { draftPrompt, type ComposerDraft } from "../src/composer-draft.ts";
+import { wrapDesktopWorkspaceContext } from "../src/file-references.ts";
 import type { DesktopEvent, Message, Snapshot } from "../src/shared.ts";
 import { createCoreFixture } from "./fixtures/core-fixture.ts";
 
@@ -57,6 +59,52 @@ async function prompt(service: DesktopService, events: DesktopEvent[], id: strin
 	);
 }
 
+test("editing a persisted prompt restores literal text, exact text-attachment boundaries and native images", { timeout: 30000 }, async () => {
+	const { fixture, options, service, events, id } = await setup();
+	let restarted: DesktopService | undefined;
+	try {
+		const attachmentText = "这是附件。\n\n附件 也是附件正文：\n继续。";
+		const draft: ComposerDraft = {
+			text: "查看样例\n\n附件 例子：\n这是正文\n\n" + wrapDesktopWorkspaceContext("用户自己输入的标签"),
+			attachments: [
+				{ name: "报告：初稿.txt", text: attachmentText },
+				{ name: "测试图片.png", image: {
+					type: "image", mimeType: "image/png",
+					data: "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC",
+				} },
+			],
+		};
+		const serialized = draftPrompt(draft).message;
+		const mark = events.length;
+		await service.sendComposerPrompt(id, draft);
+		await until(() => events.slice(mark).some((packet) => packet.event.type === "agent_settled"), "attachment prompt settles");
+		const sent = await service.sessionEntries({ conversationId: id });
+		const entry = sent.entries.find((item) => item.type === "message" && item.message.role === "user" && text(item.message).startsWith(serialized));
+		assert.ok(entry && entry.type === "message" && entry.message.role === "user", JSON.stringify(sent.entries));
+		assert.ok(Array.isArray(entry.message.content));
+		const image = entry.message.content.find((block) => block.type === "image");
+		assert.ok(image, "the test used a retained native image");
+		const visible = (await service.snapshot()).messages.map(text).join("\n");
+		assert.doesNotMatch(visible, /\[pi-desktop-draft:/);
+		assert.match(visible, /STREAM_COMPLETE.*查看样例/);
+		await prompt(service, events, id, wrapDesktopWorkspaceContext("纯文本中合法的标签"));
+		const all = await service.sessionEntries({ conversationId: id });
+		const literal = userEntry(all.entries, wrapDesktopWorkspaceContext("纯文本中合法的标签"));
+		await service.close();
+		restarted = new DesktopService(options);
+		await restarted.initialize();
+		const legacy = await restarted.navigateSession({ conversationId: id, targetId: literal.id });
+		assert.deepEqual(legacy.editorDraft, { text: wrapDesktopWorkspaceContext("纯文本中合法的标签"), attachments: [] });
+		const edited = await restarted.navigateSession({ conversationId: id, targetId: entry.id });
+		assert.deepEqual(edited.editorDraft, { text: draft.text, attachments: [draft.attachments[0], { name: "测试图片.png", image }] });
+		assert.equal(edited.leafId, entry.parentId);
+	} finally {
+		await restarted?.close();
+		await service.close();
+		await fixture.cleanup();
+	}
+});
+
 function text(message: Message): string {
 	if (!("content" in message)) return "";
 	if (typeof message.content === "string") return message.content;
@@ -88,6 +136,32 @@ function treeIds(tree: SessionTreeNode[]): string[] {
 	}
 	return result.sort();
 }
+
+test("search uses the live branch cursor while a new turn is still streaming", { timeout: 30000 }, async () => {
+	const { service, fixture, events, id } = await setup();
+	try {
+		await prompt(service, events, id, "common search branch marker");
+		await prompt(service, events, id, "previously abandoned search branch marker");
+		const { entries } = await service.sessionEntries({ conversationId: id });
+		const base = entries.find((entry) => entry.type === "message" && entry.message.role === "assistant");
+		assert.ok(base);
+		const navigated = await service.navigateSession({ conversationId: id, targetId: base.id });
+		assert.equal(navigated.snapshot.active?.sessionLeafId, base.id);
+		assert.equal((await service.searchConversations("abandoned search branch marker")).matches.length, 0);
+		const sessionFile = navigated.snapshot.active?.sessionFile;
+		assert.ok(sessionFile);
+		await service.command({ type: "prompt", message: "slow-stream live search branch marker" }, id);
+		await until(async () => (await readFile(sessionFile, "utf8")).includes("live search branch marker"), "streamed prompt persisted");
+		const snapshot = await service.snapshot();
+		assert.equal(snapshot.state?.isStreaming, true);
+		assert.equal(snapshot.active?.sessionLeafId, base.id);
+		assert.deepEqual(await service.searchConversations("live search branch marker"), {
+			matches: [{ conversationId: id, snippet: "slow-stream live search branch marker" }], partial: false,
+		});
+		assert.equal((await service.searchConversations("abandoned search branch marker")).matches.length, 0);
+		await service.command({ type: "abort" }, id);
+	} finally { await service.close(); await fixture.cleanup(); }
+});
 
 test(
 	"forking a user entry creates an independent session with earlier context and selected editor text",

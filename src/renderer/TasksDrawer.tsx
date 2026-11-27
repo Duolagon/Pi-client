@@ -15,6 +15,41 @@ import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary }
 import { computeChecklistEta, computeMonitorTiming, computeTodoTiming } from "../task-eta.ts";
 import type { CronJobRecord, DesktopTask, ExternalTask, MonitorRecord, RpcExtensionUIRequest, TaskProgress, TeamRecord, TodoRecord, WorkflowRecord, WorktreeInfo } from "../shared.ts";
 
+const TASK_STATUS_LABELS: Record<string, string> = {
+	running: "运行中",
+	starting: "启动中",
+	queued: "排队中",
+	waiting_for_input: "待确认",
+	completed: "已完成",
+	failed: "失败",
+	cancelled: "已取消",
+	interrupted: "已中断",
+	exited: "已退出",
+	stopped: "已停止",
+	active: "活跃",
+	idle: "空闲",
+	ready: "就绪",
+	merged: "已合并",
+	cleaned: "已清理",
+};
+
+const TASK_STOP_REASON_LABELS: Record<string, string> = {
+	max_turns: "达轮次上限",
+	user_stop: "已手动停止",
+	parent_abort: "主会话中止",
+	restart: "重启中断",
+	error: "执行出错",
+};
+
+function formatStatusBadge(status: string): string {
+	return TASK_STATUS_LABELS[status] ?? status;
+}
+
+function formatStopReason(reason?: string): string | undefined {
+	if (!reason || reason === "model_stop") return undefined;
+	return TASK_STOP_REASON_LABELS[reason] ?? reason;
+}
+
 export function TasksDrawer({
 	project,
 	conversationId,
@@ -464,8 +499,12 @@ export function TasksDrawer({
 									<div>
 										<strong>{detailTask.name || detailTask.title || detailTask.subagentType || "子任务"}</strong>
 										{detailTask.subagentType && <span className="cc-source-tag">{detailTask.subagentType}</span>}
-										<span className="cc-source-tag">{detailTask.status}</span>
-										{detailTask.stopReason && <span className="cc-source-tag muted">{detailTask.stopReason}</span>}
+										<span className="cc-source-tag" title={detailTask.status}>{formatStatusBadge(detailTask.status)}</span>
+										{formatStopReason(detailTask.stopReason) && (
+											<span className="cc-source-tag muted" title={detailTask.stopReason}>
+												{formatStopReason(detailTask.stopReason)}
+											</span>
+										)}
 										{isActive(detailTask.status) && progressMap[detailTask.id] && (
 											<span className="cc-source-tag muted">{formatTaskProgressSummary(progressMap[detailTask.id])}</span>
 										)}
@@ -529,8 +568,8 @@ export function TasksDrawer({
 									<div>
 										<strong>{extDetail.title}</strong>
 										<span className="cc-source-tag">{extDetail.executor}</span>
-										<span className="cc-source-tag">turn {extDetail.turn}</span>
-										<span className="cc-source-tag">{extDetail.status}</span>
+										<span className="cc-source-tag">第 {extDetail.turn} 轮</span>
+										<span className="cc-source-tag" title={extDetail.status}>{formatStatusBadge(extDetail.status)}</span>
 									</div>
 									<div className="cc-tool-ctrl-actions">
 										{!extDetail.readOnly && (
@@ -569,8 +608,8 @@ export function TasksDrawer({
 												<strong>{task.title}</strong>
 												<span className="cc-source-tag">{task.executor}</span>
 												<span className="cc-source-tag muted">{task.subagentType}</span>
-												<span className={`cc-action-badge ${task.status === "completed" ? "allow" : task.status === "failed" || task.status === "cancelled" ? "deny" : "ask"}`}>
-													{task.status}
+												<span className={`cc-action-badge ${task.status === "completed" ? "allow" : task.status === "failed" || task.status === "cancelled" ? "deny" : "ask"}`} title={task.status}>
+													{formatStatusBadge(task.status)}
 												</span>
 											</div>
 											<p className="cc-tool-ctrl-desc">{task.workingDirectory}</p>
@@ -603,7 +642,7 @@ export function TasksDrawer({
 										totalTokens ? `${formatCompactTokens(totalTokens)} tokens` : undefined,
 										active && prog?.toolUses ? `${prog.toolUses} 次工具${prog.lastToolName ? ` (${prog.lastToolName})` : ""}` : task.stats?.toolUses ? `${task.stats.toolUses} 次工具` : undefined,
 										durationMs !== undefined ? formatCompactDuration(durationMs) : undefined,
-										task.stopReason ? `stop:${task.stopReason}` : undefined,
+										formatStopReason(task.stopReason),
 									].filter(Boolean);
 									return (
 										<div key={task.id} className="cc-tool-ctrl-row">
@@ -611,8 +650,8 @@ export function TasksDrawer({
 												<div className="cc-tool-ctrl-name">
 													<strong>{task.name ? `${task.name} · ${task.title || task.prompt.slice(0, 60)}` : task.title || task.prompt.slice(0, 60)}</strong>
 													{task.subagentType && <span className="cc-source-tag">{task.subagentType}</span>}
-													<span className={`cc-action-badge ${task.status === "completed" ? "allow" : task.status === "failed" || task.status === "cancelled" || task.status === "interrupted" ? "deny" : "ask"}`}>
-														{task.status}
+													<span className={`cc-action-badge ${task.status === "completed" ? "allow" : task.status === "failed" || task.status === "cancelled" || task.status === "interrupted" ? "deny" : "ask"}`} title={task.status}>
+														{formatStatusBadge(task.status)}
 													</span>
 												</div>
 												<p className="cc-tool-ctrl-desc">
@@ -652,8 +691,8 @@ export function TasksDrawer({
 											<div className="cc-tool-ctrl-info">
 												<div className="cc-tool-ctrl-name">
 													<strong>{mon.kind === "shell" ? "[后台 Bash]" : `[Monitor:${mon.kind}]`} {mon.description}</strong>
-													<span className={`cc-action-badge ${mon.status === "running" ? "ask" : mon.status === "exited" || mon.status === "stopped" ? "allow" : "deny"}`}>
-														{mon.status}
+													<span className={`cc-action-badge ${mon.status === "running" ? "ask" : mon.status === "exited" || mon.status === "stopped" ? "allow" : "deny"}`} title={mon.status}>
+														{formatStatusBadge(mon.status)}
 													</span>
 													<span className="cc-eta-pill">{monTiming.elapsedLabel}</span>
 													{monTiming.activityLabel && (
@@ -887,8 +926,8 @@ export function TasksDrawer({
 											<div className="cc-tool-ctrl-name">
 												<strong>@{member.name}</strong>
 												{member.subagentType && <span className="cc-source-tag">{member.subagentType}</span>}
-												<span className={`cc-action-badge ${member.status === "active" ? "ask" : member.status === "idle" ? "allow" : "deny"}`}>
-													{member.status}
+												<span className={`cc-action-badge ${member.status === "active" ? "ask" : member.status === "idle" ? "allow" : "deny"}`} title={member.status}>
+													{formatStatusBadge(member.status)}
 												</span>
 											</div>
 											<p className="cc-tool-ctrl-desc">
@@ -914,7 +953,7 @@ export function TasksDrawer({
 									<div className="cc-tool-ctrl-info">
 										<div className="cc-tool-ctrl-name">
 											<strong>{wt.branch}</strong>
-											<span className="cc-source-tag">{wt.status}</span>
+											<span className="cc-source-tag" title={wt.status}>{formatStatusBadge(wt.status)}</span>
 										</div>
 										<p className="cc-tool-ctrl-desc">{wt.path}</p>
 									</div>

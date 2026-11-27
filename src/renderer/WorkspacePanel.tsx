@@ -1,5 +1,7 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowLeft, ArrowRight, Check, ChevronDown, ChevronUp, Columns2, ExternalLink, FileCode2, Folder, Maximize2, Minimize2, Minus, Plus, RefreshCw, RotateCcw, Trash2, X } from "lucide-react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ArrowLeft, ArrowRight, Check, ChevronDown, ChevronRight, ChevronUp, Columns2, Copy, ExternalLink, FileCode2, Folder, FolderOpen, LoaderCircle, Maximize2, Minimize2, Minus, Plus, RefreshCw, RotateCcw, Search, Sparkles, Trash2, X } from "lucide-react";
+import { copyText } from "./clipboard.ts";
+import { inferLangFromPath } from "./highlight.tsx";
 import { IconButton, Modal } from "../prototype/ui.tsx";
 import type { Change, CodeIntelligence, CodePosition, FileEntry, GitCheckpoint, Workspace } from "../shared.ts";
 import { CodeLines, UnifiedDiffView, type DiffReviewAnchor } from "./DiffView.tsx";
@@ -21,6 +23,29 @@ function errorMessage(cause: unknown): string {
 	return cause instanceof Error ? cause.message : String(cause);
 }
 
+function visibleTreeRows(entries: FileEntry[], expanded: Record<string, boolean>, children: Record<string, FileEntry[]>) {
+	const rows: { entry: FileEntry; parent?: string; level: number; position: number; size: number }[] = [];
+	const append = (items: FileEntry[], level: number, parent?: string) => {
+		items.forEach((entry, index) => {
+			rows.push({ entry, parent, level, position: index + 1, size: items.length });
+			if (entry.directory && expanded[entry.path] && children[entry.path]) append(children[entry.path], level + 1, entry.path);
+		});
+	};
+	append(entries, 1);
+	return rows;
+}
+
+function fallbackCommitSummary(staged: Change[]): string {
+	if (!staged.length) return "";
+	const bases = staged.map((c) => c.path.split("/").pop() || c.path);
+	const allAdded = staged.every((c) => c.status.startsWith("A") || c.status === "??");
+	const allDeleted = staged.every((c) => c.status.startsWith("D"));
+	const verb = allAdded ? "feat: 新增" : allDeleted ? "chore: 移除" : "chore: 更新";
+	if (bases.length === 1) return `${verb} ${bases[0]}`;
+	if (bases.length <= 3) return `${verb} ${bases.join("、")}`;
+	return `${verb} ${bases.slice(0, 2).join("、")} 等 ${bases.length} 个文件`;
+}
+
 export function WorkspacePanel({
 	pane,
 	setPane,
@@ -29,6 +54,9 @@ export function WorkspacePanel({
 	project,
 	conversationId,
 	checkpointId,
+	hasModel = false,
+	openFileRequest,
+	consumeOpenFileRequest,
 	onSendReview,
 	onOpenCheckpoint,
 	focusReview,
@@ -47,6 +75,9 @@ export function WorkspacePanel({
 	conversationId?: string;
 	/** Checkpoint of the exact turn selected for review. */
 	checkpointId?: string;
+	hasModel?: boolean;
+	openFileRequest?: { path: string; line?: number; requestId: number; viewKey: string };
+	consumeOpenFileRequest?: (requestId: number) => void;
 	onSendReview?: (message: string) => Promise<void>;
 	onOpenCheckpoint?: (checkpointId: string, path?: string) => void;
 	focusReview?: boolean;
@@ -60,11 +91,11 @@ export function WorkspacePanel({
 	const viewKey = conversationId ?? project ?? "no-project";
 	const [, renderView] = useState(0);
 	const view = readReviewView(viewKey);
-	const updateView = (update: (current: ReviewView) => ReviewView) => {
+	const updateView = useCallback((update: (current: ReviewView) => ReviewView) => {
 		saveReviewView(viewKey, update(readReviewView(viewKey)));
 		renderView((value) => value + 1);
-	};
-	const [entries, setEntries] = useState<FileEntry[]>([]);
+	}, [viewKey]);
+	const [directoryResult, setDirectoryResult] = useState<{ key: string; entries: FileEntry[] }>();
 	const [workspace, setWorkspace] = useState<Workspace | null>(null);
 	const [checkpoint, setCheckpoint] = useState<GitCheckpoint>();
 	const [loadedCheckpointId, setLoadedCheckpointId] = useState<string>();
@@ -87,7 +118,10 @@ export function WorkspacePanel({
 	const selectedPath = pane === "files" ? view.files.path : position.path;
 	const nameStart = (selectedPath?.lastIndexOf("/") ?? -1) + 1;
 	const source = turnReview ? checkpointId : workspaceSource;
-	const [commitMessage, setCommitMessage] = useState("");
+	const [commitDraft, setCommitDraft] = useState<{ message: string; stagedVersion?: string }>({ message: "" });
+	const commitMessage = commitDraft.message;
+	const commitEditRevision = useRef(0);
+	const [generatingCommit, setGeneratingCommit] = useState(false);
 	const [mutating, setMutating] = useState(false);
 	const [sending, setSending] = useState(false);
 	const [error, setError] = useState("");
@@ -99,10 +133,20 @@ export function WorkspacePanel({
 	const [analyzing, setAnalyzing] = useState(false);
 	const [line, setLine] = useState("1");
 	const [column, setColumn] = useState("1");
+	const [copiedFile, setCopiedFile] = useState(false);
+	const [fileFilter, setFileFilter] = useState("");
+	const [filterResult, setFilterResult] = useState<{ key: string; entries: FileEntry[]; error?: string }>();
+	const [expandedDirs, setExpandedDirs] = useState<Record<string, boolean>>({});
+	const [subTreeEntries, setSubTreeEntries] = useState<Record<string, FileEntry[]>>({});
+	const [treeFocusPath, setTreeFocusPath] = useState<string>();
 	const [discard, setDiscard] = useState<Change>();
 	const [discardVersion, setDiscardVersion] = useState<string>();
 	const [undo, setUndo] = useState<{ checkpoint: GitCheckpoint; path: string }>();
+	const workspaceError = (discard ? "" : error) || listError;
 	const scroller = useRef<HTMLDivElement>(null);
+	const tree = useRef<HTMLDivElement>(null);
+	const restoreTreeFocus = useRef(false);
+	const inspectionSequence = useRef(0);
 	const noteEditor = useRef<HTMLTextAreaElement>(null);
 	const focusNoteOnMount = useRef<Element | null>(null);
 	const focusNoteEditor = () => {
@@ -116,6 +160,18 @@ export function WorkspacePanel({
 	}, [view.draft?.id]);
 	const requestId = JSON.stringify([viewKey, pane, source, selectedPath, refresh, turnReview ? 0 : revision]);
 	const content = loaded?.requestId === requestId ? loaded : undefined;
+	const directoryKey = JSON.stringify([viewKey, view.files.directory]);
+	const entries = directoryResult?.key === directoryKey ? directoryResult.entries : [];
+	const query = fileFilter.trim();
+	const filterKey = JSON.stringify([directoryKey, query, revision, refresh]);
+	const filtering = Boolean(query && conversationId);
+	const currentFilter = filterResult?.key === filterKey ? filterResult : undefined;
+	const resetInspection = useCallback(() => {
+		inspectionSequence.current += 1;
+		setIntelligence(null);
+		setAnalyzing(false);
+	}, []);
+	useLayoutEffect(resetInspection, [pane, viewKey, selectedPath, resetInspection]);
 	const stagedChanges = workspace?.changes.filter((entry) => entry.staged) ?? [];
 	const unstagedChanges = workspace?.changes.filter((entry) => entry.unstaged || !entry.staged) ?? [];
 	const reviewPaths = turnReview ? filteredTurnFiles.map((entry) => entry.path) : workspace?.changes.map((entry) => entry.path) ?? [];
@@ -145,14 +201,198 @@ export function WorkspacePanel({
 		setListError("");
 		const files = conversationId ? window.pi.tasks.files(conversationId, view.files.directory) : window.pi.files(view.files.directory);
 		void files.then((rows) => {
-			if (current) setEntries(rows);
+			if (current) setDirectoryResult({ key: directoryKey, entries: rows });
 		}).catch((cause) => {
 			if (current) setListError(errorMessage(cause));
 		}).finally(() => {
 			if (current) setDirectoryLoading(false);
 		});
 		return () => { current = false; };
-	}, [pane, conversationId, view.files.directory, revision, refresh]);
+	}, [pane, conversationId, view.files.directory, directoryKey, revision, refresh]);
+
+	useEffect(() => {
+		setFilterResult(undefined);
+		if (pane !== "files" || !query || !conversationId) return;
+		let current = true;
+		const timer = window.setTimeout(() => {
+			void window.pi.searchFiles(conversationId, query, view.files.directory).then(
+				(rows) => {
+					if (current) setFilterResult({ key: filterKey, entries: rows });
+				},
+				(cause) => {
+					if (current) setFilterResult({ key: filterKey, entries: [], error: errorMessage(cause) });
+				},
+			);
+		}, 70);
+		return () => {
+			current = false;
+			window.clearTimeout(timer);
+		};
+	}, [pane, conversationId, query, view.files.directory, filterKey]);
+
+	useEffect(() => {
+		setExpandedDirs({});
+		setSubTreeEntries({});
+		setFileFilter("");
+		setTreeFocusPath(undefined);
+	}, [viewKey]);
+
+	const openFile = useCallback((path: string, jump?: number, alignDirectory = false) => {
+		resetInspection();
+		setError("");
+		setFileFilter("");
+		setLine(String(jump ?? 1));
+		setColumn("1");
+		setTreeFocusPath(path);
+		updateView((current) => ({
+			...current,
+			files: {
+				directory: alignDirectory ? path.split("/").slice(0, -1).join("/") : current.files.directory,
+				path,
+				lastPath: path,
+				line: jump,
+				top: 0,
+			},
+		}));
+	}, [resetInspection, updateView]);
+
+	useLayoutEffect(() => {
+		if (pane !== "files" || openFileRequest?.viewKey !== viewKey) return;
+		openFile(openFileRequest.path, openFileRequest.line, true);
+		consumeOpenFileRequest?.(openFileRequest.requestId);
+	}, [pane, viewKey, openFileRequest, consumeOpenFileRequest, openFile]);
+
+	useEffect(() => {
+		if (pane !== "files") return;
+		const openPaths = Object.keys(expandedDirs).filter((dir) => expandedDirs[dir]);
+		if (!openPaths.length) return;
+		let current = true;
+		void Promise.all(
+			openPaths.map(async (dirPath) => {
+				try {
+					const rows = conversationId ? await window.pi.tasks.files(conversationId, dirPath) : await window.pi.files(dirPath);
+					return [dirPath, rows] as const;
+				} catch {
+					return [dirPath, []] as const;
+				}
+			}),
+		).then((results) => {
+			if (!current) return;
+			setSubTreeEntries((prev) => {
+				const next = { ...prev };
+				for (const [path, rows] of results) next[path] = [...rows];
+				return next;
+			});
+		});
+		return () => {
+			current = false;
+		};
+	}, [pane, conversationId, expandedDirs, revision, refresh]);
+
+	const toggleTreeDir = (dirPath: string) => {
+		setExpandedDirs((prev) => ({ ...prev, [dirPath]: !prev[dirPath] }));
+	};
+
+	const treeRows = pane === "files" && !selectedPath && !filtering ? visibleTreeRows(entries, expandedDirs, subTreeEntries) : [];
+	const treeTabPath = treeRows.find(({ entry }) => entry.path === treeFocusPath)?.entry.path
+		?? treeRows.find(({ entry }) => entry.path === view.files.lastPath)?.entry.path
+		?? treeRows[0]?.entry.path;
+	useLayoutEffect(() => {
+		if (!restoreTreeFocus.current || !treeTabPath) return;
+		restoreTreeFocus.current = false;
+		if (document.activeElement === document.body)
+			tree.current?.querySelector<HTMLButtonElement>('[tabindex="0"]')?.focus();
+	}, [selectedPath, treeTabPath]);
+
+	const openDirectory = (directory: string) => {
+		restoreTreeFocus.current = true;
+		setFileFilter("");
+		updateView((current) => ({ ...current, files: { directory, lastPath: current.files.path ?? current.files.lastPath, top: 0 } }));
+	};
+
+	const renderTree = () => treeRows.map(({ entry, parent, level, position, size }, index) => {
+		const isExpanded = Boolean(entry.directory && expandedDirs[entry.path]);
+		const isActiveFile = !entry.directory && entry.path === view.files.lastPath;
+		return (
+			<button
+				key={entry.path}
+				type="button"
+				role="treeitem"
+				className={`cc-file-tree-row ${isExpanded ? "expanded" : ""} ${isActiveFile ? "active" : ""}`.trim()}
+				tabIndex={treeTabPath === entry.path ? 0 : -1}
+				aria-expanded={entry.directory ? isExpanded : undefined}
+				aria-current={isActiveFile ? "page" : undefined}
+				aria-level={level}
+				aria-posinset={position}
+				aria-setsize={size}
+				aria-busy={isExpanded && !subTreeEntries[entry.path]}
+				style={{ paddingLeft: `${8 + (level - 1) * 16 + (entry.directory ? 0 : 17)}px` }}
+				onFocus={() => setTreeFocusPath(entry.path)}
+				onClick={() => entry.directory ? toggleTreeDir(entry.path) : openFile(entry.path)}
+				onDoubleClick={entry.directory ? () => openDirectory(entry.path) : undefined}
+				onKeyDown={(event) => {
+					let next = -1;
+					switch (event.key) {
+						case "Enter":
+							if (!entry.directory || !event.shiftKey) return;
+							openDirectory(entry.path);
+							break;
+						case "ArrowRight":
+							if (entry.directory && !isExpanded) toggleTreeDir(entry.path);
+							else if (treeRows[index + 1]?.parent === entry.path) next = index + 1;
+							break;
+						case "ArrowLeft":
+							if (isExpanded) toggleTreeDir(entry.path);
+							else if (parent) next = treeRows.findIndex((row) => row.entry.path === parent);
+							break;
+						case "ArrowUp": next = index - 1; break;
+						case "ArrowDown": next = index + 1; break;
+						case "Home": next = 0; break;
+						case "End": next = treeRows.length - 1; break;
+						default: return;
+					}
+					event.preventDefault();
+					tree.current?.querySelectorAll<HTMLButtonElement>('[role="treeitem"]')[next]?.focus();
+				}}
+			>
+				{entry.directory ? (
+					<>
+						<ChevronRight size={13} className={`cc-tree-dir-caret ${isExpanded ? "open" : ""}`} aria-hidden="true" />
+						{isExpanded ? <FolderOpen size={14} /> : <Folder size={14} />}
+					</>
+				) : (
+					<FileCode2 size={14} />
+				)}
+				<span>{entry.name}</span>
+			</button>
+		);
+	});
+
+	const draftCommitMessage = async () => {
+		if (!stagedChanges.length || generatingCommit || mutating) return;
+		if (!window.pi.draftCommitMessage) {
+			setCommitDraft({ message: fallbackCommitSummary(stagedChanges) });
+			onNotice?.("当前未连接模型，已根据暂存文件名生成默认说明。");
+			return;
+		}
+		const revision = commitEditRevision.current;
+		setGeneratingCommit(true);
+		setError("");
+		try {
+			const res = await window.pi.draftCommitMessage(conversationId);
+			if (commitEditRevision.current !== revision) return;
+			setCommitDraft({ message: res.message, stagedVersion: res.stagedVersion });
+			if (res.source === "fallback") {
+				const reason = res.fallbackReason === "large_diff" ? "暂存差异过大" :
+					res.fallbackReason === "no_model" ? "当前未连接模型" : "模型暂不可用";
+				onNotice?.(`${reason}，已根据暂存文件名生成默认说明。`);
+			}
+		} catch (cause) {
+			if (commitEditRevision.current === revision) setError(errorMessage(cause));
+		} finally {
+			setGeneratingCommit(false);
+		}
+	};
 
 	useEffect(() => {
 		if (pane !== "changes") return;
@@ -247,15 +487,9 @@ export function WorkspacePanel({
 	};
 
 	const open = (path: string, jump?: number) => {
-		setIntelligence(null);
+		if (pane === "files") return openFile(path, jump, true);
 		setError("");
-		if (pane === "files") {
-			updateView((current) => ({ ...current, files: { ...current.files, path, line: jump, top: 0 } }));
-			setLine(String(jump ?? 1));
-			setColumn("1");
-		} else {
-			setPosition({ path, hunk: 0, top: 0 });
-		}
+		setPosition({ path, hunk: 0, top: 0 });
 	};
 
 	const jumpToHunk = (index: number) => {
@@ -273,14 +507,16 @@ export function WorkspacePanel({
 
 	const inspect = async (at?: CodePosition) => {
 		if (!conversationId || !content) return;
+		const request = ++inspectionSequence.current;
 		setAnalyzing(true);
 		setError("");
 		try {
-			setIntelligence(await window.pi.inspectCode(conversationId, content.path, at));
+			const result = await window.pi.inspectCode(conversationId, content.path, at);
+			if (request === inspectionSequence.current) setIntelligence(result);
 		} catch (cause) {
-			setError(errorMessage(cause));
+			if (request === inspectionSequence.current) setError(errorMessage(cause));
 		} finally {
-			setAnalyzing(false);
+			if (request === inspectionSequence.current) setAnalyzing(false);
 		}
 	};
 
@@ -360,10 +596,12 @@ export function WorkspacePanel({
 	};
 
 	const runGit = async (operation: () => Promise<Workspace>, notice?: string) => {
+		commitEditRevision.current++;
 		setMutating(true);
 		setError("");
 		try {
 			setWorkspace(await operation());
+			setCommitDraft((current) => current.stagedVersion ? { message: "" } : current);
 			onWorkspaceMutated?.();
 			if (notice) onNotice?.(notice);
 		} catch (cause) {
@@ -375,10 +613,10 @@ export function WorkspacePanel({
 
 	const commit = (event: React.FormEvent) => {
 		event.preventDefault();
-		if (!commitMessage.trim()) return;
+		if (!commitMessage.trim() || mutating || !stagedChanges.length) return;
 		void runGit(async () => {
-			const result = await window.pi.gitCommit(commitMessage);
-			setCommitMessage("");
+			const result = await window.pi.gitCommit(commitMessage, conversationId, commitDraft.stagedVersion);
+			setCommitDraft({ message: "" });
 			onNotice?.(`已提交 ${result.hash}`);
 			return result.workspace;
 		});
@@ -431,7 +669,9 @@ export function WorkspacePanel({
 					<div className="cc-git-row-btns">
 						<button type="button" className="cc-git-icon" title={staged ? "取消暂存" : "暂存修改"}
 							aria-label={`${staged ? "取消暂存" : "暂存"} ${change.path}`} disabled={mutating}
-							onClick={() => void runGit(() => staged ? window.pi.gitUnstage([change.path]) : window.pi.gitStage([change.path]))}>
+							onClick={() => void runGit(() => staged
+								? window.pi.gitUnstage([change.path], conversationId)
+								: window.pi.gitStage([change.path], conversationId))}>
 							{staged ? <Minus size={13} /> : <Plus size={13} />}
 						</button>
 						{!staged && <button type="button" className="cc-git-icon danger"
@@ -466,7 +706,7 @@ export function WorkspacePanel({
 					<IconButton icon={X} label="关闭工作区面板" onClick={close} />
 				</div>
 			</header>
-			{(error && !discard) || listError ? <div className="live-error" role="alert">{(error && !discard) || listError}</div> : null}
+			{workspaceError && <div className="live-error" role="alert">{workspaceError}</div>}
 			{pane === "changes" && (
 				<>
 					<div className="workspace-review-scopes" role="group" aria-label="查看改动范围">
@@ -500,18 +740,35 @@ export function WorkspacePanel({
 								{!readOnly && workspace.changes.length > 0 && (
 									<>
 										<div className="cc-git-bulk">
-											<button type="button" className="cc-mini-btn" disabled={mutating} onClick={() => void runGit(() => window.pi.gitStage())}>
+											<button type="button" className="cc-mini-btn" disabled={mutating} onClick={() => void runGit(() => window.pi.gitStage(undefined, conversationId))}>
 												<Plus size={12} /> 全部暂存
 											</button>
 											{stagedChanges.length > 0 && (
-												<button type="button" className="cc-mini-btn" disabled={mutating} onClick={() => void runGit(() => window.pi.gitUnstage())}>
+												<button type="button" className="cc-mini-btn" disabled={mutating} onClick={() => void runGit(() => window.pi.gitUnstage(undefined, conversationId))}>
 													<Minus size={12} /> 全部取消暂存
 												</button>
 											)}
 										</div>
 										<form className="cc-commit-box" onSubmit={commit}>
 											<input aria-label="Git 提交说明" placeholder={stagedChanges.length ? `提交 ${stagedChanges.length} 个已暂存文件…` : "先暂存修改…"}
-												value={commitMessage} onChange={(event) => setCommitMessage(event.target.value)} disabled={mutating || !stagedChanges.length} />
+												value={commitMessage}
+												onChange={(event) => {
+													commitEditRevision.current++;
+													setCommitDraft({ message: event.target.value });
+												}}
+												disabled={mutating || !stagedChanges.length} />
+											{stagedChanges.length > 0 && (generatingCommit || !commitMessage.trim()) && (
+												<button
+													type="button"
+													className="cc-mini-btn"
+													title={hasModel ? "读取已暂存文件 Diff 并生成 Conventional Commit 说明" : "根据已暂存文件生成提交说明"}
+													disabled={mutating || generatingCommit}
+													onClick={() => void draftCommitMessage()}
+												>
+													{generatingCommit ? <LoaderCircle size={12} className="spin" /> : <Sparkles size={12} />}{" "}
+													{generatingCommit ? "生成中…" : "拟定说明"}
+												</button>
+											)}
 											<button type="submit" className="primary-button" disabled={mutating || !stagedChanges.length || !commitMessage.trim()}>
 												<Check size={13} /> 提交
 											</button>
@@ -625,7 +882,7 @@ export function WorkspacePanel({
 									</div>
 								</div>
 								<div className="live-file-content live-diff workspace-review-diff" ref={scroller} onScroll={saveScroll}>
-									{content ? <UnifiedDiffView diff={content.text} mode={view.diffMode} hideFileHeader onReview={onSendReview && !sending ? (anchor) => void addReview(anchor) : undefined} />
+									{content ? <UnifiedDiffView diff={content.text} filePath={selectedPath} mode={view.diffMode} hideFileHeader onReview={onSendReview && !sending ? (anchor) => void addReview(anchor) : undefined} />
 										: contentError?.requestId === requestId ? <p className="subtle-note" role="alert">{contentError.message}</p>
 											: <p className="subtle-note" role="status">正在读取文件差异…</p>}
 								</div>
@@ -679,22 +936,42 @@ export function WorkspacePanel({
 				<div key={selectedPath ? `file:${selectedPath}` : `dir:${view.files.directory}`} className="cc-files-stage cc-tab-panel">
 					{selectedPath ? (
 						<>
-							<div className="file-preview-heading">
-								<button type="button" onClick={() => updateView((current) => ({ ...current, files: { directory: current.files.directory, top: 0 } }))}>
+							<div className="file-preview-heading file-preview-with-actions">
+								<button type="button" onClick={() => openDirectory(view.files.directory)}>
 									<ArrowLeft size={14} /> 返回
 								</button>
 								<span title={selectedPath}>{selectedPath}</span>
-								{conversationId && <button type="button" className="cc-mini-btn" disabled={analyzing || !content} onClick={() => void inspect()}>{analyzing ? "分析中…" : "代码分析"}</button>}
-								{onOpenInEditor && <button type="button" className="cc-mini-btn" onClick={() => onOpenInEditor(selectedPath)}><ExternalLink size={12} /> 编辑器</button>}
-								{onReferenceFile && <button type="button" className="cc-mini-btn" onClick={() => onReferenceFile(selectedPath)}>引用</button>}
+								<div className="file-preview-actions" role="group" aria-label="文件操作">
+									{content?.text && (
+										<button
+											type="button"
+											className={`cc-mini-btn ${copiedFile ? "is-copied" : ""}`.trim()}
+											onClick={() => {
+												void copyText(content.text).then((ok) => {
+													if (!ok) return;
+													setCopiedFile(true);
+													window.setTimeout(() => setCopiedFile(false), 1400);
+												});
+											}}
+										>
+											{copiedFile ? <Check size={12} /> : <Copy size={12} />} {copiedFile ? "已复制" : "复制"}
+										</button>
+									)}
+									{conversationId && <button type="button" className={`cc-mini-btn ${intelligence ? "active" : ""}`.trim()} disabled={analyzing || !content} onClick={() => void inspect()}>{analyzing ? "分析中…" : "代码分析"}</button>}
+									{onOpenInEditor && <button type="button" className="cc-mini-btn" onClick={() => onOpenInEditor(selectedPath)}><ExternalLink size={12} /> 编辑器</button>}
+									{onReferenceFile && <button type="button" className="cc-mini-btn" onClick={() => onReferenceFile(selectedPath)}>引用</button>}
+								</div>
 							</div>
 							{intelligence && (
 								<section className="cc-code-inspector">
-									<form onSubmit={(event) => { event.preventDefault(); void inspect({ line: Number(line), column: Number(column) }); }}>
-										<input type="number" required min="1" aria-label="定义查询行号" value={line} onChange={(event) => setLine(event.target.value)} />
-										<input type="number" required min="1" aria-label="定义查询列号" value={column} onChange={(event) => setColumn(event.target.value)} />
-										<button type="submit" className="cc-mini-btn" disabled={analyzing}>查找定义</button>
-									</form>
+									<div className="cc-code-inspector-bar">
+										<span className="subtle-note">可直接点击下方代码中的符号自动定位，或指定行列：</span>
+										<form onSubmit={(event) => { event.preventDefault(); void inspect({ line: Number(line), column: Number(column) }); }}>
+											<input type="number" required min="1" aria-label="定义查询行号" value={line} onChange={(event) => setLine(event.target.value)} />
+											<input type="number" required min="1" aria-label="定义查询列号" value={column} onChange={(event) => setColumn(event.target.value)} />
+											<button type="submit" className="cc-mini-btn" disabled={analyzing}>查找定义</button>
+										</form>
+									</div>
 									{intelligence.definitions.map((item, index) => <button type="button" key={index} onClick={() => open(item.path, item.line)}>{item.path}:{item.line}:{item.column}</button>)}
 									<AnimatedDetails
 										defaultOpen={intelligence.diagnostics.length > 0}
@@ -708,32 +985,88 @@ export function WorkspacePanel({
 								</section>
 							)}
 							<div className="live-file-content" ref={scroller} onScroll={saveScroll}>
-								{content ? (content.text ? <CodeLines content={content.text} activeLine={view.files.line} /> : <p className="subtle-note">空文件</p>)
-									: contentError?.requestId === requestId ? <p className="subtle-note" role="alert">{contentError.message}</p>
-										: <p className="subtle-note cc-shimmer-text" role="status">正在读取文件…</p>}
+								{content ? (
+									content.text ? (
+										<CodeLines
+											content={content.text}
+											activeLine={view.files.line}
+											lang={inferLangFromPath(selectedPath)}
+											onLineClick={
+												conversationId
+													? (clickedLine, clickedCol) => {
+															setLine(String(clickedLine));
+															setColumn(String(clickedCol));
+															updateView((current) => ({ ...current, files: { ...current.files, line: clickedLine } }));
+															if (intelligence) void inspect({ line: clickedLine, column: clickedCol });
+														}
+													: undefined
+											}
+										/>
+									) : (
+										<p className="subtle-note">空文件</p>
+									)
+								) : contentError?.requestId === requestId ? (
+									<p className="subtle-note" role="alert">{contentError.message}</p>
+								) : (
+									<p className="subtle-note cc-shimmer-text" role="status">正在读取文件…</p>
+								)}
 							</div>
 						</>
 					) : (
 						<>
-							<div className="file-preview-heading">
-								<button type="button" disabled={!view.files.directory} onClick={() => updateView((current) => ({ ...current,
-									files: { directory: current.files.directory.split("/").slice(0, -1).join("/"), top: 0 } }))}>
-									<ArrowLeft size={14} /> 上一级
-								</button>
-								<span>{view.files.directory || "项目根目录"}</span>
-							</div>
-							<div className="file-tree">
-								{entries.map((entry) => (
-									<button type="button" key={entry.path} onClick={() => entry.directory
-										? updateView((current) => ({ ...current, files: { directory: entry.path, top: 0 } }))
-										: open(entry.path)}>
-										{entry.directory ? <Folder size={15} /> : <FileCode2 size={15} />}
-										<span>{entry.name}</span>
+							<div className="file-preview-heading cc-files-Browser-head">
+								{view.files.directory ? (
+									<button type="button" onClick={() => openDirectory(view.files.directory.split("/").slice(0, -1).join("/"))}>
+										<ArrowLeft size={14} /> 上一级
 									</button>
-								))}
-								{directoryLoading ? <p className="subtle-note cc-shimmer-text" role="status">正在读取目录…</p>
-									: !entries.length && !listError && <p className="subtle-note">目录为空。</p>}
+								) : null}
+								<span title={view.files.directory || "项目根目录"}>{view.files.directory || "项目根目录"}</span>
 							</div>
+							{conversationId && (
+								<div className="cc-files-search-wrap">
+									<Search size={13} aria-hidden="true" />
+									<input
+										type="search"
+										aria-label="过滤项目文件"
+										placeholder="按文件名或路径快速搜索…"
+										value={fileFilter}
+										onChange={(e) => setFileFilter(e.target.value)}
+									/>
+									{fileFilter && (
+										<button type="button" className="cc-files-search-clear" aria-label="清除文件过滤" onClick={() => setFileFilter("")}>
+											<X size={12} />
+										</button>
+									)}
+								</div>
+							)}
+							{filtering ? (
+								<div className="file-tree" aria-busy={!currentFilter}>
+									{!currentFilter ? (
+										<p className="subtle-note cc-shimmer-text" role="status">正在搜索文件…</p>
+									) : currentFilter.error ? (
+										<p className="subtle-note" role="alert">{currentFilter.error}</p>
+									) : currentFilter.entries.length > 0 ? (
+										currentFilter.entries.map((entry) => (
+											<button
+												type="button"
+												key={entry.path}
+												onClick={() => entry.directory ? openDirectory(entry.path) : openFile(entry.path, undefined, true)}
+											>
+												{entry.directory ? <Folder size={15} /> : <FileCode2 size={15} />}
+												<span title={entry.path}>{entry.path}</span>
+											</button>
+										))
+									) : (
+										<p className="subtle-note">未找到匹配的文件。</p>
+										)}
+								</div>
+							) : entries.length ? (
+								<div ref={tree} className="file-tree" role="tree" aria-label="项目文件树" aria-busy={directoryLoading}>
+									{renderTree()}
+								</div>
+							) : directoryLoading || directoryResult?.key !== directoryKey ? (
+								!listError && <p className="subtle-note cc-shimmer-text" role="status">正在读取目录…</p>
+							) : !listError && <p className="subtle-note">目录为空。</p>}
 						</>
 					)}
 				</div>

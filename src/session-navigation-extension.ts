@@ -1,9 +1,9 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { contentText } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { isDesktopWorkspaceContext } from "./file-references.ts";
+import { composerDraftLayout, restoreComposerDraft, type ComposerDraft, type ComposerDraftLayout } from "./composer-draft.ts";
 
 export type SessionNavigationBridgeRequest =
 	| { requestId: string; operation: "navigate"; targetId: string; label?: string }
@@ -20,6 +20,7 @@ export type SessionNavigationBridgeResponse =
 			sessionId: string;
 			targetId?: string;
 			editorText?: string;
+			editorDraft?: ComposerDraft;
 	  }
 	| {
 			requestId: string;
@@ -36,6 +37,24 @@ export type SessionNavigationBridgeResponse =
 			};
 			leafId: string | null;
 	  };
+
+/** Carry attachment boundaries through the native text/queue RPC without changing the model prompt. */
+export function tagComposerPrompt(text: string, draft: ComposerDraft, token: string): string {
+	const layout = Buffer.from(JSON.stringify(composerDraftLayout(draft))).toString("base64url");
+	const signature = createHmac("sha256", token).update(layout).digest("hex");
+	return `${text}\n\n[pi-desktop-draft:${signature}:${layout}]`;
+}
+
+function readComposerTag(text: string, token: string): { text: string; layout: ComposerDraftLayout } | undefined {
+	for (const match of text.matchAll(/\n\n\[pi-desktop-draft:([a-f0-9]{64}):([A-Za-z0-9_-]+)\]/g)) {
+		const signature = createHmac("sha256", token).update(match[2]).digest("hex");
+		if (!timingSafeEqual(Buffer.from(signature), Buffer.from(match[1]))) continue;
+		return {
+			text: text.slice(0, match.index) + text.slice(match.index + match[0].length),
+			layout: JSON.parse(Buffer.from(match[2], "base64url").toString("utf8")) as ComposerDraftLayout,
+		};
+	}
+}
 
 /** Add a host-only RPC command that uses Pi's native tree hooks without a model call. */
 export default function sessionNavigation(pi: ExtensionAPI): void {
@@ -55,6 +74,24 @@ export default function sessionNavigation(pi: ExtensionAPI): void {
 		throw new Error("Invalid desktop session navigation configuration");
 	}
 	const expectedToken = Buffer.from(token);
+	pi.on("message_end", ({ message }) => {
+		if (message.role !== "user") return;
+		const first = typeof message.content === "string" ? message.content : message.content[0];
+		const text = typeof first === "string" ? first : first?.type === "text" ? first.text : undefined;
+		const tag = text?.includes("[pi-desktop-draft:") ? readComposerTag(text, token) : undefined;
+		if (!tag) return;
+		const content = typeof message.content === "string" ? tag.text
+			: [{ type: "text" as const, text: tag.text }, ...message.content.slice(1)];
+		const saved = { ...message, content, desktopDraft: tag.layout };
+		return { message: saved };
+	});
+	pi.on("context", ({ messages }) => {
+		if (!messages.some((message) => message.role === "user" && "desktopDraft" in message)) return;
+		return { messages: messages.map((message) => {
+			if (message.role !== "user" || !("desktopDraft" in message)) return message;
+			return { role: message.role, content: message.content, timestamp: message.timestamp };
+		}) };
+	});
 	const requestPath = join(directory, "request.json");
 	const responsePath = join(directory, "response.json");
 	pi.registerCommand(command, {
@@ -116,13 +153,14 @@ export default function sessionNavigation(pi: ExtensionAPI): void {
 			try {
 				const result = await ctx.navigateTree(request.targetId, { summarize: false, label: request.label });
 				let editorText: string | undefined;
+				let editorDraft: ComposerDraft | undefined;
 				if (!result.cancelled && request.targetId !== oldLeafId) {
 					if (target.type === "message" && target.message.role === "user") {
-						const content = target.message.content;
-						editorText = contentText(typeof content === "string" ? content : content.filter((block, index) =>
-							index === 0 || block.type !== "text" || !isDesktopWorkspaceContext(block.text)), "");
+						editorDraft = restoreComposerDraft(target.message);
+						editorText = editorDraft.text;
+					} else if (target.type === "custom_message") {
+						editorText = contentText(target.content, "");
 					}
-					else if (target.type === "custom_message") editorText = contentText(target.content, "");
 				}
 				await respond({
 					requestId,
@@ -134,6 +172,7 @@ export default function sessionNavigation(pi: ExtensionAPI): void {
 					leafId: ctx.sessionManager.getLeafId(),
 					sessionId: ctx.sessionManager.getSessionId(),
 					...(editorText !== undefined ? { editorText } : {}),
+					...(editorDraft ? { editorDraft } : {}),
 				});
 			} catch (error) {
 				await fail("navigation_failed", error instanceof Error ? error.message : String(error));

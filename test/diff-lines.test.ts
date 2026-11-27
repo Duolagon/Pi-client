@@ -20,12 +20,32 @@ test("diff lines beginning with Git metadata prefixes keep review anchors inside
 	const lines = parseUnifiedDiff(diff);
 	assert.equal(diffHunkCount(diff), 2);
 	assert.deepEqual(lines.filter((line) => line.type === "del" || line.type === "add" || line.type === "ctx"), [
-		{ type: "del", text: "-- removed SQL line comment", oldNum: 20, hunk: 0, section: "已暂存" },
-		{ type: "add", text: "++ added text beginning with ++", newNum: 30, hunk: 0, section: "已暂存" },
-		{ type: "ctx", text: "SELECT 1;", oldNum: 21, newNum: 31, hunk: 0, section: "已暂存" },
-		{ type: "add", text: "created later", newNum: 5, hunk: 1, section: "未暂存" },
+		{ type: "del", text: "-- removed SQL line comment", oldNum: 20, hunk: 0, section: "已暂存", oldPath: "query.sql", newPath: "query.sql" },
+		{ type: "add", text: "++ added text beginning with ++", newNum: 30, hunk: 0, section: "已暂存", oldPath: "query.sql", newPath: "query.sql" },
+		{ type: "ctx", text: "SELECT 1;", oldNum: 21, newNum: 31, hunk: 0, section: "已暂存", oldPath: "query.sql", newPath: "query.sql" },
+		{ type: "add", text: "created later", newNum: 5, hunk: 1, section: "未暂存", oldPath: "query.sql", newPath: "query.sql" },
 	]);
 	assert.equal(lines.filter((line) => line.type === "meta").length, 6);
+});
+
+test("multi-file unified diffs retain the path of each side, including quoted names and deleted files", () => {
+	const diff = [
+		'diff --git "a/\\346\\265\\213\\350\\257\\225.py" "b/\\346\\265\\213\\350\\257\\225.py"',
+		'--- "a/\\346\\265\\213\\350\\257\\225.py"',
+		"+++ /dev/null",
+		"@@ -1 +0,0 @@",
+		"-# removed Python",
+		"diff --git a/Dockerfile b/entry.sh",
+		"--- a/Dockerfile",
+		"+++ b/entry.sh",
+		"@@ -1 +1 @@",
+		"-FROM alpine",
+		"+RUN alpine",
+	].join("\n");
+	const paths = parseUnifiedDiff(diff)
+		.filter(({ type }) => type === "add" || type === "del")
+		.map(({ oldPath, newPath }) => [oldPath, newPath]);
+	assert.deepEqual(paths, [["测试.py", undefined], ["Dockerfile", "entry.sh"], ["Dockerfile", "entry.sh"]]);
 });
 
 test("a small change in a long snippet still has exact counts and line anchors", () => {

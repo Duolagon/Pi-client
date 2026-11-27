@@ -120,7 +120,7 @@ const { tree, leafId } = await window.pi.sessions.tree(conversationId);
 const { entries } = await window.pi.sessions.entries({ conversationId });
 const updates = await window.pi.sessions.entries({ conversationId, since: entries[0].id });
 const navigation = await window.pi.sessions.navigate({ conversationId, targetId: entries[0].id });
-// 用 navigation.snapshot 刷新消息；若有 editorText，放入输入框，不自动发送。
+// 用 navigation.snapshot 刷新消息；有 editorDraft 时恢复正文和附件，等待用户发送。
 ```
 
 省略 `conversationId` 使用当前前台会话。`fork` 复用 Pi 原生行为：从所选用户消息**之前**创建独立 JSONL，返回该消息的 `selectedText`。`clone` 复制当前所选分支直到当前叶节点。二者保留父会话和文件，新增 `parentConversationId / forkEntryId / origin` 元数据；不会复制整个树，也不会复制 Git 检查点或后台任务所有权。空叶节点不能克隆。
@@ -131,7 +131,9 @@ const navigation = await window.pi.sessions.navigate({ conversationId, targetId:
 
 所选叶节点单独持久化，重启后恢复。若第三方扩展取消恢复或 Pi 无法表达该节点，运行时会停止并明确报错，避免继续使用错误上下文。会话操作只改变对话上下文；项目文件的回退使用 `pi.git.restore`。
 
-`fork / clone` 返回 `{ cancelled, conversation?, selectedText?, snapshot }`；`navigate` 返回 `{ cancelled, leafId, editorText?, snapshot }`。返回的 snapshot 对应操作目标，`activate: false` 时不能据此替换全局前台选择；需以 `pi.snapshot()` 获取前台。后台任务完成后可以分支／克隆，但新会话不会继承原任务 ID、状态和审批。事件继续按新会话的 `conversationId` 路由。
+`fork / clone` 返回 `{ cancelled, conversation?, selectedText?, snapshot }`；`navigate` 返回 `{ cancelled, leafId, editorText?, editorDraft?, snapshot }`。旧会话缺少文本附件边界时，`editorDraft` 保留原文和已存图片。返回的 snapshot 对应操作目标，`activate: false` 时不能据此替换全局前台选择；需以 `pi.snapshot()` 获取前台。后台任务完成后可以分支／克隆，但新会话不会继承原任务 ID、状态和审批。事件继续按新会话的 `conversationId` 路由。
+
+`pi.searchConversations(query)` 查询会话当前分支的历史，返回 `{ matches, partial }`。分支文件不可读取或达到扫描上限时，`partial` 为 `true`；空查询取消当前扫描。
 
 ## 导入已有 Pi CLI 历史
 
@@ -286,6 +288,8 @@ const result = await window.pi.git.restore({
 检查点记录开始到结束期间整个工作树的变化，可能包括外部程序同期修改，不能将它标成“仅 Agent 修改”。恢复前应提供差异审核。`pending` 必须先封存后才能恢复。
 
 单个工作区文件可以调用 `pi.gitDiscardPreview({ conversationId, path, kind })` 取得预览版本。界面显示影响范围并获得确认后，将该版本作为 `expectedVersion` 传给 `pi.gitDiscard`。文件或暂存版本变化时应重新预览。未跟踪文件移到废纸篓，已跟踪文件恢复为暂存版本，并返回一份单文件撤销检查点。
+
+在 Git 仓库的子目录打开工作区时，拟定说明和提交都要求暂存内容位于该工作区。拟定期间暂存区发生变化时，应重新生成说明。
 
 ## PTY 终端
 

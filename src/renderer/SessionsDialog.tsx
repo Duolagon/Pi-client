@@ -3,6 +3,7 @@ import { Archive, Bot, Copy, GitBranch, GitFork, Import, Sparkles, User } from "
 import { Modal } from "../prototype/ui.tsx";
 import { SlidingTabList } from "./SegmentedTabs.tsx";
 import type { CliSessionHistoryItem, Conversation, SessionTreeResult, Snapshot } from "../shared.ts";
+import type { ComposerDraft } from "../composer-draft.ts";
 
 type TreeNode = SessionTreeResult["tree"][number];
 
@@ -150,7 +151,7 @@ export function SessionsDialog({
 	allSubagents = [],
 	onSelectConversation,
 	onSnapshot,
-	onEditorText,
+	onEditorDraft,
 	close,
 	fail,
 }: {
@@ -162,7 +163,7 @@ export function SessionsDialog({
 	allSubagents?: Conversation[];
 	onSelectConversation?: (id: string) => void;
 	onSnapshot: (snapshot: Snapshot) => void;
-	onEditorText?: (text: string) => void;
+	onEditorDraft?: (draft: ComposerDraft) => void;
 	close: () => void;
 	fail: (error: unknown) => void;
 }) {
@@ -209,8 +210,9 @@ export function SessionsDialog({
 			const res = await window.pi.sessions.navigate({ conversationId, targetId });
 			if (!res.cancelled) {
 				onSnapshot(res.snapshot);
-				if (res.editorText && onEditorText) {
-					onEditorText(res.editorText);
+				const draft = res.editorDraft ?? (res.editorText === undefined ? undefined : { text: res.editorText, attachments: [] });
+				if (draft && onEditorDraft) {
+					onEditorDraft(draft);
 					close();
 					return;
 				}

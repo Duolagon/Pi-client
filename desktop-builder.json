@@ -24,7 +24,7 @@
 		}
 	],
 	"npmRebuild": false,
-	"mac": { "category": "public.app-category.developer-tools", "target": ["zip"] },
-	"win": { "target": ["nsis"] },
-	"linux": { "target": ["AppImage"], "category": "Development" }
+	"mac": { "icon": "build/icon.icns", "category": "public.app-category.developer-tools", "target": ["zip"] },
+	"win": { "icon": "build/icon.png", "target": ["nsis"] },
+	"linux": { "icon": "build/icon.png", "target": ["AppImage"], "category": "Development" }
 }

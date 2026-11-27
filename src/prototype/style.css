@@ -1711,6 +1711,8 @@ button:hover {
 	display: flex;
 	align-items: center;
 	gap: 4px;
+	flex-shrink: 0;
+	white-space: nowrap;
 	font-size: var(--fs-xs, 11px);
 	color: var(--muted);
 }
@@ -1719,6 +1721,20 @@ button:hover {
 }
 .file-preview-heading > span {
 	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.file-preview-with-actions {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr);
+}
+.file-preview-actions {
+	grid-column: 1 / -1;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
 }
 .file-code {
 	padding: 14px 0;

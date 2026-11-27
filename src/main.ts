@@ -1,6 +1,6 @@
 import { maximumImageDataLength, maximumPromptLength, type ComposerAttachment, type PromptImage } from "./composer-draft.ts";
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, safeStorage, shell } from "electron";
-import { watch } from "node:fs";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, safeStorage, screen, shell } from "electron";
+import { readFileSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mkdir, stat } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
@@ -139,10 +139,60 @@ async function configureTracingContent(dataDir: string, captureContent: boolean)
 	}, encryptLocal);
 }
 
+interface SavedWindowState {
+	x?: number;
+	y?: number;
+	width: number;
+	height: number;
+	isMaximized?: boolean;
+	isFullScreen?: boolean;
+}
+
+function loadWindowState(): SavedWindowState {
+	const workArea = screen.getPrimaryDisplay().workArea;
+	const fallback: SavedWindowState = {
+		width: Math.min(1480, Math.max(1080, workArea.width - 40)),
+		height: Math.min(980, Math.max(720, workArea.height - 40)),
+	};
+	try {
+		const raw = JSON.parse(readFileSync(join(app.getPath("userData"), "window-state.json"), "utf8")) as Partial<SavedWindowState>;
+		const width = typeof raw.width === "number" && Number.isFinite(raw.width) ? Math.max(780, Math.round(raw.width)) : fallback.width;
+		const height = typeof raw.height === "number" && Number.isFinite(raw.height) ? Math.max(620, Math.round(raw.height)) : fallback.height;
+		if (typeof raw.x === "number" && typeof raw.y === "number" && Number.isFinite(raw.x) && Number.isFinite(raw.y)) {
+			const visible = screen.getAllDisplays().some(({ workArea: area }) =>
+				raw.x! + width > area.x + 80 &&
+				raw.x! < area.x + area.width - 80 &&
+				raw.y! + 48 > area.y &&
+				raw.y! < area.y + area.height - 60,
+			);
+			if (visible) {
+				return {
+					x: Math.round(raw.x),
+					y: Math.round(raw.y),
+					width: Math.min(width, workArea.width),
+					height: Math.min(height, workArea.height),
+					isMaximized: Boolean(raw.isMaximized),
+					isFullScreen: Boolean(raw.isFullScreen),
+				};
+			}
+		}
+		return {
+			width: Math.min(width, workArea.width),
+			height: Math.min(height, workArea.height),
+			isMaximized: Boolean(raw.isMaximized),
+			isFullScreen: Boolean(raw.isFullScreen),
+		};
+	} catch {
+		return fallback;
+	}
+}
+
 function createWindow() {
+	const savedState = loadWindowState();
 	window = new BrowserWindow({
-		width: 1480,
-		height: 980,
+		...(savedState.x !== undefined && savedState.y !== undefined ? { x: savedState.x, y: savedState.y } : {}),
+		width: savedState.width,
+		height: savedState.height,
 		minWidth: 780,
 		minHeight: 620,
 		title: "Pi Desktop",
@@ -155,6 +205,33 @@ function createWindow() {
 			contextIsolation: true,
 			sandbox: true,
 		},
+	});
+	if (savedState.isFullScreen) window.setFullScreen(true);
+	else if (savedState.isMaximized) window.maximize();
+	let saveBoundsTimer: ReturnType<typeof setTimeout> | undefined;
+	const persistWindowState = () => {
+		if (!window || window.isDestroyed()) return;
+		const isMaximized = window.isMaximized();
+		const isFullScreen = window.isFullScreen();
+		const bounds = isMaximized || isFullScreen ? window.getNormalBounds() : window.getBounds();
+		try {
+			writeFileSync(
+				join(app.getPath("userData"), "window-state.json"),
+				JSON.stringify({ ...bounds, isMaximized, isFullScreen }),
+			);
+		} catch {
+			/* ignore write failure during shutdown */
+		}
+	};
+	const scheduleSaveBounds = () => {
+		clearTimeout(saveBoundsTimer);
+		saveBoundsTimer = setTimeout(persistWindowState, 250);
+	};
+	window.on("resize", scheduleSaveBounds);
+	window.on("move", scheduleSaveBounds);
+	window.on("close", () => {
+		clearTimeout(saveBoundsTimer);
+		persistWindowState();
 	});
 	void window.loadFile(indexPath);
 	window.webContents.on("will-navigate", (event) => event.preventDefault());
@@ -408,7 +485,11 @@ function installHandlers() {
 		}
 	});
 	handle("pi:files", (path) => service.files(string(path, "文件路径")));
-	handle("pi:search-files", (id, query) => service.searchFiles(string(id, "会话 ID", 200), string(query, "文件查询", 4096)));
+	handle("pi:search-files", (id, query, preferredDirectory) => service.searchFiles(
+		string(id, "会话 ID", 200),
+		string(query, "文件查询", 4096),
+		preferredDirectory === undefined ? undefined : string(preferredDirectory, "当前目录", 4096),
+	));
 	handle("pi:check-file-references", (id, paths) => {
 		if (!Array.isArray(paths) || paths.length > 24) throw new Error("文件引用列表无效。");
 		return service.checkFileReferences(string(id, "会话 ID", 200), paths.map((path) => string(path, "文件路径", 4096)));
@@ -789,33 +870,82 @@ void app.whenReady().then(async () => {
 		if (window && !window.webContents.isDestroyed()) window.webContents.send("pi:workflow:event", event);
 	});
 	installHandlers();
+	const sendMenuAction = (action: string) => {
+		if (!window || window.isDestroyed()) createWindow();
+		if (window && !window.webContents.isDestroyed()) {
+			if (window.isMinimized()) window.restore();
+			window.show();
+			window.focus();
+			window.webContents.send("pi:menu:action", action);
+		}
+	};
 	Menu.setApplicationMenu(
 		Menu.buildFromTemplate([
-			{ label: "Pi Desktop", submenu: [{ role: "about" }, { role: "hide" }, { role: "quit" }] },
 			{
-				label: "Edit",
+				label: "Pi Desktop",
 				submenu: [
-					{ role: "undo" },
-					{ role: "redo" },
+					{ role: "about", label: "关于 Pi Desktop" },
 					{ type: "separator" },
-					{ role: "cut" },
-					{ role: "copy" },
-					{ role: "paste" },
-					{ role: "selectAll" },
+					{ label: "设置…", accelerator: "CmdOrCtrl+,", click: () => sendMenuAction("settings") },
+					{ label: "环境诊断…", click: () => sendMenuAction("doctor") },
+					{ label: "用量统计…", click: () => sendMenuAction("stats") },
+					{ type: "separator" },
+					{ role: "services", label: "服务" },
+					{ type: "separator" },
+					{ role: "hide", label: "隐藏 Pi Desktop" },
+					{ role: "hideOthers", label: "隐藏其他" },
+					{ role: "unhide", label: "全部显示" },
+					{ type: "separator" },
+					{ role: "quit", label: "退出 Pi Desktop" },
 				],
 			},
 			{
-				label: "View",
+				label: "文件",
 				submenu: [
-					{ role: "reload" },
-					{ role: "toggleDevTools" },
-					{ role: "resetZoom" },
-					{ role: "zoomIn" },
-					{ role: "zoomOut" },
-					{ role: "togglefullscreen" },
+					{ label: "新建会话", accelerator: "CmdOrCtrl+N", click: () => sendMenuAction("new-conversation") },
+					{ label: "打开项目目录…", accelerator: "CmdOrCtrl+O", click: () => sendMenuAction("open-workspace") },
+					{ type: "separator" },
+					{ label: "导出当前会话…", accelerator: "CmdOrCtrl+Shift+E", click: () => sendMenuAction("export-conversation") },
 				],
 			},
-			{ role: "windowMenu" },
+			{
+				label: "编辑",
+				submenu: [
+					{ role: "undo", label: "撤销" },
+					{ role: "redo", label: "重做" },
+					{ type: "separator" },
+					{ role: "cut", label: "剪切" },
+					{ role: "copy", label: "复制" },
+					{ role: "paste", label: "粘贴" },
+					{ role: "selectAll", label: "全选" },
+					{ type: "separator" },
+					{ label: "在会话中查找…", accelerator: "CmdOrCtrl+F", click: () => sendMenuAction("find-in-session") },
+				],
+			},
+			{
+				label: "视图",
+				submenu: [
+					{ label: "命令面板…", accelerator: "CmdOrCtrl+P", click: () => sendMenuAction("command-palette") },
+					{ label: "搜索会话与内容…", accelerator: "CmdOrCtrl+K", click: () => sendMenuAction("search-sessions") },
+					{ type: "separator" },
+					{ label: "切换侧边栏", accelerator: "CmdOrCtrl+B", click: () => sendMenuAction("toggle-sidebar") },
+					{ label: "切换集成终端", accelerator: "CmdOrCtrl+J", click: () => sendMenuAction("toggle-terminal") },
+					{ label: "切换代码修改面板", accelerator: "CmdOrCtrl+Shift+D", click: () => sendMenuAction("toggle-changes") },
+					{ type: "separator" },
+					{ role: "reload", label: "重新加载界面" },
+					{ role: "toggleDevTools", label: "开发者工具" },
+					{ type: "separator" },
+					{ role: "resetZoom", label: "实际大小" },
+					{ role: "zoomIn", label: "放大" },
+					{ role: "zoomOut", label: "缩小" },
+					{ type: "separator" },
+					{ role: "togglefullscreen", label: "进入全屏" },
+				],
+			},
+			{
+				label: "窗口",
+				role: "windowMenu",
+			},
 		]),
 	);
 	createWindow();

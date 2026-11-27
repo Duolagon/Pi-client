@@ -8,6 +8,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { _electron as electron } from "playwright";
+import { verifyCommitDraft } from "./verify-commit-draft.mjs";
+import { verifyWorkspaceNavigation } from "./verify-workspace-navigation.mjs";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const executableArgument = process.argv.indexOf("--executable");
@@ -20,6 +22,7 @@ const builtExecutable = join(
 // To test the installed copy, pass --executable "/Applications/Pi Desktop.app/Contents/MacOS/Pi Desktop".
 const executable = executableArgument >= 0 ? resolve(process.argv[executableArgument + 1]) : builtExecutable;
 const capture = process.argv.includes("--screenshots");
+const workspaceScreenshots = process.argv.includes("--workspace-screenshots") ? join(repo, "artifacts/workspace-regressions") : undefined;
 const contestScreenshots = process.argv.includes("--contest-screenshots") ? join(repo, "artifacts/contest-handoff") : undefined;
 const testArgs = process.platform === "darwin" ? ["--use-mock-keychain"] : [];
 async function until(check, label) {
@@ -499,6 +502,8 @@ try {
 		await page.getByRole("region", { name: `允许执行 ${name}？`, exact: true }).waitFor();
 		await assertChatEdges(".cc-active-request");
 		if (name === "write") {
+			await page.getByRole("region", { name: "允许执行 write？", exact: true })
+				.locator(".cc-code-lines .tok-keyword").getByText("export", { exact: true }).waitFor();
 			await resizeWindow(1100);
 			await page.getByRole("button", { name: "代码修改", exact: true }).click();
 			await page.locator(".live-app.has-compact-inspector").waitFor();
@@ -1594,6 +1599,8 @@ try {
 	await page.getByRole("button", { name: "后台任务与 Worktree", exact: true }).click();
 	const drawer = page.getByRole("dialog", { name: "后台任务、子 Agent 与 Worktree (/tasks)", exact: true });
 	await drawer.getByRole("button", { name: "停止全部后台任务", exact: true }).waitFor();
+	await drawer.locator(".cc-tool-ctrl-row").filter({ hasText: "演示本轮后台命令" })
+		.getByText("已停止", { exact: true }).waitFor();
 	await drawer.getByRole("button", { name: "关闭对话框", exact: true }).click();
 	await page.evaluate((id) => window.pi.monitors.stop(id), older.id);
 	checks.push("stop remains available after the reply and reload, rejects another run ID, and exits only the current process");
@@ -1747,6 +1754,8 @@ try {
 	const updateSpotlights = page.locator(".cc-edit-spotlight-row").filter({ hasText: "已更新" });
 	const exactSpotlight = updateSpotlights.filter({ has: page.getByText("+1", { exact: true }) });
 	await exactSpotlight.getByText("-1", { exact: true }).waitFor();
+	if (await exactSpotlight.getAttribute("aria-expanded") !== "true") await exactSpotlight.click();
+	await exactSpotlight.locator("..").locator(".cc-diff-add .tok-keyword").getByText("const", { exact: true }).waitFor();
 	const broadSpotlight = updateSpotlights.filter({ hasText: "差异预览" });
 	assert.equal(await broadSpotlight.locator(".cc-tool-diff-stat").count(), 0);
 	const broadDiff = broadSpotlight.locator("..");
@@ -1845,11 +1854,104 @@ try {
 	await contextDialog.getByRole("button", { name: "关闭对话框", exact: true }).click();
 	checks.push("real SDK compaction shows progress, a completion estimate, and a persisted summary while context usage waits for the next reply");
 
+	if (workspaceScreenshots) await mkdir(workspaceScreenshots, { recursive: true });
+	await newChat();
+	const originalText = "复核编辑重发原文\n\n附件 例子：\n这段仍是正文。\n\n<pi-desktop-workspace-context>\n这是用户输入的字面文本。\n</pi-desktop-workspace-context>";
+	await page.getByRole("textbox", { name: "输入任务", exact: true }).fill(originalText);
+	await page.getByLabel("选择附件", { exact: true }).setInputFiles([
+		{ name: "报告：初稿.txt", mimeType: "text/plain", buffer: Buffer.from("这是正文附件。\n\n附件 仍是附件正文：\n保留。") },
+		{ name: "复核图片.png", mimeType: "image/png",
+			buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC", "base64") },
+	]);
+	const originalPicture = page.getByRole("button", { name: "移除附件 复核图片.png", exact: true });
+	await originalPicture.waitFor();
+	await page.getByRole("button", { name: "发送任务", exact: true }).click();
+	const originalPrompt = page.locator(".cl-msg-user").filter({ hasText: "复核编辑重发原文" });
+	await originalPrompt.waitFor();
+	await idle();
+	await page.reload();
+	await ready();
+	await originalPrompt.hover();
+	await originalPrompt.getByRole("button", { name: "编辑并重新发送", exact: true }).click();
+	await originalPicture.waitFor();
+	await page.getByRole("button", { name: "移除附件 报告：初稿.txt", exact: true }).waitFor();
+	assert.equal(await page.getByRole("textbox", { name: "输入任务", exact: true }).inputValue(), originalText);
+	await originalPrompt.waitFor({ state: "hidden" });
+	if (workspaceScreenshots) await page.screenshot({ path: join(workspaceScreenshots, "edit-and-resend.png"), scale: "css" });
+	checks.push("editing a persisted message restores exact text and both attachment chips after reload");
+
+	await page.getByRole("button", { name: "发送任务", exact: true }).click();
+	await originalPrompt.waitFor();
+	await idle();
+	await newChat();
+	await submit("全文搜索回归的会话标题");
+	await idle();
+	await submit('这行正文包含 "SEARCH_HISTORY_FIXTURE"。');
+	await page.locator(".cl-msg-user").filter({ hasText: "SEARCH_HISTORY_FIXTURE" }).waitFor();
+	await idle();
+	await page.keyboard.press("Meta+k");
+	const historySearch = page.getByRole("combobox", { name: "搜索会话标题或项目", exact: true });
+	await historySearch.fill('"SEARCH_HISTORY_FIXTURE"');
+	const exactHistoryHit = page.getByRole("option").filter({ hasText: "全文搜索回归的会话标题" });
+	await exactHistoryHit.waitFor();
+	assert.equal(await exactHistoryHit.evaluate((result) => {
+		const icon = result.querySelector(".cc-palette-icon").getBoundingClientRect();
+		const title = result.querySelector(".cc-palette-result-text strong").getBoundingClientRect();
+		const project = result.querySelector(".cc-palette-result-text > span").getBoundingClientRect();
+		return icon.right < title.left && icon.top < project.bottom && project.top >= title.bottom;
+	}), true, "The result icon stays beside the copy and the project sits below the title");
+	if (workspaceScreenshots) await page.screenshot({ path: join(workspaceScreenshots, "history-search.png"), scale: "css" });
+	await historySearch.fill("NO_MATCHING_SESSION_6789");
+	await historySearch.press("Enter");
+	await historySearch.waitFor();
+	await exactHistoryHit.waitFor({ state: "hidden" });
+	await page.keyboard.press("Escape");
+	checks.push("history search finds quoted content and cannot open stale results for a different query");
+
+	await newChat();
+	await page.evaluate(() => window.pi.saveSettings({ permission: "ask", theme: "light", editor: "vscode" }));
+	await setPermissionMode("auto");
+	await submit("验证独立 Worktree 的编辑器定位");
+	const worktreeRow = page.locator(".cc-subagent-row").filter({ hasText: "独立 Worktree 定位" });
+	await worktreeRow.waitFor();
+	const worktreeTask = await page.evaluate(async () => (await window.pi.tasks.list()).find((item) => item.title === "独立 Worktree 定位"));
+	assert.ok(worktreeTask?.worktreeId && worktreeTask?.workingDirectory);
+	await worktreeRow.click();
+	await page.getByRole("button", { name: "返回主会话", exact: true }).waitFor();
+	await page.getByRole("button", { name: "读取 1 个文件", exact: true }).click();
+	await application.evaluate(({ shell }) => {
+		globalThis.verifyEditorUri = undefined;
+		globalThis.verifyEditorOriginal = shell.openExternal;
+		shell.openExternal = async (uri) => { globalThis.verifyEditorUri = uri; };
+	});
+	try {
+		await page.getByRole("button", { name: "在编辑器中打开 src/greeting.mjs", exact: true }).click();
+		let editorUri;
+		await until(async () => { editorUri = await application.evaluate(() => globalThis.verifyEditorUri); return Boolean(editorUri); }, "child editor URL");
+		assert.ok(decodeURI(editorUri).includes(`${worktreeTask.workingDirectory}/src/greeting.mjs`), editorUri);
+		if (workspaceScreenshots) await page.screenshot({ path: join(workspaceScreenshots, "worktree-transcript.png"), scale: "css" });
+	} finally {
+		await application.evaluate(({ shell }) => { shell.openExternal = globalThis.verifyEditorOriginal; });
+	}
+	await page.getByRole("button", { name: "返回主会话", exact: true }).click();
+	await idle();
+	checks.push("opening a tool path in a child transcript resolves through its actual Worktree");
+
+	checks.push(...await verifyWorkspaceNavigation({ page, root, agentDir, cliFixtures, ready, workspaceScreenshots }));
+	checks.push(await verifyCommitDraft(executable));
+
 	assert.deepEqual(pageErrors, []);
 	if (capture)
 		for (const name of ["client-light.png", "client-dark.png"])
 			assert.ok((await stat(join(repo, "docs/screenshots", name))).size < 1024 * 1024);
-	console.log(JSON.stringify({ passed: checks, screenshots: capture ? "docs/screenshots" : undefined, contestScreenshots }, null, 2));
+	console.log(JSON.stringify({ passed: checks, screenshots: capture ? "docs/screenshots" : undefined, contestScreenshots, workspaceScreenshots }, null, 2));
+	if (process.argv.includes("--inspect") && process.stdin.isTTY) {
+		await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.focus());
+		console.log("Packaged client ready for manual inspection. Press Enter to close it.");
+		process.stdin.resume();
+		await new Promise((resolve) => process.stdin.once("data", resolve));
+		process.stdin.pause();
+	}
 } catch (error) {
 	const artifacts = join(repo, "artifacts");
 	await mkdir(artifacts, { recursive: true });

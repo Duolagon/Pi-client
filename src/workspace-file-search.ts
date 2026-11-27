@@ -38,12 +38,13 @@ async function searchPaths(root: string, env: NodeJS.ProcessEnv): Promise<string
 	return result;
 }
 
-export async function searchWorkspaceFiles(root: string, query: string, env: NodeJS.ProcessEnv): Promise<FileEntry[]> {
+export async function searchWorkspaceFiles(root: string, query: string, env: NodeJS.ProcessEnv, preferredDirectory?: string): Promise<FileEntry[]> {
 	const prefix = query.toLocaleLowerCase().replace(/^\.\//, "");
 	const slash = prefix.lastIndexOf("/");
 	const directory = slash >= 0 ? prefix.slice(0, slash + 1) : "";
 	const needle = slash >= 0 ? prefix.slice(slash + 1) : prefix;
-	const matches = new Map<string, FileEntry & { score: number }>();
+	const preferred = preferredDirectory?.replace(/\/+$/, "");
+	const matches = new Map<string, FileEntry & { local: boolean; score: number }>();
 	const add = (path: string, directoryEntry: boolean) => {
 		if (matches.has(path)) return;
 		const parts = path.split("/");
@@ -57,7 +58,8 @@ export async function searchWorkspaceFiles(root: string, query: string, env: Nod
 			: lowerName === needle ? 1
 			: lowerName.startsWith(needle) ? 2
 			: 3;
-		matches.set(path, { path, name, directory: directoryEntry, score: score * 10 + Math.min(depth, 9) });
+		const local = Boolean(preferred && (path === preferred || path.startsWith(`${preferred}/`)));
+		matches.set(path, { path, name, directory: directoryEntry, local, score: score * 10 + Math.min(depth, 9) });
 	};
 	for (const path of await searchPaths(root, env)) {
 		const names = path.split("/");
@@ -65,7 +67,7 @@ export async function searchWorkspaceFiles(root: string, query: string, env: Nod
 		add(path, false);
 		for (let length = names.length - 1; length > 0; length--) add(names.slice(0, length).join("/"), true);
 	}
-	return [...matches.values()].sort((left, right) => left.score - right.score || left.path.localeCompare(right.path))
+	return [...matches.values()].sort((left, right) => Number(right.local) - Number(left.local) || left.score - right.score || left.path.localeCompare(right.path))
 		.slice(0, resultLimit)
 		.map(({ path, name, directory: folder }) => ({ path, name, directory: folder }));
 }

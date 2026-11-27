@@ -5,6 +5,8 @@ export interface DiffLine {
 	newNum?: number;
 	hunk?: number;
 	section?: string;
+	oldPath?: string;
+	newPath?: string;
 }
 
 export interface LineChangeCounts {
@@ -104,6 +106,21 @@ export function summarizeLineChanges(edits: readonly { oldText: string; newText:
 }
 
 const unifiedHunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+const gitPathEscapes: Record<string, string> = { a: "\x07", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v" };
+
+function diffPath(header: string): string | undefined {
+	let [path] = header.replace(/\r$/, "").split("\t", 1);
+	if (path.startsWith('"') && path.endsWith('"')) {
+		path = path.slice(1, -1).replace(/(?:\\[0-7]{3})+|\\./g, (encoded) => {
+			if (/^\\[0-7]/.test(encoded)) {
+				const bytes = Array.from(encoded.matchAll(/\\([0-7]{3})/g), (match) => Number.parseInt(match[1], 8));
+				return new TextDecoder().decode(Uint8Array.from(bytes));
+			}
+			return gitPathEscapes[encoded[1]] ?? encoded[1];
+		});
+	}
+	return path && path !== "/dev/null" ? path.replace(/^[ab]\//, "") : undefined;
+}
 
 export function diffHunkCount(raw: string): number {
 	return raw.split("\n").filter((line) => unifiedHunk.test(line)).length;
@@ -118,6 +135,7 @@ export function parseUnifiedDiff(raw: string): DiffLine[] {
 	let newRemaining = 0;
 	let hunk = -1;
 	let section: string | undefined;
+	let paths: Pick<DiffLine, "oldPath" | "newPath"> = {};
 	for (const text of raw.split("\n")) {
 		const header = unifiedHunk.exec(text);
 		if (header) {
@@ -128,16 +146,25 @@ export function parseUnifiedDiff(raw: string): DiffLine[] {
 			result.push({ type: "hunk", text, hunk: ++hunk, section });
 		} else if (oldRemaining > 0 && text.startsWith("-")) {
 			oldRemaining--;
-			result.push({ type: "del", text: text.slice(1), oldNum: oldLine++, hunk, section });
+			result.push({ type: "del", text: text.slice(1), oldNum: oldLine++, hunk, section, ...paths });
 		} else if (newRemaining > 0 && text.startsWith("+")) {
 			newRemaining--;
-			result.push({ type: "add", text: text.slice(1), newNum: newLine++, hunk, section });
+			result.push({ type: "add", text: text.slice(1), newNum: newLine++, hunk, section, ...paths });
 		} else if (oldRemaining > 0 && newRemaining > 0 && text.startsWith(" ")) {
 			oldRemaining--;
 			newRemaining--;
-			result.push({ type: "ctx", text: text.slice(1), oldNum: oldLine++, newNum: newLine++, hunk, section });
+			result.push({ type: "ctx", text: text.slice(1), oldNum: oldLine++, newNum: newLine++, hunk, section, ...paths });
 		} else if (text) {
-			if (text === "# 已暂存" || text === "# 未暂存") section = text.slice(2);
+			if (text === "# 已暂存" || text === "# 未暂存") {
+				section = text.slice(2);
+				paths = {};
+			} else if (text.startsWith("diff --git ")) {
+				paths = {};
+			} else if (text.startsWith("--- ")) {
+				paths = { oldPath: diffPath(text.slice(4)) };
+			} else if (text.startsWith("+++ ")) {
+				paths.newPath = diffPath(text.slice(4));
+			}
 			result.push({ type: "meta", text });
 		}
 	}

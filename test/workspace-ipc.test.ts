@@ -16,6 +16,7 @@ import type {
 	DesktopTask,
 	GitCheckpoint,
 	GitCheckpointDiff,
+	GitCommitDraft,
 	GitCommitResult,
 	GitDiscardInput,
 	GitDiscardResult,
@@ -59,9 +60,35 @@ function command(value: unknown): Command {
 	throw new Error("测试命令不在白名单或参数无效。");
 }
 
-async function setup() {
+async function setup({ observeCommitDraft = false } = {}) {
 	const fixture = await createCoreFixture();
 	const project = await realpath(fixture.project);
+	const commitProbe = join(fixture.root, "commit-model-input.json");
+	if (observeCommitDraft) {
+		await writeFile(join(fixture.agentDir, "extensions", "faux-provider.js"), `
+import { writeFileSync } from "node:fs";
+import { fauxProvider, fauxAssistantMessage } from "@earendil-works/pi-ai";
+const options = {
+	provider: "desktop-test", api: "desktop-test-api",
+	models: [{ id: "desktop-test-1", name: "Desktop Test One" }],
+	tokensPerSecond: 30, tokenSize: { min: 1, max: 1 },
+};
+const faux = fauxProvider(options);
+export default function (pi) {
+	pi.registerProvider(options.provider, {
+		api: options.api,
+		apiKey: "fixture-only",
+		baseUrl: "http://127.0.0.1:0",
+		models: faux.models,
+		streamSimple(model, context, streamOptions) {
+			writeFileSync(process.env.PI_COMMIT_FIXTURE_PROBE, JSON.stringify(context.messages));
+			faux.setResponses([fauxAssistantMessage("fix: 准确说明暂存变更")]);
+			return faux.provider.streamSimple(model, context, streamOptions);
+		},
+	});
+}
+`);
+	}
 	await git(project, "-c", "init.defaultBranch=main", "init");
 	await git(project, "add", "--", "seed.txt");
 	await git(project, "-c", "user.name=Desktop Test", "-c", "user.email=desktop@example.invalid", "-c", "commit.gpgSign=false", "commit", "-m", "feat: Initialize workspace IPC fixture");
@@ -70,7 +97,7 @@ async function setup() {
 		executable: process.execPath,
 		entry: fixture.entry,
 		permissionExtension: extension,
-		env: { ...fixture.env, HOME: fixture.root, SHELL: "/bin/bash" },
+		env: { ...fixture.env, HOME: fixture.root, SHELL: "/bin/bash", PI_COMMIT_FIXTURE_PROBE: commitProbe },
 		initialProject: project,
 		ptyHelperPath: helperPath,
 	});
@@ -91,7 +118,7 @@ async function setup() {
 	try {
 		const snapshot = await service.initialize();
 		assert.equal(snapshot.engineStatus, "ready", snapshot.engineError);
-		return { fixture, project, service, handlers, invoke, packets, terminalEvents, conversationId: snapshot.active!.id };
+		return { fixture, project, service, handlers, invoke, packets, terminalEvents, commitProbe, conversationId: snapshot.active!.id };
 	} catch (error) {
 		await service.close();
 		await fixture.cleanup();
@@ -108,6 +135,85 @@ async function until<T>(read: () => Promise<T>, predicate: (value: T) => boolean
 	}
 	assert.fail(`Timed out waiting for ${label}`);
 }
+
+test("commit drafting and committing share the visible staged scope", { timeout: 30000 }, async () => {
+	const data = await setup({ observeCommitDraft: true });
+	try {
+		const child = join(data.project, "child");
+		await mkdir(child);
+		await writeFile(join(child, "change.txt"), "STAGED_CHILD_CONTENT\n");
+		await writeFile(join(data.project, "seed.txt"), "STAGED_SIBLING_CONTENT\n");
+		const childSnapshot = await data.service.selectProject(child);
+		const childId = childSnapshot.active!.id;
+		await data.service.selectConversation(data.conversationId);
+		const scoped = await data.invoke<Workspace>("pi:workspace:stage", undefined, childId);
+		assert.deepEqual(scoped.changes.map((change) => change.path), ["change.txt"]);
+		assert.equal(await git(data.project, "diff", "--cached", "--name-only"), "child/change.txt");
+		await git(data.project, "add", "--", "seed.txt");
+		const head = await git(data.project, "rev-parse", "HEAD");
+		await assert.rejects(data.invoke("pi:workspace:draft-commit-message", childId), /仓库其他目录/);
+		await assert.rejects(data.invoke("pi:workspace:commit", "fix: Only child", childId), /仓库其他目录/);
+		await assert.rejects(access(data.commitProbe), { code: "ENOENT" });
+		assert.equal(await git(data.project, "rev-parse", "HEAD"), head);
+		assert.match(await git(data.project, "diff", "--cached"), /STAGED_SIBLING_CONTENT/);
+
+		await git(data.project, "reset", "-q", "HEAD", "--", "seed.txt");
+		await data.service.selectConversation(childId);
+		await writeFile(join(child, "change.txt"), "UNSTAGED_CHILD_CONTENT\n");
+		const draft = await data.invoke<GitCommitDraft>("pi:workspace:draft-commit-message", childId);
+		assert.equal(draft.source, "model");
+		assert.equal(draft.message, "fix: 准确说明暂存变更");
+		const modelInput = await readFile(data.commitProbe, "utf8");
+		assert.match(modelInput, /STAGED_CHILD_CONTENT/);
+		assert.doesNotMatch(modelInput, /UNSTAGED_CHILD_CONTENT|STAGED_SIBLING_CONTENT/);
+		await git(data.project, "config", "user.name", "Desktop Test");
+		await git(data.project, "config", "user.email", "desktop@example.invalid");
+		await git(data.project, "config", "commit.gpgSign", "false");
+		const result = await data.invoke<GitCommitResult>("pi:workspace:commit", draft.message, childId, draft.stagedVersion);
+		assert.ok(result.hash);
+		assert.equal(await git(data.project, "show", "HEAD:child/change.txt"), "STAGED_CHILD_CONTENT");
+		assert.equal(await readFile(join(child, "change.txt"), "utf8"), "UNSTAGED_CHILD_CONTENT\n");
+		assert.equal(await readFile(join(data.project, "seed.txt"), "utf8"), "STAGED_SIBLING_CONTENT\n");
+	} finally {
+		await data.service.close();
+		await data.fixture.cleanup();
+	}
+});
+
+test("commit drafts reject changed staged contents and fall back for large patches", { timeout: 30000 }, async () => {
+	const data = await setup({ observeCommitDraft: true });
+	try {
+		const path = join(data.project, "seed.txt");
+		await writeFile(path, "first staged version\n");
+		await git(data.project, "add", "--", "seed.txt");
+		const draft = await data.invoke<GitCommitDraft>("pi:workspace:draft-commit-message", data.conversationId);
+		assert.equal(draft.source, "model");
+		await writeFile(path, "updated during draft\n");
+		await git(data.project, "add", "--", "seed.txt");
+		await assert.rejects(data.invoke("pi:workspace:commit", draft.message, data.conversationId, draft.stagedVersion), /暂存内容已变化/);
+		await assert.rejects(data.invoke("pi:workspace:commit", draft.message, data.conversationId, "not-a-version"), /暂存版本无效/);
+
+		await rm(data.commitProbe);
+		const pending = data.invoke<GitCommitDraft>("pi:workspace:draft-commit-message", data.conversationId);
+		const rejected = assert.rejects(pending, /暂存内容已变化/);
+		await until(() => access(data.commitProbe).then(() => true, () => false), Boolean, "the draft model request");
+		await writeFile(path, "updated while the model response was pending\n");
+		await git(data.project, "add", "--", "seed.txt");
+		await rejected;
+
+		await rm(data.commitProbe);
+		await writeFile(path, "large patch text line\n".repeat(120000));
+		await git(data.project, "add", "--", "seed.txt");
+		const fallback = await data.invoke<GitCommitDraft>("pi:workspace:draft-commit-message", data.conversationId);
+		assert.equal(fallback.source, "fallback");
+		assert.equal(fallback.fallbackReason, "large_diff");
+		assert.match(fallback.message, /seed\.txt/);
+		await assert.rejects(access(data.commitProbe), { code: "ENOENT" });
+	} finally {
+		await data.service.close();
+		await data.fixture.cleanup();
+	}
+});
 
 test("workspace endpoints expose real Git checkpoints and owned worktree lifecycle", { timeout: 30000 }, async () => {
 	const data = await setup();

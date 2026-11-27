@@ -35,6 +35,8 @@ export function installSessionHandlers(handle: Handle, service: DesktopService):
 		const input = object(value);
 		return service.importSessionHistory({ token: id(input.token), activate: optionalBoolean(input.activate) });
 	});
+	// An empty query cancels the active search without starting another sidecar.
+	handle("pi:session:search-content", (query) => service.searchConversations(optionalText(query, 400) ?? ""));
 }
 
 function copyInput(input: Record<string, unknown>): SessionCopyInput {

@@ -47,7 +47,9 @@ import {
 	Pin,
 	MessageSquare,
 	CornerDownRight,
+	BarChart3,
 } from "lucide-react";
+import type { ComposerDraft } from "../composer-draft.ts";
 import type {
 	Conversation,
 	DesktopAPI,
@@ -227,8 +229,15 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [searching, setSearching] = useState(false);
 	const [query, setQuery] = useState("");
 	const [searchIndex, setSearchIndex] = useState(0);
+	const [contentSearch, setContentSearch] = useState<{ query: string; snippets: Record<string, string>; partial: boolean }>();
+	const [workspaceFileReq, setWorkspaceFileReq] = useState<{ path: string; line?: number; requestId: number; viewKey: string }>();
+	const workspaceRequestSequence = useRef(0);
+	const consumeWorkspaceFileRequest = useCallback((requestId: number) => {
+		setWorkspaceFileReq((previous) => previous?.requestId === requestId ? undefined : previous);
+	}, []);
 	const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
 	const [viewportHeight, setViewportHeight] = useState(() => window.innerHeight);
+	const [sidebarUserWidth, setSidebarUserWidth] = useState(() => savedInspectorWidth("pi.sidebarWidth", 256));
 	const [inspectorWidth, setInspectorWidth] = useState(() => savedInspectorWidth("pi.inspectorWidth", 400));
 	const [reviewWidth, setReviewWidth] = useState(() => savedInspectorWidth("pi.reviewInspectorWidth", 500));
 	const [terminalHeight, setTerminalHeight] = useState(() => {
@@ -271,6 +280,14 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [findOpen, setFindOpen] = useState(false);
 	const [findQuery, setFindQuery] = useState("");
 	const [findIndex, setFindIndex] = useState<number | null>(null);
+	const [findAnchorKey, setFindAnchorKey] = useState<string>();
+	const pendingFindScroll = useRef<{ container: HTMLElement; anchor: HTMLElement; top: number } | undefined>(undefined);
+	useLayoutEffect(() => {
+		if (findOpen || !pendingFindScroll.current) return;
+		const { container, anchor, top } = pendingFindScroll.current;
+		pendingFindScroll.current = undefined;
+		if (container.contains(anchor)) container.scrollTop += anchor.getBoundingClientRect().top - top;
+	}, [findOpen]);
 	const [trustOpen, setTrustOpen] = useState(false);
 	// Projects whose trust prompt the user postponed in this session; the topbar shield keeps a dot.
 	const [trustLater, setTrustLater] = useState<Record<string, true>>({});
@@ -362,6 +379,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		scroll.current?.scrollTo({ top: position?.top ?? 0, behavior: "instant" });
 		setShowJump(Boolean(position && !position.stick));
 		setFindIndex(null);
+		setFindAnchorKey(undefined);
+		setWorkspaceFileReq((previous) => previous?.viewKey === id ? previous : undefined);
 		setDeferredApproval(undefined);
 		setFocusedSubagentTaskId(null);
 		setPlanEditorOpen(false);
@@ -375,7 +394,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		const id = snapshot?.active?.id;
 		if (!id || running || changing) return;
 		let disposed = false;
-		void Promise.all([api.sessions.entries({ conversationId: id }), api.git.list(id)]).then(([entries, checkpoints]) => {
+		void Promise.all([api.sessions.entries({ conversationId: id }), api.git.list(id).catch(() => [])]).then(([entries, checkpoints]) => {
 			if (!disposed) setTurnData({ conversationId: id, entries, checkpoints });
 		}).catch(() => {
 			if (!disposed) setTurnData(undefined);
@@ -956,8 +975,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				if (path) app.setNotice(`会话已导出：${path}`);
 			})
 			.catch(app.fail);
-	const openInEditor = (filePath: string, line?: number) => {
-		const target = resolveEditorPath(snapshot?.active?.project, filePath);
+	const openInEditor = (filePath: string, line?: number, project = snapshot?.active?.project) => {
+		const target = resolveEditorPath(project, filePath);
 		if (!target) {
 			app.fail(new Error("无法定位此文件路径。"));
 			return;
@@ -1181,6 +1200,74 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			else startGrail();
 		}
 	};
+	const lastShortcutTs = useRef(0);
+	const runMenuOrShortcut = (action: string) => {
+		const now = Date.now();
+		if (now - lastShortcutTs.current < 65) return;
+		lastShortcutTs.current = now;
+		if (action === "settings") {
+			setConnecting(false);
+			setSettings(true);
+		}
+		else if (action === "doctor") setDoctorOpen(true);
+		else if (action === "stats") setUsageOpen(true);
+		else if (action === "new-conversation") {
+			if (snapshot?.active && !changing) startNewConversation();
+		} else if (action === "open-workspace") {
+			if (!changing) openWorkspace();
+		} else if (action === "export-conversation") {
+			if (snapshot?.active && !blocked) exportActive();
+		} else if (action === "find-in-session") {
+			if (snapshot?.active) {
+				if (findOpen) closeFind();
+				else setFindOpen(true);
+			}
+		} else if (action === "command-palette") {
+			setPaletteOpen((open) => !open);
+		} else if (action === "search-sessions") {
+			setQuery("");
+			setSearchIndex(0);
+			setSearching(true);
+		} else if (action === "toggle-sidebar") {
+			setSidebar((open) => !open);
+		} else if (action === "toggle-terminal") {
+			if (snapshot?.active) setTerminalOpen((open) => !open);
+		} else if (action === "toggle-changes") {
+			if (snapshot?.active) setPane(pane === "changes" ? null : "changes");
+		}
+	};
+	useEffect(() => {
+		const q = query.trim().toLowerCase();
+		const request = api.searchConversations;
+		if (!searching || q.length < 2 || !request) {
+			setContentSearch(undefined);
+			return;
+		}
+		let cancelled = false;
+		let pending = false;
+		const timer = window.setTimeout(() => {
+			pending = true;
+			void request(q).then(
+				({ matches, partial }) => {
+					pending = false;
+					if (cancelled) return;
+					setContentSearch({ query: q, snippets: Object.fromEntries(matches.map((hit) => [hit.conversationId, hit.snippet])), partial });
+				},
+				() => {
+					pending = false;
+					if (!cancelled) setContentSearch({ query: q, snippets: {}, partial: true });
+				},
+			);
+		}, 110);
+		return () => {
+			cancelled = true;
+			window.clearTimeout(timer);
+			if (pending) void request("").catch(() => {});
+		};
+	}, [searching, query, api]);
+	useEffect(() => {
+		return api.onMenuAction?.((action) => runMenuOrShortcut(action));
+	});
 	useEffect(() => {
 		const onKey = (event: KeyboardEvent) => {
 			if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
@@ -1220,24 +1307,46 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					return;
 				}
 			}
+			if (event.key === "," && !event.shiftKey) {
+				event.preventDefault();
+				runMenuOrShortcut("settings");
+				return;
+			}
+			if (lower === "o" && !event.shiftKey) {
+				event.preventDefault();
+				runMenuOrShortcut("open-workspace");
+				return;
+			}
+			if (event.metaKey && !event.ctrlKey && !event.shiftKey && lower === "b") {
+				event.preventDefault();
+				runMenuOrShortcut("toggle-sidebar");
+				return;
+			}
+			if (lower === "j" && !event.shiftKey) {
+				event.preventDefault();
+				runMenuOrShortcut("toggle-terminal");
+				return;
+			}
+			if (event.shiftKey && lower === "d") {
+				event.preventDefault();
+				runMenuOrShortcut("toggle-changes");
+				return;
+			}
 			if (lower === "k") {
 				event.preventDefault();
-				setQuery("");
-				setSearchIndex(0);
-				setSearching(true);
+				runMenuOrShortcut("search-sessions");
 			}
 			if (lower === "p") {
 				event.preventDefault();
-				setPaletteOpen((open) => !open);
+				runMenuOrShortcut("command-palette");
 			}
 			if (lower === "f" && snapshot?.active) {
 				event.preventDefault();
-				if (findOpen) closeFind();
-				else setFindOpen(true);
+				runMenuOrShortcut("find-in-session");
 			}
 			if (lower === "n" && snapshot?.active && !changing) {
 				event.preventDefault();
-				startNewConversation();
+				runMenuOrShortcut("new-conversation");
 			}
 		};
 		window.addEventListener("keydown", onKey);
@@ -1489,6 +1598,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		setFindIndex(next);
 		for (const el of nodes) delete el.dataset.findHit;
 		const target = hits[next];
+		setFindAnchorKey(target.closest<HTMLElement>("[data-transcript-unit]")?.dataset.transcriptUnit);
 		target.dataset.findHit = "true";
 		window.setTimeout(() => {
 			if (target.dataset.findHit === "true") delete target.dataset.findHit;
@@ -1496,6 +1606,15 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		target.scrollIntoView({ behavior: prefersReducedMotion() ? "instant" : "smooth", block: "center" });
 	};
 	const closeFind = () => {
+		const container = scroll.current;
+		const anchor = findAnchorKey && container?.querySelector<HTMLElement>(`[data-transcript-unit="${CSS.escape(findAnchorKey)}"]`);
+		if (container && anchor) {
+			const box = anchor.getBoundingClientRect();
+			const viewport = container.getBoundingClientRect();
+			if (box.bottom > viewport.top && box.top < viewport.bottom) {
+				pendingFindScroll.current = { container, anchor, top: box.top };
+			}
+		}
 		setFindOpen(false);
 		setFindIndex(null);
 		composerInputRef.current?.focus({ preventScroll: true });
@@ -1611,7 +1730,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const fullReview = reviewing && (focusReview || viewportWidth <= 860);
 	const minInspectorWidth = 320;
 	const minConversationWidth = 430;
-	const preferredSidebarWidth = viewportWidth <= 1000 ? 204 : viewportWidth <= 1180 ? 224 : 256;
+	const minSidebarWidth = 196;
+	const maxSidebarWidth = Math.min(380, Math.max(220, viewportWidth - minConversationWidth - 40));
+	const clampSidebar = (width: number) => Math.round(Math.min(maxSidebarWidth, Math.max(minSidebarWidth, width)));
+	const responsiveSidebarMax = viewportWidth <= 1000 ? 220 : viewportWidth <= 1180 ? 260 : maxSidebarWidth;
+	const preferredSidebarWidth = Math.min(responsiveSidebarMax, clampSidebar(sidebarUserWidth));
 	const preferredInspectorWidth = reviewing ? 500 : minInspectorWidth;
 	const compactInspector = inspectorOpen && !fullReview &&
 		viewportWidth < preferredInspectorWidth + minConversationWidth + preferredSidebarWidth;
@@ -1623,11 +1746,66 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const changeInspectorWidth = reviewing ? setReviewWidth : setInspectorWidth;
 	const inspectorWidthKey = reviewing ? "pi.reviewInspectorWidth" : "pi.inspectorWidth";
 	const saveInspectorWidth = (width: number) => localStorage.setItem(inspectorWidthKey, String(width));
+	const openQuickWorkspaceFile = (filePath: string, line?: number) => {
+		const viewKey = snapshot.active?.id;
+		if (!viewKey) return;
+		setPreviewUrl(null);
+		setPane("files");
+		setWorkspaceFileReq({ path: filePath, line, requestId: ++workspaceRequestSequence.current, viewKey });
+	};
 	return (
 		<div
 			className={`desktop-app live-app ${sidebarVisible ? "" : "cl-side-hidden"} ${inspectorOpen ? "has-inspector" : ""} ${compactInspector ? "has-compact-inspector" : ""} ${reviewing ? "is-review-pane" : ""} ${fullReview ? "is-full-review" : ""}`}
-			style={{ "--inspector-w": `${dockedWidth}px` } as CSSProperties}
+			style={{ "--inspector-w": `${dockedWidth}px`, "--cl-side-w": `${preferredSidebarWidth}px` } as CSSProperties}
 		>
+			{sidebarVisible && viewportWidth > 1000 && (
+				<div
+					className="cc-sidebar-resize"
+					role="separator"
+					aria-orientation="vertical"
+					aria-label="调整左侧边栏宽度"
+					aria-valuemin={minSidebarWidth}
+					aria-valuemax={maxSidebarWidth}
+					aria-valuenow={preferredSidebarWidth}
+					tabIndex={0}
+					style={{ left: `${preferredSidebarWidth - 3}px` }}
+					title="拖动调整侧栏宽度，双击恢复默认"
+					onDoubleClick={() => {
+						setSidebarUserWidth(256);
+						localStorage.setItem("pi.sidebarWidth", "256");
+					}}
+					onKeyDown={(event) => {
+						if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+						event.preventDefault();
+						const next = clampSidebar(preferredSidebarWidth + (event.key === "ArrowRight" ? 20 : -20));
+						setSidebarUserWidth(next);
+						localStorage.setItem("pi.sidebarWidth", String(next));
+					}}
+					onPointerDown={(event) => {
+						event.preventDefault();
+						const handle = event.currentTarget;
+						handle.setPointerCapture(event.pointerId);
+						document.body.classList.add("cc-resizing");
+						const startX = event.clientX;
+						const startW = preferredSidebarWidth;
+						let latest = startW;
+						const move = (e: PointerEvent) => {
+							latest = clampSidebar(startW + (e.clientX - startX));
+							setSidebarUserWidth(latest);
+						};
+						const up = () => {
+							handle.removeEventListener("pointermove", move);
+							handle.removeEventListener("pointerup", up);
+							handle.removeEventListener("pointercancel", up);
+							document.body.classList.remove("cc-resizing");
+							localStorage.setItem("pi.sidebarWidth", String(latest));
+						};
+						handle.addEventListener("pointermove", move);
+						handle.addEventListener("pointerup", up);
+						handle.addEventListener("pointercancel", up);
+					}}
+				/>
+			)}
 			{inspectorOpen && !compactInspector && !fullReview && (
 				<div
 					className="cc-inspector-resize"
@@ -1903,39 +2081,27 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							</span>
 							<button
 								type="button"
-								className={`cl-foot-sandbox ${snapshot.settings.sandbox ? "on" : "off"}`}
-								onClick={() => setSandboxOpen(true)}
-								title="点击管理命令沙箱"
+								className="cl-foot-sandbox"
+								onClick={() => setUsageOpen(true)}
+								title="查看近 30 天 Token 用量与费用明细"
 							>
-								{snapshot.settings.sandbox ? (
-									snapshot.settings.sandboxOffline ? (
-										<>
-											<WifiOff size={11} />
-											<span>离线沙箱</span>
-										</>
-									) : (
-										<>
-											<ShieldCheck size={11} />
-											<span>沙箱保护</span>
-										</>
-									)
-								) : (
-									<>
-										<ShieldAlert size={11} />
-										<span>无沙箱</span>
-									</>
-								)}
+								<BarChart3 size={11} />
+								<span>用量统计</span>
 							</button>
 						</div>
 						<button
 							type="button"
 							className={`cl-foot-settings ${settings ? "active" : ""}`}
 							aria-label="设置"
-							title="设置"
-							onClick={() => setSettings(true)}
+							title="打开设置 (⌘,)"
+							onClick={() => {
+								setConnecting(false);
+								setSettings(true);
+							}}
 						>
 							<Settings size={14} />
 							<span>设置</span>
+							<kbd className="cc-foot-kbd" aria-hidden="true">⌘,</kbd>
 						</button>
 					</div>
 				</aside>
@@ -2019,7 +2185,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								type="button"
 								className={`cc-top-btn ${pane === "changes" ? "active" : ""}`}
 								aria-label="代码修改"
-								title="代码修改与 Git Diff"
+								disabled={!snapshot.active}
+								title={!snapshot.active ? "请先打开项目文件夹" : "代码修改与 Git Diff (⌘⇧D)"}
 								onClick={() => { setPane(pane === "changes" ? null : "changes"); }}
 							>
 								<GitCompareArrows size={14} />
@@ -2030,7 +2197,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								type="button"
 								className={`cc-top-btn ${pane === "files" ? "active" : ""}`}
 								aria-label="项目文件"
-								title="浏览项目文件"
+								disabled={!snapshot.active}
+								title={!snapshot.active ? "请先打开项目文件夹" : "浏览项目文件"}
 								onClick={() => { setPane(pane === "files" ? null : "files"); }}
 							>
 								<Files size={14} />
@@ -2040,7 +2208,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								type="button"
 								className={`cc-top-btn ${terminalOpen ? "active" : ""}`}
 								aria-label="终端"
-								title="打开终端 / 交互 PTY"
+								disabled={!snapshot.active}
+								title={!snapshot.active ? "请先打开项目文件夹" : "打开终端 / 交互 PTY (⌘J)"}
 								onClick={() => setTerminalOpen(!terminalOpen)}
 							>
 								<TerminalIcon size={14} />
@@ -2297,20 +2466,71 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					</div>
 				</header>
 				<SurfacePresence show={Boolean(app.error || snapshot.engineError)} direction="banner" group="err-banner">
-					{(errRef) => (
-						<div ref={errRef} className="cl-banner cl-banner-error" role="alert">
-							<span>{app.error || snapshot.engineError}</span>
-							<button
-								onClick={() => {
-									app.setError("");
-									if (snapshot.engineError) void app.refresh();
-								}}
-								aria-label="关闭错误提示"
-							>
-								<X size={14} />
-							</button>
-						</div>
-					)}
+					{(errRef) => {
+						const errMsg = app.error || snapshot.engineError || "";
+						const isAuthErr = /401|403|api[_\s-]*key|unauthorized|authentication|密钥|鉴权|未连接|无效的服务商/i.test(errMsg);
+						const isQuotaErr = /402|429|rate[_\s-]*limit|quota|balance|insufficient|余额|限流|额度/i.test(errMsg);
+						const isContextErr = /context|token.*limit|maximum context|上下文.*超|过长/i.test(errMsg);
+						return (
+							<div ref={errRef} className="cl-banner cl-banner-error" role="alert">
+								<span>{errMsg}</span>
+								<div className="cc-banner-actions">
+									{isAuthErr ? (
+										<button
+											type="button"
+											className="cc-mini-btn cc-banner-cta"
+											onClick={() => {
+												app.setError("");
+												setConnecting(true);
+												setSettings(true);
+											}}
+										>
+											配置模型密钥
+										</button>
+									) : isQuotaErr ? (
+										<button
+											type="button"
+											className="cc-mini-btn cc-banner-cta"
+											onClick={() => {
+												app.setError("");
+												setUsageOpen(true);
+											}}
+										>
+											查看用量与模型
+										</button>
+									) : isContextErr && snapshot.active && !blocked && history.messages.length > 0 ? (
+										<button
+											type="button"
+											className="cc-mini-btn cc-banner-cta"
+											onClick={() => {
+												app.setError("");
+												void app.command({ type: "compact" });
+											}}
+										>
+											立即压缩上下文
+										</button>
+									) : snapshot.engineError ? (
+										<button
+											type="button"
+											className="cc-mini-btn cc-banner-cta"
+											onClick={() => setDoctorOpen(true)}
+										>
+											环境诊断
+										</button>
+									) : null}
+									<button
+										onClick={() => {
+											app.setError("");
+											if (snapshot.engineError) void app.refresh();
+										}}
+										aria-label="关闭错误提示"
+									>
+										<X size={14} />
+									</button>
+								</div>
+							</div>
+						);
+					}}
 				</SurfacePresence>
 				<SurfacePresence show={Boolean(app.notice)} direction="banner" group="notice-banner">
 					{(noticeRef) => (
@@ -2393,6 +2613,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 								task={focusedSubagentTask}
 								progress={taskProgressMap[focusedSubagentTask.id]}
 								onBack={() => setFocusedSubagentTaskId(null)}
+									onOpenFile={(filePath, line) => openInEditor(filePath, line, focusedSubagentTask.workingDirectory)}
 								onMainCompact={(customInstructions) => {
 									setFocusedSubagentTaskId(null);
 									void app.command({ type: "compact", ...(customInstructions ? { customInstructions } : {}) });
@@ -2483,10 +2704,31 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											entryIds={entryIds}
 											checkpointIds={checkpointIds}
 											approvalTool={approvalTool}
+											forceExpandAll={findOpen}
+											findAnchorKey={findAnchorKey}
 											onRewindPrompt={(checkpointId) => openCheckpoint(checkpointId)}
 											onForkPrompt={(entryId) => {
 												const conversationId = snapshot.active?.id;
 												if (conversationId) switchTo(async () => (await api.sessions.fork({ conversationId, entryId, activate: true })).snapshot);
+											}}
+											onEditPrompt={(entryId) => {
+												if (blocked) {
+													app.setNotice("请等待当前回复结束后再编辑重发。");
+													return;
+												}
+												const conversationId = snapshot.active?.id;
+												if (!conversationId) return;
+												let restored: ComposerDraft | undefined;
+												void app.switchTo(async () => {
+													const res = await api.sessions.navigate({ conversationId, targetId: entryId });
+													if (res.cancelled) return null;
+													restored = res.editorDraft;
+													return res.snapshot;
+												}, () => {
+													if (!restored) return;
+													app.replaceDraft(conversationId, restored);
+													requestAnimationFrame(() => composerInputRef.current?.focus());
+												});
 											}}
 											onRerunCheck={(command) => {
 												const conversationId = snapshot.active?.id;
@@ -2596,16 +2838,49 @@ function Desktop({ api }: { api: DesktopAPI }) {
 														<ArrowUpRight size={14} className="cc-starter-arrow" aria-hidden="true" />
 													</button>
 												</div>
-											) : snapshot.active ? (
-												<button type="button" className="primary-button cc-connect-first" onClick={() => { setConnecting(true); setSettings(true); }}>连接模型</button>
 											) : (
-												<>
-													<p>选择一个本地项目文件夹，Pi 会在该目录中读取代码、安全编辑并在沙箱内执行命令。</p>
-													<button className="primary-button cc-empty-cta" onClick={openWorkspace}>
-														<FolderOpen size={15} />
-														<span>打开项目文件夹</span>
-													</button>
-												</>
+												<div className="cc-onboard-steps" role="region" aria-label="快速开始步骤">
+													<div className={`cc-onboard-step ${snapshot.models.length > 0 ? "done" : "current"}`}>
+														<span className="cc-onboard-num">{snapshot.models.length > 0 ? <Check size={13} /> : "1"}</span>
+														<div className="cc-onboard-copy">
+															<strong>连接 AI 模型服务</strong>
+															<small>
+																{snapshot.models.length > 0
+																	? `已就绪 · ${snapshot.state?.model?.name || snapshot.models[0]?.name || snapshot.models[0]?.id}`
+																	: "支持 Anthropic、OpenAI、Gemini、DeepSeek、OpenRouter 或兼容接口"}
+															</small>
+														</div>
+														{snapshot.models.length === 0 && (
+															<button
+																type="button"
+																className="primary-button cc-connect-first"
+																onClick={() => {
+																	setConnecting(true);
+																	setSettings(true);
+																}}
+															>
+																连接模型
+															</button>
+														)}
+													</div>
+													<div className={`cc-onboard-step ${snapshot.active ? "done" : snapshot.models.length > 0 ? "current" : ""}`}>
+														<span className="cc-onboard-num">{snapshot.active ? <Check size={13} /> : "2"}</span>
+														<div className="cc-onboard-copy">
+															<strong>打开本地项目文件夹</strong>
+															<small>
+																{snapshot.active && project
+																	? `已挂载 · ${project.name}`
+																	: "Pi 将在该目录内读取代码、生成检查点并在命令沙箱内安全执行"}
+															</small>
+														</div>
+														{!snapshot.active && (
+															<button type="button" className="primary-button cc-empty-cta" onClick={openWorkspace}>
+																<FolderOpen size={14} />
+																<span>打开项目文件夹</span>
+															</button>
+														)}
+													</div>
+												</div>
 											)}
 											{(!snapshot.active || snapshot.models.length > 0) && <div className="cc-empty-hints">
 												<span><kbd>⌘N</kbd> 新建会话</span>
@@ -3150,6 +3425,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						pane={pane}
 						conversationId={snapshot.active?.id}
 						checkpointId={lastCheckpoint?.id}
+						hasModel={snapshot.models.length > 0}
+						openFileRequest={workspaceFileReq}
+						consumeOpenFileRequest={consumeWorkspaceFileRequest}
 						focusReview={focusReview}
 						onToggleReviewFocus={toggleReviewFocus}
 						onOpenCheckpoint={openCheckpoint}
@@ -3239,79 +3517,104 @@ function Desktop({ api }: { api: DesktopAPI }) {
 						setFlash(connecting ? "模型已连接" : "设置已保存");
 						if (connecting) requestAnimationFrame(() => composerInputRef.current?.focus());
 					}}
+					onOpenHub={(target) => {
+						setSettings(false);
+						setConnecting(false);
+						if (target === "tools" || target === "permissions" || target === "hooks" || target === "skills") setControlsTab(target);
+						else if (target === "mcp") setMcpOpen(true);
+						else if (target === "agents") setAgentsOpen(true);
+						else if (target === "memory") setMemoryTab("memory");
+					}}
 					apply={app.apply}
 					fail={app.fail}
 				/>
 			)}
 			{searching && (() => {
 				const needle = query.trim().toLowerCase();
+				const exactContent = needle.length >= 2 && contentSearch?.query === needle ? contentSearch : undefined;
+				const searchingContent = needle.length >= 2 && Boolean(api.searchConversations) && !exactContent;
 				const results = snapshot.conversations.filter((session) =>
-					`${session.title} ${projectName(snapshot, session.project)}`.toLowerCase().includes(needle),
+					session.kind !== "subagent" && (
+						!needle ||
+						`${session.title} ${projectName(snapshot, session.project)}`.toLowerCase().includes(needle) ||
+						Boolean(exactContent?.snippets[session.id])
+					),
 				);
 				const current = Math.min(searchIndex, Math.max(results.length - 1, 0));
 				const open = (id: string) => switchTo(() => api.selectConversation(id));
 				return (
-					<Modal title="搜索会话" close={() => setSearching(false)}>
-						<div className="search-dialog-input">
-							<Search size={17} />
-							<input
-								autoFocus data-autofocus
-								role="combobox"
-								aria-expanded="true"
-								aria-controls="cc-search-results"
-								aria-activedescendant={results[current] ? `cc-search-${results[current].id}` : undefined}
-								aria-label="搜索会话标题或项目"
-								value={query}
-								onChange={(event) => {
-									setQuery(event.target.value);
-									setSearchIndex(0);
-								}}
-								onKeyDown={(event) => {
-									if (event.nativeEvent.isComposing) return;
-									if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-										event.preventDefault();
-										if (!results.length) return;
-										const next = (current + (event.key === "ArrowDown" ? 1 : -1) + results.length) % results.length;
-										setSearchIndex(next);
-										document.getElementById(`cc-search-${results[next].id}`)?.scrollIntoView({ block: "nearest" });
-									} else if (event.key === "Enter" && results[current] && !changing) {
-										event.preventDefault();
-										open(results[current].id);
-									}
-								}}
-								placeholder="搜索标题或项目…"
-							/>
-						</div>
-						<SlidingTabList variant="list" className="search-results" id="cc-search-results" role="listbox" aria-label="搜索结果">
-							{results.length === 0 && <p className="cc-search-empty">没有匹配的会话</p>}
-							{results.map((session, index) => (
-								<button
-									id={`cc-search-${session.id}`}
-									role="option"
-									aria-selected={index === current}
-									aria-current={session.id === snapshot.active?.id ? "true" : undefined}
-									className={index === current ? "active" : undefined}
-									disabled={changing}
-									key={session.id}
-									tabIndex={-1}
-									onMouseEnter={() => setSearchIndex(index)}
-									onClick={() => open(session.id)}
-								>
-									<div className="cc-palette-row-main">
-										<MessageSquare size={14} className="cc-palette-icon" aria-hidden="true" />
-										<div>
-											<strong>{highlightMatch(session.title, needle)}</strong>
-											<span title={session.project}>{highlightMatch(projectName(snapshot, session.project), needle)}</span>
-										</div>
-									</div>
-									{session.id === snapshot.active?.id && <em className="cc-search-current">当前</em>}
-								</button>
-							))}
-						</SlidingTabList>
-						<div className="cc-palette-foot" aria-hidden="true">
-							<span><kbd>↑↓</kbd> 选择</span>
-							<span><kbd>↵</kbd> 切换会话</span>
-							<span><kbd>Esc</kbd> 关闭</span>
+					<Modal title="搜索会话与历史记录" close={() => setSearching(false)}>
+						<div className="simple-dialog">
+							<div className="search-dialog-input">
+								<Search size={17} />
+								<input
+									autoFocus data-autofocus
+									role="combobox"
+									aria-expanded="true"
+									aria-controls="cc-search-results"
+									aria-activedescendant={results[current] ? `cc-search-${results[current].id}` : undefined}
+									aria-label="搜索会话标题或项目"
+									value={query}
+									onChange={(event) => {
+										setQuery(event.target.value);
+										setSearchIndex(0);
+									}}
+									onKeyDown={(event) => {
+										if (event.nativeEvent.isComposing) return;
+										if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+											event.preventDefault();
+											if (!results.length) return;
+											const next = (current + (event.key === "ArrowDown" ? 1 : -1) + results.length) % results.length;
+											setSearchIndex(next);
+											document.getElementById(`cc-search-${results[next].id}`)?.scrollIntoView({ block: "nearest" });
+										} else if (event.key === "Enter" && results[current] && !changing) {
+											event.preventDefault();
+											open(results[current].id);
+										}
+									}}
+									placeholder="搜索会话标题、项目或历史对话内容…"
+								/>
+							</div>
+							<SlidingTabList variant="list" className="search-results" id="cc-search-results" role="listbox" aria-label="搜索结果">
+								{results.length === 0 && (
+									<p className="cc-search-empty">
+										{needle.length >= 2 && searchingContent ? "正在检索历史对话内容…" : "没有匹配的会话或对话内容"}
+									</p>
+								)}
+								{results.map((session, index) => {
+									const snippet = exactContent?.snippets[session.id];
+									return (
+										<button
+											id={`cc-search-${session.id}`}
+											role="option"
+											aria-selected={index === current}
+											aria-current={session.id === snapshot.active?.id ? "true" : undefined}
+											className={index === current ? "active" : undefined}
+											disabled={changing}
+											key={session.id}
+											tabIndex={-1}
+											onMouseEnter={() => setSearchIndex(index)}
+											onClick={() => open(session.id)}
+										>
+											<div className="cc-palette-row-main">
+												<span className="cc-palette-icon" aria-hidden="true"><MessageSquare size={14} /></span>
+												<div className="cc-palette-result-text">
+													<strong>{highlightMatch(session.title, needle)}</strong>
+													<span title={session.project}>{highlightMatch(projectName(snapshot, session.project), needle)}</span>
+													{snippet && <small className="cc-search-snippet">{highlightMatch(snippet, needle)}</small>}
+												</div>
+											</div>
+											{session.id === snapshot.active?.id && <em className="cc-search-current">当前</em>}
+										</button>
+									);
+								})}
+							</SlidingTabList>
+							{exactContent?.partial && <p className="subtle-note cc-search-empty" role="status">部分历史内容超出检索范围或暂时不可读。</p>}
+							<div className="cc-palette-foot" aria-hidden="true">
+								<span><kbd>↑↓</kbd> 选择</span>
+								<span><kbd>↵</kbd> 切换会话</span>
+								<span><kbd>Esc</kbd> 关闭</span>
+							</div>
 						</div>
 					</Modal>
 				);
@@ -3567,7 +3870,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					allSubagents={sidebarGroups.allSubagents}
 					onSelectConversation={(id) => switchTo(() => api.selectConversation(id))}
 					onSnapshot={() => void app.refresh()}
-					onEditorText={(text) => app.setDraft(text)}
+					onEditorDraft={(draft) => {
+						if (snapshot.active) app.replaceDraft(snapshot.active.id, draft);
+					}}
 					close={() => setSessionsOpen(false)}
 					fail={app.fail}
 				/>
@@ -3634,6 +3939,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			{paletteOpen && (
 				<CommandPalette
 					actions={paletteActions}
+					conversationId={snapshot.active?.id}
+					onOpenFile={snapshot.active ? openQuickWorkspaceFile : undefined}
 					close={() => setPaletteOpen(false)}
 				/>
 			)}

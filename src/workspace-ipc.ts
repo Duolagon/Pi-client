@@ -143,8 +143,8 @@ export function installWorkspaceHandlers(
 	});
 	handle("pi:worktree:merge", (worktreeId) => service.mergeWorktree(id(worktreeId)));
 	handle("pi:preview:default", (conversationId) => service.defaultPreviewUrl(id(conversationId)));
-	handle("pi:workspace:stage", (paths) => service.gitStage(optionalPathArray(paths)));
-	handle("pi:workspace:unstage", (paths) => service.gitUnstage(optionalPathArray(paths)));
+	handle("pi:workspace:stage", (paths, conversationId) => service.gitStage(optionalPathArray(paths), optionalId(conversationId)));
+	handle("pi:workspace:unstage", (paths, conversationId) => service.gitUnstage(optionalPathArray(paths), optionalId(conversationId)));
 	handle("pi:workspace:discard:preview", (value) => service.gitDiscardPreview(discardInput(value)));
 	handle("pi:workspace:discard", (value) => {
 		const input = discardInput(value);
@@ -152,7 +152,11 @@ export function installWorkspaceHandlers(
 		if (!/^[a-f0-9]{64}$/.test(expectedVersion)) throw new Error("请先确认要操作的文件版本。");
 		return service.gitDiscard({ ...input, expectedVersion });
 	});
-	handle("pi:workspace:commit", (message) => service.gitCommit(string(message, "提交说明", 32768)));
+	handle("pi:workspace:commit", (message, conversationId, expectedStagedVersion) => {
+		const version = expectedStagedVersion === undefined ? undefined : string(expectedStagedVersion, "Git 暂存版本", 64);
+		if (version !== undefined && !/^[a-f0-9]{64}$/.test(version)) throw new Error("Git 暂存版本无效。");
+		return service.gitCommit(string(message, "提交说明", 32768), optionalId(conversationId), version);
+	});
 	handle("pi:workspace:read-memory", () => service.readMemory());
 	handle("pi:workspace:write-memory", (file, content) => {
 		if (file !== "AGENTS.md" && file !== "CLAUDE.md") throw new Error("记忆文件名无效。");
@@ -177,6 +181,7 @@ export function installWorkspaceHandlers(
 		service.writePlan(string(content, "计划内容", 512 * 1024), optionalId(conversationId)),
 	);
 	handle("pi:btw", (question) => service.askBtw(string(question, "侧问问题", 32768)));
+	handle("pi:workspace:draft-commit-message", (conversationId) => service.draftCommitMessage(optionalId(conversationId)));
 	handle("pi:sandbox:status", () => service.sandboxStatus());
 }
 

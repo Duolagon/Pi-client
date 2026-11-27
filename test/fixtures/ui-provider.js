@@ -57,10 +57,10 @@ export default function uiProvider(pi) {
 				response = fauxAssistantMessage(preserved ? "仍能看到前一轮的文件引用。" : "上一轮文件引用缺失。");
 			} else if (prompt.startsWith("验证时间线增删行")) {
 				const original = Array.from({ length: 210 }, (_, i) => `line ${i + 1}`);
-				const exact = original.map((line, i) => i === 107 ? "replacement" : line);
+				const exact = original.map((line, i) => i === 107 ? "const replacement = true;" : line);
 				const broad = exact.map((line, i) => i === 0 ? "new start" : i === 209 ? "new end" : line);
 				const text = (lines) => lines.join("\n") + "\n";
-				const path = "timeline-edit.txt";
+				const path = "timeline-edit.js";
 				const steps = [
 					fauxToolCall("write", { path: "timeline-write.txt", content: "new row one\nnew row two\nnew row three\n" }),
 					fauxToolCall("write", { path, content: text(original) }),
@@ -139,6 +139,15 @@ export default function uiProvider(pi) {
 				];
 				response = results.length < steps.length ? fauxAssistantMessage(steps[results.length], { stopReason: "toolUse" })
 					: fauxAssistantMessage("后台检查已登记，等待退出结果。");
+			} else if (prompt === "验证独立 Worktree 的编辑器定位") {
+				response = results.length ? fauxAssistantMessage("已派发独立 Worktree 定位任务。")
+					: fauxAssistantMessage(fauxToolCall("Agent", {
+						description: "独立 Worktree 定位", prompt: "读取用于定位的工作树文件",
+						subagent_type: "general-purpose", isolation: "worktree", run_in_background: true,
+					}), { stopReason: "toolUse" });
+			} else if (prompt === "读取用于定位的工作树文件") {
+				response = results.length ? fauxAssistantMessage("已读取工作树文件。")
+					: fauxAssistantMessage(fauxToolCall("read", { path: "src/greeting.mjs" }), { stopReason: "toolUse" });
 			} else if (prompt.includes("审批拒绝验证")) {
 				response = results.length ? fauxAssistantMessage(results[0].isError ? "写入已按你的选择取消。" : "写入已执行。")
 					: fauxAssistantMessage(fauxToolCall("write", { path: "denied.txt", content: "should be denied\n" }), { stopReason: "toolUse" });

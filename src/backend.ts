@@ -1,6 +1,6 @@
 import { draftPrompt, mergeDrafts, type ComposerDraft, type Prompt } from "./composer-draft.ts";
 import { QueuedPrompts, type NativeQueue } from "./queued-prompts.ts";
-import type { DesktopPromptResult, FileReferenceAvailability, QueueActionResult, QueuedPromptGroups } from "./shared.ts";
+import type { DesktopPromptResult, FileReferenceAvailability, QueueActionResult, QueuedPromptGroups, SessionContentSearchResult } from "./shared.ts";
 import { searchWorkspaceFiles } from "./workspace-file-search.ts";
 import { isDesktopWorkspaceContext, isReferenceablePath, visiblePromptText } from "./file-references.ts";
 import { createDraftPullRequest, readPullRequest, readPullRequestComments, setPullRequestAutoMerge, type DraftPullRequest } from "./review-service.ts";
@@ -35,6 +35,7 @@ import {
 import { TerminalService } from "./terminal-service.ts";
 import { WorktreeService } from "./worktree-service.ts";
 import { SessionHistoryService } from "./session-history.ts";
+import { maximumSearchSessions, type SessionHistorySearchCandidate } from "./session-history-types.ts";
 import { applyLiveEvent, type LiveTranscript } from "./transcript.ts";
 import type {
 	SessionCopyInput,
@@ -49,9 +50,10 @@ import type {
 	SessionHistoryImportInput,
 	SessionHistoryImportResult,
 } from "./session-types.ts";
-import type {
-	SessionNavigationBridgeRequest,
-	SessionNavigationBridgeResponse,
+import {
+	tagComposerPrompt,
+	type SessionNavigationBridgeRequest,
+	type SessionNavigationBridgeResponse,
 } from "./session-navigation-extension.ts";
 import type { GitCheckpoint, GitCheckpointDiff, GitRestoreResult } from "./git-types.ts";
 import type { TerminalCreateInput, TerminalEvent, TerminalInfo, TerminalReplay } from "./terminal-types.ts";
@@ -97,6 +99,7 @@ import type {
 	Conversation,
 	DesktopEvent,
 	FileEntry,
+	GitCommitDraft,
 	GitCommitResult,
 	MemoryFileEntry,
 	Message,
@@ -288,6 +291,8 @@ interface SessionRuntime {
 	transcriptRevision: number;
 	agent?: AgentProcess;
 	state?: RpcSessionState;
+	/** Last physical entry already observed by saveSessionLeaf, for lightweight live cursor reads. */
+	historyTailId?: string;
 	models: Model[];
 	engineStatus: Snapshot["engineStatus"];
 	engineError?: string;
@@ -440,6 +445,7 @@ export class DesktopService {
 	private worktrees: WorktreeService;
 	private history: SessionHistoryService;
 	private historyAvailable = false;
+	private searchAbort?: AbortController;
 	private readonly usage = new UsageStatsCollector();
 	private connectionCheck?: { agent: AgentProcess; cancel: (error: Error) => void };
 	private connectionTestOperation: Promise<void> = Promise.resolve();
@@ -2198,6 +2204,61 @@ export class DesktopService {
 		return { messages: forkMessages };
 	}
 
+	async searchConversations(rawQuery: string): Promise<SessionContentSearchResult> {
+		this.searchAbort?.abort();
+		this.searchAbort = undefined;
+		const needle = rawQuery.trim();
+		if (needle.length < 2 || this.closed) return { matches: [], partial: false };
+		if (!this.historyAvailable) return { matches: [], partial: true };
+		const controller = new AbortController();
+		this.searchAbort = controller;
+		try {
+			// Navigation serializes its cursor update. Do not search a branch halfway through that change.
+			await this.operation;
+			controller.signal.throwIfAborted();
+			const children = new Set(this.store.tasks.filter((task) => task.parentConversationId).map((task) => task.conversationId));
+			const candidates = this.store.conversations
+				.filter((conv) => conv.kind !== "subagent" && !children.has(conv.id))
+				.sort((a, b) => b.updatedAt - a.updatedAt)
+				.flatMap((conv) => {
+					const runtime = this.runtimes.get(conv.id);
+					const live = runtime && !runtime.replacing && !runtime.stopping ? runtime : undefined;
+					const sessionFile = live?.state?.sessionFile ?? conv.sessionFile;
+					if (!sessionFile) return [];
+					const candidate: SessionHistorySearchCandidate = {
+						conversationId: conv.id,
+						sessionFile,
+						leafId: conv.sessionLeafId,
+						unmaterialized: sessionFile !== conv.sessionFile,
+					};
+					return [{ candidate, live }];
+				});
+			let partial = candidates.length > maximumSearchSessions;
+			const cursorSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(1500)]);
+			const sessions = (await Promise.all(candidates.slice(0, maximumSearchSessions).map(async ({ candidate, live }) => {
+				const agent = live?.agent;
+				// Without a saved override, the physical tail already follows every live append.
+				if (!agent || candidate.leafId === undefined) return candidate;
+				try {
+					const cursor = await agent.request<SessionEntriesResult>({ type: "get_entries", since: live.historyTailId }, cursorSignal);
+					if (this.runtimes.get(candidate.conversationId) !== live || live.agent !== agent || live.replacing || live.stopping)
+						throw new Error("会话在搜索期间切换。");
+					return { ...candidate, leafId: cursor.leafId };
+				} catch (error) {
+					if (controller.signal.aborted) throw error;
+					partial = true;
+				}
+			}))).filter((candidate) => candidate !== undefined);
+			const result = await this.history.searchSessions({ query: needle, sessions }, controller.signal);
+			controller.signal.throwIfAborted();
+			return { matches: result.matches, partial: partial || result.partial };
+		} catch {
+			return { matches: [], partial: !controller.signal.aborted };
+		} finally {
+			if (this.searchAbort === controller) this.searchAbort = undefined;
+		}
+	}
+
 	navigateSession(input: SessionNavigateInput): Promise<SessionNavigateResult> {
 		return this.serialize(async () => {
 			const conversation = this.conversation(input.conversationId);
@@ -2227,6 +2288,7 @@ export class DesktopService {
 				cancelled: result.cancelled,
 				leafId: result.leafId,
 				editorText: result.operation === "navigate" ? result.editorText : undefined,
+				editorDraft: result.operation === "navigate" ? result.editorDraft : undefined,
 				snapshot: await this.buildSnapshot(conversation.id),
 			};
 		});
@@ -2394,6 +2456,7 @@ export class DesktopService {
 		const conversation = this.conversation(runtime.conversationId);
 		const result = await runtime.agent?.request<SessionEntriesResult>({ type: "get_entries" });
 		if (!result) return;
+		runtime.historyTailId = result.entries.at(-1)?.id;
 		const materialized =
 			conversation.sessionFile &&
 			(await stat(conversation.sessionFile).then(
@@ -2404,7 +2467,7 @@ export class DesktopService {
 				},
 			));
 		// Pi keeps empty-session metadata in memory. Ordinary appends already persist their final leaf.
-		if (!materialized || result.entries.at(-1)?.id === result.leafId) delete conversation.sessionLeafId;
+		if (!materialized || runtime.historyTailId === result.leafId) delete conversation.sessionLeafId;
 		else conversation.sessionLeafId = result.leafId;
 	}
 
@@ -3280,7 +3343,21 @@ export class DesktopService {
 			text: command.message,
 			attachments: command.images?.map((image, index) => ({ image, name: `图片 ${index + 1}` })) ?? [],
 		};
-		return queue.send(lane, original, () => agent.request<DesktopPromptResult>(command));
+		return queue.send(lane, original, async () => {
+			const navigation = runtime.navigation;
+			if (!navigation || !draft?.attachments.length) return agent.request<DesktopPromptResult>(command);
+			// Keep real slash-command arguments intact. A slash-prefixed literal
+			// still goes through the normal prompt path and retains its attachments.
+			const slashName = /^\/([^\s]+)/.exec(command.message)?.[1];
+			if (slashName) {
+				const { commands } = await agent.request<{ commands: SlashCommand[] }>({ type: "get_commands" });
+				if (commands.some(({ name }) => name === slashName)) return agent.request<DesktopPromptResult>(command);
+			}
+			return agent.request<DesktopPromptResult>({
+				...command,
+				message: tagComposerPrompt(command.message, draft, navigation.token),
+			});
+		});
 	}
 
 	private async executeCommand(command: Command, conversationId?: string, launch?: number, draft?: ComposerDraft): Promise<unknown> {
@@ -3555,10 +3632,10 @@ export class DesktopService {
 			.sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name));
 	}
 
-	async searchFiles(conversationId: string, query: string): Promise<FileEntry[]> {
+	async searchFiles(conversationId: string, query: string, preferredDirectory?: string): Promise<FileEntry[]> {
 		await this.operation;
 		const { project } = this.conversation(conversationId);
-		return searchWorkspaceFiles(project, query, this.options.env ?? process.env);
+		return searchWorkspaceFiles(project, query, this.options.env ?? process.env, preferredDirectory);
 	}
 
 	async checkFileReferences(conversationId: string, paths: string[]): Promise<FileReferenceAvailability[]> {
@@ -3805,11 +3882,47 @@ export class DesktopService {
 		});
 	}
 
-	async gitCommit(message: string, conversationId?: string): Promise<GitCommitResult> {
-		this.assertWritableMode("执行 Git 提交", conversationId);
+	private async stagedGitChanges(cwd: string) {
+		const [{ stdout: prefixOutput }, { stdout: raw }] = await Promise.all([
+			exec("git", ["rev-parse", "--show-prefix"], { cwd, timeout: 10000 }),
+			exec("git", [
+				"diff", "--cached", "--raw", "--no-renames", "--no-abbrev", "--no-relative",
+				"--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=none", "-z",
+			], {
+				cwd,
+				maxBuffer: 2 * 1024 * 1024,
+				timeout: 10000,
+			}),
+		]);
+		const prefix = prefixOutput.replace(/\r?\n$/, "");
+		const fields = raw.split("\0");
+		const files: { status: string; path: string }[] = [];
+		// The Git commit consumes the whole index. Refuse staged paths absent from this project's panel.
+		for (let i = 0; i + 1 < fields.length; i += 2) {
+			const [metadata, path] = fields.slice(i, i + 2);
+			if (prefix && !path.startsWith(prefix)) {
+				throw new Error("仓库其他目录还有已暂存修改。请从仓库根目录打开项目，或取消那些文件的暂存后重试。");
+			}
+			files.push({ status: metadata.split(" ").at(-1) ?? "", path: path.slice(prefix.length) });
+		}
+		return { files, version: createHash("sha256").update(raw).digest("hex") };
+	}
+
+	private async assertStagedGitVersion(cwd: string, expectedVersion: string) {
+		if ((await this.stagedGitChanges(cwd)).version !== expectedVersion)
+			throw new Error("Git 暂存内容已变化，请重新拟定提交说明。");
+	}
+
+	async gitCommit(message: string, conversationId?: string, expectedStagedVersion?: string): Promise<GitCommitResult> {
+		const conv = this.conversation(conversationId);
+		this.assertWritableMode("执行 Git 提交", conv.id);
 		const trimmed = message.trim();
 		if (!trimmed) throw new Error("请输入提交说明。");
-		const cwd = this.conversation(conversationId).project;
+		const cwd = conv.project;
+		this.assertProjectIdle(cwd);
+		if (expectedStagedVersion) await this.assertStagedGitVersion(cwd, expectedStagedVersion);
+		else await this.stagedGitChanges(cwd);
+		this.assertWritableMode("执行 Git 提交", conv.id);
 		this.assertProjectIdle(cwd);
 		const { stdout } = await exec("git", ["commit", "-m", trimmed], {
 			cwd,
@@ -3818,7 +3931,7 @@ export class DesktopService {
 			timeout: 15000,
 		});
 		const { stdout: hash } = await exec("git", ["rev-parse", "--short", "HEAD"], { cwd, timeout: 5000 });
-		return { hash: hash.trim(), summary: stdout.trim(), workspace: await this.workspace(conversationId) };
+		return { hash: hash.trim(), summary: stdout.trim(), workspace: await this.workspace(conv.id) };
 	}
 
 	async readMemory(conversationId?: string): Promise<MemoryFileEntry[]> {
@@ -4918,6 +5031,120 @@ export class DesktopService {
 			this.options.tracing?.finishRun(traceId, "error");
 			await rm(temporary, { recursive: true, force: true });
 		}
+	}
+
+	async draftCommitMessage(conversationId?: string): Promise<GitCommitDraft> {
+		if (this.closed) throw new Error("桌面服务已关闭。");
+		const conv = this.conversation(conversationId);
+		const cwd = conv.project;
+		const staged = await this.stagedGitChanges(cwd);
+		if (!staged.files.length) throw new Error("请先暂存修改后再生成提交说明。");
+		const fallback = (reason: NonNullable<GitCommitDraft["fallbackReason"]>): GitCommitDraft => {
+			const allAdded = staged.files.every((file) => file.status === "A");
+			const allDeleted = staged.files.every((file) => file.status === "D");
+			const verb = allAdded ? "feat: 新增" : allDeleted ? "chore: 移除" : "chore: 更新";
+			const names = staged.files.map((file) => basename(file.path).replace(/[\r\n\t]+/g, " "));
+			const summary = names.length <= 3 ? names.join("、") : `${names.slice(0, 2).join("、")} 等 ${names.length} 个文件`;
+			return { message: `${verb} ${summary}`, source: "fallback", fallbackReason: reason, stagedVersion: staged.version };
+		};
+		const runtime = this.runtimes.get(conv.id);
+		const activeModel = runtime?.state?.model ?? this.store.settings.defaultModel;
+		if (!activeModel?.provider || !activeModel?.id) {
+			return fallback("no_model");
+		}
+		let statText: string;
+		let cachedDiff: string;
+		const diffArgs = [
+			"--literal-pathspecs", "diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=none",
+		];
+		try {
+			[{ stdout: statText }, { stdout: cachedDiff }] = await Promise.all([
+				exec("git", [...diffArgs, "--stat", "--", "."], { cwd, maxBuffer: 1024 * 1024, timeout: 10000 }),
+				exec("git", [...diffArgs, "--", "."], { cwd, maxBuffer: 2 * 1024 * 1024, timeout: 10000 }),
+			]);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") throw error;
+			await this.assertStagedGitVersion(cwd, staged.version);
+			return fallback("large_diff");
+		}
+		await this.assertStagedGitVersion(cwd, staged.version);
+		const prompt = [
+			"你是资深工程师。请严格根据下方 `git diff --cached`（仅已暂存变更），拟定一条精炼准确的中文 Conventional Commit 提交说明（单行，不超过 60 字，使用 feat/fix/refactor/perf/docs/test/chore 前缀）。",
+			"只输出这一行提交说明本身，禁止包含引号、Markdown 代码块或多行解释。",
+			"",
+			"### 暂存统计",
+			statText.trim().slice(0, 1500),
+			"",
+			"### 暂存差异摘要",
+			cachedDiff.slice(0, 10000),
+		].join("\n");
+		let agent: AgentProcess | undefined;
+		let timer: NodeJS.Timeout | undefined;
+		let firstLine: string | undefined;
+		try {
+			const env: NodeJS.ProcessEnv = {
+				...process.env,
+				...this.options.env,
+				PI_SKIP_VERSION_CHECK: "1",
+				PI_DESKTOP_CONNECTION_TEST: "1",
+				...networkEnvironment(this.store.settings),
+			};
+			if (this.store.settings.agentDir) env.PI_CODING_AGENT_DIR = this.store.settings.agentDir;
+			env.PI_DESKTOP_CONNECTIONS = JSON.stringify(this.connectionEnvironment(env));
+			const runtimeDir = this.options.runtimeDir ?? dirname(dirname(dirname(this.options.entry!)));
+			let resultMessage: Extract<Message, { role: "assistant" }> | undefined;
+			let settle!: () => void;
+			let fail!: (error: Error) => void;
+			const completion = new Promise<void>((resolve, reject) => {
+				settle = resolve;
+				fail = reject;
+			});
+			agent = new AgentProcess({
+				executable: this.options.executable,
+				entry: this.options.entry ?? join(runtimeDir, "dist/bundle/rpc-entry.js"),
+				cwd,
+				args: [
+					"--no-session",
+					"--no-tools",
+					"--no-skills",
+					"--no-prompt-templates",
+					"--no-context-files",
+					"--no-approve",
+					"--extension",
+					this.options.permissionExtension ?? join(runtimeDir, "permission-extension.mjs"),
+					"--provider",
+					activeModel.provider,
+					"--model",
+					activeModel.id,
+				],
+				env,
+				onEvent: (event) => {
+					if (event.type === "message_end" && event.message.role === "assistant") resultMessage = event.message;
+					if (event.type === "agent_settled") settle();
+					if (event.type === "desktop_error") fail(new Error(event.message));
+				},
+			});
+			timer = setTimeout(() => fail(new Error("生成提交说明超时。")), 30000);
+			await Promise.all([agent.request({ type: "prompt", message: prompt }), completion]);
+			if (resultMessage && resultMessage.stopReason !== "error" && resultMessage.stopReason !== "aborted") {
+				firstLine = resultMessage.content
+					.filter((block) => block.type === "text")
+					.map((block) => block.text)
+					.join("\n")
+					.replace(/^```[^\n]*\n?/g, "")
+					.replace(/```$/g, "")
+					.split("\n")
+					.map((line) => line.trim().replace(/^["'`]+|["'`]+$/g, ""))
+					.find(Boolean);
+			}
+		} catch {
+			// A connection failure or timeout can use the staged filenames instead.
+		} finally {
+			clearTimeout(timer);
+			await agent?.stop();
+		}
+		await this.assertStagedGitVersion(cwd, staged.version);
+		return firstLine ? { message: firstLine, source: "model", stagedVersion: staged.version } : fallback("model_unavailable");
 	}
 
 	/** Wait until a task satisfies `predicate` with no overall deadline; `TaskWaiters.wait` with timeout 0 returns at once. */
@@ -6411,6 +6638,7 @@ export class DesktopService {
 
 	async close(): Promise<void> {
 		this.closed = true;
+		this.searchAbort?.abort();
 		this.remoteJobs.dispose();
 		this.languages.close();
 		this.agentWatcher?.stop();

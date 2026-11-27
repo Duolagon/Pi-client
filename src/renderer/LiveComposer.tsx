@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, Brain, File, Folder, Paperclip, ShieldCheck, Square, X } from "lucide-react";
+import { ArrowUp, Brain, Eye, File, Folder, Paperclip, ShieldCheck, Square, X } from "lucide-react";
+import { Modal } from "../prototype/ui.tsx";
 import type { Command, FileEntry, FileReferenceAvailability, Message, PermissionMode, Project, SandboxStatus, Snapshot, ThinkingLevel } from "../shared.ts";
 import { SandboxControl } from "./SandboxControl.tsx";
 import { SelectPopover } from "./SelectPopover.tsx";
@@ -150,7 +151,7 @@ export function LiveComposer({
 	command,
 	setPermission,
 	onSelectProject: _onSelectProject,
-	onOpenProject: _onOpenProject,
+	onOpenProject,
 	sandboxStatus,
 	sandboxOpen,
 	setSandboxOpen,
@@ -234,6 +235,7 @@ export function LiveComposer({
 	const [skillsOpen, setSkillsOpen] = useState(false);
 	const [skillsFilter, setSkillsFilter] = useState("");
 	const [skillsIndex, setSkillsIndex] = useState(0);
+	const [previewAttachment, setPreviewAttachment] = useState<ComposerAttachment | null>(null);
 	const skillsRef = useRef<HTMLDivElement>(null);
 	const promptHistory = useMemo(() => {
 		const prompts: string[] = [];
@@ -732,7 +734,19 @@ export function LiveComposer({
 									) : (
 										<File size={12} aria-hidden="true" />
 									)}
-									<span className="cl-attachment-name">{item.name}</span>
+									{item.text ? (
+										<button
+											type="button"
+											className="cc-attach-preview-btn"
+											title="点击预览文本附件内容"
+											onClick={() => setPreviewAttachment(item)}
+										>
+											<span className="cl-attachment-name">{item.name}</span>
+											<Eye size={11} aria-hidden="true" />
+										</button>
+									) : (
+										<span className="cl-attachment-name">{item.name}</span>
+									)}
 									<button
 										type="button"
 										aria-label={`移除附件 ${item.name}`}
@@ -812,6 +826,26 @@ export function LiveComposer({
 						if (event.clipboardData.files.length) {
 							event.preventDefault();
 							void attach(Array.from(event.clipboardData.files));
+							return;
+						}
+						const pasted = event.clipboardData.getData("text/plain");
+						if (pasted && snapshot.active && !pasted.includes("\0")) {
+							const lineCount = pasted.replace(/\r?\n$/, "").split("\n").length;
+							const byteLen = new TextEncoder().encode(pasted).byteLength;
+							if ((lineCount >= 28 || pasted.length >= 2000) && byteLen <= 1024 * 1024) {
+								event.preventDefault();
+								try {
+									updateAttachments((items) => {
+										const seq = items.filter((i) => i.name.startsWith("粘贴文本")).length + 1;
+										const label = seq > 1 ? `粘贴文本 #${seq} (${lineCount} 行)` : `粘贴文本 (${lineCount} 行)`;
+										const next = [...items, { name: label, text: pasted }];
+										draftPrompt({ text: currentDraft.current, attachments: next });
+										return next;
+									});
+								} catch (error) {
+									fail(error);
+								}
+							}
 						}
 					}}
 					onKeyDown={(event) => {
@@ -881,18 +915,21 @@ export function LiveComposer({
 							stop();
 							return;
 						}
+						const caretCollapsed = event.currentTarget.selectionStart === event.currentTarget.selectionEnd;
+						const onFirstLine = caretCollapsed && !draft.slice(0, event.currentTarget.selectionStart).includes("\n");
+						const onLastLine = caretCollapsed && !draft.slice(event.currentTarget.selectionEnd).includes("\n");
 						if (event.key === "ArrowUp" && draft === "" && historyCursor.current === -1 && onFocusSubagentPanel?.()) {
 							event.preventDefault();
 							return;
 						}
-						if (event.key === "ArrowUp" && promptHistory.length > 0 && (draft === "" || historyCursor.current !== -1)) {
+						if (event.key === "ArrowUp" && promptHistory.length > 0 && onFirstLine && (draft === "" || historyCursor.current !== -1)) {
 							const cursor = historyCursor.current === -1 ? promptHistory.length - 1 : Math.max(0, historyCursor.current - 1);
 							event.preventDefault();
 							historyCursor.current = cursor;
 							setDraft(promptHistory[cursor]);
 							return;
 						}
-						if (event.key === "ArrowDown" && historyCursor.current !== -1) {
+						if (event.key === "ArrowDown" && historyCursor.current !== -1 && onLastLine) {
 							event.preventDefault();
 							if (historyCursor.current >= promptHistory.length - 1) {
 								historyCursor.current = -1;
@@ -1036,11 +1073,19 @@ export function LiveComposer({
 								</SurfacePresence>
 							</div>
 						)}
-						{!snapshot.commands.length && (
+						{!snapshot.active ? (
+							<button type="button" className="cl-config cc-dock-setup-cta" onClick={onOpenProject}>
+								选择项目
+							</button>
+						) : !hasModel ? (
+							<button type="button" className="cl-config cc-dock-setup-cta" onClick={openSettings}>
+								连接模型
+							</button>
+						) : !snapshot.commands.length ? (
 							<button type="button" className="cl-config" onClick={openSettings}>
 								配置
 							</button>
-						)}
+						) : null}
 						{running && (
 							<>
 								<SelectPopover
@@ -1085,6 +1130,19 @@ export function LiveComposer({
 					event.target.value = "";
 				}}
 			/>
+			{previewAttachment && (
+				<Modal title={previewAttachment.name} close={() => setPreviewAttachment(null)} wide>
+					<div className="simple-dialog">
+						<pre className="cc-paste-preview-box">{previewAttachment.text ?? ""}</pre>
+						<div className="dialog-actions">
+							<span />
+							<button type="button" className="primary-button" onClick={() => setPreviewAttachment(null)}>
+								关闭预览
+							</button>
+						</div>
+					</div>
+				</Modal>
+			)}
 		</div>
 	);
 }

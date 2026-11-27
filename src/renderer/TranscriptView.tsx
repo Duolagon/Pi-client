@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { copyText } from "./clipboard.ts";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -11,7 +11,7 @@ import type { DesktopTask, ExternalTask, Message, MonitorRecord, TaskProgress } 
 import type { Transcript, ToolProgress } from "./messages.ts";
 import { CodeLines, InlineEditDiff } from "./DiffView.tsx";
 import { summarizeLineChanges, type LineChangeCounts } from "./diff-lines.ts";
-import { highlightCode } from "./highlight.tsx";
+import { highlightCode, inferLangFromPath } from "./highlight.tsx";
 import { collectVerificationEvidence, scoreTurn, type QualityVerdict, type VerificationCheck } from "./quality-verdict.ts";
 import { OmenGlyph } from "./GrailIcons.tsx";
 import { isDesktopWorkspaceContext } from "../file-references.ts";
@@ -114,11 +114,26 @@ function linesLabel(count: number): string {
 type CopyState = "idle" | "done" | "failed";
 const copyLabel: Record<CopyState, string> = { idle: "复制", done: "已复制", failed: "复制失败" };
 
-function CodeBlock({ className, children }: { className?: string; children?: ReactNode }) {
+const SHELL_LANGS = new Set(["bash", "sh", "zsh", "shell", "console"]);
+
+function CodeBlock({
+	className,
+	children,
+	onRunInTerminal,
+}: {
+	className?: string;
+	children?: ReactNode;
+	onRunInTerminal?: (cmd: string) => void;
+}) {
 	const [copied, setCopied] = useState<CopyState>("idle");
+	const [wrapped, setWrapped] = useState(false);
+	const [expanded, setExpanded] = useState(false);
 	const match = /language-([^\s]+)/.exec(className || "");
-	const lang = match?.[1] || "text";
+	const lang = (match?.[1] || "text").toLowerCase();
 	const raw = String(children ?? "").replace(/\n$/, "");
+	const lineCount = countLines(raw);
+	const collapsible = lineCount > 45;
+	const canRun = Boolean(onRunInTerminal && SHELL_LANGS.has(lang) && raw.trim());
 
 	const copy = () => {
 		void copyText(raw).then((ok) => {
@@ -128,29 +143,65 @@ function CodeBlock({ className, children }: { className?: string; children?: Rea
 	};
 
 	return (
-		<div className="cc-codeblock">
+		<div className={`cc-codeblock ${wrapped ? "is-wrapped" : ""} ${collapsible && !expanded ? "is-collapsed" : ""}`.trim()}>
 			<div className="cc-codeblock-head">
-				<span className="cc-codeblock-lang">{lang}</span>
-				<button
-					type="button"
-					className={`cc-codeblock-copy ${copied === "done" ? "is-copied" : ""}`}
-					onClick={copy}
-					aria-label="复制代码"
-				>
-					{copied === "done" ? <Check size={12} /> : <Copy size={12} />}
-					<span role={copied === "failed" ? "alert" : undefined}>{copyLabel[copied]}</span>
-				</button>
+				<span className="cc-codeblock-lang">{lang}{lineCount > 6 ? ` · ${lineCount} 行` : ""}</span>
+				<div className="cc-codeblock-actions">
+					{canRun && (
+						<button
+							type="button"
+							className="cc-codeblock-copy"
+							onClick={() => onRunInTerminal?.(raw.trim())}
+							title="将此命令填入底部集成终端"
+						>
+							<TerminalIcon size={12} />
+							<span>填入终端</span>
+						</button>
+					)}
+					{raw.length > 80 && (
+						<button
+							type="button"
+							className={`cc-codeblock-copy ${wrapped ? "active" : ""}`.trim()}
+							onClick={() => setWrapped((v) => !v)}
+							title="切换代码自动换行"
+						>
+							<span>{wrapped ? "取消换行" : "自动换行"}</span>
+						</button>
+					)}
+					<button
+						type="button"
+						className={`cc-codeblock-copy ${copied === "done" ? "is-copied" : ""}`}
+						onClick={copy}
+						aria-label="复制代码"
+					>
+						{copied === "done" ? <Check size={12} /> : <Copy size={12} />}
+						<span role={copied === "failed" ? "alert" : undefined}>{copyLabel[copied]}</span>
+					</button>
+				</div>
 			</div>
 			<pre>
-				<code className={className}>{highlightCode(raw)}</code>
+				<code className={className}>{highlightCode(raw, lang)}</code>
 			</pre>
+			{collapsible && (
+				<button type="button" className="cc-codeblock-expand" onClick={() => setExpanded((v) => !v)}>
+					{expanded ? "收起代码" : `展开全部 ${lineCount} 行`}
+				</button>
+			)}
 		</div>
 	);
 }
 
 const REMARK_PLUGINS = [remarkGfm];
 
-function MarkdownContent({ text, onOpenPreview }: { text: string; onOpenPreview?: (url: string) => void }) {
+function MarkdownContent({
+	text,
+	onOpenPreview,
+	onRunInTerminal,
+}: {
+	text: string;
+	onOpenPreview?: (url: string) => void;
+	onRunInTerminal?: (cmd: string) => void;
+}) {
 	const components = useMemo<Components>(
 		() => ({
 			pre({ children }) {
@@ -188,7 +239,11 @@ function MarkdownContent({ text, onOpenPreview }: { text: string; onOpenPreview?
 			code({ className, children, node: _node, ...props }) {
 				const isBlock = Boolean(className) || String(children).includes("\n");
 				if (isBlock) {
-					return <CodeBlock className={className}>{children}</CodeBlock>;
+					return (
+						<CodeBlock className={className} onRunInTerminal={onRunInTerminal}>
+							{children}
+						</CodeBlock>
+					);
 				}
 				return (
 					<code className={className} {...props}>
@@ -197,7 +252,7 @@ function MarkdownContent({ text, onOpenPreview }: { text: string; onOpenPreview?
 				);
 			},
 		}),
-		[onOpenPreview],
+		[onOpenPreview, onRunInTerminal],
 	);
 	return (
 		<div className="cl-markdown">
@@ -366,6 +421,7 @@ export function TranscriptView({
 	onStopTask,
 	onRewindPrompt,
 	onForkPrompt,
+	onEditPrompt,
 	entryIds,
 	checkpointIds,
 	backgroundMonitors,
@@ -373,6 +429,8 @@ export function TranscriptView({
 	onRerunCheck,
 	onOpenPreview,
 	onOpenFile,
+	forceExpandAll = false,
+	findAnchorKey,
 }: {
 	transcript: Transcript;
 	tasks?: DesktopTask[];
@@ -383,6 +441,7 @@ export function TranscriptView({
 	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
 	onRewindPrompt?: (checkpointId: string) => void;
 	onForkPrompt?: (entryId: string) => void;
+	onEditPrompt?: (entryId: string) => void;
 	entryIds?: Record<number, string>;
 	checkpointIds?: Record<string, string>;
 	backgroundMonitors?: readonly MonitorRecord[];
@@ -391,16 +450,58 @@ export function TranscriptView({
 	onOpenPreview?: (url: string) => void;
 	/** Opens a tool's file path in the configured external editor. */
 	onOpenFile?: OpenFileHandler;
+	forceExpandAll?: boolean;
+	findAnchorKey?: string;
 }) {
 	const [lightbox, setLightbox] = useState<ImagePreview | null>(null);
+	const [unitWindowLimit, setUnitWindowLimit] = useState(64);
+	const scrollAnchorRef = useRef<{ el: HTMLElement; prevHeight: number; prevTop: number } | null>(null);
+	useLayoutEffect(() => {
+		const anchor = scrollAnchorRef.current;
+		if (!anchor) return;
+		scrollAnchorRef.current = null;
+		const delta = anchor.el.scrollHeight - anchor.prevHeight;
+		if (delta > 0) anchor.el.scrollTop = anchor.prevTop + delta;
+	}, [unitWindowLimit]);
 	const verificationEvidence = useMemo(() => collectVerificationEvidence(state.messages, backgroundMonitors), [state.messages, backgroundMonitors]);
 	const messageIndices = new Map(state.messages.map((message, index) => [message, index]));
 	const approvals = approvalTool ? Object.entries(state.tools)
 		.filter(([, tool]) => tool.name === approvalTool && tool.status === "running") : [];
 	const waitingToolId = approvals.length === 1 ? approvals[0][0] : undefined;
+	const allUnits = useMemo(() => units(state.messages), [state.messages]);
+	const unitKey = (unit: (typeof allUnits)[number], index: number) => {
+		const message = unit.kind === "turn" ? unit.messages[0] : unit.message;
+		return entryIds?.[messageIndices.get(message) ?? -1] ?? `${unit.kind}-${message.timestamp}-${index}`;
+	};
+	const anchorIndex = findAnchorKey ? allUnits.findIndex((unit, index) => unitKey(unit, index) === findAnchorKey) : -1;
+	const defaultHiddenCount = Math.max(0, allUnits.length - unitWindowLimit);
+	const hiddenCount = forceExpandAll ? 0 : anchorIndex < 0 ? defaultHiddenCount : Math.min(defaultHiddenCount, anchorIndex);
+	const visibleUnits = hiddenCount > 0 ? allUnits.slice(hiddenCount) : allUnits;
 	return (
 		<div className="cl-transcript">
-			{units(state.messages).map((unit, index, allUnits) => {
+			{hiddenCount > 0 && (
+				<div className="cc-older-turns-wrap">
+					<button
+						type="button"
+						className="cc-mini-btn"
+						onClick={(event) => {
+							const scroller = event.currentTarget.closest<HTMLElement>(".cl-scroll");
+							if (scroller) {
+								scrollAnchorRef.current = {
+									el: scroller,
+									prevHeight: scroller.scrollHeight,
+									prevTop: scroller.scrollTop,
+								};
+							}
+							setUnitWindowLimit((prev) => prev + 64);
+						}}
+					>
+						显示更早的 {hiddenCount} 条对话记录
+					</button>
+				</div>
+			)}
+			{visibleUnits.map((unit, relIdx) => {
+				const index = hiddenCount + relIdx;
 				if (unit.kind === "user") {
 					const message = unit.message;
 					if (message.role === "custom" && message.customType === "desktop_task_notification") {
@@ -458,14 +559,23 @@ export function TranscriptView({
 									.filter((block, part) => !(message.role === "user" && part > 0 && isDesktopWorkspaceContext(block.text)))
 									.map((block) => block.text)
 									.join("\n");
-					const hasUserActions = Boolean(
-						plainUserText.trim() || (entryId && onForkPrompt) || (entryId && onRewindPrompt && checkpointId),
-					);
+					const editEntryId = message.role === "user" && onEditPrompt ? entryId : undefined;
+					const hasUserActions = Boolean(plainUserText.trim() || editEntryId || (entryId && onForkPrompt) || (entryId && onRewindPrompt && checkpointId));
 					return (
-						<div className="cl-msg cl-msg-user" key={`user-${message.timestamp}-${index}`}>
+						<div className="cl-msg cl-msg-user" key={`user-${message.timestamp}-${index}`} data-transcript-unit={unitKey(unit, index)}>
 							{hasUserActions && (
 								<div className="cc-user-actions">
 									<CopyUserButton text={plainUserText} />
+									{editEntryId && (
+										<button
+											type="button"
+											title="编辑并重新发送"
+											aria-label="编辑并重新发送"
+											onClick={() => onEditPrompt?.(editEntryId)}
+										>
+											<FilePen size={12} />
+										</button>
+									)}
 									{entryId && onForkPrompt && (
 										<button type="button" title="从此处分叉对话" aria-label="从此处分叉对话" onClick={() => onForkPrompt(entryId)}>
 											<GitFork size={12} />
@@ -563,7 +673,7 @@ export function TranscriptView({
 					.join("\n\n");
 				const isLatestTurn = index === allUnits.findLastIndex((u) => u.kind === "turn");
 				return (
-					<article className="cl-msg cl-msg-ai" key={`turn-${last.timestamp}-${index}`}>
+					<article className="cl-msg cl-msg-ai" key={`turn-${last.timestamp}-${index}`} data-transcript-unit={unitKey(unit, index)}>
 						{groupTurnItems(
 							unit.messages.flatMap((message, part) =>
 								turnItems({
@@ -578,6 +688,7 @@ export function TranscriptView({
 									onBackgroundTask,
 									onStopTask,
 									onOpenPreview,
+									onRerunCheck,
 									onOpenFile,
 									onZoomImage: setLightbox,
 								}),
@@ -662,6 +773,7 @@ function turnItems({
 	onBackgroundTask,
 	onStopTask,
 	onOpenPreview,
+	onRerunCheck,
 	onOpenFile,
 	onZoomImage,
 }: {
@@ -676,6 +788,7 @@ function turnItems({
 	onBackgroundTask?: (taskId: string) => void;
 	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
 	onOpenPreview?: (url: string) => void;
+	onRerunCheck?: (command: string) => void;
 	onOpenFile?: OpenFileHandler;
 	onZoomImage?: (image: ImagePreview) => void;
 }): TurnItem[] {
@@ -692,7 +805,7 @@ function turnItems({
 					<div className={`cc-ai-text ${activeStreamText ? "is-streaming" : ""}`.trim()} key={key}>
 						<span className="cc-ai-bullet" aria-hidden="true" />
 						<div className="cc-ai-text-inner">
-							<MarkdownContent text={block.text} onOpenPreview={onOpenPreview} />
+							<MarkdownContent text={block.text} onOpenPreview={onOpenPreview} onRunInTerminal={onRerunCheck} />
 						</div>
 					</div>
 				),
@@ -922,11 +1035,11 @@ function EditSpotlightRow({ item, defaultOpen = false }: { item: EditSpotlight; 
 					{item.kind === "edit" ? (
 						item.editPairs.map((pair, idx) => (
 							<div key={idx} className={idx > 0 ? "cc-edit-hunk-sep" : undefined}>
-								<InlineEditDiff oldText={pair.oldText} newText={pair.newText} />
+								<InlineEditDiff oldText={pair.oldText} newText={pair.newText} filePath={item.target} />
 							</div>
 						))
 					) : item.content ? (
-						<CodeLines content={item.content.split("\n").slice(0, 40).join("\n")} />
+						<CodeLines content={item.content.split("\n").slice(0, 40).join("\n")} lang={inferLangFromPath(item.target)} />
 					) : (
 						<span className="cc-tool-badge">空文件</span>
 					)}
@@ -1313,14 +1426,33 @@ function InlineBashBlock({
 	);
 }
 
+function formatTaskStatusBadge(status: DesktopTask["status"]): string {
+	switch (status) {
+		case "queued":
+			return "排队中";
+		case "running":
+			return "运行中";
+		case "waiting_for_input":
+			return "待确认";
+		case "completed":
+			return "已完成";
+		case "failed":
+			return "失败";
+		case "cancelled":
+			return "已取消";
+		case "interrupted":
+			return "已中断";
+	}
+}
+
 function formatMatchedTaskSummary(task: DesktopTask | ExternalTask, taskProgress?: TaskProgress): string {
 	const active = task.status === "queued" || task.status === "running" || task.status === "waiting_for_input";
 	if (active) {
 		if (taskProgress) return formatTaskProgressSummary(taskProgress);
-		return `${task.status === "waiting_for_input" ? "待审批" : task.status === "queued" ? "排队中" : "运行中"} · ${task.workingDirectory}`;
+		return `${formatTaskStatusBadge(task.status)} · ${task.workingDirectory}`;
 	}
 	if ("executor" in task) {
-		return `${task.executor} · ${task.status} · ${formatCompactDuration(Math.max(0, task.updatedAt - task.createdAt))}`;
+		return `${task.executor} · ${formatTaskStatusBadge(task.status)} · ${formatCompactDuration(Math.max(0, task.updatedAt - task.createdAt))}`;
 	}
 	const parts: string[] = [];
 	const model = task.stats?.model?.id ?? task.model?.id;
@@ -1329,8 +1461,17 @@ function formatMatchedTaskSummary(task: DesktopTask | ExternalTask, taskProgress
 	if (task.stats?.toolUses) parts.push(`${task.stats.toolUses} 次工具`);
 	if (task.stats?.durationMs !== undefined) parts.push(formatCompactDuration(task.stats.durationMs));
 	else parts.push(formatCompactDuration(Math.max(0, task.updatedAt - task.createdAt)));
-	if (task.stopReason) parts.push(task.stopReason);
-	return parts.length ? parts.join(" · ") : `${task.status} · ${task.workingDirectory}`;
+	if (task.stopReason && task.stopReason !== "model_stop") {
+		const stopMap: Record<Exclude<NonNullable<DesktopTask["stopReason"]>, "model_stop">, string> = {
+			max_turns: "达轮次上限",
+			user_stop: "已手动停止",
+			parent_abort: "主会话中止",
+			restart: "重启中断",
+			error: "执行出错",
+		};
+		parts.push(stopMap[task.stopReason]);
+	}
+	return parts.length ? parts.join(" · ") : `${formatTaskStatusBadge(task.status)} · ${task.workingDirectory}`;
 }
 
 function ToolCard({
@@ -1425,7 +1566,7 @@ function ToolCard({
 				</span>
 				{matchedTask && (
 					<span className="cc-tool-badge">
-						{"executor" in matchedTask ? matchedTask.executor : "pi"} · {matchedTask.status}
+						{"executor" in matchedTask ? matchedTask.executor : "子任务"} · {formatTaskStatusBadge(matchedTask.status)}
 					</span>
 				)}
 				{liveTimerLabel && <span className="cc-tool-badge cc-eta-pill">{liveTimerLabel}</span>}
@@ -1493,7 +1634,7 @@ function ToolCard({
 				<div className="cl-tool-body cc-inline-edit-body">
 					{(info.editPairs ?? []).map((pair, idx) => (
 						<div key={idx} className={idx > 0 ? "cc-edit-hunk-sep" : undefined}>
-							<InlineEditDiff oldText={pair.oldText} newText={pair.newText} />
+							<InlineEditDiff oldText={pair.oldText} newText={pair.newText} filePath={fileTarget?.path ?? info.target} />
 						</div>
 					))}
 				</div>
@@ -1521,7 +1662,7 @@ function ToolCard({
 								)
 							: output;
 						return info.lineContent ? (
-							<CodeLines content={info.lineContent.content} startLine={info.lineContent.startLine} />
+							<CodeLines content={info.lineContent.content} startLine={info.lineContent.startLine} lang={inferLangFromPath(fileTarget?.path ?? info.target)} />
 						) : displayOutput ? (
 							<pre className={name === "bash" ? "cc-bash-out" : ""}>{displayOutput}</pre>
 						) : !images.length && !archivedOutput && status !== "running" ? (

@@ -50,7 +50,7 @@ export function SandboxControl({
 
 	const unsupported = status?.supported === false;
 	const stateClass = draftEnabled ? (draftOffline ? "offline" : "on") : "off";
-	const pillText = draftEnabled ? (draftOffline ? "离线沙箱" : "Seatbelt 沙箱") : "无沙箱";
+	const pillText = draftEnabled ? (draftOffline ? "离线沙箱" : "命令沙箱") : "无沙箱";
 
 	const apply = async (next: { sandbox: boolean; sandboxOffline: boolean }) => {
 		if (busy || disabled) return;

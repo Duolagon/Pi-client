@@ -5,6 +5,7 @@ import { link, lstat, mkdir, open, readFile, readdir, realpath, rm, writeFile } 
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { SessionContentSearchResult } from "./shared.ts";
 import type {
 	CliSessionHistoryInput,
 	CliSessionHistoryItem,
@@ -15,6 +16,7 @@ import type {
 	SessionHistoryHelperResponse,
 	SessionHistoryInspectInput,
 	SessionHistoryInspection,
+	SessionHistorySearchCandidate,
 	SessionHistorySourceInspection,
 } from "./session-history-types.ts";
 
@@ -196,6 +198,22 @@ export class SessionHistoryService {
 		return response.result;
 	}
 
+	async searchSessions(
+		input: { query: string; sessions: SessionHistorySearchCandidate[] },
+		signal?: AbortSignal,
+	): Promise<SessionContentSearchResult> {
+		signal?.throwIfAborted();
+		if (input.query.trim().length < 2 || !input.sessions.length) return { matches: [], partial: false };
+		const response = await this.helper({
+			type: "search",
+			query: input.query,
+			root: resolve(this.options.dataDir, "sessions"),
+			sessions: input.sessions,
+		}, signal);
+		if (response.type !== "search") throw new Error("Pi 历史搜索响应不匹配。");
+		return { matches: response.matches, partial: response.partial };
+	}
+
 	private importPath(id: string): string {
 		return resolve(this.options.dataDir, "sessions", `cli-import_${id}.jsonl`);
 	}
@@ -265,7 +283,7 @@ async function configuredSessionDir(path: string, skipped: CliSessionHistoryResu
 	}
 }
 
-async function safeDirectory(path: string, root: string = path): Promise<string> {
+export async function safeDirectory(path: string, root: string = path): Promise<string> {
 	const normalized = resolve(path);
 	const base = resolve(root);
 	const rootInfo = await lstat(base);
@@ -348,5 +366,8 @@ function validateResponse(value: unknown): asserts value is SessionHistoryHelper
 	if (!value || typeof value !== "object" || !("type" in value)) throw new Error("无效的 Pi 历史响应。");
 	if (value.type === "discover" && "files" in value && Array.isArray(value.files)) return;
 	if (value.type === "inspect" && "result" in value && value.result && typeof value.result === "object") return;
+	if (value.type === "search" && "partial" in value && typeof value.partial === "boolean" &&
+		"matches" in value && Array.isArray(value.matches) && value.matches.every((match) =>
+			match && typeof match.conversationId === "string" && typeof match.snippet === "string")) return;
 	throw new Error("无效的 Pi 历史响应。");
 }

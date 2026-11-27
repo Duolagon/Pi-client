@@ -274,7 +274,7 @@ export function useDesktop(api: DesktopAPI) {
 		media.addEventListener("change", applyTheme);
 		return () => media.removeEventListener("change", applyTheme);
 	}, [snapshot?.settings.theme]);
-	const switchTo = async (operation: () => Promise<Snapshot | null>) => {
+	const switchTo = async (operation: () => Promise<Snapshot | null>, afterApply?: () => void) => {
 		if (selecting.current) return;
 		selecting.current = true;
 		setChanging(true);
@@ -282,7 +282,10 @@ export function useDesktop(api: DesktopAPI) {
 		const token = ++generation.current;
 		try {
 			const next = await operation();
-			if (next && token === generation.current) apply(next);
+			if (next && token === generation.current) {
+				apply(next);
+				afterApply?.();
+			}
 		} catch (cause) {
 			fail(cause);
 		} finally {
@@ -359,6 +362,7 @@ export function useDesktop(api: DesktopAPI) {
 	};
 	return {
 		prependDrafts,
+		replaceDraft: (id: string, next: ComposerDraft) => updateDraft(id, next),
 		updateAttachments,
 		forgetDraft,
 		snapshot,

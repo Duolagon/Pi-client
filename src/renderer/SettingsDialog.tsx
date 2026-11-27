@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Bell, Bot, Globe, Plug, Route, ShieldCheck } from "lucide-react";
+import { Bell, BookOpen, Bot, Globe, Plug, Route, Search, ShieldCheck, SlidersHorizontal, Wrench } from "lucide-react";
 import type {
 	ConnectionInput,
 	ConnectionMode,
@@ -107,6 +107,7 @@ export function SettingsDialog({
 	close,
 	apply,
 	onSaved,
+	onOpenHub,
 }: {
 	settings: Settings;
 	presets: ProviderPreset[];
@@ -118,6 +119,7 @@ export function SettingsDialog({
 	apply: (snapshot: Snapshot) => void;
 	fail: (error: unknown) => void;
 	onSaved?: () => void;
+	onOpenHub?: (target: "tools" | "permissions" | "hooks" | "skills" | "mcp" | "agents" | "memory") => void;
 }) {
 	const initialProvider =
 		presets.find((item) => settings.defaultModel?.provider === `desktop-${item.provider}`)?.provider ??
@@ -187,6 +189,7 @@ export function SettingsDialog({
 	const [makeDefault, setMakeDefault] = useState(false);
 	const [savedMessage, setSavedMessage] = useState("");
 	const [section, setSection] = useState<"connection" | "appearance" | "budget" | "agents" | "routing" | "network">("connection");
+	const [navFilter, setNavFilter] = useState("");
 	const connectionDrafts = useRef(new Map<Provider, ConnectionDraft>());
 	const { confirm, confirmation } = useConfirmation();
 	useEffect(() => {
@@ -501,13 +504,27 @@ export function SettingsDialog({
 	};
 	const activeSection = connectionOnly ? "connection" : section;
 	const navItems = [
-		{ id: "connection" as const, label: "连接与模型", icon: Plug },
-		{ id: "appearance" as const, label: "权限与外观", icon: ShieldCheck },
-		{ id: "agents" as const, label: "Agent 与自动化", icon: Bot },
-		{ id: "routing" as const, label: "模型路由与评审", icon: Route },
-		{ id: "budget" as const, label: "预算与通知", icon: Bell },
-		{ id: "network" as const, label: "网络与证书", icon: Globe },
+		{ id: "connection" as const, label: "连接与模型", keywords: "api key provider anthropic openai gemini deepseek openrouter base url", icon: Plug },
+		{ id: "appearance" as const, label: "权限与外观", keywords: "theme light dark grail sandbox seatbelt editor output style 主题 沙箱 编辑器", icon: ShieldCheck },
+		{ id: "agents" as const, label: "Agent 与自动化", keywords: "subagent fork concurrent depth cron teams hooks 子agent 并发 定时", icon: Bot },
+		{ id: "routing" as const, label: "模型路由与评审", keywords: "explore plan review fallback grail 路由 备用 鉴定", icon: Route },
+		{ id: "budget" as const, label: "预算与通知", keywords: "cost budget balance notification web search 预算 余额 通知 联网", icon: Bell },
+		{ id: "network" as const, label: "网络与证书", keywords: "proxy noproxy ca cert agentdir 代理 证书", icon: Globe },
 	];
+	const navQuery = navFilter.trim().toLowerCase();
+	const visibleNavItems = navQuery
+		? navItems.filter((item) => `${item.label} ${item.keywords}`.toLowerCase().includes(navQuery))
+		: navItems;
+	const hubItems = [
+		{ id: "tools" as const, label: "工具开关与权限规则", keywords: "tools permissions allow deny 规则 工具", icon: Wrench },
+		{ id: "mcp" as const, label: "MCP 服务器配置", keywords: "mcp server stdio http oauth", icon: Plug },
+		{ id: "agents" as const, label: "自定义子 Agent", keywords: "custom agents prompt role", icon: Bot },
+		{ id: "skills" as const, label: "Skills 与生命周期 Hooks", keywords: "skills hooks pretooluse slash", icon: SlidersHorizontal },
+		{ id: "memory" as const, label: "项目记忆与 AGENTS.md", keywords: "memory rules claude.md agents.md 记忆", icon: BookOpen },
+	];
+	const visibleHubItems = onOpenHub
+		? (navQuery ? hubItems.filter((item) => `${item.label} ${item.keywords}`.toLowerCase().includes(navQuery)) : hubItems)
+		: [];
 
 	return (
 		<>
@@ -526,8 +543,26 @@ export function SettingsDialog({
 			>
 				{!connectionOnly && (
 					<nav className="cc-settings-nav" aria-label="设置分类">
+						<div className="cc-settings-search">
+							<Search size={13} aria-hidden="true" />
+							<input
+								type="search"
+								aria-label="搜索设置项"
+								placeholder="搜索设置或能力…"
+								value={navFilter}
+								onChange={(e) => {
+									const next = e.target.value;
+									setNavFilter(next);
+									const q = next.trim().toLowerCase();
+									if (q) {
+										const hit = navItems.find((item) => `${item.label} ${item.keywords}`.toLowerCase().includes(q));
+										if (hit && hit.id !== section) setSection(hit.id);
+									}
+								}}
+							/>
+						</div>
 						<SlidingTabList variant="nav" className="cc-settings-nav-track">
-							{navItems.map((item) => {
+							{visibleNavItems.map((item) => {
 								const Icon = item.icon;
 								const active = activeSection === item.id;
 								return (
@@ -544,6 +579,30 @@ export function SettingsDialog({
 								);
 							})}
 						</SlidingTabList>
+						{visibleHubItems.length > 0 && onOpenHub && (
+							<div className="cc-settings-hub-links">
+								<span className="cc-settings-hub-title">能力与项目扩展</span>
+								{visibleHubItems.map((item) => {
+									const Icon = item.icon;
+									return (
+										<button
+											key={item.id}
+											type="button"
+											className="cc-settings-nav-btn cc-hub-jump-btn"
+											disabled={generalSettingsChanged || connectionChanged}
+											title={generalSettingsChanged || connectionChanged ? "请先保存当前更改再跳转" : `打开${item.label}`}
+											onClick={() => {
+												close();
+												onOpenHub(item.id);
+											}}
+										>
+											<Icon size={14} aria-hidden="true" />
+											<span>{item.label}</span>
+										</button>
+									);
+								})}
+							</div>
+						)}
 					</nav>
 				)}
 				<div className="cc-settings-main">

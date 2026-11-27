@@ -593,6 +593,12 @@ export interface GitCommitResult {
 	summary: string;
 	workspace: Workspace;
 }
+export interface GitCommitDraft {
+	message: string;
+	source: "model" | "fallback";
+	stagedVersion: string;
+	fallbackReason?: "no_model" | "model_unavailable" | "large_diff";
+}
 export interface MemoryFileEntry {
 	file: "AGENTS.md" | "CLAUDE.md";
 	path: string;
@@ -699,6 +705,29 @@ export type Command = RpcCommand;
 export type DesktopPromptResult = { disposition: "started" | "handled" | "queued" | "forked_skill" };
 export type QueueActionResult = { drafts: ComposerDraft[]; error?: string };
 export type QueuedPromptGroups = { steering: string[]; followUp: string[] };
+export type DesktopMenuAction =
+	| "settings"
+	| "doctor"
+	| "stats"
+	| "new-conversation"
+	| "open-workspace"
+	| "export-conversation"
+	| "find-in-session"
+	| "command-palette"
+	| "search-sessions"
+	| "toggle-sidebar"
+	| "toggle-terminal"
+	| "toggle-changes";
+
+export interface SessionContentMatch {
+	conversationId: string;
+	snippet: string;
+}
+
+export interface SessionContentSearchResult {
+	matches: SessionContentMatch[];
+	partial: boolean;
+}
 export type FileReferenceAvailability = "ready" | "untrusted" | "unavailable";
 export interface DesktopTodosAPI {
 	list(conversationId?: string): Promise<TodoRecord[]>;
@@ -777,7 +806,7 @@ export interface DesktopAPI {
 	actOnQueue(id: string, action: "withdraw" | "send"): Promise<QueueActionResult>;
 	respond(response: RpcExtensionUIResponse, conversationId?: string): Promise<void>;
 	files(path: string): Promise<FileEntry[]>;
-	searchFiles(conversationId: string, query: string): Promise<FileEntry[]>;
+	searchFiles(conversationId: string, query: string, preferredDirectory?: string): Promise<FileEntry[]>;
 	checkFileReferences(conversationId: string, paths: string[]): Promise<FileReferenceAvailability[]>;
 	readFile(path: string): Promise<{ path: string; content: string }>;
 	readToolOutput(conversationId: string, id: string, offset?: number): Promise<import("./tool-output-types.ts").ToolOutputPage>;
@@ -787,11 +816,12 @@ export interface DesktopAPI {
 	setPullRequestAutoMerge(conversationId: string, number: number, enabled: boolean, method?: PullRequestMergeMethod): Promise<PullRequestStatus | null>;
 	pullRequestComments(conversationId: string, number: number): Promise<PullRequestComment[]>;
 	diff(path: string): Promise<string>;
-	gitStage(paths?: string[]): Promise<Workspace>;
-	gitUnstage(paths?: string[]): Promise<Workspace>;
+	gitStage(paths?: string[], conversationId?: string): Promise<Workspace>;
+	gitUnstage(paths?: string[], conversationId?: string): Promise<Workspace>;
 	gitDiscardPreview(input: GitDiscardInput): Promise<{ version: string }>;
 	gitDiscard(input: GitDiscardInput & { expectedVersion: string }): Promise<GitDiscardResult>;
-	gitCommit(message: string): Promise<GitCommitResult>;
+	gitCommit(message: string, conversationId?: string, expectedStagedVersion?: string): Promise<GitCommitResult>;
+	draftCommitMessage?(conversationId?: string): Promise<GitCommitDraft>;
 	readMemory(): Promise<MemoryFileEntry[]>;
 	writeMemory(file: "AGENTS.md" | "CLAUDE.md", content: string): Promise<MemoryFileEntry>;
 	contextReport(): Promise<ContextBreakdown>;
@@ -872,6 +902,8 @@ export interface DesktopAPI {
 	testConnection(input: ConnectionInput): Promise<ConnectionTestResult>;
 	providerBalance(input: ConnectionInput): Promise<ProviderBalanceResult>;
 	exportConversation(): Promise<string | null>;
+	searchConversations?(query: string): Promise<SessionContentSearchResult>;
+	onMenuAction?(listener: (action: DesktopMenuAction) => void): () => void;
 	onEvent(listener: (event: DesktopEvent) => void): () => void;
 }
 export type { RpcSessionState, SessionStats, RpcExtensionUIRequest, RpcExtensionUIResponse };

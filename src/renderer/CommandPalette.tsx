@@ -4,6 +4,7 @@ import {
 	BookOpen,
 	Bot,
 	Command as CommandIcon,
+	FileCode2,
 	Files,
 	FolderOpen,
 	GitCompareArrows,
@@ -23,6 +24,7 @@ import {
 } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
 import { SlidingTabList } from "./SegmentedTabs.tsx";
+import type { FileEntry } from "../shared.ts";
 
 export interface PaletteAction {
 	id: string;
@@ -76,6 +78,8 @@ function actionIcon(id: string): ReactNode {
 			return <GitCompareArrows size={14} />;
 		case "files":
 			return <Files size={14} />;
+		case "quick-file":
+			return <FileCode2 size={14} />;
 		case "compact":
 			return <Archive size={14} />;
 		case "settings":
@@ -101,22 +105,55 @@ function highlightQuery(text: string, rawQuery: string): ReactNode {
 
 export function CommandPalette({
 	actions,
+	conversationId,
+	onOpenFile,
 	close,
 }: {
 	actions: PaletteAction[];
+	conversationId?: string;
+	onOpenFile?: (path: string) => void;
 	close: () => void;
 }) {
 	const [query, setQuery] = useState("");
 	const [index, setIndex] = useState(0);
-
-	const filtered = actions.filter((a) =>
-		!a.disabled && `${a.label} ${a.keywords ?? ""}`.toLowerCase().includes(query.trim().toLowerCase()),
-	);
-	const activeIdx = filtered.length ? Math.min(index, filtered.length - 1) : 0;
+	const [fileSearch, setFileSearch] = useState<{ query: string; conversationId: string; hits: FileEntry[] }>();
+	const term = query.trim();
+	const searchEnabled = Boolean(onOpenFile);
+	const currentFileSearch = fileSearch?.query === term && fileSearch.conversationId === conversationId ? fileSearch : undefined;
+	const pendingFiles = Boolean(term && conversationId && searchEnabled && !currentFileSearch);
 
 	useEffect(() => {
-		setIndex(0);
-	}, [query]);
+		setFileSearch(undefined);
+		if (!term || !conversationId || !searchEnabled) {
+			return;
+		}
+		let cancelled = false;
+		const settle = (entries: FileEntry[]) => {
+			if (!cancelled) setFileSearch({ query: term, conversationId, hits: entries.filter((entry) => !entry.directory).slice(0, 8) });
+		};
+		const timer = window.setTimeout(() => {
+			void window.pi.searchFiles(conversationId, term).then(settle, () => settle([]));
+		}, 60);
+		return () => {
+			cancelled = true;
+			window.clearTimeout(timer);
+		};
+	}, [term, conversationId, searchEnabled]);
+
+	const matchedActions = actions.filter((a) =>
+		!a.disabled && `${a.label} ${a.keywords ?? ""}`.toLowerCase().includes(term.toLowerCase()),
+	);
+	const fileActions: PaletteAction[] = onOpenFile
+		? (currentFileSearch?.hits ?? []).map((entry) => ({
+				id: `file:${entry.path}`,
+				label: `打开文件：${entry.name}`,
+				keywords: entry.path,
+				run: () => onOpenFile(entry.path),
+			}))
+		: [];
+	const filtered = [...matchedActions, ...fileActions];
+	const activeIdx = filtered.length ? Math.min(index, filtered.length - 1) : 0;
+
 	useEffect(() => {
 		const item = filtered[activeIdx];
 		if (item) document.getElementById(`cc-cmd-${item.id}`)?.scrollIntoView({ block: "nearest" });
@@ -135,25 +172,29 @@ export function CommandPalette({
 						aria-activedescendant={filtered[activeIdx] ? `cc-cmd-${filtered[activeIdx].id}` : undefined}
 						aria-label="搜索客户端命令"
 						value={query}
-						onChange={(e) => setQuery(e.target.value)}
+						onChange={(e) => {
+							setQuery(e.target.value);
+							setIndex(0);
+						}}
 						onKeyDown={(e) => {
+							if (e.nativeEvent.isComposing) return;
 							if (e.key === "ArrowDown" && filtered.length) {
 								e.preventDefault();
 								setIndex((i) => (i + 1) % filtered.length);
 							} else if (e.key === "ArrowUp" && filtered.length) {
 								e.preventDefault();
 								setIndex((i) => (i - 1 + filtered.length) % filtered.length);
-							} else if (e.key === "Enter" && filtered.length && !e.nativeEvent.isComposing) {
+							} else if (e.key === "Enter" && filtered.length) {
 								e.preventDefault();
 								filtered[activeIdx].run();
 								close();
 							}
 						}}
-						placeholder="输入命令名或快捷键搜索…"
+						placeholder="搜索命令、快捷键，或输入文件名快速预览…"
 					/>
 					<span className="cc-palette-count" aria-hidden="true">{filtered.length}</span>
 				</div>
-				<SlidingTabList variant="list" className="search-results" id="cc-cmd-results" role="listbox" aria-label="命令">
+				<SlidingTabList variant="list" className="search-results" id="cc-cmd-results" role="listbox" aria-label="命令" aria-busy={pendingFiles}>
 					{filtered.map((item, idx) => (
 						<button
 							type="button"
@@ -171,9 +212,9 @@ export function CommandPalette({
 						>
 							<div className="cc-palette-row-main">
 								<span className="cc-palette-icon" aria-hidden="true">
-									{actionIcon(item.id)}
+									{actionIcon(item.id.startsWith("file:") ? "quick-file" : item.id)}
 								</span>
-								<div>
+								<div className="cc-palette-result-text">
 									<strong>{highlightQuery(item.label, query)}</strong>
 									{item.keywords && <span>{highlightQuery(item.keywords, query)}</span>}
 								</div>
@@ -181,7 +222,7 @@ export function CommandPalette({
 							{item.shortcut && <kbd>{item.shortcut}</kbd>}
 						</button>
 					))}
-					{!filtered.length && <p className="subtle-note cc-search-empty">没有匹配的命令。</p>}
+					{!filtered.length && <p className="subtle-note cc-search-empty" role="status">{pendingFiles ? "正在搜索文件…" : "没有匹配的命令或文件。"}</p>}
 				</SlidingTabList>
 				<div className="cc-palette-foot" aria-hidden="true">
 					<span><kbd>↑↓</kbd> 导航</span>

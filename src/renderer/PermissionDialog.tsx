@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Check, FileCode2, HelpCircle, ShieldCheck, Terminal } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
 import { CodeLines, InlineEditDiff } from "./DiffView.tsx";
+import { inferLangFromPath } from "./highlight.tsx";
 import type { DesktopAPI, RpcExtensionUIRequest, TaskPendingApproval } from "../shared.ts";
 
 type Response = Parameters<DesktopAPI["respond"]>[0];
@@ -191,6 +192,8 @@ export function PermissionDialog({
 	const canDefer = Boolean(defer) && !("timeout" in request && request.timeout);
 	const reason = parsedConfirm?.reason;
 	const detailReason = inline && reason === "此工具操作需要确认。" ? "" : reason;
+	const confirmedPath = parsedConfirm?.input.path;
+	const filePath = typeof confirmedPath === "string" ? confirmedPath : undefined;
 	const fileReason = parsedConfirm && <p className="cc-perm-reason">
 		{detailReason && <span>{detailReason}{!inline && " · "}</span>}
 		<code>{String(parsedConfirm.input.path ?? "")}</code>
@@ -217,7 +220,7 @@ export function PermissionDialog({
 								<div className="cc-perm-scroll">
 									{editHunks.map((hunk, idx) => (
 										<div key={idx} className={idx > 0 ? "cc-edit-hunk-sep" : undefined}>
-											<InlineEditDiff oldText={hunk.oldText} newText={hunk.newText} />
+											<InlineEditDiff oldText={hunk.oldText} newText={hunk.newText} filePath={filePath} />
 										</div>
 									))}
 								</div>
@@ -226,7 +229,7 @@ export function PermissionDialog({
 							<div className="cc-perm-preview">
 								{fileReason}
 								<div className="cc-perm-scroll">
-									<CodeLines content={parsedConfirm.input.content} />
+									<CodeLines content={parsedConfirm.input.content} lang={inferLangFromPath(filePath)} />
 								</div>
 							</div>
 						) : parsedConfirm && inferredTool === "bash" && typeof parsedConfirm.input.command === "string" ? (

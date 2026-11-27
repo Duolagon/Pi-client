@@ -14,6 +14,24 @@ import { classifySubagentViewSlash, isActiveTaskStatus } from "./subagent-panel-
  * Reuses TranscriptView and live conversation events; messages go through `pi:task:send`
  * so the host keeps turn numbers and state transitions consistent.
  */
+const SUBAGENT_STATUS_LABELS: Record<DesktopTask["status"], string> = {
+	queued: "排队中",
+	running: "运行中",
+	waiting_for_input: "待确认",
+	completed: "已完成",
+	failed: "失败",
+	cancelled: "已取消",
+	interrupted: "已中断",
+};
+
+const SUBAGENT_STOP_LABELS: Record<Exclude<NonNullable<DesktopTask["stopReason"]>, "model_stop">, string> = {
+	max_turns: "达轮次上限",
+	user_stop: "已手动停止",
+	parent_abort: "主会话中止",
+	restart: "重启中断",
+	error: "执行出错",
+};
+
 export function SubagentTranscriptView({
 	api,
 	task,
@@ -22,6 +40,7 @@ export function SubagentTranscriptView({
 	onBack,
 	onMainCompact,
 	onMainClear,
+	onOpenFile,
 	onNotice,
 	fail,
 }: {
@@ -32,6 +51,7 @@ export function SubagentTranscriptView({
 	onBack: () => void;
 	onMainCompact: (customInstructions?: string) => void;
 	onMainClear: () => void;
+	onOpenFile?: (path: string, line?: number) => void;
 	onNotice: (message: string) => void;
 	fail: (error: unknown) => void;
 }) {
@@ -140,7 +160,7 @@ export function SubagentTranscriptView({
 		if (task.stats?.tokens.total) parts.push(`${formatCompactTokens(task.stats.tokens.total)} tokens`);
 		if (task.stats?.toolUses) parts.push(`${task.stats.toolUses} 次工具`);
 		if (task.stats?.durationMs !== undefined) parts.push(formatCompactDuration(task.stats.durationMs));
-		if (task.stopReason) parts.push(task.stopReason);
+		if (task.stopReason && task.stopReason !== "model_stop") parts.push(SUBAGENT_STOP_LABELS[task.stopReason]);
 		return parts.join(" · ");
 	})();
 
@@ -157,8 +177,8 @@ export function SubagentTranscriptView({
 					<Bot size={14} />
 					<strong>{task.name || task.title || task.subagentType || "子 Agent"}</strong>
 					{task.subagentType && <span className="cc-source-tag">{task.subagentType}</span>}
-					<span className="cc-source-tag">{task.status}</span>
-					<span className="cc-source-tag muted">turn {task.turn ?? 1}</span>
+					<span className="cc-source-tag" title={task.status}>{SUBAGENT_STATUS_LABELS[task.status]}</span>
+					<span className="cc-source-tag muted">第 {task.turn ?? 1} 轮</span>
 				</div>
 				<div className="cc-subagent-view-actions">
 					{statsSummary && <span className="cc-subagent-meta">{statsSummary}</span>}
@@ -219,7 +239,7 @@ export function SubagentTranscriptView({
 						<span className="cl-spinner" /> <span className="cc-shimmer-text">正在加载子 Agent 记录…</span>
 					</div>
 				) : history.messages.length ? (
-					<TranscriptView transcript={history} />
+					<TranscriptView transcript={history} onOpenFile={onOpenFile} />
 				) : (
 					<p className="subtle-note cc-subagent-view-empty">子 Agent 尚无输出。</p>
 				)}

@@ -59,10 +59,19 @@ export interface SessionHistoryInspection {
 	forkMessages: Array<{ entryId: string; text: string }>;
 }
 
-/** Internal sidecar wire types. Source contents arrive over stdin, never as executable input. */
+export const maximumSearchSessions = 2000;
+
+export interface SessionHistorySearchCandidate extends SessionHistoryInspectInput {
+	conversationId: string;
+	/** A new live session can have a path before its first message is saved. */
+	unmaterialized?: boolean;
+}
+
+/** Internal sidecar wire types. Only the host selects the permitted search root and session paths. */
 export type SessionHistoryHelperRequest =
 	| { type: "discover"; files: Array<{ key: string; content: string }> }
-	| { type: "inspect"; content: string; leafId?: string | null };
+	| { type: "inspect"; content: string; leafId?: string | null }
+	| { type: "search"; query: string; root: string; sessions: SessionHistorySearchCandidate[] };
 
 export interface SessionHistorySourceInspection {
 	sourceSessionId: string;
@@ -82,4 +91,5 @@ export interface SessionHistorySourceInspection {
 
 export type SessionHistoryHelperResponse =
 	| { type: "discover"; files: Array<{ key: string; source?: SessionHistorySourceInspection; error?: string }> }
-	| { type: "inspect"; result: SessionHistoryInspection };
+	| { type: "inspect"; result: SessionHistoryInspection }
+	| { type: "search"; matches: Array<{ conversationId: string; snippet: string }>; partial: boolean };

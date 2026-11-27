@@ -60,3 +60,25 @@ test("file lookup can reach beyond the small shallow composer list", async () =>
 		await rm(root, { recursive: true, force: true });
 	}
 });
+
+test("nearest directory results are ranked before the global file search limit", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-workspace-local-search-"));
+	try {
+		const outside = Array.from({ length: 36 }, (_, i) => `package-${String(i).padStart(2, "0")}`);
+		const preferred = "workspace/components";
+		const directories = [...outside, preferred, `${preferred}/nested`, `${preferred}-other`];
+		await Promise.all(directories.map(async (dir) => {
+			await mkdir(join(root, dir), { recursive: true });
+			await writeFile(join(root, dir, "README.md"), dir);
+		}));
+
+		const unscoped = await searchWorkspaceFiles(root, "README.md", process.env);
+		assert.equal(unscoped.length, 32);
+		assert.ok(!unscoped.some(({ path }) => path.startsWith(`${preferred}/`)));
+		const local = await searchWorkspaceFiles(root, "README.md", process.env, preferred);
+		assert.deepEqual(local.slice(0, 2).map(({ path }) => path), [`${preferred}/README.md`, `${preferred}/nested/README.md`]);
+		assert.equal(local.length, 32);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});

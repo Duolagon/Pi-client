@@ -1,4 +1,5 @@
 import type { SessionEntry, SessionTreeNode } from "@earendil-works/pi-coding-agent";
+import type { ComposerDraft } from "./composer-draft.ts";
 import type { Conversation, Snapshot } from "./shared.ts";
 import type {
 	CliSessionHistoryInput,
@@ -41,6 +42,7 @@ export interface SessionNavigateResult {
 	cancelled: boolean;
 	leafId: string | null;
 	editorText?: string;
+	editorDraft?: ComposerDraft;
 	snapshot: Snapshot;
 }
 export interface SessionHistoryInput extends Omit<CliSessionHistoryInput, "agentDir"> {}

@@ -3784,11 +3784,28 @@ body.cc-resizing .cc-inspector-resize::after {
 	border-radius: 9px;
 }
 
-.cc-palette-row-main {
+.search-results > button > .cc-palette-row-main {
 	display: flex;
 	align-items: center;
 	gap: 10px;
 	min-width: 0;
+}
+
+.cc-palette-result-text {
+	display: grid;
+	gap: 2px;
+	min-width: 0;
+}
+
+.cc-palette-result-text > :is(strong, span, small) {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.cc-palette-result-text > span {
+	color: var(--cl-3);
+	font-size: var(--fs-xs);
 }
 
 .cc-palette-icon {
@@ -4468,6 +4485,468 @@ body.cc-resizing .cc-terminal-resize::before {
 	border-color: rgba(142, 162, 255, 0.36);
 }
 
+/* ── 15. Commercial Desktop Polish & Native Interactions ── */
+
+/* Modal top window-drag region: keeps hiddenInset window movable even when modal is open */
+.cc-modal-window-drag {
+	position: fixed;
+	top: 0;
+	left: 0;
+	right: 0;
+	height: 28px;
+	-webkit-app-region: drag;
+	z-index: 0;
+}
+
+.modal > .modal-shell {
+	position: relative;
+	z-index: 1;
+	-webkit-app-region: no-drag;
+}
+
+/* Resizable left sidebar rail */
+.cc-sidebar-resize {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	width: 6px;
+	z-index: 18;
+	cursor: col-resize;
+	-webkit-app-region: no-drag;
+}
+
+.cc-sidebar-resize::after {
+	content: "";
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	left: 2px;
+	width: 2px;
+	background: transparent;
+	transition: background var(--dur-fast) var(--ease);
+}
+
+.cc-sidebar-resize:hover::after,
+.cc-sidebar-resize:focus-visible::after,
+body.cc-resizing .cc-sidebar-resize::after {
+	background: var(--cl-clay);
+}
+
+body.cc-resizing .live-app {
+	transition: none !important;
+}
+
+/* Sidebar footer kbd hint */
+.cl-foot-settings .cc-foot-kbd {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	height: 18px;
+	padding: 0 5px;
+	margin-left: 2px;
+	border-radius: 5px;
+	border: 1px solid var(--cl-line);
+	background: color-mix(in srgb, var(--cl-surface) 75%, transparent);
+	font-family: var(--font-sans);
+	font-size: 10.5px;
+	font-weight: 500;
+	color: var(--cl-3);
+	line-height: 1;
+}
+
+/* Actionable error banner recovery buttons */
+.cl-banner-error .cc-banner-actions {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	margin-left: auto;
+	flex-shrink: 0;
+}
+
+.cl-banner-error .cc-banner-cta {
+	height: 24px;
+	padding: 0 10px;
+	font-size: 12px;
+	font-weight: 550;
+	border-radius: 6px;
+	border: 1px solid color-mix(in srgb, var(--cl-red) 32%, var(--cl-line));
+	background: var(--cl-surface);
+	color: var(--cl-text);
+}
+
+.cl-banner-error .cc-banner-cta:hover {
+	border-color: color-mix(in srgb, var(--cl-red) 55%, var(--cl-line));
+	background: var(--cl-hover);
+}
+
+/* Cold-start guided onboarding checklist */
+.cc-onboard-steps {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	width: min(560px, 100%);
+	margin-top: 6px;
+}
+
+.cc-onboard-step {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 13px 16px;
+	border-radius: 12px;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-surface);
+	text-align: left;
+	transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
+}
+
+.cc-onboard-step.current {
+	border-color: color-mix(in srgb, var(--cl-clay) 46%, var(--cl-line));
+	box-shadow: var(--elev-1);
+}
+
+.cc-onboard-step.done {
+	opacity: 0.78;
+	background: color-mix(in srgb, var(--cl-soft) 55%, var(--cl-surface));
+}
+
+.cc-onboard-num {
+	width: 24px;
+	height: 24px;
+	border-radius: 999px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+	font-size: 12px;
+	font-weight: 650;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-soft);
+	color: var(--cl-2);
+}
+
+.cc-onboard-step.current .cc-onboard-num {
+	border-color: color-mix(in srgb, var(--cl-clay) 50%, transparent);
+	background: var(--cl-clay-soft);
+	color: var(--cl-clay);
+}
+
+.cc-onboard-step.done .cc-onboard-num {
+	border-color: color-mix(in srgb, var(--cl-green) 42%, transparent);
+	background: color-mix(in srgb, var(--cl-green) 14%, transparent);
+	color: var(--cl-green);
+}
+
+.cc-onboard-copy {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+	flex: 1;
+}
+
+.cc-onboard-copy strong {
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--cl-text);
+}
+
+.cc-onboard-copy small {
+	font-size: 12px;
+	color: var(--cl-3);
+	line-height: 1.4;
+}
+
+/* Composer large-paste preview chip & cold-start dock CTA */
+.cc-attach-preview-btn {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	min-width: 0;
+	padding: 0;
+	border: 0;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	cursor: pointer;
+}
+
+.cc-attach-preview-btn:hover .cl-attachment-name {
+	text-decoration: underline;
+	color: var(--cl-clay);
+}
+
+.cc-paste-preview-box {
+	max-height: min(60vh, 460px);
+	overflow: auto;
+	margin: 0;
+	padding: 12px 14px;
+	border-radius: 10px;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-soft);
+	font-family: var(--font-mono);
+	font-size: 12px;
+	line-height: 1.55;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	color: var(--cl-text);
+}
+
+.cc-dock-setup-cta {
+	color: var(--cl-clay) !important;
+	border-color: color-mix(in srgb, var(--cl-clay) 36%, var(--cl-line)) !important;
+	background: color-mix(in srgb, var(--cl-clay-soft) 65%, transparent) !important;
+	font-weight: 550;
+}
+
+.cc-dock-setup-cta:hover {
+	border-color: color-mix(in srgb, var(--cl-clay) 58%, var(--cl-line)) !important;
+	background: var(--cl-clay-soft) !important;
+}
+
+/* Workspace files search & expandable directory tree */
+.cc-files-Browser-head {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+}
+
+.cc-files-search-wrap {
+	position: relative;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	height: 28px;
+	padding: 0 8px;
+	border-radius: 7px;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-surface);
+	min-width: 170px;
+	flex: 1 1 180px;
+	max-width: 260px;
+}
+
+.cc-files-search-wrap svg {
+	color: var(--cl-3);
+	flex-shrink: 0;
+}
+
+.cc-files-search-wrap input {
+	border: 0 !important;
+	background: transparent !important;
+	box-shadow: none !important;
+	outline: none !important;
+	padding: 0 !important;
+	height: 100% !important;
+	font-size: 12px !important;
+	width: 100%;
+	min-width: 0;
+	color: var(--cl-text);
+}
+
+.cc-files-search-clear {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 18px;
+	height: 18px;
+	padding: 0;
+	border: 0;
+	border-radius: 4px;
+	background: transparent;
+	color: var(--cl-3);
+	cursor: pointer;
+}
+
+.cc-files-search-clear:hover {
+	background: var(--cl-hover);
+	color: var(--cl-text);
+}
+
+.cc-file-tree-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.cc-file-tree-row.active {
+	background: var(--cl-clay-soft);
+	color: var(--cl-clay);
+	font-weight: 550;
+}
+
+.cc-tree-dir-caret {
+	flex-shrink: 0;
+	color: var(--cl-3);
+	transition: transform var(--dur-fast) var(--ease);
+}
+
+.cc-tree-dir-caret.open {
+	transform: rotate(90deg);
+}
+
+.cc-code-inspector-bar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	margin-bottom: 6px;
+}
+
+.cc-code-lines.is-interactive .cc-code-line {
+	cursor: pointer;
+}
+
+.cc-code-lines.is-interactive .cc-code-line:hover {
+	background: color-mix(in srgb, var(--cl-clay-soft) 45%, transparent);
+}
+
+/* Unified Settings search & capability hub links */
+.cc-settings-search {
+	position: relative;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	height: 30px;
+	padding: 0 9px;
+	margin-bottom: 8px;
+	border-radius: 8px;
+	border: 1px solid var(--cl-line);
+	background: var(--cl-surface);
+}
+
+.cc-settings-search svg {
+	color: var(--cl-3);
+	flex-shrink: 0;
+}
+
+.cc-settings-search input {
+	border: 0 !important;
+	background: transparent !important;
+	box-shadow: none !important;
+	outline: none !important;
+	padding: 0 !important;
+	height: 100% !important;
+	font-size: 12px !important;
+	width: 100%;
+	min-width: 0;
+}
+
+.cc-settings-hub-links {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	margin-top: 10px;
+	padding-top: 10px;
+	border-top: 1px solid var(--cl-line-soft);
+}
+
+.cc-settings-hub-title {
+	padding: 2px 10px 4px;
+	font-size: 11px;
+	font-weight: 600;
+	color: var(--cl-3);
+	letter-spacing: 0.02em;
+}
+
+.cc-hub-jump-btn {
+	justify-content: space-between;
+}
+
+.cc-hub-jump-btn > svg:last-child {
+	margin-left: auto;
+	opacity: 0.55;
+}
+
+/* Full-text session search snippet */
+.cc-search-snippet {
+	display: block;
+	font-size: 11.5px;
+	color: var(--cl-3);
+}
+
+/* Markdown codeblock actions, line-wrap, collapse & older-turns windowing */
+.cc-codeblock-actions {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	margin-left: auto;
+}
+
+.cc-codeblock-copy.active {
+	color: var(--cl-clay);
+	background: var(--cl-clay-soft);
+}
+
+.cc-codeblock.is-wrapped pre,
+.cc-codeblock.is-wrapped pre code {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+.cc-codeblock.is-collapsed pre {
+	max-height: 320px;
+	overflow: hidden;
+	-webkit-mask-image: linear-gradient(to bottom, #000 72%, transparent 100%);
+	mask-image: linear-gradient(to bottom, #000 72%, transparent 100%);
+}
+
+.cc-codeblock-expand {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 100%;
+	height: 30px;
+	border: 0;
+	border-top: 1px solid var(--cl-line-soft);
+	background: color-mix(in srgb, var(--cl-soft) 65%, var(--cl-surface));
+	font-size: 12px;
+	font-weight: 550;
+	color: var(--cl-2);
+	cursor: pointer;
+	transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+
+.cc-codeblock-expand:hover {
+	background: var(--cl-hover);
+	color: var(--cl-clay);
+}
+
+.cc-older-turns-wrap {
+	display: flex;
+	justify-content: center;
+	padding: 8px 0 14px;
+}
+
+/* Grail theme bespoke glass & starlight accents for Section 15 commercial surfaces */
+:root[data-theme="grail"] .cc-onboard-step {
+	background: color-mix(in srgb, var(--cl-surface) 88%, rgba(18, 22, 38, 0.72));
+	border-color: rgba(142, 162, 255, 0.18);
+	backdrop-filter: blur(10px);
+}
+
+:root[data-theme="grail"] .cc-onboard-step.current {
+	border-color: color-mix(in srgb, var(--cl-clay) 58%, rgba(142, 162, 255, 0.42));
+	box-shadow: 0 8px 24px -12px rgba(10, 14, 28, 0.65), 0 0 0 1px color-mix(in srgb, var(--cl-clay) 20%, transparent);
+}
+
+:root[data-theme="grail"] .cc-dock-setup-cta {
+	border-color: color-mix(in srgb, var(--cl-clay) 46%, rgba(142, 162, 255, 0.3)) !important;
+	background: color-mix(in srgb, var(--cl-clay-soft) 72%, rgba(22, 28, 48, 0.6)) !important;
+}
+
+:root[data-theme="grail"] .cc-file-tree-row.active {
+	background: rgba(142, 162, 255, 0.14);
+}
+
+:root[data-theme="grail"] .cc-codeblock-expand {
+	background: color-mix(in srgb, var(--cl-surface) 82%, rgba(14, 18, 32, 0.85));
+	border-top-color: rgba(142, 162, 255, 0.16);
+}
+
 @media (max-width: 1120px) {
 	.cl-side-action kbd {
 		display: none;
@@ -4487,7 +4966,11 @@ body.cc-resizing .cc-terminal-resize::before {
 	.cc-sidebar-track > .cl-side > *,
 	.cl-side :is(button, .cl-conv-row, .cl-conv-fold-icon),
 	.cc-smooth-collapse,
-	.cc-seg-glider.is-animated {
+	.cc-seg-glider.is-animated,
+	.cc-sidebar-resize::after,
+	.cc-onboard-step,
+	.cc-tree-dir-caret,
+	.cc-codeblock-expand {
 		transition: none !important;
 	}
 	.cc-shimmer-text,
@@ -4507,6 +4990,7 @@ body.cc-resizing .cc-terminal-resize::before {
 	.cc-doctor-row,
 	.cc-grail-findings > li,
 	.cc-spin,
+	.spin,
 	.cc-subagent-view,
 	.cc-preview-bar.is-checking::after {
 		animation: none !important;

@@ -14,30 +14,30 @@ import type {
 
 const thinkingOptions: { value: ThinkingLevel | ""; label: string }[] = [
 	{ value: "", label: "继承父会话" },
-	{ value: "off", label: "off" },
-	{ value: "minimal", label: "minimal" },
-	{ value: "low", label: "low" },
-	{ value: "medium", label: "medium" },
-	{ value: "high", label: "high" },
-	{ value: "xhigh", label: "xhigh" },
-	{ value: "max", label: "max" },
+	{ value: "off", label: "关闭 (off)" },
+	{ value: "minimal", label: "极简 (minimal)" },
+	{ value: "low", label: "低 (low)" },
+	{ value: "medium", label: "中 (medium)" },
+	{ value: "high", label: "高 (high)" },
+	{ value: "xhigh", label: "极高 (xhigh)" },
+	{ value: "max", label: "最大 (max)" },
 ];
 
 const permissionModeOptions: { value: AgentPermissionMode | ""; label: string }[] = [
 	{ value: "", label: "继承当前会话" },
-	{ value: "default", label: "default（手动确认）" },
-	{ value: "acceptEdits", label: "acceptEdits（自动允许编辑）" },
-	{ value: "plan", label: "plan（仅调研/规划）" },
-	{ value: "dontAsk", label: "dontAsk（未授权操作自动拒绝）" },
-	{ value: "bypassPermissions", label: "bypassPermissions（仅父会话 auto 时沿用）" },
-	{ value: "read", label: "read（只读）" },
+	{ value: "default", label: "手动确认 (default)" },
+	{ value: "acceptEdits", label: "自动接受编辑 (acceptEdits)" },
+	{ value: "plan", label: "计划模式 (plan)" },
+	{ value: "dontAsk", label: "未授权操作自动拒绝 (dontAsk)" },
+	{ value: "bypassPermissions", label: "跟随全局放行 (bypassPermissions)" },
+	{ value: "read", label: "只读浏览 (read)" },
 ];
 
 const memoryOptions: { value: AgentMemoryScope | ""; label: string }[] = [
 	{ value: "", label: "无持久化记忆" },
-	{ value: "user", label: "user (~/.pi/agent/agent-memory)" },
-	{ value: "project", label: "project (.claude/agent-memory)" },
-	{ value: "local", label: "local (.claude/agent-memory-local)" },
+	{ value: "user", label: "用户全局 (~/.pi/agent/agent-memory)" },
+	{ value: "project", label: "当前项目 (.claude/agent-memory)" },
+	{ value: "local", label: "本机私有 (.claude/agent-memory-local)" },
 ];
 
 function emptyForm(): AgentSaveInput {

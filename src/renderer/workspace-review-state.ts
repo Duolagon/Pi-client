@@ -13,7 +13,7 @@ export type ReviewView = {
 	scope?: ReviewScope;
 	turn: ReviewPosition & { checkpointId?: string };
 	workspace: ReviewPosition;
-	files: { directory: string; path?: string; top: number; line?: number };
+	files: { directory: string; path?: string; lastPath?: string; top: number; line?: number };
 	diffMode: "unified" | "split";
 	notes: ReviewNote[];
 	draft?: ReviewNote;

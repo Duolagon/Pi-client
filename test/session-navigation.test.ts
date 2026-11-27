@@ -72,6 +72,7 @@ async function createBridge(initialLeaf: string | null = "second") {
 	});
 	try {
 		navigation({
+			on() { return () => {}; },
 			registerCommand(name, definition) {
 				assert.equal(name, command);
 				handler = definition.handler;

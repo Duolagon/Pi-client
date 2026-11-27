@@ -100,6 +100,7 @@ export function Modal({
 			}}
 			aria-label={title}
 		>
+			<div className="cc-modal-window-drag" aria-hidden="true" />
 			<div className="modal-shell">
 				<header>
 					<h2>{title}</h2>
