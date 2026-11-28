@@ -153,6 +153,13 @@ test("ACP follow-ups queue for the same native session and both background resul
 		try {
 			await restored.initialize();
 			assert.deepEqual(restored.pendingNotifications("parent-a").map((notice) => notice.task.turn), [1, 2]);
+			const [firstNotice, secondNotice] = restored.pendingNotifications("parent-a");
+			assert.equal(firstNotice.requirements, undefined);
+			assert.equal(firstNotice.task.pendingMessages, 2);
+			assert.deepEqual(secondNotice.requirements, { original: "hold-next", followUps: [
+				{ turn: 2, source: "user", text: "second" }, { turn: 2, source: "user", text: "third" },
+			] });
+			assert.deepEqual((await restored.result(first.id)).requirements, secondNotice.requirements);
 			await restored.markNotified(first.id, 1);
 			assert.deepEqual(restored.pendingNotifications("parent-a").map((notice) => notice.task.turn), [2]);
 		} finally { await restored.close(); }
@@ -741,4 +748,46 @@ test("native settings are scoped to the originating multi task and stay pinned a
 		assert.equal(data.adapter.opens[2].model, undefined);
 		assert.equal(data.adapter.opens[2].effort, undefined);
 	} finally { await resumed.close(); await data.cleanup(); }
+});
+
+test("a task-panel continuation of a finished foreground task wakes its parent with acceptance criteria", async () => {
+	const data = await setup();
+	data.options.flushNotifications = () => {};
+	try {
+		const task = await data.manager.start({ executor: "kimi", description: "Write", prompt: "Make one line" }, "parent-a", "tool-first");
+		await data.manager.awaitModelResult(task.id, "parent-a", false);
+		await data.manager.send({ taskId: task.id, message: "Append a second line", runInBackground: false });
+		await until(() => data.manager.snapshot(task.id), terminal, "continued foreground task");
+		const [notice] = data.manager.pendingNotifications("parent-a");
+		assert.equal(notice.task.turn, 2);
+		assert.equal(notice.task.runInBackground, false);
+		assert.deepEqual(notice.requirements, { original: "Make one line", followUps: [{ turn: 2, source: "user", text: "Append a second line" }] });
+		assert.deepEqual(data.manager.pendingNotifications("parent-b"), []);
+	} finally { await data.cleanup(); }
+});
+
+test("a native steer belongs to the same turn and reaches the parent as a user requirement", async () => {
+	const data = await setup();
+	data.options.flushNotifications = () => {};
+	data.options.adapters.codex = {
+		async open(options) {
+			const session = await data.adapter.open(options);
+			return { ...session, steer: async () => {
+				data.adapter.releases.get("hold-first")!();
+				await new Promise(resolve => setTimeout(resolve, 15));
+				return true;
+			} };
+		},
+	};
+	try {
+		const task = await data.manager.start({ executor: "codex", description: "Steer", prompt: "hold-first" }, "parent-a", "tool-steer");
+		await until(() => data.adapter.releases.has("hold-first"), Boolean, "foreground turn running");
+		const waiting = data.manager.awaitModelResult(task.id, "parent-a", false);
+		const sent = await data.manager.send({ taskId: task.id, message: "Also document it" });
+		assert.equal(sent.sendDisposition, "steered");
+		const result = await waiting;
+		assert.equal(result.turn, 1);
+		assert.deepEqual(result.requirements, { original: "hold-first", followUps: [{ turn: 1, source: "user", text: "Also document it" }] });
+		assert.deepEqual(data.manager.pendingNotifications("parent-a")[0]?.requirements, result.requirements);
+	} finally { await data.cleanup(); }
 });

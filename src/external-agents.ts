@@ -1,3 +1,4 @@
+import { acceptanceGuidance, extendRequirements, storedRequirements, type ExternalRequirements, type FollowUpInstruction } from "./external-requirements.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile, rename, realpath, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
@@ -61,12 +62,17 @@ interface StoredTask {
 	usesMultiSettings?: true;
 	outputSchema?: AgentOutputSchema;
 	originalPrompt?: string;
-	followUps?: string[];
+	followUps?: FollowUpInstruction[];
+	requirements?: ExternalRequirements;
+	cumulativeChanges?: ExternalChangeSummary;
+	/** A continuation sent from the task UI still returns to its parent when it finishes. */
+	notifyForFollowUp?: boolean;
 	undelivered?: ExternalNotification[];
 }
 /** A finished background turn whose result the parent has not received yet. */
-export interface ExternalNotification { task: ExternalTask; stopReason?: ExternalStopReason }
+export interface ExternalNotification { task: ExternalTask; stopReason?: ExternalStopReason; requirements?: ExternalRequirements; cumulativeChanges?: ExternalChangeSummary }
 interface Runtime {
+	steering?: Promise<boolean>;
 	session?: ExternalSession;
 	abort?: AbortController;
 	running?: Promise<void>;
@@ -98,6 +104,7 @@ export interface ExternalAgentOptions {
 	canStart(task: ExternalTask): boolean;
 	/** Start a checkpoint; the returned function finishes it and summarizes the turn's changes. */
 	beginCheckpoint?(task: ExternalTask): Promise<() => Promise<ExternalChangeSummary | void>>;
+	cumulativeDiff?(task: ExternalTask, checkpointId: string): Promise<ExternalChangeSummary>;
 	/** Native model and effort the user pinned for an executor. */
 	executorModel?(executor: ExternalProvider, owner: string): { model?: string; effort?: string } | undefined;
 	usesMultiSettings?(conversationId: string): boolean;
@@ -172,6 +179,9 @@ export class ExternalAgents {
 				this.tasks.set(task.id, { task, policy: validateRuntimePolicy(record.policy), prompt: record.prompt, notify: Boolean(record.notify), notifiedTurn: record.notifiedTurn, stopReason: record.stopReason,
 					usage: validatedUsage(record.usage), outputSchema,
 					originalPrompt: typeof record.originalPrompt === "string" ? record.originalPrompt.slice(0, 2 * 1024 * 1024) : undefined,
+					requirements: storedRequirements(record.requirements, task.turn) ?? (task.turn > 1 ?
+						extendRequirements(undefined, record.originalPrompt, task.turn, [{ text: record.prompt, source: "unknown" }], task.turn > 2) : undefined),
+					cumulativeChanges: validatedChanges(record.cumulativeChanges), notifyForFollowUp: record.notifyForFollowUp === true,
 					followUps, undelivered: storedNotifications(record.undelivered, task, outputSchema), ...(record.usesMultiSettings === true ? { usesMultiSettings: true } : {}) });
 				// The event log can be newer than the last atomic task snapshot after a crash.
 				const recovered = await this.replay(task.id);
@@ -267,6 +277,8 @@ export class ExternalAgents {
 		});
 	}
 
+	reviewRequirements(id: string, owner?: string) { return this.record(id, owner).requirements; }
+
 	originalRequest(id: string, owner?: string): string {
 		const record = this.record(id, owner);
 		if (record.originalPrompt) return record.originalPrompt;
@@ -324,13 +336,23 @@ export class ExternalAgents {
 			const runtime = this.runtimes.get(task.id);
 			if (task.supportsResume === false && task.nativeSessionId && !runtime?.session)
 				throw new Error("此 ACP 执行器无法恢复已关闭的会话，请新建任务。");
-			if (active.has(task.status) && !record.followUps?.length && runtime?.session?.steer &&
-				!runtime.abort?.signal.aborted && await runtime.session.steer(input.message)) {
-				return { ...structuredClone(task), sendDisposition: "steered" };
+			const instruction: FollowUpInstruction = { source: owner ? "controller" : "user", text: input.message };
+			if (active.has(task.status) && !record.followUps?.length && runtime?.session?.steer && !runtime.abort?.signal.aborted) {
+				const steer = runtime.session.steer(input.message).then(async accepted => {
+					if (accepted) {
+						if (task.turn === 1) record.originalPrompt ??= record.prompt;
+						record.requirements = extendRequirements(record.requirements, record.originalPrompt, task.turn, [instruction]);
+						if (!owner) record.notifyForFollowUp = true;
+						await this.persist();
+					}
+					return accepted;
+				});
+				runtime.steering = steer;
+				try { if (await steer) return { ...structuredClone(task), sendDisposition: "steered" }; }
+				finally { delete runtime.steering; }
 			}
-			const messages = [...(record.followUps ?? []), input.message];
-			const prompt = messages.join("\n\n");
-			validatePrompt(prompt);
+			const messages = [...(record.followUps ?? []), instruction];
+			validatePrompt(messages.map(item => item.text).join("\n\n"));
 			if (active.has(task.status)) {
 				if (messages.length > maxPendingMessages) throw new Error("排队的追加消息已达上限。");
 				record.followUps = messages;
@@ -341,19 +363,23 @@ export class ExternalAgents {
 			}
 			await runtime?.running;
 			await realpath(task.workingDirectory);
-			await this.queueTurn(record, prompt, input.runInBackground ?? false);
+			await this.queueTurn(record, messages, input.runInBackground ?? false);
 			return structuredClone(task);
 		});
 	}
 
-	private async queueTurn(record: StoredTask, prompt: string, background: boolean): Promise<void> {
+	private async queueTurn(record: StoredTask, messages: FollowUpInstruction[], background: boolean): Promise<void> {
 		const { task } = record;
 		if (shouldNotify(record)) {
 			const pending = record.undelivered ??= [];
 			if (pending.length >= maxUndeliveredResults) throw new Error("请先交付此前的后台结果，再运行下一轮。");
-			pending.push({ task: structuredClone(task), stopReason: record.stopReason });
+			pending.push(structuredClone(this.notification(record)));
 		}
-		record.prompt = prompt;
+		if (task.turn === 1) record.originalPrompt ??= record.prompt;
+		record.requirements = extendRequirements(record.requirements, record.originalPrompt, task.turn + 1, messages);
+		record.cumulativeChanges = undefined;
+		record.notifyForFollowUp = messages.some(entry => entry.source === "user");
+		record.prompt = messages.map(entry => entry.text).join("\n\n");
 		record.notify = background;
 		record.stopReason = undefined;
 		record.followUps = undefined;
@@ -380,7 +406,10 @@ export class ExternalAgents {
 			signal?.throwIfAborted(); await delay(Math.min(100, timeout - (Date.now() - started)), undefined, { signal }); task = this.record(id, owner).task;
 		}
 		signal?.throwIfAborted();
-		return { task_id: task.id, executor: task.executor, parent_conversation_id: task.parentConversationId, parent_tool_call_id: task.parentToolCallId,
+		const record = this.record(id, owner);
+		return { ...(record.requirements ? { acceptance_guidance: acceptanceGuidance, requirements: structuredClone(record.requirements) } : {}),
+			...(record.cumulativeChanges && !active.has(task.status) ? { cumulative_changes: structuredClone(record.cumulativeChanges) } : {}),
+			task_id: task.id, executor: task.executor, parent_conversation_id: task.parentConversationId, parent_tool_call_id: task.parentToolCallId,
 			status: task.status, turn: task.turn, native_session_id: task.nativeSessionId, worktree_id: task.worktreeId, working_directory: task.workingDirectory,
 			output: task.output, truncated: task.truncated, error: task.error, pending_approvals: task.pendingApprovals.length,
 			...(task.pendingMessages ? { pending_messages: task.pendingMessages } : {}),
@@ -393,8 +422,12 @@ export class ExternalAgents {
 		try {
 			let result: ExternalTaskResult;
 			const started = Date.now();
-			do { result = await this.result(id, { block: true, timeout: 60000 }, owner, signal); }
-			while (active.has(result.status) && !result.pending_approvals && Date.now() - started < 300000);
+			do {
+				result = await this.result(id, { block: true, timeout: 60000 }, owner, signal);
+				// Sealing a checkpoint and dequeuing its continuation are separate operations.
+				if (result.status === "completed" && result.pending_messages) await delay(50, undefined, { signal });
+				else if (!active.has(result.status) || result.pending_approvals) break;
+			} while (Date.now() - started < 300000);
 			if (active.has(result.status)) {
 				// The parent stops waiting; the result now reaches it through the outbox.
 				this.record(id, owner).notify = true;
@@ -427,7 +460,7 @@ export class ExternalAgents {
 		}
 		await this.persist(); this.pump();
 		// A running turn is delivered once it has recorded its output (see run()).
-		if (record.notify && !silentStops.has(reason)) this.options.flushNotifications(task.parentConversationId);
+		if ((record.notify || record.notifyForFollowUp) && !silentStops.has(reason)) this.options.flushNotifications(task.parentConversationId);
 		return structuredClone(task);
 	}
 	/**
@@ -445,13 +478,17 @@ export class ExternalAgents {
 			task.createdAt >= since && (active.has(task.status) || this.runtimes.get(task.id)?.executing === true));
 	}
 
+	private notification(record: StoredTask): ExternalNotification {
+		return { task: record.task, stopReason: record.stopReason, requirements: record.requirements, cumulativeChanges: record.cumulativeChanges };
+	}
+
 	/** Finished background turns of `owner` that have not been delivered yet. */
 	pendingNotifications(owner: string): ExternalNotification[] {
 		return [...this.tasks.values()]
 			.filter(({ task }) => task.parentConversationId === owner)
 			.flatMap((record) => [
 				...(record.undelivered ?? []),
-				...(shouldNotify(record) && !this.runtimes.get(record.task.id)?.executing ? [{ task: record.task, stopReason: record.stopReason }] : []),
+				...(shouldNotify(record) && !this.runtimes.get(record.task.id)?.executing ? [this.notification(record)] : []),
 			]).map((notice) => structuredClone(notice));
 	}
 	/** Record a delivered turn, including one archived while a follow-up runs. */
@@ -549,7 +586,7 @@ export class ExternalAgents {
 						const turn = record.task.turn;
 						void this.serialize(async () => {
 							if (record.task.turn === turn && record.task.status === "completed" && record.followUps?.length)
-								await this.queueTurn(record, record.followUps.join("\n\n"), true);
+								await this.queueTurn(record, record.followUps, true);
 						}).catch(() => {});
 					}
 				});
@@ -646,10 +683,13 @@ export class ExternalAgents {
 			}
 		} finally {
 			this.clearApprovals(task, runtime);
+			await runtime.steering?.catch(() => {});
 			const changes = await finishCheckpoint?.().catch((error: unknown) => {
 				this.event(task, { type: "diagnostic", message: `无法完成恢复点：${error instanceof Error ? error.message : String(error)}` });
 			});
 			if (changes) task.changes = changes;
+			if (task.turn > 1 && task.changes?.checkpointId)
+				record.cumulativeChanges = await this.options.cumulativeDiff?.(task, task.changes.checkpointId).catch(() => undefined);
 			const reported = [...(runtime.usageAttempts ?? []), ...(runtime.usage ? [runtime.usage] : [])];
 			if (reported.length) this.recordUsage(record, reported, resumed, status === "failed");
 			await budget?.release().catch(() => {});
@@ -671,7 +711,7 @@ export class ExternalAgents {
 			}
 			runtime.executing = false;
 			await this.persist();
-			if (!this.closed && record.notify) this.options.flushNotifications(task.parentConversationId);
+			if (!this.closed && (record.notify || record.notifyForFollowUp)) this.options.flushNotifications(task.parentConversationId);
 		}
 	}
 
@@ -890,15 +930,16 @@ function validatePrompt(value: string): void { if (typeof value !== "string" || 
 function validateDescription(value: string): void { if (typeof value !== "string" || !value.trim() || exceedsLength(value, 160) || value.includes("\0")) throw new Error("外部任务名称无效。"); }
 function contains(root: string, path: string): boolean { const part = relative(root, path); return !isAbsolute(part) && part !== ".." && !part.startsWith(`..${sep}`); }
 function overlaps(left: string, right: string): boolean { return contains(left, right) || contains(right, left); }
-function shouldNotify({ task, notify, notifiedTurn, stopReason }: StoredTask): boolean {
-	return notify && notifiedTurn !== task.turn && (["completed", "failed"].includes(task.status) ||
+function shouldNotify({ task, notify, notifyForFollowUp, notifiedTurn, stopReason }: StoredTask): boolean {
+	return (notify || notifyForFollowUp === true) && notifiedTurn !== task.turn && (["completed", "failed"].includes(task.status) ||
 		(["cancelled", "interrupted"].includes(task.status) && stopReason !== undefined && !silentStops.has(stopReason)));
 }
 
-function storedFollowUps(value: unknown): string[] | undefined {
-	if (!Array.isArray(value) || !value.length || value.length > maxPendingMessages || value.some((item) => typeof item !== "string")) return;
-	try { validatePrompt(value.join("\n\n")); return value as string[]; }
-	catch { return undefined; }
+function storedFollowUps(value: unknown): FollowUpInstruction[] | undefined {
+	if (!Array.isArray(value) || !value.length || value.length > maxPendingMessages) return;
+	const entries = value.map(item => typeof item === "string" ? { text: item, source: "unknown" } : item);
+	if (entries.some(item => !item || typeof item.text !== "string" || !["user", "controller", "unknown"].includes(item.source))) return;
+	try { validatePrompt(entries.map(item => item.text).join("\n\n")); return entries; } catch { return undefined; }
 }
 
 function storedNotifications(value: unknown, task: ExternalTask, schema?: AgentOutputSchema): ExternalNotification[] | undefined {
@@ -916,8 +957,10 @@ function storedNotifications(value: unknown, task: ExternalTask, schema?: AgentO
 			task: {
 				...task, turn: old.turn, status: old.status, updatedAt: old.updatedAt, output: old.output,
 				truncated: old.truncated === true, error: typeof old.error === "string" ? old.error.slice(0, 8000) : undefined,
-				pendingApprovals: [], pendingMessages: undefined, changes: validatedChanges(old.changes), usage: validatedTurnUsage(old.usage), structuredOutput,
+				pendingApprovals: [], pendingMessages: Number.isSafeInteger(old.pendingMessages) && old.pendingMessages! > 0 && old.pendingMessages! <= maxPendingMessages ? old.pendingMessages : undefined,
+				changes: validatedChanges(old.changes), usage: validatedTurnUsage(old.usage), structuredOutput,
 			},
+			requirements: storedRequirements(entry.requirements, old.turn), cumulativeChanges: validatedChanges(entry.cumulativeChanges),
 			stopReason: entry.stopReason && stopReasons.includes(entry.stopReason) ? entry.stopReason : undefined,
 		}];
 	});

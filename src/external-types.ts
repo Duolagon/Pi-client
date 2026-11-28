@@ -168,6 +168,9 @@ export interface ExternalTaskSendInput { taskId: string; message: string; runInB
 export interface ExternalCandidate { executor: ExternalProvider; model?: string; effort?: string }
 export interface ExternalComparison { comparisonId: string; tasks: ExternalTask[]; errors?: string[] }
 export interface ExternalTaskResult {
+	acceptance_guidance?: string;
+	requirements?: import("./external-requirements.ts").ExternalRequirements;
+	cumulative_changes?: ExternalChangeSummary;
 	task_id: string;
 	executor: ExternalProvider;
 	parent_conversation_id: string;

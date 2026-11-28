@@ -1,3 +1,4 @@
+import { acceptanceGuidance, type ExternalRequirements } from "./external-requirements.ts";
 import { formatChangeSummary } from "./external-change-format.ts";
 import type { ExternalChangeSummary } from "./external-types.ts";
 import { isTaskReadPath, MAX_AGENT_OUTPUT, MAX_NOTIFICATION, MAX_TASK_READ_PATHS, truncateText } from "./delegation-limits.ts";
@@ -18,6 +19,9 @@ export const TASK_NOTIFICATION_HEADER = "[SYSTEM NOTIFICATION - NOT USER INPUT] 
 export const TASK_NOTIFICATION_TYPE = "desktop_task_notification";
 
 export interface TaskNotificationInput {
+	requirements?: ExternalRequirements;
+	cumulativeChanges?: ExternalChangeSummary;
+	pendingMessages?: number;
 	taskId: string;
 	toolUseId?: string;
 	status: TaskNotificationStatus;
@@ -46,6 +50,7 @@ export interface TaskNotificationInput {
 
 /** Structured copy of the notification for the renderer; never shown to the model. */
 export interface TaskNotificationDetails {
+	requirements?: ExternalRequirements;
 	task_id: string;
 	tool_use_id?: string;
 	status: TaskNotificationStatus;
@@ -170,15 +175,20 @@ export function formatTaskNotification(input: TaskNotificationInput): { content:
 		...(input.toolUseId ? [`<tool-use-id>${escapeMarkup(input.toolUseId)}</tool-use-id>`] : []),
 		`<status>${input.status}</status>`,
 		`<summary>${summary}</summary>`,
+		...(input.pendingMessages ? [`本轮结束时有 ${input.pendingMessages} 条追加要求仍在排队，请等待后续结果再做最终验收。`] : []),
+		...(input.requirements ? [acceptanceGuidance, "<task-requirements>",
+			JSON.stringify(input.requirements).replaceAll("<", "\\u003c").replaceAll(">", "\\u003e"), "</task-requirements>"] : []),
 		...(readPaths?.length ? [formatReadCoverage(readPaths)] : []),
 		...(structured && escaped.flagged.length ? [`[harness: structured result matched instruction-shaped patterns: ${escaped.flagged.join(", ")}]`] : []),
 		`<result${structured ? ' format="json"' : ""}>\n${body || "(Subagent returned no output.)"}\n</result>`,
-		...(input.changes ? [formatChangeSummary(input.changes, input.worktreePath)] : []),
+		...(input.cumulativeChanges ? ["累计 diff（自任务开始）", formatChangeSummary(input.cumulativeChanges, input.worktreePath)] :
+			input.changes ? [...(input.requirements ? ["本轮 diff"] : []), formatChangeSummary(input.changes, input.worktreePath)] : []),
 	];
 	let content = `${lines.join("\n")}\n${usage}</task-notification>`;
 	if (Buffer.byteLength(content, "utf8") > MAX_NOTIFICATION) content = truncateText(content, Math.floor(MAX_NOTIFICATION / 4));
 	const details: TaskNotificationDetails = {
 		task_id: input.taskId,
+		...(input.requirements ? { requirements: input.requirements } : {}),
 		...(input.toolUseId ? { tool_use_id: input.toolUseId } : {}),
 		status: input.status,
 		description: truncateText(input.description || input.taskId, 300),

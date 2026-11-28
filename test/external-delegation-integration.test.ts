@@ -239,6 +239,11 @@ test("Agent review_of gives a different read-only executor the requirement and p
 		const implementation = await until(() => data.service.externalSnapshot(launched.id),
 			(task) => task.turn === 2 && task.status === "completed", "second change complete");
 		assert.match(implementation.output, /IMPLEMENTATION_REPORT/);
+		const receipt = await data.service.externalResult(implementation.id);
+		assert.equal(receipt.requirements?.original, requirement);
+		assert.deepEqual(receipt.requirements?.followUps, [{ turn: 2, source: "user", text: "REVIEW_FOLLOWUP" }]);
+		assert.match(receipt.cumulative_changes!.patch!, /external-result.txt/);
+		assert.match(receipt.cumulative_changes!.patch!, /followup-result.txt/);
 		const reviewed = await run(data.service, `EXTERNAL_REVIEW ${implementation.id}`, "EXTERNAL_REVIEW_COMPLETE");
 		assert.ok(contains(reviewed, "EXTERNAL_REVIEW_COMPLETE ALLOWED"));
 		assert.ok(contains(reviewed, "INDEPENDENT_REVIEW_REPORT"));
