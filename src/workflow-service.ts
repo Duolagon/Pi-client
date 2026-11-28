@@ -287,12 +287,16 @@ export class WorkflowService {
 			this.workflows.get(id)?.conversationId === conversationId);
 	}
 
-	async resume(id: string): Promise<WorkflowRecord> {
+	async resume(id: string, ceiling?: { maxAgents: number; maxCost: number }): Promise<WorkflowRecord> {
 		if (this.closed) throw new Error("Workflow service is closed");
 		const record = this.workflows.get(id);
 		if (!record) throw new Error(`Workflow not found: ${id}`);
 		if (this.activeRuns.has(id)) throw new Error("Workflow is already running");
 		if (record.status === "completed") return structuredClone(record);
+		if (ceiling) {
+			record.budget.maxAgents = Math.min(record.budget.maxAgents ?? ceiling.maxAgents, ceiling.maxAgents);
+			record.budget.maxCost = Math.min(record.budget.maxCost ?? ceiling.maxCost, ceiling.maxCost);
+		}
 
 		record.status = "running";
 		delete record.error;
@@ -537,6 +541,10 @@ export class WorkflowService {
 
 		record.budget.spentTokens += totalTokens;
 		record.budget.spentCost += totalCost;
+		// Cost is known only when a step settles, so agents already running can overshoot the cap.
+		// Once it is crossed, cancel the rest instead of letting a wide parallel() finish.
+		if (record.budget.maxCost !== undefined && record.budget.spentCost >= record.budget.maxCost)
+			await this.callbacks.cancelWorkflowTasks?.(record.id).catch(() => {});
 
 		return {
 			stepKey,

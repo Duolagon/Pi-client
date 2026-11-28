@@ -234,12 +234,16 @@ export interface Conversation {
 	permissionMode?: PermissionMode;
 	/** Active or last-run /goal autonomous continuation state. */
 	goal?: GoalState;
+	/** "ultracode" makes orchestrating subagents the default for substantive work; absent means standard. */
+	codingTier?: CodingTier;
 	updatedAt: number;
 }
+export type CodingTier = "standard" | "ultracode";
 export interface ConversationMetaPatch {
 	pinned?: boolean;
 	archived?: boolean;
 	group?: string | null;
+	codingTier?: CodingTier;
 }
 export interface Project {
 	path: string;

@@ -33,7 +33,6 @@ export const deferredSpecialistTools = [
 	"WorktreeCreate", "WorktreeList", "WorktreeMerge", "WorktreeRemove",
 	"Monitor",
 	"ScheduleWakeup", "CronCreate", "CronList", "CronDelete",
-	"WorkflowRun",
 	"PreviewCheck",
 	"KaggleComputerUse",
 ] as const satisfies readonly DesktopModelToolName[];

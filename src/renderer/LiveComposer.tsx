@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, Brain, Eye, File, Folder, Paperclip, ShieldCheck, Square, X } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
-import type { Command, FileEntry, FileReferenceAvailability, Message, PermissionMode, Project, SandboxStatus, Snapshot, ThinkingLevel } from "../shared.ts";
+import type { Command, FileEntry, FileReferenceAvailability, Message, CodingTier, PermissionMode, Project, SandboxStatus, Snapshot, ThinkingLevel } from "../shared.ts";
 import { SandboxControl } from "./SandboxControl.tsx";
 import { SelectPopover } from "./SelectPopover.tsx";
 import { SurfacePresence } from "./Presence.tsx";
@@ -76,7 +76,8 @@ export type BuiltinSlashAction =
 	| "add-dir"
 	| "goal"
 	| "verify"
-	| "grail";
+	| "grail"
+	| "ultracode";
 
 const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[] = [
 	{ name: "compact", description: "压缩上下文（支持 /compact <聚焦指令>）" },
@@ -111,11 +112,12 @@ const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[
 	{ name: "add-dir", description: "附加工作目录并放行读写与沙箱（/add-dir <目录> 或 /add-dir rm <目录>）" },
 	{ name: "grail", description: "鉴定本次需求的全部改动（测试、作弊扫描、独立评审；结果不发给 Agent）" },
 	{ name: "goal", description: "设定目标自动续跑（/goal [--max-turns 8] [--max-cost 2] <目标>，/goal stop 停止）" },
+	{ name: "ultracode", description: "切换 ultracode 档位：模型默认用子 Agent 并行编排并逐条复核（/ultracode on|off）" },
 	{ name: "verify", description: "让模型用 PreviewCheck 自动验证本地网页（启动服务、操作 DOM、截图与检查报错）" },
 ];
 
 /** Builtins that accept an argument after the name, plus Claude Code aliases. */
-const BUILTIN_WITH_ARGS = new Set<BuiltinSlashAction>(["theme", "rename", "copy", "export", "fork", "output-style", "add-dir", "goal", "verify"]);
+const BUILTIN_WITH_ARGS = new Set<BuiltinSlashAction>(["theme", "rename", "copy", "export", "fork", "output-style", "add-dir", "goal", "verify", "ultracode"]);
 const BUILTIN_ALIASES: Record<string, BuiltinSlashAction> = { branch: "fork" };
 /** Argument-free builtins added later that also yield to a Pi command or skill of the same name. */
 const YIELDING_BUILTINS = new Set<BuiltinSlashAction>(["doctor", "stats", "grail"]);
@@ -150,6 +152,7 @@ export function LiveComposer({
 	stopping,
 	command,
 	setPermission,
+	setCodingTier,
 	onSelectProject: _onSelectProject,
 	onOpenProject,
 	sandboxStatus,
@@ -181,6 +184,7 @@ export function LiveComposer({
 	stopping?: boolean;
 	command: (value: Command) => Promise<void>;
 	setPermission: (value: PermissionMode) => void;
+	setCodingTier: (value: CodingTier) => void;
 	onSelectProject: (path: string) => void;
 	onOpenProject: () => void;
 	sandboxStatus: SandboxStatus | null;
@@ -996,6 +1000,18 @@ export function LiveComposer({
 								dotClass: mode,
 							}))}
 							onChange={(val) => setPermission(val as PermissionMode)}
+						/>
+						<SelectPopover
+							ariaLabel="编排档位"
+							pillClassName="ghost"
+							title="ultracode：模型默认用子 Agent 并行编排并逐条复核，更彻底也更费额度"
+							value={snapshot.active?.codingTier ?? "standard"}
+							disabled={changing || !snapshot.active || snapshot.active?.kind === "subagent"}
+							options={[
+								{ value: "standard", label: "标准", shortLabel: "标准", hint: "按需委派子 Agent" },
+								{ value: "ultracode", label: "ultracode", shortLabel: "ultracode", hint: "默认并行编排、对抗复核" },
+							]}
+							onChange={(val) => setCodingTier(val as CodingTier)}
 						/>
 						<SandboxControl
 							enabled={Boolean(snapshot.settings.sandbox)}

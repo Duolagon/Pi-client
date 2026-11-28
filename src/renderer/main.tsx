@@ -64,7 +64,7 @@ import type {
 	TodoRecord,
 	WorkflowRecord,
 } from "../shared.ts";
-import type { GrailState } from "../shared.ts";
+import type { CodingTier, GrailState } from "../shared.ts";
 import { GrailBadge, GrailReportDialog, GrailReveal } from "./GrailReport.tsx";
 import { grailWording, latestVerdict, revealDecision } from "./grail-view.ts";
 import { IconButton, Modal, PiMark, menuKeyNav } from "../prototype/ui.tsx";
@@ -1020,7 +1020,30 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		}
 		void api.defaultPreviewUrl(snapshot.active.id).then((url) => setPreviewUrl((current) => current ?? url)).catch(app.fail);
 	};
+	const saveCodingTier = async (tier: CodingTier) => {
+		const id = snapshot?.active?.id;
+		if (!id) return;
+		try {
+			const next = await api.updateConversationMeta(id, { codingTier: tier });
+			app.apply(next);
+			app.setNotice(tier === "ultracode"
+				? "已开启 ultracode：从下一轮起，模型默认用子 Agent 并行编排并逐条复核（每个工作流最多 100 个 Agent、$3）。"
+				: "已切回标准档位：模型按需委派子 Agent（每个工作流最多 24 个 Agent、$0.5）。");
+		} catch (error) {
+			app.fail(error);
+		}
+	};
 	const handleBuiltinSlash = (action: BuiltinSlashAction, argument = "") => {
+		if (action === "ultracode") {
+			if (!snapshot?.active) return;
+			if (snapshot.active.kind === "subagent") return app.setNotice("请在主会话切换档位。");
+			const arg = argument.trim().toLowerCase();
+			if (arg && arg !== "on" && arg !== "off") return app.setNotice("用法：/ultracode on | off（不带参数时切换）。");
+			const current = snapshot.active.codingTier ?? "standard";
+			const wanted: CodingTier = arg === "on" ? "ultracode" : arg === "off" ? "standard" : current === "ultracode" ? "standard" : "ultracode";
+			void saveCodingTier(wanted);
+			return;
+		}
 		if (action === "output-style") {
 			if (!snapshot) return;
 			const wanted = argument.trim();
@@ -3361,6 +3384,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							stopping={Boolean(stoppingRunId && stoppingRunId === turn?.id)}
 							command={app.command}
 							setPermission={(permission) => void (permission === "plan" && !inPlanMode ? togglePlanMode() : savePermission(permission))}
+							setCodingTier={(tier) => void saveCodingTier(tier)}
 							onSelectProject={selectWorkspace}
 							onOpenProject={openWorkspace}
 							sandboxStatus={sandboxStatus}

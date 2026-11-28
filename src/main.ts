@@ -407,7 +407,11 @@ function installHandlers() {
 	);
 	handle("pi:conversation:meta", (id, input) => {
 		const record = object(input);
-		const patch: { pinned?: boolean; archived?: boolean; group?: string | null } = {};
+		const patch: { pinned?: boolean; archived?: boolean; group?: string | null; codingTier?: "standard" | "ultracode" } = {};
+		if (record.codingTier !== undefined) {
+			if (record.codingTier !== "standard" && record.codingTier !== "ultracode") throw new Error("档位参数无效。");
+			patch.codingTier = record.codingTier;
+		}
 		if (record.pinned !== undefined) {
 			if (typeof record.pinned !== "boolean") throw new Error("置顶参数无效。");
 			patch.pinned = record.pinned;

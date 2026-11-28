@@ -851,6 +851,7 @@ export default function permissions(pi: ExtensionAPI) {
 	for (const [provider, connection] of Object.entries(connections))
 		registerConnection(provider as Provider, connection);
 	registerOutputStyle(pi, process.env.PI_DESKTOP_OUTPUT_STYLE_FILE);
+	registerCodingTier(pi, process.env.PI_DESKTOP_CODING_TIER_FILE);
 	const memoryRoot = process.env.PI_DESKTOP_MEMORY_ROOT;
 	const canonicalMemoryRoot = memoryRoot ? realpath(memoryRoot).catch(() => memoryRoot) : undefined;
 	const userMemoryFile = process.env.PI_DESKTOP_USER_MEMORY_FILE;
@@ -1601,6 +1602,18 @@ async function redactSearchResult<T extends { type: string }>(
  * Delegated children never receive the file path.
  */
 export const OUTPUT_STYLE_SECTION = "output_style";
+export const CODING_TIER_SECTION = "coding_tier";
+/** Like the output style: the tier file is re-read every turn, so a switch applies on the next turn. */
+export function registerCodingTier(pi: Pick<ExtensionAPI, "on">, file: string | undefined): void {
+	if (!file) return;
+	pi.on("before_agent_start", async (event) => {
+		const sections = event?.systemPromptOptions?.sections as Record<string, string> | undefined;
+		if (!sections) return;
+		const text = (await readFile(file, "utf8").catch(() => "")).trim();
+		if (text) sections[CODING_TIER_SECTION] = text.slice(0, 16 * 1024);
+		else delete sections[CODING_TIER_SECTION];
+	});
+}
 export function registerOutputStyle(pi: Pick<ExtensionAPI, "on">, file: string | undefined): void {
 	if (!file) return;
 	pi.on("before_agent_start", async (event) => {

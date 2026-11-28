@@ -142,6 +142,7 @@ import { planRelativePath } from "./plan-path.ts";
 import { buildLaunchShellCommand, launchConfigUrl, readLaunchConfigurations, validateLocalPreviewUrl } from "./launch-config.ts";
 import { DEFAULT_LOCAL_PREVIEW_URL, formatPreviewInspectSummary, type PreviewInspectInput, type PreviewInspectResult, type PreviewInteraction } from "./preview-check-types.ts";
 import { detectProjectTrustResources } from "./project-trust.ts";
+import { codingTierOf, codingTierPromptSection, WORKFLOW_LIMITS, workflowBudgetFor } from "./coding-tier.ts";
 import { DEFAULT_OUTPUT_STYLE, discoverOutputStyles, findOutputStyle, outputStylePromptSection, validOutputStyleName } from "./output-styles.ts";
 import { EDITOR_CHOICES, type EditorChoice } from "./editor-open.ts";
 import { UsageStatsCollector } from "./usage-stats.ts";
@@ -161,7 +162,7 @@ import { McpRegistry } from "./mcp-registry.ts";
 import type { McpRemoveInput, McpSaveInput, McpServerInfo } from "./mcp-types.ts";
 import { HooksService, type HookRunContext } from "./hooks-service.ts";
 import type { HookEntry, HookRemoveInput, HookRunResult, HookSaveInput, HookTestInput } from "./hook-types.ts";
-import { BUNDLED_SKILLS, SkillRegistry, bundledSkillFile, formatForkedSkillPrompt, parseSkillInvocation } from "./skill-registry.ts";
+import { BUNDLED_SKILLS, ORCHESTRATION_SKILLS, SkillRegistry, bundledSkillFile, formatForkedSkillPrompt, parseSkillInvocation } from "./skill-registry.ts";
 import { balanceTarget, fetchBalance, type BalanceTarget } from "./provider-balance.ts";
 import { EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
 import { rootCertificates } from "node:tls";
@@ -330,6 +331,8 @@ interface SessionRuntime {
 	shellEnv?: NodeJS.ProcessEnv;
 	/** Output style prompt read by the permission extension each turn; main conversations only. */
 	outputStyleFile?: string;
+	/** Coding tier prompt read by the permission extension each turn; main conversations only. */
+	codingTierFile?: string;
 	metaWritten?: boolean;
 	controlWrites?: Promise<void>;
 	/**
@@ -1282,6 +1285,15 @@ export class DesktopService {
 		await rename(temporary, runtime.outputStyleFile);
 	}
 
+	/** Writes the tier prompt section (empty for standard) read by the permission extension each turn. */
+	private async writeCodingTier(runtime: SessionRuntime): Promise<void> {
+		if (!runtime.codingTierFile) return;
+		const tier = this.store.conversations.find((item) => item.id === runtime.conversationId)?.codingTier;
+		const temporary = `${runtime.codingTierFile}.${randomBytes(4).toString("hex")}.tmp`;
+		await writeFile(temporary, codingTierPromptSection(tier), { mode: 0o600 });
+		await rename(temporary, runtime.codingTierFile);
+	}
+
 	editorSetting(): EditorChoice | undefined {
 		return this.store.settings.editor;
 	}
@@ -1307,7 +1319,7 @@ export class DesktopService {
 	 * `/skills` are also callable in the conversation. Project directories are
 	 * only loaded after an explicit trust decision.
 	 */
-	private async claudeResourceArgs(project: string, trusted: boolean): Promise<string[]> {
+	private async claudeResourceArgs(project: string, trusted: boolean, delegated = false): Promise<string[]> {
 		const home = this.options.env?.HOME ?? homedir();
 		const roots = [join(home, ".claude"), ...(trusted ? [join(project, ".claude")] : [])];
 		const isDirectory = (path: string) => stat(path).then((info) => info.isDirectory(), () => false);
@@ -1325,7 +1337,7 @@ export class DesktopService {
 				if (entry.isDirectory() && !entry.name.startsWith(".")) args.push("--prompt-template", join(commands, entry.name));
 			}
 		}
-		args.push(...(await this.bundledSkillArgs()));
+		args.push(...(await this.bundledSkillArgs(delegated)));
 		return args;
 	}
 
@@ -1335,12 +1347,21 @@ export class DesktopService {
 	 * Bundled skills are written under the data directory and passed last, so a
 	 * user or project skill with the same name loads first and wins.
 	 */
-	private bundledSkillArgs(): Promise<string[]> {
+	private async bundledSkillArgs(delegated = false): Promise<string[]> {
+		const args = await this.writeBundledSkills();
+		if (!delegated) return args;
+		// Orchestration guides describe WorkflowRun and worktree fan-out, which children cannot use.
+		const parentOnly = new Set(BUNDLED_SKILLS.filter((skill) => ORCHESTRATION_SKILLS.has(skill.name)).map((skill) => join(this.options.dataDir, "bundled-skills", skill.name, "SKILL.md")));
+		const kept: string[] = [];
+		for (let index = 0; index < args.length; index += 2) if (!parentOnly.has(args[index + 1])) kept.push(args[index], args[index + 1]);
+		return kept;
+	}
+
+	private writeBundledSkills(): Promise<string[]> {
 		this.bundledSkillsReady ??= (async () => {
 			const root = join(this.options.dataDir, "bundled-skills");
 			const args: string[] = [];
 			for (const skill of BUNDLED_SKILLS) {
-				if (skill.name === "batch") continue;
 				const dir = join(root, skill.name);
 				await mkdir(dir, { recursive: true, mode: 0o700 });
 				const file = join(dir, "SKILL.md");
@@ -1965,6 +1986,13 @@ export class DesktopService {
 				const cleaned = patch.group === null ? "" : patch.group.trim().slice(0, 60);
 				conversation.group = cleaned || undefined;
 			}
+			if (patch.codingTier !== undefined) {
+				// The tier steers the main conversation; delegated children never read it.
+				if (this.rootConversationId(id, false) !== id) throw new Error("请在主会话切换档位。");
+				conversation.codingTier = patch.codingTier === "ultracode" ? "ultracode" : undefined;
+				const runtime = this.runtimes.get(id);
+				if (runtime) await this.writeCodingTier(runtime);
+			}
 			await this.persist();
 			return this.buildSnapshot();
 		});
@@ -2393,6 +2421,7 @@ export class DesktopService {
 				parentConversationId: parent.id,
 				forkEntryId: entryId,
 				origin: entryId === undefined ? "clone" : "fork",
+				...(parent.codingTier ? { codingTier: parent.codingTier } : {}),
 			};
 			this.store.conversations.unshift(child);
 			this.runtimes.delete(parent.id);
@@ -2405,6 +2434,7 @@ export class DesktopService {
 			await agent.request({ type: "set_session_name", name: child.title });
 			await this.saveSessionLeaf(runtime);
 			await this.writeRuntimeControls(runtime);
+			await this.writeCodingTier(runtime);
 			if (runtime.controls) await this.controlRequest(runtime, "apply");
 			if (input.activate !== false) await this.activate(child);
 			else if (this.store.activeId === parent.id) await this.ensureRuntime(parent);
@@ -2541,12 +2571,15 @@ export class DesktopService {
 			conversationId: conv.id,
 			rootConversationId: this.rootConversationId(conv.id),
 			project: conv.project,
-			input,
+			input: { ...input, budget: workflowBudgetFor(codingTierOf(this.conversation(this.rootConversationId(conv.id, false)).codingTier), input.budget) },
 		});
 	}
 	async resumeWorkflow(id: string): Promise<WorkflowRecord> {
 		await this.operation;
-		return this.workflows.resume(id);
+		const record = (await this.workflows.list()).find((item) => item.id === id);
+		const owner = record ? this.store.conversations.find((item) => item.id === record.rootConversationId) : undefined;
+		// A run saved before tiers existed, or on ultracode, must not outlive a later switch to standard.
+		return this.workflows.resume(id, WORKFLOW_LIMITS[codingTierOf(owner?.codingTier)]);
 	}
 	async stopWorkflow(id: string): Promise<WorkflowRecord> {
 		await this.operation;
@@ -3004,7 +3037,7 @@ export class DesktopService {
 				input: {
 					title: typeof input.title === "string" ? input.title : undefined,
 					script: String(input.script),
-					budget: input.budget as WorkflowRunInput["budget"],
+					budget: workflowBudgetFor(codingTierOf(this.conversation(this.rootConversationId(conv.id, false)).codingTier), input.budget as WorkflowRunInput["budget"]),
 				},
 			});
 			if (input.run_in_background === true) {
@@ -5602,7 +5635,14 @@ export class DesktopService {
 		const delegating = this.canDelegateFurther(conversation.id) || Boolean(task?.isFork);
 		const project = this.trustProjectFor(conversation.project);
 		const definitions = delegating ? await this.agents.list(project, this.projectTrusted(project)) : [];
-		await this.atomicJson(join(runtime.controls.directory, "agents.json"), buildAgentListing(definitions));
+		// A subagent of this conversation runs one level deeper; it may nest while below the cap.
+		const depth = task?.parentConversationId ? (task.delegationDepth ?? 1) : 0;
+		const maxDepth = this.store.settings.maxSubagentDepth ?? DEFAULT_MAX_SUBAGENT_DEPTH;
+		const limits = {
+			maxConcurrent: this.store.settings.maxConcurrentSubagents ?? DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+			nestedDepth: Math.max(0, maxDepth - depth - 1),
+		};
+		await this.atomicJson(join(runtime.controls.directory, "agents.json"), buildAgentListing(definitions, limits));
 	}
 
 	/** Rewrite every runtime's agent listing after definitions changed; takes effect next turn. */
@@ -7204,6 +7244,7 @@ export class DesktopService {
 		if (runtime.sandboxProfileFile) await rm(runtime.sandboxProfileFile, { force: true });
 		if (runtime.escalationFile) await rm(runtime.escalationFile, { force: true });
 		if (runtime.outputStyleFile) await rm(runtime.outputStyleFile, { force: true });
+		if (runtime.codingTierFile) await rm(runtime.codingTierFile, { force: true });
 		await this.releaseRuntimeCost(runtime);
 		if (runtime.costLimitFile) await this.serializeCost(() => rm(runtime.costLimitFile!, { force: true }));
 		if (this.runtimes.get(runtime.conversationId) === runtime) this.runtimes.delete(runtime.conversationId);
@@ -7523,10 +7564,14 @@ export class DesktopService {
 			// Set these explicitly so an inherited shell environment cannot change a session's role.
 			env.PI_DESKTOP_CHILD = delegated ? "1" : "0";
 			delete env.PI_DESKTOP_OUTPUT_STYLE_FILE;
+			delete env.PI_DESKTOP_CODING_TIER_FILE;
 			if (!delegated) {
 				runtime.outputStyleFile = join(this.options.dataDir, `style-${conversation.id}-${randomBytes(8).toString("hex")}.md`);
 				await this.writeOutputStyle(runtime);
 				env.PI_DESKTOP_OUTPUT_STYLE_FILE = runtime.outputStyleFile;
+				runtime.codingTierFile = join(this.options.dataDir, `tier-${conversation.id}-${randomBytes(8).toString("hex")}.md`);
+				await this.writeCodingTier(runtime);
+				env.PI_DESKTOP_CODING_TIER_FILE = runtime.codingTierFile;
 			}
 			delete env.PI_DESKTOP_MAX_COST;
 			delete env.PI_DESKTOP_MAX_COST_FILE;
@@ -7618,7 +7663,7 @@ export class DesktopService {
 				...(navigationInstalled ? ["--extension", navigationExtension] : []),
 				...(toolsInstalled ? ["--extension", toolExtension] : []),
 				...(trustResources.length ? [trustDecision === "trusted" ? "--approve" : "--no-approve"] : []),
-				...(scopedRead ? [] : await this.claudeResourceArgs(conversation.project, trustDecision === "trusted")),
+				...(scopedRead ? [] : await this.claudeResourceArgs(conversation.project, trustDecision === "trusted", Boolean(task?.parentConversationId))),
 				...(this.options.args ?? []),
 			];
 			if (!sessionFile && this.store.settings.defaultModel) {
@@ -8377,6 +8422,7 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 		conversations: value.conversations.map((conversation) => ({
 			...conversation,
 			permissionMode: permissionModes.has(conversation.permissionMode) ? conversation.permissionMode : undefined,
+			codingTier: conversation.codingTier === "ultracode" ? "ultracode" : undefined,
 		})),
 		activeId: value.activeId,
 		settings: {

@@ -43,27 +43,97 @@ export interface SkillRemoveInput {
 
 const namePattern = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
+/** Guides for WorkflowRun and worktree fan-out; delegated children cannot use either. */
+export const ORCHESTRATION_SKILLS: ReadonlySet<string> = new Set(["batch", "workflow-authoring"]);
 export const BUNDLED_SKILLS: readonly SkillDefinitionEntry[] = [
-	{
-		id: "bundled:skill:batch",
-		name: "batch",
-		description: "Orchestrate large-scale parallel repository changes across 5-30 independent work units using isolated worktrees or WorkflowRun",
-		body: [
-			"# /batch — Parallel Change Orchestration",
+	modelSkill(
+		"batch",
+		"Split a large repository change (a migration, a rename across many files, the same fix in many modules) into independent units and run them in parallel in isolated worktrees",
+		[
+			"# /batch: parallel change orchestration",
 			"",
-			"When invoked for a batch refactoring, migration, or multi-target update:",
-			"1. Research the repository and decompose the requested change into 5-30 cleanly independent, non-overlapping units.",
-			"2. Record the decomposed work items using `TodoCreate` so progress stays visible in the shared root checklist.",
-			"3. Execute independent units in parallel using `Agent(isolation=\"worktree\", run_in_background=true)` or a deterministic `WorkflowRun` script (`parallel`, `phase`, `budget`).",
-			"4. Collect worker outputs, review diffs/tests, and summarize which worktrees are ready to merge.",
-		].join("\n"),
-		scope: "bundled",
-		kind: "skill",
-		sourceDir: "builtin:skills",
-		filePath: "builtin:skills/batch/SKILL.md",
-		editable: false,
-		estimatedTokens: 140,
-	},
+			"Use this for one change that has to be made in many places, where each place can be done without the others.",
+			"",
+			"## 1. Understand before you split",
+			"Read enough of the repository to know where the change lands and how it is tested. Find the project's type check and test commands. If one unit would need another's result first (a shared type that the rest import, a helper they all call), do that unit yourself before fanning out.",
+			"",
+			"## 2. Split into units that are truly independent",
+			"Aim for 5 to 30 units. Two units are independent only if neither needs the other's result and they do not edit the same files. A unit that is too small wastes an agent; one that is too large defeats the parallelism. Group by module or directory when you can.",
+			"",
+			"## 3. Write the plan to the checklist",
+			"Create one TodoCreate item per unit before starting any of them, so the user sees the whole plan. Put the unit's files and its acceptance criteria in the description. Mark each in_progress when its agent starts and completed when you have checked its result.",
+			"",
+			"## 4. Run the units",
+			"For up to about 8 units, launch one Agent per unit in a single message, with isolation \"worktree\" and run_in_background true. For more, or when every unit needs the same verification step afterwards, write a WorkflowRun script that fans out with parallel().",
+			"Brief each agent completely, since the prompt is its only context: the exact change, the files in its unit and only those, the checks to run before it reports, and what to return (files changed, check results, anything it could not do). Tell it not to touch files outside its unit.",
+			"",
+			"## 5. Check and report",
+			"Read each agent's report as evidence, not proof. Look at the diff of any unit whose report is vague or whose checks failed. Tell the user which worktrees are ready to merge, which need attention and why. Do not merge on their behalf unless they asked.",
+		],
+	),
+	modelSkill(
+		"workflow-authoring",
+		"How to write a WorkflowRun script: the API, determinism rules, resume behaviour and worked examples of fan-out, adversarial verification and loop-until-dry",
+		[
+			"# Writing a WorkflowRun script",
+			"",
+			"The script is the body of an async function. Use await directly. It runs in a sandbox with no file system, network or timers; all real work happens in the agents it starts.",
+			"",
+			"## API",
+			"- `agent({prompt, description?, subagent_type?, model?, isolation?, schema?, key?})` starts one subagent and resolves to `{output, structuredOutput?, taskId, usage?, worktreeId?}`. `subagent_type` defaults to general-purpose; use Explore for read-only searching. `isolation` is \"worktree\" or \"shared\". With `schema` (a JSON Schema) the agent must call StructuredOutput, and `structuredOutput` holds the validated value; invalid output is retried up to five times.",
+			"- `parallel([thunk, ...])` runs the thunks concurrently and resolves when all of them have. Pass functions (`() => agent(...)`), not promises.",
+			"- `pipeline(value, step1, step2, ...)` passes a value through the steps one after another and resolves to the last result.",
+			"- `phase(name, async () => {...})` groups the steps inside it under a heading in the progress view and resolves to the callback's result.",
+			"- `log(...values)` shows a progress line. `budget()` resolves to `{spentCost, spentTokens, spawnedAgents, maxCost?, maxTokens?, maxAgents}`.",
+			"- The script's return value is what you receive back from the tool.",
+			"",
+			"## Determinism and resume",
+			"`Math.random()`, `Date.now()`, argless `new Date()`, `setTimeout`, `fetch`, `require` and `import` throw or are absent. Completed agent() steps are journaled by their position in the script, or by `key` when you pass one. A resumed run replays journaled steps instead of re-running them, so keep the order of agent() calls stable. Inside a loop whose length depends on earlier results, pass a `key` built from the item (for example the file path) so a step keeps its identity.",
+			"",
+			"## Briefing agents",
+			"Each prompt is that agent's only context. Give it the goal, the exact files or scope, what to return and in what shape. When later code reads the result, pass a schema so you branch on fields instead of parsing prose.",
+			"",
+			"## Example: fan out, then verify each finding",
+			"```js",
+			"const FINDINGS = { type: 'object', properties: { findings: { type: 'array', items: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'integer' }, claim: { type: 'string' } }, required: ['file', 'claim'] } } }, required: ['findings'] };",
+			"const VERDICT = { type: 'object', properties: { refuted: { type: 'boolean' }, reason: { type: 'string' } }, required: ['refuted', 'reason'] };",
+			"const areas = ['src/auth', 'src/api', 'src/storage'];",
+			"const found = await phase('Find', () => parallel(areas.map((area) => () => agent({",
+			"  description: `review ${area}`, subagent_type: 'Explore', schema: FINDINGS, key: `find:${area}`,",
+			"  prompt: `Review ${area} for real defects. Report each with file, line and the concrete failure. Stay inside ${area}.`,",
+			"}))));",
+			"const all = found.flatMap((r) => r.structuredOutput.findings);",
+			"log(`${all.length} candidate findings`);",
+			"const checked = await phase('Verify', () => parallel(all.map((f, i) => () => parallel([0, 1, 2].map((n) => () => agent({",
+			"  description: `refute ${i}.${n}`, subagent_type: 'Explore', schema: VERDICT, key: `verify:${f.file}:${f.line}:${n}`,",
+			"  prompt: `Try to REFUTE this claim by reading the code. Default to refuted=true if you cannot confirm it.\\nClaim: ${f.claim}\\nLocation: ${f.file}:${f.line}`,",
+			"}))).then((votes) => ({ ...f, survives: votes.filter((v) => !v.structuredOutput.refuted).length >= 2 })))));",
+			"return checked.filter((f) => f.survives);",
+			"```",
+			"",
+			"## Example: loop until nothing new turns up",
+			"```js",
+			"const seen = new Set();",
+			"const kept = [];",
+			"let dry = 0, round = 0;",
+			"while (dry < 2 && round < 6) {",
+			"  const r = await agent({ key: `round:${round}`, schema: FINDINGS, subagent_type: 'Explore',",
+			"    prompt: `Find defects in src/ not already in this list:\\n${[...seen].join('\\n') || '(none yet)'}` });",
+			"  const fresh = r.structuredOutput.findings.filter((f) => !seen.has(`${f.file}:${f.claim}`));",
+			"  fresh.forEach((f) => seen.add(`${f.file}:${f.claim}`));",
+			"  kept.push(...fresh);",
+			"  dry = fresh.length ? 0 : dry + 1;",
+			"  round++;",
+			"}",
+			"log(`stopped after ${round} rounds, ${kept.length} findings`);",
+			"return kept;",
+			"```",
+			"Deduplicate against everything seen, not only what was kept, or a rejected finding comes back every round and the loop never ends.",
+			"",
+			"## Sizing",
+			"Bound a run with budget.maxAgents and maxCost in the tool call. Report anything you capped or skipped; a silent limit reads as full coverage.",
+		],
+	),
 	bundledSkill(
 		"code-review",
 		"Review the current diff, a pull request number, a branch or a path for correctness bugs, then report verified findings ranked by severity",
@@ -182,6 +252,15 @@ function bundledSkill(name: string, description: string, lines: string[]): Skill
 		estimatedTokens: estimateTokens(body),
 		disableModelInvocation: true,
 	};
+}
+
+/**
+ * A bundled skill the model may load on its own when the task calls for it. The review skills
+ * stay user-invoked; orchestration guidance is meant to be reached for by the model.
+ */
+function modelSkill(name: string, description: string, lines: string[]): SkillDefinitionEntry {
+	const { disableModelInvocation: _user, ...skill } = bundledSkill(name, description, lines);
+	return skill;
 }
 
 /** SKILL.md text Pi can load for a bundled skill. */

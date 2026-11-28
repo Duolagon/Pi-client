@@ -25,6 +25,22 @@ export interface AgentListing {
 	agents: AgentListingEntry[];
 	/** Entries or description text left out to stay within the listing budget. */
 	truncated: boolean;
+	/** How much fan-out the host allows, so the model sizes a batch before a launch is rejected. */
+	limits?: AgentListingLimits;
+}
+export interface AgentListingLimits {
+	/** Subagents of one parent that may run at once; more are queued. */
+	maxConcurrent: number;
+	/** Further levels of nesting below this conversation; 0 means its subagents cannot delegate. */
+	nestedDepth: number;
+}
+
+function validLimits(value: unknown): value is AgentListingLimits {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const item = value as Record<string, unknown>;
+	return Object.keys(item).length === 2 &&
+		Number.isSafeInteger(item.maxConcurrent) && (item.maxConcurrent as number) >= 1 && (item.maxConcurrent as number) <= 64 &&
+		Number.isSafeInteger(item.nestedDepth) && (item.nestedDepth as number) >= 0 && (item.nestedDepth as number) <= 16;
 }
 
 const namePattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -38,7 +54,7 @@ function oneLine(value: string, max: number): string {
  * state (untrusted projects contribute no project-scope agents). Sorted by name so the
  * same definitions always produce the same text.
  */
-export function buildAgentListing(definitions: AgentDefinition[]): AgentListing {
+export function buildAgentListing(definitions: AgentDefinition[], limits?: AgentListingLimits): AgentListing {
 	const sorted = [...definitions].filter((item) => namePattern.test(item.name)).sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
 	const agents: AgentListingEntry[] = [];
 	let budget = MAX_AGENT_LISTING_CHARS;
@@ -62,14 +78,15 @@ export function buildAgentListing(definitions: AgentDefinition[]): AgentListing 
 			readOnly: definition.readOnly,
 		});
 	}
-	return { version: 1, agents, truncated };
+	return { version: 1, agents, truncated, ...(limits && validLimits(limits) ? { limits } : {}) };
 }
 
 /** Validate the listing file again inside the Pi process; it is rendered into the prompt. */
 export function parseAgentListing(value: unknown): AgentListing {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid agent listing");
 	const input = value as Record<string, unknown>;
-	if (input.version !== 1 || !Array.isArray(input.agents) || input.agents.length > MAX_LISTED_AGENTS || typeof input.truncated !== "boolean")
+	if (input.version !== 1 || !Array.isArray(input.agents) || input.agents.length > MAX_LISTED_AGENTS || typeof input.truncated !== "boolean" ||
+		(input.limits !== undefined && !validLimits(input.limits)))
 		throw new Error("Invalid agent listing");
 	const agents = input.agents.map((item): AgentListingEntry => {
 		if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("Invalid agent listing");
@@ -90,7 +107,7 @@ export function parseAgentListing(value: unknown): AgentListing {
 			readOnly: entry.readOnly,
 		};
 	});
-	return { version: 1, agents, truncated: input.truncated };
+	return { version: 1, agents, truncated: input.truncated, ...(input.limits ? { limits: input.limits as AgentListingLimits } : {}) };
 }
 
 /** Deterministic system prompt section; empty when there is nothing to list. */
@@ -105,5 +122,10 @@ export function formatAgentListing(listing: AgentListing): string {
 		'Use these names as subagent_type in the Agent tool (default general-purpose; "fork" forks this conversation).',
 		...lines,
 		...(listing.truncated ? ["(Some agent types or descriptions were omitted to keep this list short.)"] : []),
+		...(listing.limits ? [
+			`Up to ${listing.limits.maxConcurrent} of your subagents run at once; launching more while that many are still running fails, so wait for a result first (WorkflowRun steps queue instead). ${listing.limits.nestedDepth > 0
+				? `Your subagents may delegate ${listing.limits.nestedDepth} more level${listing.limits.nestedDepth === 1 ? "" : "s"} down.`
+				: "Your subagents cannot launch subagents of their own, so give each one a self-contained piece of work."}`,
+		] : []),
 	].join("\n");
 }
