@@ -108,18 +108,9 @@ class CodexSession implements ExternalSession {
 		const { model, effort } = this.options;
 		const effective = model ?? threadModel;
 		if (!effective || (!model && !effort)) return;
-		const models: RecordValue[] = [];
-		let cursor: unknown = null;
-		try {
-			for (let page = 0; page < 10; page++) {
-				const response = await this.rpc.request<RecordValue>("model/list", {
-					includeHidden: true, limit: 100, ...(modelProvider ? { modelProvider } : {}), ...(cursor ? { cursor } : {}),
-				}, 10000);
-				if (Array.isArray(response.data)) models.push(...response.data.filter((item): item is RecordValue => Boolean(item) && typeof item === "object"));
-				cursor = response.nextCursor;
-				if (!cursor) break;
-			}
-		} catch { return; }
+		let catalog;
+		try { catalog = await codexModelList(this.rpc, modelProvider, true); } catch { return; }
+		const { models, cursor } = catalog;
 		if (!models.length) return;
 		const selected = models.find((item) => item.model === effective || item.id === effective);
 		if (model && !selected && !cursor)
@@ -392,4 +383,18 @@ async function bounded(promise: Promise<unknown>, milliseconds: number): Promise
 	let timer: NodeJS.Timeout | undefined;
 	try { return await Promise.race([promise.then(() => true, () => true), new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), milliseconds); })]); }
 	finally { clearTimeout(timer); }
+}
+
+export async function codexModelList(rpc: JsonLineProcess, modelProvider?: string, includeHidden = false) {
+	const models: RecordValue[] = [];
+	let cursor: unknown;
+	for (let page = 0; page < 10; page++) {
+		const response = await rpc.request<RecordValue>("model/list", {
+			includeHidden, limit: 100, ...(modelProvider ? { modelProvider } : {}), ...(cursor ? { cursor } : {}),
+		}, 10000);
+		if (Array.isArray(response.data)) models.push(...response.data.filter((item): item is RecordValue => Boolean(item) && typeof item === "object"));
+		cursor = response.nextCursor;
+		if (!cursor) break;
+	}
+	return { models, cursor };
 }

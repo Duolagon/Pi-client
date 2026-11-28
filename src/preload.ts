@@ -8,6 +8,8 @@ function listen<T>(channel: string, listener: (event: T) => void): () => void {
 }
 
 const api: DesktopAPI = {
+	multiCatalog: () => ipcRenderer.invoke("pi:multi:catalog"),
+	updateMultiProfile: (action) => ipcRenderer.invoke("pi:multi:profile", action),
 	externalAgents: {
 		executors: (options) => ipcRenderer.invoke("pi:external:executors", options),
 		configure: (input) => ipcRenderer.invoke("pi:external:configure", input),

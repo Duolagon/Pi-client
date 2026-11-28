@@ -6,6 +6,12 @@ import type { ClaudeHelperConfig, ClaudeHelperPacket, ClaudeHelperRequest } from
 import type { ExternalAdapter, ExternalSession, ExternalSessionOptions, ExternalTurnResult } from "./external-types.ts";
 import { ExternalFailure, redactDiagnostic, withDiagnostics } from "./external-errors.ts";
 
+export async function discoverClaudeModels(options: ExternalSessionOptions) {
+	const session = new ClaudeSession(options);
+	try { await session.initialize(); return await session.models(); }
+	finally { await session.close(); }
+}
+
 export class ClaudeAdapter implements ExternalAdapter {
 	async open(options: ExternalSessionOptions): Promise<ExternalSession> {
 		if (!options.helperPath || !isAbsolute(options.helperPath)) throw new Error("Claude SDK helper is missing; rebuild the desktop runtime");
@@ -77,6 +83,9 @@ class ClaudeSession implements ExternalSession {
 			...(this.options.effort ? { effort: this.options.effort as ClaudeHelperConfig["effort"] } : {}),
 			...(this.options.outputSchema ? { outputSchema: this.options.outputSchema } : {}),
 		} }, 15000);
+	}
+	async models() {
+		return await this.request({ type: "models", id: randomUUID() }, 10000) as import("./multi-profiles.ts").NativeModel[];
 	}
 	async run(prompt: string, signal?: AbortSignal): Promise<ExternalTurnResult> {
 		if (this.closing || this.failure) throw this.failure ?? new Error("Claude session is closed");

@@ -23,7 +23,8 @@ import { SelectPopover } from "./SelectPopover.tsx";
 import { SmoothCollapse } from "./SmoothCollapse.tsx";
 import { parseForegroundMinutes } from "./settings-input.ts";
 import { MODEL_ROUTING_ROLES, type ModelRoutingRole } from "../agent-types.ts";
-import { MultiAgentSettingsFields, multiAgentDraft, multiAgentFromDraft, type MultiAgentDraft } from "./MultiAgentSettingsFields.tsx";
+import { MultiProfileEditor } from "./MultiProfileEditor.tsx";
+import { multiAgentDraft, multiAgentFromDraft, type MultiAgentDraft } from "./MultiAgentSettingsFields.tsx";
 
 const ROUTING_LABELS: Record<ModelRoutingRole, { title: string; hint: string }> = {
 	explore: { title: "Explore（检索）", hint: "只读找代码，适合便宜快速的模型" },
@@ -448,7 +449,7 @@ export function SettingsDialog({
 				}
 				update.modelRouting = next;
 			}
-			if (multiAgentChanged) update.multiAgent = multiAgent.controller || multiAgent.executors ? multiAgent : null;
+			if (multiAgentChanged) update.multiAgent = multiAgent;
 			if (fallbackModel !== initialFallback) update.fallbackModel = parseRoutingKey(fallbackModel) ?? null;
 			if (grailModel !== initialGrailModel) update.grailModel = parseRoutingKey(grailModel) ?? null;
 			if (grailCostText.trim() !== initialGrailCost) update.grailMaxCost = grailCost;
@@ -1404,7 +1405,7 @@ export function SettingsDialog({
 								);
 							})}
 						</fieldset>
-						<MultiAgentSettingsFields draft={multiDraft} setDraft={setMultiDraft} models={models} presets={presets} disabled={pending} />
+						<MultiProfileEditor settings={settings} apply={apply} draft={multiDraft} setDraft={setMultiDraft} models={models} presets={presets} disabled={pending} />
 					</div>
 				)}
 				</div>

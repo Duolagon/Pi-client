@@ -126,6 +126,7 @@ export interface ExternalTask {
 	runInBackground?: boolean;
 	model?: string;
 	effort?: string;
+	accessFailure?: "auth" | "subscription" | "quota";
 	pendingMessages?: number;
 	sendDisposition?: "steered" | "queued";
 	usage?: ExternalUsage;

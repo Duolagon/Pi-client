@@ -28,7 +28,7 @@ async function until(check: () => boolean, label: string) {
 	while (!check()) { if (Date.now() > end) throw new Error(label); await new Promise((resolve) => setTimeout(resolve, 5)); }
 }
 
-function sdkHarness(policy: RuntimePermissionPolicy, options: { deny?: boolean; question?: boolean; slow?: boolean } = {}) {
+function sdkHarness(policy: RuntimePermissionPolicy, options: { deny?: boolean; question?: boolean; slow?: boolean; signedOut?: boolean } = {}) {
 	const packets: ClaudeHelperPacket[] = [];
 	let config: Options | undefined;
 	let factoryCalls = 0;
@@ -52,7 +52,10 @@ function sdkHarness(policy: RuntimePermissionPolicy, options: { deny?: boolean; 
 					...(native.outputFormat ? { structured_output: { count: 4 } } : {}) };
 			}
 		})();
-		return Object.assign(generator, { initializationResult: async () => ({}), interrupt: async () => { interrupt?.(); }, close: () => { interrupt?.(); } }) as unknown as Query;
+		return Object.assign(generator, { initializationResult: async () => ({}),
+			supportedModels: async () => [{ value: "opus", resolvedModel: "fixture-opus", supportedEffortLevels: ["low", "max"] }],
+			accountInfo: async () => options.signedOut ? { apiProvider: "firstParty", apiKeySource: "none" } : { apiProvider: "gateway" },
+			interrupt: async () => { interrupt?.(); }, close: () => { interrupt?.(); } }) as unknown as Query;
 	};
 	let helper: ClaudeSdkHelper;
 	helper = new ClaudeSdkHelper((packet) => {
@@ -325,4 +328,22 @@ test("Claude helper passes the pinned model and effort to the SDK and rejects ma
 		await bad.receive({ type: "init", id: "bad", config: { executable: "/fake/claude", cwd: data.cwd, policy: basePolicy(data.cwd), effort: "ultra" } });
 		assert.ok(packets.some((packet) => packet.type === "response" && !packet.ok && /Invalid Claude effort/.test(packet.error)));
 	} finally { await bad.close(); await data.cleanup(); }
+});
+
+
+test("Claude metadata probes list native efforts and distinguish signed-out from externally authenticated providers", async () => {
+	const data = await fixture();
+	try {
+		for (const signedOut of [true, false]) {
+			const harness = sdkHarness(basePolicy(data.cwd), { signedOut });
+			try {
+				await harness.helper.receive({ type: "init", id: "init", config: { executable: "/fake/claude", cwd: data.cwd, policy: basePolicy(data.cwd) } });
+				await harness.helper.receive({ type: "models", id: "catalog" });
+				const result = harness.packets.find(p => p.type === "response" && p.id === "catalog");
+				assert.deepEqual(result, { type: "response", id: "catalog", ok: true, value: ["opus", "fixture-opus"].map(id =>
+					({ id, efforts: ["low", "max"], access: signedOut ? "auth" : "listed" })) });
+				assert.ok(!harness.packets.some(p => p.type === "permission"));
+			} finally { await harness.helper.close(); }
+		}
+	} finally { await data.cleanup(); }
 });

@@ -715,7 +715,7 @@ test("external children under a dontAsk parent deny unapproved commands without 
 	} finally { await data.cleanup(); }
 });
 
-test("native settings are scoped to the originating multi task and are re-read after restart", async () => {
+test("native settings are scoped to the originating multi task and stay pinned after restart", async () => {
 	const data = await setup();
 	let usesMultiSettings = true;
 	let pin = { model: "configured-model", effort: "high" };
@@ -734,8 +734,8 @@ test("native settings are scoped to the originating multi task and are re-read a
 		await resumed.send({ taskId: first.id, message: "continue" }, "parent-a");
 		await until(() => resumed.snapshot(first.id), terminal, "continued multi turn");
 		assert.equal(data.adapter.opens[1].resumeSessionId, "native-session-1");
-		assert.equal(data.adapter.opens[1].model, pin.model);
-		assert.equal(data.adapter.opens[1].effort, pin.effort);
+		assert.equal(data.adapter.opens[1].model, "configured-model");
+		assert.equal(data.adapter.opens[1].effort, "high");
 		const standard = await resumed.start({ executor: "codex", description: "Standard", prompt: "ordinary" }, "parent-a");
 		await until(() => resumed.snapshot(standard.id), terminal, "ordinary turn");
 		assert.equal(data.adapter.opens[2].model, undefined);

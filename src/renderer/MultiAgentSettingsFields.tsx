@@ -4,6 +4,7 @@ import { SelectPopover } from "./SelectPopover.tsx";
 
 /** Editable form of the multi tier settings: "" means "keep the default". */
 export interface MultiAgentDraft {
+	routes: Pick<MultiAgentSettings, "implementation" | "reviewer" | "allowed" | "fallbacks" | "reviewPolicy" | "parallelism">;
 	controllerModel: string;
 	controllerThinking: string;
 	executors: Record<MultiExecutorId, { model: string; effort: string }>;
@@ -25,6 +26,7 @@ const EXECUTORS: Record<MultiExecutorId, { title: string; models: string[]; hint
 export function multiAgentDraft(settings: MultiAgentSettings | undefined): MultiAgentDraft {
 	const model = settings?.controller?.model;
 	return {
+		routes: { parallelism: settings?.parallelism, implementation: settings?.implementation, reviewer: settings?.reviewer, allowed: settings?.allowed, fallbacks: settings?.fallbacks, reviewPolicy: settings?.reviewPolicy },
 		controllerModel: model ? `${model.provider}/${model.id}` : "",
 		controllerThinking: settings?.controller?.thinkingLevel ?? "",
 		executors: Object.fromEntries(MULTI_EXECUTORS.map((id) => [id, {
@@ -34,7 +36,7 @@ export function multiAgentDraft(settings: MultiAgentSettings | undefined): Multi
 }
 
 export function multiAgentFromDraft(draft: MultiAgentDraft): MultiAgentSettings {
-	const result: MultiAgentSettings = {};
+	const result: MultiAgentSettings = { ...draft.routes };
 	const at = draft.controllerModel.indexOf("/");
 	const model = at > 0 && at < draft.controllerModel.length - 1
 		? { provider: draft.controllerModel.slice(0, at), id: draft.controllerModel.slice(at + 1) } : undefined;
@@ -69,12 +71,14 @@ function controllerOptions(models: Array<{ provider: string; id: string; name: s
 	return options;
 }
 
-export function MultiAgentSettingsFields({ draft, setDraft, models, presets, disabled }: {
+export function MultiAgentSettingsFields({ draft, setDraft, models, presets, disabled, catalog, children }: {
 	draft: MultiAgentDraft;
 	setDraft: (update: (current: MultiAgentDraft) => MultiAgentDraft) => void;
 	models: Array<{ provider: string; id: string; name: string }>;
 	presets: ProviderPreset[];
 	disabled: boolean;
+	catalog?: import("../multi-profiles.ts").MultiCatalog;
+	children?: import("react").ReactNode;
 }) {
 	const setExecutor = (id: MultiExecutorId, patch: Partial<{ model: string; effort: string }>) =>
 		setDraft((current) => ({ ...current, executors: { ...current.executors, [id]: { ...current.executors[id], ...patch } } }));
@@ -82,6 +86,7 @@ export function MultiAgentSettingsFields({ draft, setDraft, models, presets, dis
 		<fieldset className="live-routing live-multi">
 			<legend>multi 档位：外部 Agent 协作</legend>
 			<small>会话切到 multi 档位后，主控模型负责拆分任务、审查 diff 并合并；改代码交给 Codex / Claude Code / Kimi Code，各自用本机 CLI 的账号和额度。留空表示沿用默认。</small>
+			{children}
 			<div className="field-label">
 				主控模型
 				<SelectPopover ariaLabel="主控模型" field direction="down" value={draft.controllerModel} disabled={disabled}
@@ -98,16 +103,19 @@ export function MultiAgentSettingsFields({ draft, setDraft, models, presets, dis
 			{MULTI_EXECUTORS.map((id) => {
 				const info = EXECUTORS[id];
 				const entry = draft.executors[id];
-				const efforts = EXECUTOR_EFFORTS[id];
+				const discovered = catalog?.sources.find(s => s.id === id)?.models ?? [];
+				const modelNames = discovered.length ? discovered.map(m => m.id) : info.models;
+				const nativeEfforts = discovered.find(m => m.id === entry.model)?.efforts;
+				const efforts = nativeEfforts ?? EXECUTOR_EFFORTS[id];
 				const listId = `multi-models-${id}`;
 				return (
 					<div className="field-label live-multi-executor" key={id}>
 						{info.title}
 						<div className="live-multi-row">
-							<input aria-label={`${info.title} 模型`} list={info.models.length ? listId : undefined} placeholder="模型：CLI 默认"
+							<input aria-label={`${info.title} 模型`} list={modelNames.length ? listId : undefined} placeholder="模型：CLI 默认"
 								value={entry.model} disabled={disabled} spellCheck={false}
 								onChange={(event) => setExecutor(id, { model: event.target.value })} />
-							{info.models.length > 0 && <datalist id={listId}>{info.models.map((model) => <option key={model} value={model} />)}</datalist>}
+							{modelNames.length > 0 && <datalist id={listId}>{modelNames.map((model) => <option key={model} value={model} />)}</datalist>}
 							{efforts ? (
 								<SelectPopover ariaLabel={`${info.title} 思考强度`} field direction="down" value={entry.effort} disabled={disabled}
 									options={[

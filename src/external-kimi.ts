@@ -440,7 +440,7 @@ async function settledWithin(promise: Promise<unknown>, milliseconds: number): P
 }
 
 /** Values of an ACP select config option; options may be flat or grouped. */
-function configValues(options: unknown): string[] {
+export function configValues(options: unknown): string[] {
 	if (!Array.isArray(options)) return [];
 	const values: string[] = [];
 	for (const entry of options) {

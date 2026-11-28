@@ -1,3 +1,7 @@
+import type { Api, Model as PiNativeModel } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai/models";
+import { editProfile, loadLibrary, validateProfileResources, type ProfileAction } from "./multi-profiles.ts";
+import { discoverMultiSources, recentModelAccess } from "./multi-discovery.ts";
 import { draftPrompt, mergeDrafts, type ComposerDraft, type Prompt } from "./composer-draft.ts";
 import { QueuedPrompts, type NativeQueue } from "./queued-prompts.ts";
 import type { DesktopPromptResult, FileReferenceAvailability, QueueActionResult, QueuedPromptGroups, SessionContentSearchResult } from "./shared.ts";
@@ -342,6 +346,7 @@ interface SessionRuntime {
 	turnTier?: CodingTier;
 	/** The tier of an active run, even if the user selects a different tier for the next one. */
 	runningTier?: CodingTier;
+	runningMulti?: MultiAgentSettings;
 	metaWritten?: boolean;
 	controlWrites?: Promise<void>;
 	/**
@@ -864,8 +869,8 @@ export class DesktopService {
 					.then(summarizeCheckpoint).catch(() => undefined);
 				};
 			},
-			executorModel: (executor) => executor === "codex" || executor === "claude" || executor === "kimi"
-				? this.store.settings.multiAgent?.executors?.[executor] : undefined,
+			executorModel: (executor, owner) => executor === "codex" || executor === "claude" || executor === "kimi"
+				? this.multiSettingsFor(owner)?.executors?.[executor] : undefined,
 			usesMultiSettings: (owner) => this.effectiveTier(owner) === "multi",
 			checkBudget: (executor) => {
 				if (this.store.settings.minBalance)
@@ -1310,9 +1315,9 @@ export class DesktopService {
 		if (!file) return;
 		const tier = this.configuredTier(runtime.conversationId);
 		const standing = this.store.conversations.find((item) => item.id === runtime.conversationId)?.codingTier;
-		const settings = this.store.settings.multiAgent;
+		const settings = this.multiSettingsFor(runtime.conversationId);
 		const write = (runtime.codingTierWrite ?? Promise.resolve()).catch(() => {}).then(async () => {
-			const multi = tier === "multi" ? { settings, available: await this.multiExecutorsAvailable() } : undefined;
+			const multi = tier === "multi" ? { settings, available: (await this.multiExecutorsAvailable()).filter(id => !settings?.allowed || settings.allowed.includes(id)) } : undefined;
 			const config: CodingTierRuntimeConfig = {
 				prompt: codingTierPromptSection(tier, tier === "ultracode" && standing !== tier, multi),
 				controller: multi?.settings?.controller,
@@ -1342,6 +1347,11 @@ export class DesktopService {
 	private effectiveTier(conversationId: string): CodingTier {
 		const root = this.rootConversationId(conversationId, false);
 		return this.runtimes.get(root)?.runningTier ?? this.configuredTier(root);
+	}
+
+	private multiSettingsFor(owner: string) {
+		const runtime = this.runtimes.get(this.rootConversationId(owner, false));
+		return runtime?.runningTier === "multi" ? runtime.runningMulti : this.store.settings.multiAgent;
 	}
 
 	private configuredTier(root: string): CodingTier {
@@ -2928,7 +2938,7 @@ export class DesktopService {
 
 	private async modelTool(request: DesktopToolInvocation, context: ToolHostContext): Promise<unknown> {
 		if (this.closed) throw new Error("桌面服务已关闭。");
-		const input = request.input;
+		const input = { ...request.input };
 		if (request.tool === "PreviewCheck") {
 			return this.handlePreviewCheckTool(input, context);
 		}
@@ -3135,9 +3145,26 @@ export class DesktopService {
 			if (input.output_schema !== undefined) throw new Error("独立只读审查暂不接受 output_schema。");
 			const background = (input.run_in_background as boolean | undefined) ?? this.store.settings.subagentDefaultBackground !== false;
 			const task = await this.reviewExternal({ taskId: input.review_of, executor: input.executor as ExternalProvider | undefined,
-				...externalModelOptions(input.model, input.effort) },
+				model: input.model as string | undefined, effort: input.effort as string | undefined },
 				context.conversationId, context.toolCallId, background);
 			return this.external.awaitModelResult(task.id, context.conversationId, background, context.signal);
+		}
+		if (request.tool === "Agent" && this.effectiveTier(context.conversationId) === "multi") {
+			const settings = this.multiSettingsFor(context.conversationId);
+			const ordinary = !input.subagent_type || input.subagent_type === "general-purpose";
+			if (!input.executor && ordinary && !input.fork && !input.scope_paths && !input.name && !input.team_name && settings?.implementation) {
+				const choices = [settings.implementation, ...(settings.fallbacks ?? [])];
+				const available = await this.multiExecutorsAvailable();
+				const history = this.external.list();
+				const executor = choices.find(id => {
+					const access = recentModelAccess(history, id, settings.executors?.[id]?.model);
+					return available.includes(id) && (!access || access === "confirmed");
+				});
+				if (!executor) throw new Error("方案的实现执行器不可用，请调整 multi 配置。");
+				input.executor = executor;
+			}
+			if (input.executor && input.executor !== "pi" && settings?.allowed && !settings.allowed.includes(input.executor as MultiExecutorId))
+				throw new Error("此执行器未获当前 multi 方案允许。");
 		}
 		if (request.tool === "Agent" && input.executor && input.executor !== "pi") {
 			if (input.scope_paths !== undefined) throw new Error("scope_paths is only available for local Pi subagents");
@@ -3411,6 +3438,32 @@ export class DesktopService {
 
 	subscribeExternal(listener: (event: ExternalEvent) => void): () => void { return this.external.subscribe(listener); }
 	externalExecutors(options?: { verifyCompatibility?: boolean }) { return this.external.executors(options); }
+	async multiCatalog() {
+		const active = this.active();
+		const controllers = active ? this.runtimes.get(active.id)?.models ?? [] : [];
+		const runtimeDir = this.options.runtimeDir ?? (this.options.entry ? dirname(dirname(dirname(this.options.entry))) : this.options.dataDir);
+		const sources = await discoverMultiSources(await this.external.executors(), this.external.list(), {
+			env: { ...process.env, ...this.options.env, ...networkEnvironment(this.store.settings) },
+			nodeExecutable: this.options.executable, helperPath: this.options.claudeHelperPath ?? join(runtimeDir, "external-claude-helper.mjs"),
+		});
+		return { controllers, sources };
+	}
+
+	updateMultiProfile(action: ProfileAction) {
+		return this.serialize(async () => {
+			const settings = this.store.settings;
+			const { config, library } = editProfile(settings.multiAgent ?? {}, loadLibrary(settings.multiProfiles), action);
+			const activating = ["apply", "activate", "saveAndApply", "undo"].includes(action.type);
+			if (activating) validateProfileResources(config, await this.multiCatalog());
+			const old = { multiAgent: settings.multiAgent, multiProfiles: settings.multiProfiles };
+			settings.multiAgent = Object.keys(config).length ? config : undefined;
+			settings.multiProfiles = library;
+			try { await this.persist(); } catch (error) { Object.assign(settings, old); throw error; }
+			if (activating) await this.refreshMultiTierFiles();
+			return this.buildSnapshot();
+		});
+	}
+
 	async configureExternal(input: ExternalExecutorInput) {
 		const executors = await this.external.configure(input);
 		await this.refreshMultiTierFiles();
@@ -3432,8 +3485,20 @@ export class DesktopService {
 		const checkpoint = task.changes?.checkpointId;
 		if (task.status !== "completed" || task.readOnly || !checkpoint)
 			throw new Error("只有完成且保存了改动的任务可启动独立审查。");
-		const executors = (await this.external.executors()).filter((item) => item.enabled && item.available && item.capabilities.readOnly);
-		const executor = input.executor ? executors.find((item) => item.id === input.executor) : executors.find((item) => item.id !== task.executor);
+		const settings = this.effectiveTier(task.parentConversationId) === "multi" ? this.multiSettingsFor(task.parentConversationId) : undefined;
+		const reviewer = settings?.reviewer;
+		const preferred = input.executor ?? reviewer?.executor;
+		const history = settings && !input.executor ? this.external.list() : [];
+		const executors = (await this.external.executors()).filter(item => {
+			const id = item.id as MultiExecutorId;
+			const model = id === reviewer?.executor ? reviewer.model : settings?.executors?.[id]?.model;
+			const access = recentModelAccess(history, id, model);
+			return item.enabled && item.available && item.capabilities.readOnly && (!settings?.allowed || settings.allowed.includes(id)) &&
+				(!access || access === "confirmed");
+		});
+		const executor = preferred ? executors.find(item => item.id === preferred) ??
+			(!input.executor ? settings?.fallbacks?.map(id => executors.find(item => item.id === id)).find(Boolean) : undefined)
+			: executors.find(item => item.id !== task.executor);
 		if (!executor) throw new Error("没有可用的独立只读执行器，请启用支持只读模式的执行器。");
 		const diff = await this.git.diffTaskChanges(task.workingDirectory, checkpoint, task.id, undefined, MAX_SUMMARY_FILES);
 		let patch = "";
@@ -3449,7 +3514,8 @@ export class DesktopService {
 			"Original requirement (JSON string)", JSON.stringify(requirement),
 			"Patch (JSON string)", JSON.stringify(patch),
 		].join("\n\n");
-		return this.external.start({ executor: executor.id, description: `独立审查 · ${task.title}`.slice(0, 160), prompt, model: input.model, effort: input.effort,
+		return this.external.start({ executor: executor.id, description: `独立审查 · ${task.title}`.slice(0, 160), prompt, model: input.model ?? (executor.id === reviewer?.executor ? reviewer.model : settings?.executors?.[executor.id as MultiExecutorId]?.model),
+			effort: input.effort ?? (executor.id === reviewer?.executor ? reviewer.effort : settings?.executors?.[executor.id as MultiExecutorId]?.effort),
 			subagent_type: "Explore", isolation: "shared", run_in_background: background }, task.parentConversationId, toolCallId, { reviewOf: task.id });
 	}
 
@@ -3736,6 +3802,7 @@ export class DesktopService {
 					// The keyword can override the standing tier only at the start of a new run.
 					const keyword = selected !== "ultracode" && !command.message.trimStart().startsWith("/") && mentionsUltracode(command.message);
 					runtime.runningTier = keyword ? "ultracode" : selected;
+					runtime.runningMulti = runtime.runningTier === "multi" ? this.store.settings.multiAgent : undefined;
 					if (keyword) await this.setTurnTier(runtime, "ultracode");
 					else if (selected === "multi") await this.writeCodingTier(runtime).catch(() => {});
 				}
@@ -4307,7 +4374,8 @@ export class DesktopService {
 			}
 			if (settings.multiAgent !== undefined) {
 				const multi = settings.multiAgent === null ? {} : parseMultiAgentSettings(settings.multiAgent);
-				if (multi.controller || multi.executors) next.settings.multiAgent = multi;
+				if (next.settings.multiProfiles) delete next.settings.multiProfiles.active;
+				if (Object.keys(multi).length) next.settings.multiAgent = multi;
 				else delete next.settings.multiAgent;
 			}
 			if (settings.modelRouting !== undefined) {
@@ -7283,6 +7351,7 @@ export class DesktopService {
 		this.clearTaskProgressTimer(runtime);
 		const runningTier = runtime.runningTier;
 		runtime.runningTier = undefined;
+		runtime.runningMulti = undefined;
 		// Every way a turn ends comes through here (settled, handled, failed, process error), so the
 		// keyword turn ends here too; otherwise the next plain turn would still run on ultracode.
 		if (runtime.turnTier) {
@@ -7914,13 +7983,11 @@ export class DesktopService {
 			});
 			runtime.agent = agent;
 			await this.syncState(runtime);
-			const result = await agent.request<{ models: Model[] }>({ type: "get_available_models" });
-			runtime.models = result.models.map(({ id, name, provider, contextWindow, reasoning }) => ({
-				id,
-				name,
-				provider,
-				contextWindow,
-				reasoning,
+			const result = await agent.request<{ models: PiNativeModel<Api>[] }>({ type: "get_available_models" });
+			runtime.models = result.models.map(model => ({
+				thinkingLevels: getSupportedThinkingLevels(model),
+				...(model.cost ? { cost: { input: model.cost.input, output: model.cost.output } } : {}),
+				id: model.id, name: model.name, provider: model.provider, contextWindow: model.contextWindow, reasoning: model.reasoning,
 			}));
 			runtime.engineStatus = "ready";
 			runtime.sessionStarted = true;
@@ -8680,6 +8747,7 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 			agentTeams: typeof value.settings.agentTeams === "boolean" ? value.settings.agentTeams : undefined,
 			modelRouting: sanitizeModelRouting(value.settings.modelRouting),
 			multiAgent: sanitizeMultiAgentSettings(value.settings.multiAgent),
+			multiProfiles: value.settings.multiProfiles ? loadLibrary(value.settings.multiProfiles) : undefined,
 			maxCostUsd:
 				typeof value.settings.maxCostUsd === "number" &&
 				Number.isFinite(value.settings.maxCostUsd) &&

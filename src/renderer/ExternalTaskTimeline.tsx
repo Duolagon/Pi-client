@@ -48,6 +48,7 @@ export function ExternalTaskTimeline({ task }: { task: ExternalTask }) {
 	return (
 		<section className="cc-external-timeline" aria-label="执行时间线">
 			<h3>执行时间线</h3>
+			<p className="subtle-note">{[task.executor, task.model ?? "CLI 默认模型", task.effort ?? "默认强度"].join(" · ")}</p>
 			{played.loading && <p className="subtle-note" role="status">正在读取执行记录…</p>}
 			{played.failed && <div className="cc-external-timeline-notice"><span>历史执行记录读取失败。</span><button type="button" className="cc-mini-btn" onClick={() => setReplayVersion((value) => value + 1)}>重试</button></div>}
 			{played.truncated && <p className="subtle-note">较早的执行记录已截断。</p>}

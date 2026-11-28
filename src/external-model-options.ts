@@ -6,7 +6,8 @@ export function isExternalModelId(value: unknown, executor?: string): value is s
 	const pattern = executor === "kimi"
 		? /^[A-Za-z0-9][A-Za-z0-9._:/@[\] -]*$/
 		: /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]*$/;
-	return pattern.test(value);
+	const id = executor === "kimi" && value.endsWith(",thinking") ? value.slice(0, -",thinking".length) : value;
+	return pattern.test(id);
 }
 
 export function externalModelOptions(model: unknown, effort: unknown, executor?: ExternalProvider): { model?: string; effort?: string } {

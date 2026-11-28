@@ -99,7 +99,7 @@ export interface ExternalAgentOptions {
 	/** Start a checkpoint; the returned function finishes it and summarizes the turn's changes. */
 	beginCheckpoint?(task: ExternalTask): Promise<() => Promise<ExternalChangeSummary | void>>;
 	/** Native model and effort the user pinned for an executor. */
-	executorModel?(executor: ExternalProvider): { model?: string; effort?: string } | undefined;
+	executorModel?(executor: ExternalProvider, owner: string): { model?: string; effort?: string } | undefined;
 	usesMultiSettings?(conversationId: string): boolean;
 	checkBudget?(executor: ExternalProvider): void;
 	reserveBudget?(task: ExternalTask): Promise<{ maxBudgetUsd: number; release(): Promise<void> } | undefined>;
@@ -276,10 +276,11 @@ export class ExternalAgents {
 
 	start(input: ExternalTaskStartInput, owner: string, toolCallId?: string, provenance?: { reviewOf?: string; comparisonId?: string }): Promise<ExternalTask> {
 		const usesMultiSettings = this.options.usesMultiSettings?.(owner) === true;
+		const defaults = usesMultiSettings && !provenance?.reviewOf ? this.options.executorModel?.(input.executor, owner) : undefined;
 		return this.serialize(async () => {
 			if (this.options.delegated(owner)) throw new Error("子任务不能再委派外部 Agent。");
 			validatePrompt(input.prompt); validateDescription(input.description);
-			const model = externalModelOptions(input.model, input.effort, input.executor);
+			const model = externalModelOptions(input.model === "inherit" ? defaults?.model : input.model ?? defaults?.model, input.effort ?? defaults?.effort, input.executor);
 			const outputSchema = input.output_schema === undefined ? undefined : parseAgentOutputSchema(input.output_schema);
 			if (!isExternalProvider(input.executor)) throw new Error("未知外部执行器。");
 			const previous = toolCallId && [...this.tasks.values()].find(({ task }) => task.parentConversationId === owner && task.parentToolCallId === toolCallId);
@@ -309,8 +310,7 @@ export class ExternalAgents {
 			if (provenance?.reviewOf) task.reviewOf = provenance.reviewOf;
 			if (provenance?.comparisonId) task.comparisonId = provenance.comparisonId;
 			this.tasks.set(task.id, { task, policy, prompt: input.prompt, originalPrompt: input.prompt, notify: input.run_in_background ?? false,
-				outputSchema,
-				...(usesMultiSettings ? { usesMultiSettings: true } : {}) });
+				outputSchema });
 			this.update(task, "queued"); await this.persist(); this.pump(); return structuredClone(task);
 		});
 	}
@@ -578,6 +578,7 @@ export class ExternalAgents {
 		let finishCheckpoint: (() => Promise<ExternalChangeSummary | void>) | undefined;
 		let budget: Awaited<ReturnType<NonNullable<ExternalAgentOptions["reserveBudget"]>>>;
 		let status: ExternalTask["status"] = "completed";
+		delete task.accessFailure;
 		let failure: string | undefined;
 		let structuredOutput: unknown;
 		let env = this.options.env;
@@ -597,9 +598,14 @@ export class ExternalAgents {
 			runtime.abort!.signal.throwIfAborted();
 			env = { ...this.options.env, ...this.options.networkEnv?.() };
 			for (const key of Object.keys(env)) if (key.startsWith("PI_DESKTOP_") || key.startsWith("PI_CODING_")) delete env[key];
-			const pinned = record.usesMultiSettings ? this.options.executorModel?.(task.executor) : undefined;
-			const model = task.model ?? pinned?.model;
-			const effort = task.effort ?? pinned?.effort;
+			const pinned = record.usesMultiSettings ? this.options.executorModel?.(task.executor, task.parentConversationId) : undefined;
+			// Old records resolved defaults lazily. Freeze them once when first resumed by this version.
+			if (record.usesMultiSettings) {
+				task.model ??= pinned?.model;
+				task.effort ??= pinned?.effort;
+				delete record.usesMultiSettings;
+			}
+			const { model, effort } = task;
 			const adapter = this.options.adapters[task.executor] ?? createRegistryExternalAdapter(task.executor);
 			if (!adapter) throw new Error("执行器协议不可用。");
 			if (!runtime.session) runtime.session = await adapter.open({
@@ -635,6 +641,7 @@ export class ExternalAgents {
 			else {
 				const described = describeExternalFailure(task.executor, error, diagnosticsOf(error) ?? runtime.session?.diagnostics?.(), env);
 				failure = described.message;
+				if (["auth", "subscription", "quota"].includes(described.kind)) task.accessFailure = described.kind as ExternalTask["accessFailure"];
 				this.event(task, { type: "diagnostic", message: `失败类型：${described.kind}` });
 			}
 		} finally {

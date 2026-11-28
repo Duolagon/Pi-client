@@ -54,6 +54,9 @@ export default function externalDelegationProvider(pi) {
 				else response = fauxAssistantMessage("EXTERNAL_CANCEL_COMPLETE " + textOf(results[1]));
 			} else if (text.startsWith("EXTERNAL_BLOCK ")) {
 				response = !results.length ? tool("Agent", { executor, description: "External parent cancellation", prompt: "BLOCK", subagent_type: "general-purpose", run_in_background: true }) : fauxAssistantMessage("EXTERNAL_BLOCK_LAUNCHED " + textOf(results[0]));
+			} else if (text === "MULTI_AUTO_WRITE") {
+				response = !results.length ? tool("Agent", { description: "Profile implementation", prompt: "WRITE from profile", run_in_background: false })
+					: fauxAssistantMessage("PROFILE_WRITE_DONE " + textOf(results[0]));
 			} else if (text.startsWith("EXTERNAL_PARAMS ")) {
 				const calls = [
 					{ executor, description: "External with model", prompt: "WRITE model", model: "fixture-model", effort: "high", run_in_background: false },

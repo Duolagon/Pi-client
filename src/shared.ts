@@ -206,6 +206,8 @@ export interface ProviderPreset {
 	models: ProviderModelPreset[];
 }
 export interface Model {
+	thinkingLevels?: ThinkingLevel[];
+	cost?: { input: number; output: number };
 	id: string;
 	name: string;
 	provider: string;
@@ -254,7 +256,19 @@ export const MULTI_EXECUTORS: readonly MultiExecutorId[] = ["codex", "claude", "
  * hands work to Codex / Claude Code / Kimi Code. Each executor may pin a native model and effort;
  * absent fields keep the executor's own configuration.
  */
+export interface MultiRole {
+	executor: MultiExecutorId;
+	model?: string;
+	effort?: string;
+}
 export interface MultiAgentSettings {
+	implementation?: MultiExecutorId;
+	parallelism?: "single" | "parallel";
+	reviewer?: MultiRole;
+	reviewPolicy?: "important" | "on-demand" | "always";
+	allowed?: MultiExecutorId[];
+	/** Ordered alternatives when the preferred executor is unavailable before launch. */
+	fallbacks?: MultiExecutorId[];
 	controller?: { model?: { provider: string; id: string }; thinkingLevel?: ThinkingLevel };
 	executors?: Partial<Record<MultiExecutorId, { model?: string; effort?: string }>>;
 }
@@ -303,6 +317,7 @@ export interface Settings {
 	modelRouting?: ModelRouting;
 	/** Controller and executor models for the multi tier. */
 	multiAgent?: MultiAgentSettings;
+	multiProfiles?: import("./multi-profiles.ts").MultiLibrary;
 	/** HTTP(S) proxy URL for model and web requests; overrides the shell's HTTPS_PROXY. */
 	proxy?: string;
 	/** Comma-separated hosts that bypass the proxy (NO_PROXY). */
@@ -793,6 +808,8 @@ export interface DesktopWorkflowAPI {
 }
 export interface DesktopAPI {
 	externalAgents: DesktopExternalAgentsAPI;
+	multiCatalog(): Promise<import("./multi-profiles.ts").MultiCatalog>;
+	updateMultiProfile(action: import("./multi-profiles.ts").ProfileAction): Promise<Snapshot>;
 	agents: DesktopAgentsAPI;
 	mcp: DesktopMcpAPI;
 	hooks: DesktopHooksAPI;

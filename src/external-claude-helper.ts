@@ -26,7 +26,7 @@ export type ClaudeHelperRequest =
 	| { type: "init"; id: string; config: ClaudeHelperConfig }
 	| { type: "run"; id: string; prompt: string }
 	| { type: "steer"; id: string; prompt: string }
-	| { type: "interrupt" | "close"; id: string }
+	| { type: "interrupt" | "close" | "models"; id: string }
 	| { type: "permission_response"; id: string; response: ExternalApprovalResponse };
 export type ClaudeHelperPacket =
 	| { type: "response"; id: string; ok: true; value?: unknown }
@@ -121,6 +121,16 @@ export class ClaudeSdkHelper {
 				return;
 			}
 			if (!this.config || this.closed) throw new Error("Claude helper is unavailable");
+			if (request.type === "models") {
+				const [models, account] = await Promise.all([this.native!.supportedModels(), this.native!.accountInfo().catch(() => undefined)]);
+				const missingAuth = account?.apiProvider === "firstParty" && !account.email &&
+					!([account.tokenSource, account.apiKeySource].some(source => source && source !== "none"));
+				this.respond(request.id, models.flatMap(model => [...new Set([model.value, model.resolvedModel].filter(Boolean))].map(id => ({
+					id, efforts: model.supportedEffortLevels ?? [], access: missingAuth ? "auth" : "listed",
+					...(account?.subscriptionType && account.subscriptionType !== "none" ? { billing: "subscription" } : {}),
+				}))));
+				return;
+			}
 			if (request.type === "steer") {
 				if (typeof request.prompt !== "string" || !request.prompt.trim() || Buffer.byteLength(request.prompt) > 2 * 1024 * 1024) throw new Error("Invalid Claude prompt");
 				if (!this.current || this.current.cancelled || !this.native) {

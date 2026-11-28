@@ -2096,6 +2096,7 @@ try {
 	await page.locator(".cc-dock-header .cc-ultracode-badge").waitFor({ state: "detached" });
 	checks.push("the ultracode keyword glows while typed, runs only its own turn, marks that prompt, and a standing ultracode conversation shows a dock badge");
 
+	await page.evaluate(() => window.pi.externalAgents.configure({ id: "claude", enabled: false }));
 	const multiDialog = page.getByRole("dialog", { name: "设置与模型连接", exact: true });
 	const multiSettingsGroup = multiDialog.getByRole("group", { name: "multi 档位：外部 Agent 协作", exact: true });
 	const openMultiSettings = async () => {
@@ -2187,6 +2188,26 @@ try {
 	await saveMultiSettings();
 	assert.equal((await snapshot()).settings.multiAgent, undefined);
 	checks.push("restoring all multi settings to defaults clears the persisted overrides");
+
+	await openMultiSettings();
+	await multiDialog.getByRole("button", { name: "应用极致", exact: true }).click();
+	await until(async () => (await snapshot()).settings.multiProfiles?.active === "极致", "applying a discovered profile");
+	assert.ok((await snapshot()).settings.multiAgent.implementation);
+	await multiDialog.getByRole("button", { name: "基于此方案编辑" }).last().click();
+	await multiDialog.getByLabel("方案名称", { exact: true }).fill("本地开发");
+	await multiDialog.getByLabel("默认实现执行器").selectOption("kimi");
+	await multiDialog.getByLabel("Kimi Code 模型", { exact: true }).fill("kimi-k3");
+	await multiDialog.getByRole("button", { name: "另存方案", exact: true }).click();
+	await until(async () => (await snapshot()).settings.multiProfiles.saved.some(p => p.name === "本地开发"), "saving a named custom profile");
+	await multiDialog.getByRole("button", { name: "应用已保存方案" }).click();
+	await until(async () => (await snapshot()).settings.multiProfiles.active === "本地开发", "switching to the named profile");
+	assert.equal((await snapshot()).settings.multiAgent.executors.kimi.model, "kimi-k3");
+	await multiDialog.getByRole("button", { name: "撤销切换" }).click();
+	await until(async () => (await snapshot()).settings.multiProfiles.active === "极致", "undoing a profile change");
+	await page.keyboard.press("Escape");
+	await multiDialog.waitFor({ state: "detached" });
+	checks.push("native model discovery, one-click recommended profiles, custom roles and saved profile switching with undo");
+
 
 	await page.evaluate(
 		(proj) => window.pi.permissions.upsert({ id: "e2e-allow-wf", scope: "project", project: proj, action: "allow", tool: "WorkflowRun" }),

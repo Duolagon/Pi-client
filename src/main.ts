@@ -387,6 +387,8 @@ function installHandlers() {
 			window.focus();
 		});
 	});
+	handle("pi:multi:catalog", () => service.multiCatalog());
+	handle("pi:multi:profile", (action) => service.updateMultiProfile(action as import("./multi-profiles.ts").ProfileAction));
 	handle("pi:snapshot", () => service.snapshot());
 	handle("pi:open-project", async () => {
 		const result = await dialog.showOpenDialog(window!, { title: "打开项目文件夹", properties: ["openDirectory"] });

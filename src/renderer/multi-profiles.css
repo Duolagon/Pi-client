@@ -1,0 +1,8 @@
+.multi-profiles, .multi-profiles details[open] { display: grid; gap: 10px; min-width: 0; }
+.multi-profiles .multi-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.multi-cards, .multi-roles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr)); gap: 8px; }
+.multi-cards section { border: 1px solid var(--line, #8886); border-radius: 8px; padding: 10px; display: grid; align-content: start; gap: 5px; overflow-wrap: anywhere; }
+.multi-cards span, .multi-roles label, .multi-profiles details { font-size: 12px; }
+.multi-roles label { display: grid; gap: 4px; }
+.multi-profiles select, .multi-profiles input { max-width: 100%; min-width: 0; }
+.multi-profiles summary { cursor: pointer; }

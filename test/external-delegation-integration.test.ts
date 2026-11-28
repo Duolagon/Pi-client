@@ -400,3 +400,51 @@ test("a running external task durably records its native session before completi
 		await data.service.cancelExternal(task.id);
 	} finally { await data.service.close(); await data.fixture.cleanup(); }
 });
+
+test("multi dispatches the default writer, pins continuations and sends the diff to the configured read-only reviewer", { timeout: 45000 }, async () => {
+	const data = await setup();
+	const { service } = data;
+	try {
+		await service.saveSettings({ permission: "auto", theme: "light", multiAgent: {
+			implementation: "kimi", executors: { kimi: { model: "Kimi For Coding/k3.1-pro", effort: "low" }, codex: { model: "writer", effort: "high" } },
+			reviewer: { executor: "codex", model: "review-model", effort: "medium" }, allowed: ["kimi", "codex"],
+		} });
+		await service.updateConversationMeta(data.parentId, { codingTier: "multi" });
+		await run(service, "MULTI_AUTO_WRITE", "PROFILE_WRITE_DONE");
+		const writer = service.listExternal(data.parentId)[0];
+		assert.equal(writer.executor, "kimi");
+		assert.equal(writer.model, "Kimi For Coding/k3.1-pro");
+		assert.ok(writer.changes?.files.length);
+		const review = await service.reviewExternal({ taskId: writer.id });
+		await until(() => service.externalSnapshot(review.id), t => t.status === "completed", "profile review");
+		assert.deepEqual([review.executor, review.model, review.effort, review.readOnly], ["codex", "review-model", "medium", true]);
+		await service.saveSettings({ permission: "auto", theme: "light", multiAgent: { executors: { kimi: { model: "new", effort: "high" } } } });
+		await service.sendExternal({ taskId: writer.id, message: "WRITE more" });
+		await until(() => service.externalSnapshot(writer.id), t => t.status === "completed" && t.turn === 2, "pinned continuation");
+		assert.equal(data.native.opened.at(-1)?.model, writer.model);
+		assert.equal(data.native.opened.at(-1)?.effort, "low");
+	} finally { await service.close(); await data.fixture.cleanup(); }
+});
+
+test("applying a saved profile validates native resources before replacing settings and survives service restart", { timeout: 45000 }, async () => {
+	const data = await setup();
+	let service = data.service;
+	try {
+		const executable = join(data.fixture.root, "catalog-codex");
+		await cp(join(here, "fixtures/external-codex.mjs"), executable);
+		await chmod(executable, 0o700);
+		await service.configureExternal({ id: "codex", executable, enabled: true });
+		for (const id of ["claude", "kimi"] as const) await service.configureExternal({ id, enabled: false });
+		const config = { allowed: ["codex"], implementation: "codex", executors: { codex: { model: "fixture-large", effort: "high" } } } as const;
+		const mutable = { ...config, allowed: [...config.allowed] };
+		await service.updateMultiProfile({ type: "save", name: "开发", config: mutable });
+		await service.updateMultiProfile({ type: "apply", name: "开发", config: mutable });
+		await assert.rejects(service.updateMultiProfile({ type: "apply", name: "失效方案", config: { ...mutable, executors: { codex: { model: "gone" } } } }), /未被当前 CLI 列出/);
+		await service.close();
+		service = new DesktopService(data.options);
+		const next = await service.initialize();
+		assert.equal(next.settings.multiProfiles?.active, "开发");
+		assert.deepEqual(next.settings.multiProfiles?.saved[0].config, mutable);
+		assert.deepEqual(next.settings.multiAgent, mutable);
+	} finally { await service.close(); await data.fixture.cleanup(); }
+});

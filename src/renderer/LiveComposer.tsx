@@ -731,7 +731,7 @@ export function LiveComposer({
 								</span>
 							)}
 							{snapshot.active?.codingTier === "multi" && snapshot.active?.turnTier !== "ultracode" && (
-								<span className="cc-multi-badge" title="本会话为 multi 档位：主控模型拆分任务，交给 Codex / Claude Code / Kimi Code 执行">multi</span>
+								<span className="cc-multi-badge" title="本会话为 multi 档位：主控模型拆分任务，交给 Codex / Claude Code / Kimi Code 执行">multi{snapshot.settings.multiProfiles?.active ? " · " + snapshot.settings.multiProfiles.active : ""}</span>
 							)}
 							{dockStatus?.stepBadge && <span className="cc-dock-step">{dockStatus.stepBadge}</span>}
 							<span className={`cc-dock-state-label ${dockStatus?.active ? "cc-shimmer-text" : ""}`}>
