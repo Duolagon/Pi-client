@@ -4,7 +4,7 @@ import { access, mkdtemp, realpath, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
-import { classifyExternalError, redactDiagnostic } from "./external-errors.ts";
+import { classifyExternalError, describeExternalFailure, redactDiagnostic } from "./external-errors.ts";
 import { acpExecutorDefinition, acpRestoreMethod, externalExecutorDefinitions, isExternalProvider } from "./external-registry.ts";
 import { JsonLineProcess } from "./external-rpc.ts";
 import type { ExternalExecutor, ExternalExecutorInput, ExternalProvider } from "./external-types.ts";
@@ -105,8 +105,11 @@ export async function checkExecutorCompatibility(executor: ExternalExecutor, env
 		return { ...executor, capabilities, available: true, compatibility: "compatible", error: undefined };
 	} catch (error) {
 		const message = redactDiagnostic(error instanceof Error ? error.message : String(error), env).slice(0, 700);
-		if (classifyExternalError(error, executor.id) === "auth")
+		const kind = classifyExternalError(error, executor.id);
+		if (kind === "auth")
 			return { ...executor, compatibility: "unverified", error: "请先在本机 CLI 登录后再检查兼容性。" };
+		if (kind === "subscription")
+			return { ...executor, compatibility: "unverified", error: describeExternalFailure(executor.id, error, undefined, env).message };
 		return { ...executor, available: false, compatibility: "incompatible", error: "CLI 与当前客户端不兼容：" + message + "。请升级官方 CLI 后重试。" };
 	} finally {
 		await rpc?.close();

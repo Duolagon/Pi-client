@@ -1,7 +1,7 @@
 import { isAbsolute } from "node:path";
 import { JsonLineProcess, type RpcId } from "./external-rpc.ts";
 import { validateRuntimePolicy } from "./permission-policy.ts";
-import { ExternalFailure, ExternalRpcError, withDiagnostics } from "./external-errors.ts";
+import { classifyExternalError, ExternalFailure, withDiagnostics } from "./external-errors.ts";
 import { acpExecutorDefinition, acpRestoreMethod } from "./external-registry.ts";
 import { externalPlan } from "./external-plan.ts";
 import type {
@@ -17,6 +17,7 @@ const outputLimit = 1024 * 1024;
 
 /** How one ACP (Agent Client Protocol) CLI is launched and what it guarantees. */
 export interface AcpProfile {
+	id: ExternalProvider;
 	/** Name used in errors, e.g. "Kimi". */
 	label: string;
 	args: readonly string[];
@@ -34,6 +35,7 @@ export function acpProfileFor(id: ExternalProvider): AcpProfile | undefined {
 	const definition = acpExecutorDefinition(id);
 	if (!definition) return undefined;
 	return {
+		id,
 		label: definition.label,
 		args: definition.acp.args,
 		env: definition.acp.env ?? {},
@@ -116,8 +118,7 @@ class AcpSession implements ExternalSession {
 		try { await this.handshake(); }
 		catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			// ACP reports a missing login as error -32000 (auth_required); older CLIs only say so in text.
-			if ((error instanceof ExternalRpcError && error.code === -32000) || /authentication required|auth_required/i.test(message))
+			if (classifyExternalError(error, this.profile.id) === "auth")
 				throw new ExternalFailure("auth", this.profile.loginHint
 					? `${this.profile.label} 未登录：请先在终端运行 ${this.profile.loginHint} 登录一次。`
 					: `${this.profile.label} 未登录：${message}`);

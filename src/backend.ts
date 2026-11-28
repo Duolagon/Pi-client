@@ -3465,7 +3465,7 @@ export class DesktopService {
 		const candidates = input.candidates.map(({ executor, model, effort }) => {
 			if (!available.some((item) => item.id === executor && item.enabled && item.available))
 				throw new Error(`候选执行器 ${executor} 当前不可用。`);
-			return { executor, ...externalModelOptions(model, effort) };
+			return { executor, ...externalModelOptions(model, effort, executor) };
 		});
 		const comparisonId = randomUUID();
 		const tasks: ExternalTask[] = [];

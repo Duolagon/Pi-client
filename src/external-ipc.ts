@@ -22,7 +22,7 @@ export function installExternalHandlers(handle: Handle, service: DesktopService)
 			description: text(input.description, 160), prompt: text(input.prompt, 2 * 1024 * 1024),
 			subagent_type: input.subagent_type as ExternalTaskStartInput["subagent_type"], isolation: input.isolation as ExternalTaskStartInput["isolation"],
 			worktree_id: input.worktree_id === undefined ? undefined : id(input.worktree_id), run_in_background: optionalBoolean(input.run_in_background),
-			...externalModelOptions(input.model, input.effort),
+			...externalModelOptions(input.model, input.effort, input.executor),
 			...(input.output_schema === undefined ? {} : { output_schema: parseAgentOutputSchema(input.output_schema) }),
 		};
 		return service.startExternal(request);
@@ -81,7 +81,7 @@ export function installExternalHandlers(handle: Handle, service: DesktopService)
 		return service.compareExternal({ taskId: id(input.taskId), candidates: input.candidates.map((value) => {
 			const candidate = object(value, ["executor", "model", "effort"]);
 			if (!isExternalProvider(candidate.executor)) throw new Error("未知执行器。");
-			return { executor: candidate.executor, ...externalModelOptions(candidate.model, candidate.effort) };
+			return { executor: candidate.executor, ...externalModelOptions(candidate.model, candidate.effort, candidate.executor) };
 		}) });
 	});
 }

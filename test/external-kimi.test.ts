@@ -4,6 +4,8 @@ import { chmod, copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { checkExecutorCompatibility, discoverExecutors } from "../src/external-executors.ts";
+import { describeExternalFailure } from "../src/external-errors.ts";
 import { KimiAdapter, assertKimiPolicy } from "../src/external-kimi.ts";
 import type { ExternalAdapterEvent, ExternalApprovalRequest, ExternalApprovalResponse, ExternalSessionOptions } from "../src/external-types.ts";
 
@@ -200,5 +202,36 @@ test("Kimi maps ACP auth_required to a structured login failure", async () => {
 		const error = await new KimiAdapter().open(data.options).catch((value: unknown) => value);
 		assert.ok(error instanceof ExternalFailure);
 		assert.equal(error.kind, "auth");
+		assert.match(describeExternalFailure("kimi", error).message, /未登录.*\/login/);
 	} finally { await data.cleanup(); }
+});
+
+test("Kimi subscription errors stay distinct from login and CLI compatibility failures", async () => {
+	const adapter = new KimiAdapter();
+	for (const phase of ["session/new", "session/prompt", "initialize"]) {
+		const data = await fixture({ env: { KIMI_TEST_SUBSCRIPTION_PHASE: phase } });
+		try {
+			if (phase === "initialize") {
+				const executors = await discoverExecutors({ kimi: { enabled: true, executable: data.options.executable } }, data.options.env);
+				const checked = await checkExecutorCompatibility(executors.find((executor) => executor.id === "kimi")!, data.options.env);
+				assert.equal(checked.available, true);
+				assert.equal(checked.compatibility, "unverified");
+				assert.match(checked.error!, /订阅无权.*API Key/);
+				assert.doesNotMatch(checked.error!, /未登录|\/login/);
+				continue;
+			}
+			const run = async () => {
+				const session = await adapter.open(data.options);
+				try { return await session.run("fixture"); }
+				finally { await session.close(); }
+			};
+			await assert.rejects(run, (error: unknown) => {
+				const failure = describeExternalFailure("kimi", error);
+				assert.equal(failure.kind, "subscription");
+				assert.match(failure.message, /订阅无权.*API Key/);
+				assert.doesNotMatch(failure.message, /未登录|\/login/);
+				return true;
+			});
+		} finally { await data.cleanup(); }
+	}
 });

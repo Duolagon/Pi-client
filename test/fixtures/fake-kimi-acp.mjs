@@ -36,6 +36,10 @@ line.on("line", (raw) => {
 	const message = JSON.parse(raw);
 	log(message);
 	if (!message.method) { callbacks.get(message.id)?.(message); callbacks.delete(message.id); return; }
+	if (message.method === process.env.KIMI_TEST_SUBSCRIPTION_PHASE)
+		return send({ id: message.id, error: {
+			code: -32000, message: "Authentication required: Your current subscription does not have access to Kimi Code right now. Upgrade your plan to keep coding with Kimi Code.",
+		} });
 	if (message.method === "initialize" && process.env.ACP_TEST_AUTH === "1")
 		return send({ id: message.id, error: { code: -32000, message: "Authentication required" } });
 	if (message.method === "initialize") return result(message.id, {

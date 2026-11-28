@@ -154,7 +154,7 @@ export class ExternalAgents {
 					throw new Error("外部任务存档无效。");
 				if (task.nativeSessionId !== undefined && (typeof task.nativeSessionId !== "string" || task.nativeSessionId.length > 500 || task.nativeSessionId.includes("\0"))) throw new Error("外部会话标识无效。");
 				task.pendingApprovals = [];
-				Object.assign(task, externalModelOptions(task.model, task.effort));
+				Object.assign(task, externalModelOptions(task.model, task.effort, task.executor));
 				task.runInBackground = Boolean(record.notify);
 				task.changes = validatedChanges(task.changes);
 				task.usage = validatedTurnUsage(task.usage);
@@ -279,7 +279,7 @@ export class ExternalAgents {
 		return this.serialize(async () => {
 			if (this.options.delegated(owner)) throw new Error("子任务不能再委派外部 Agent。");
 			validatePrompt(input.prompt); validateDescription(input.description);
-			const model = externalModelOptions(input.model, input.effort);
+			const model = externalModelOptions(input.model, input.effort, input.executor);
 			const outputSchema = input.output_schema === undefined ? undefined : parseAgentOutputSchema(input.output_schema);
 			if (!isExternalProvider(input.executor)) throw new Error("未知外部执行器。");
 			const previous = toolCallId && [...this.tasks.values()].find(({ task }) => task.parentConversationId === owner && task.parentToolCallId === toolCallId);

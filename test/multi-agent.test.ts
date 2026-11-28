@@ -1,3 +1,4 @@
+import { externalModelOptions } from "../src/external-model-options.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { parseMultiAgentSettings, sanitizeMultiAgentSettings, multiTierPromptSection } from "../src/multi-agent.ts";
@@ -23,6 +24,15 @@ test("multi settings accept a DeepSeek controller and per-executor model and eff
 	assert.throws(() => parseMultiAgentSettings({ controller: { thinkingLevel: "huge" } }), /主控思考强度/);
 	assert.equal(sanitizeMultiAgentSettings({ executors: { codex: { model: "$(evil)" } } }), undefined);
 	assert.equal(sanitizeMultiAgentSettings({}), undefined);
+});
+
+test("Kimi accepts the provider-qualified model ID returned for an API Key", () => {
+	const model = "Kimi For Coding/k3.1-pro";
+	assert.deepEqual(parseMultiAgentSettings({ executors: { kimi: { model, effort: "low" } } }),
+		{ executors: { kimi: { model, effort: "low" } } });
+	assert.deepEqual(externalModelOptions(model, "low", "kimi"), { model, effort: "low" });
+	assert.throws(() => externalModelOptions(model, "low", "codex"), /模型标识无效/);
+	assert.throws(() => externalModelOptions(model + "\nfoo", "low", "kimi"), /模型标识无效/);
 });
 
 test("multi is a third tier with its own prompt that lists only available executors", () => {

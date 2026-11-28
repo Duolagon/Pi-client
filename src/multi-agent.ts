@@ -1,8 +1,7 @@
+import { isExternalModelId } from "./external-model-options.ts";
 import { MULTI_EXECUTORS, type MultiAgentSettings, type MultiExecutorId, type ThinkingLevel } from "./shared.ts";
 
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-/** Native model ids: provider/model names, aliases such as `opus` or `kimi-k2`, bracketed context tags. */
-const NATIVE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]{0,199}$/;
 const EFFORT = /^[a-z][a-z0-9_-]{0,31}$/;
 /** Suggested native values. Codex and Kimi validate against their model's advertised options. */
 export const EXECUTOR_EFFORTS: Record<MultiExecutorId, readonly string[] | undefined> = {
@@ -51,7 +50,7 @@ export function parseMultiAgentSettings(value: unknown): MultiAgentSettings {
 			if (model !== undefined && model !== null && model !== "") {
 				const name = typeof model === "string" ? model.trim() : "";
 				const base = id === "kimi" && name.endsWith(",thinking") ? name.slice(0, -",thinking".length) : name;
-				if (name.length > 200 || !NATIVE_MODEL.test(base)) throw new Error(`${id} 模型名无效。`);
+				if (name.length > 200 || !isExternalModelId(base, id)) throw new Error(`${id} 模型名无效。`);
 				next.model = name;
 			}
 			if (effort !== undefined && effort !== null && effort !== "") {

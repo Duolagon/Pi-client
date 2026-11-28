@@ -3,7 +3,7 @@ import { redactLogText } from "./desktop-log.ts";
 import { externalExecutorDefinition } from "./external-registry.ts";
 
 /** Why an external turn failed, as far as the protocol or the message tells. */
-export type ExternalFailureKind = "auth" | "quota" | "rate_limit" | "context" | "model" | "refusal" | "policy" | "network" | "protocol" | "exit" | "other";
+export type ExternalFailureKind = "auth" | "subscription" | "quota" | "rate_limit" | "context" | "model" | "refusal" | "policy" | "network" | "protocol" | "exit" | "other";
 
 /** A JSON-RPC error response, keeping its code and data for classification. */
 export class ExternalRpcError extends Error {
@@ -44,7 +44,7 @@ export function codexErrorKind(info: unknown): ExternalFailureKind | undefined {
 }
 
 function kindFromText(message: string): ExternalFailureKind {
-	if (/auth(?:entication|orization)? required|not (?:logged|signed) in|unauthori[sz]ed|\b401\b|invalid api key|login required|please (?:log ?in|sign in)/i.test(message)) return "auth";
+	if (/auth(?:entication|orization)? required|\bauth_required\b|not (?:logged|signed) in|unauthori[sz]ed|\b401\b|invalid api key|login required|please (?:log ?in|sign in)/i.test(message)) return "auth";
 	if (/usage limit|quota|insufficient (?:balance|credit)|billing|credit balance|\b402\b|budget/i.test(message)) return "quota";
 	if (/rate.?limit|too many requests|\b429\b|overloaded|\b529\b/i.test(message)) return "rate_limit";
 	if (/context (?:window|length)|too many tokens|maximum context|prompt is too long/i.test(message)) return "context";
@@ -59,6 +59,7 @@ function kindFromText(message: string): ExternalFailureKind {
 
 const HINT: Record<ExternalFailureKind, (provider: ExternalProvider) => string | undefined> = {
 	auth: (provider) => `${labelOf(provider)} 未登录或登录已过期：请${loginFor(provider)}，再用 SendMessage 继续此任务。`,
+	subscription: (provider) => `${labelOf(provider)} 当前 CLI 账户的订阅无权使用此服务。请核对 CLI 登录的账户和套餐。使用 API Key 时，请选择 CLI 中对应的模型，或清空模型覆盖以使用 CLI 默认配置。`,
 	quota: (provider) => `${labelOf(provider)} 账号额度或预算已用完：请换一个执行器，或等额度恢复后再继续。`,
 	rate_limit: (provider) => `${labelOf(provider)} 被限流或服务繁忙：稍后用 SendMessage 继续，或换一个执行器。`,
 	context: () => "上下文超出模型窗口：缩小任务范围，或开一个新任务只传必要信息。",
@@ -73,13 +74,17 @@ const HINT: Record<ExternalFailureKind, (provider: ExternalProvider) => string |
 
 /** Kind of a failure from structured data first (RPC code, adapter kind), then from its message. */
 export function classifyExternalError(error: unknown, provider?: ExternalProvider): ExternalFailureKind {
+	const message = error instanceof Error ? error.message : String(error);
+	// Kimi uses ACP auth_required for both a missing login and a plan without CLI access.
+	if (provider === "kimi" && /\b(?:subscription|plan)\b[^\n.!?]{0,100}\b(?:does not (?:have access|include)|cannot access|is not eligible)\b[^\n]{0,60}\bKimi Code\b/i.test(message))
+		return "subscription";
 	if (error instanceof ExternalFailure) return error.kind;
 	if (error instanceof ExternalRpcError) {
 		// ACP auth_required; JSON-RPC parse / invalid request errors are protocol mismatches.
 		if (error.code === -32000 && provider && externalExecutorDefinition(provider)?.capabilities.transport === "acp") return "auth";
 		if (error.code === -32700 || error.code === -32600 || error.code === -32601) return "protocol";
 	}
-	return kindFromText(error instanceof Error ? error.message : String(error));
+	return kindFromText(message);
 }
 
 /** A user-facing failure text: the original message, a recovery hint, and the redacted stderr tail. */
