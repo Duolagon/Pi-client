@@ -11,6 +11,7 @@ import type {
 	WorkflowJournalEntry,
 	WorkflowRecord,
 	WorkflowRunInput,
+	WorkflowStepRecord,
 } from "./workflow-types.ts";
 import type { DeliverCustomType, NotificationDelivery, NotificationDisposition } from "./tool-control-types.ts";
 
@@ -18,6 +19,32 @@ export const WORKFLOW_EVENT_TYPE: DeliverCustomType = "desktop_workflow_event";
 const MAX_STRUCTURED_RETRIES = 5;
 const MAX_LOGS = 200;
 const MAX_AGENTS_PER_WORKFLOW = 100;
+/** A runaway script cannot grow the record without bound; the agent cap is lower than this. */
+const MAX_STEP_RECORDS = 400;
+
+/**
+ * Fallback for a worker that sends no phase path. Step keys embed their scope, e.g.
+ * `root/phase:Review#0/par#0[1]`; the last phase wins. Names containing `/` or `#` do not parse.
+ */
+export function phaseOfStepKey(stepKey: string): string | undefined {
+	const matches = [...stepKey.matchAll(/(?:^|\/)phase:([^/#]+)#/g)];
+	return matches.at(-1)?.[1];
+}
+
+/** The innermost phase of a step: the worker's phase path when sent, else parsed from the key. */
+function stepPhase(phases: unknown, stepKey: string): string | undefined {
+	if (Array.isArray(phases)) {
+		const last = phases.at(-1);
+		return typeof last === "string" && last.trim() ? last.trim().slice(0, 200) : undefined;
+	}
+	return phaseOfStepKey(stepKey);
+}
+
+function stepDescription(opts: Record<string, unknown>, stepKey: string): string {
+	return typeof opts.description === "string" && opts.description.trim()
+		? opts.description.trim().slice(0, 160)
+		: `Workflow step ${stepKey}`;
+}
 
 export interface WorkflowAgentStepRequest {
 	workflowId: string;
@@ -31,6 +58,8 @@ export interface WorkflowAgentStepRequest {
 	model?: string;
 	isolation?: "worktree" | "shared";
 	schema?: unknown;
+	/** Called once the child task exists, so a running step row can link to it. */
+	onTaskStarted?: (taskId: string) => void;
 }
 
 export interface WorkflowAgentStepResult {
@@ -198,10 +227,13 @@ export class WorkflowService {
 					const parsed = JSON.parse(await readFile(target, "utf8")) as { version?: unknown; workflow?: WorkflowRecord };
 					if (parsed?.version !== 1 || !parsed.workflow?.id) continue;
 					const wf = parsed.workflow;
+					// Records written before per-step rows existed carry none.
+					if (!wf.steps || typeof wf.steps !== "object" || Array.isArray(wf.steps)) wf.steps = {};
 					if (wf.status === "running" || wf.status === "waiting_for_approval") {
 						wf.status = "failed";
 						wf.error = "应用已重启；可使用工作流 Journal 恢复继续运行。";
 						delete wf.pendingApproval;
+						this.settleRunningSteps(wf, "应用已重启，这一步未完成。");
 					}
 					this.workflows.set(wf.id, wf);
 				} catch {}
@@ -270,6 +302,8 @@ export class WorkflowService {
 			phases: [],
 			logs: [],
 			journal: {},
+			steps: {},
+			...(params.input.toolCallId ? { toolCallId: params.input.toolCallId.slice(0, 300) } : {}),
 			createdAt: now,
 			updatedAt: now,
 		};
@@ -388,6 +422,7 @@ export class WorkflowService {
 		if (stopping) {
 			record.status = "cancelled";
 			record.error = "工作流已停止。";
+			this.settleRunningSteps(record, "工作流已停止。");
 			record.updatedAt = Date.now();
 		}
 		if (record.pendingApproval) {
@@ -460,18 +495,38 @@ export class WorkflowService {
 		}
 	}
 
+	/** Step rows still marked running when the run can no longer finish them are settled as failed. */
+	private settleRunningSteps(record: WorkflowRecord, message: string): void {
+		const now = Date.now();
+		for (const step of Object.values(record.steps ?? {})) {
+			if (step.status !== "running") continue;
+			step.status = "failed";
+			step.completedAt = now;
+			step.error = message;
+		}
+	}
+
+	/** Upsert one step row and tell the renderer at once; the tree updates as steps start and settle. */
+	private trackStep(record: WorkflowRecord, step: WorkflowStepRecord): void {
+		if (Object.keys(record.steps).length >= MAX_STEP_RECORDS && !record.steps[step.stepKey]) return;
+		record.steps[step.stepKey] = step;
+		record.updatedAt = Date.now();
+		this.emit(record);
+		// Persist too: a row that only lived in memory would vanish on restart.
+		void this.serialize(record.id, () => this.saveWorkflow(record)).catch(() => {});
+	}
+
 	private async executeAgentWithSchemaRetries(
 		record: WorkflowRecord,
 		opts: Record<string, unknown>,
 		stepKey: string,
 		workspaceKey: string,
+		phase: string | undefined,
 		signal: AbortSignal,
 	): Promise<WorkflowJournalEntry> {
 		const prompt = typeof opts.prompt === "string" && opts.prompt.trim() ? opts.prompt.trim() : "";
 		if (!prompt) throw new Error("agent() step requires non-empty prompt");
-		const description = typeof opts.description === "string" && opts.description.trim()
-			? opts.description.trim().slice(0, 160)
-			: `Workflow step ${stepKey}`;
+		const description = stepDescription(opts, stepKey);
 		const subagentType = typeof opts.subagent_type === "string" ? opts.subagent_type : "general-purpose";
 		const isolation = opts.isolation === "shared" || opts.isolation === "worktree" ? opts.isolation : undefined;
 		const model = typeof opts.model === "string" ? opts.model : undefined;
@@ -491,6 +546,8 @@ export class WorkflowService {
 		}
 
 		record.budget.spawnedAgents += 1;
+		const startedAt = Date.now();
+		this.trackStep(record, { stepKey, label: description, ...(phase ? { phase } : {}), status: "running", startedAt });
 		let stepResult = await this.callbacks.runAgentStep(
 			{
 				workflowId: record.id,
@@ -504,6 +561,10 @@ export class WorkflowService {
 				model,
 				isolation,
 				schema,
+				onTaskStarted: (taskId) => {
+					const row = record.steps[stepKey];
+					if (row?.status === "running" && row.startedAt === startedAt) this.trackStep(record, { ...row, taskId });
+				},
 			},
 			signal,
 		);
@@ -541,6 +602,12 @@ export class WorkflowService {
 
 		record.budget.spentTokens += totalTokens;
 		record.budget.spentCost += totalCost;
+		this.trackStep(record, {
+			stepKey, label: description, ...(phase ? { phase } : {}), status: "completed",
+			startedAt, completedAt: Date.now(),
+			...(stepResult.taskId ? { taskId: stepResult.taskId } : {}),
+			usage: { totalTokens, cost: totalCost },
+		});
 		// Cost is known only when a step settles, so agents already running can overshoot the cap.
 		// Once it is crossed, cancel the rest instead of letting a wide parallel() finish.
 		if (record.budget.maxCost !== undefined && record.budget.spentCost >= record.budget.maxCost)
@@ -645,6 +712,7 @@ export class WorkflowService {
 				record.status = "failed";
 				record.error = done.error ?? "Workflow execution failed";
 			}
+			this.settleRunningSteps(record, done.ok ? "工作流已结束，这一步未返回。" : "工作流失败，这一步未完成。");
 			record.updatedAt = Date.now();
 			await this.serialize(id, () => this.saveWorkflow(record));
 			this.emit(record);
@@ -670,6 +738,7 @@ export class WorkflowService {
 			if (!cancelled()) {
 				record.status = "failed";
 				record.error = err instanceof Error ? err.message : String(err);
+				this.settleRunningSteps(record, "工作流失败，这一步未完成。");
 				record.updatedAt = Date.now();
 				await this.serialize(id, () => this.saveWorkflow(record)).catch(() => {});
 				this.emit(record);
@@ -729,10 +798,17 @@ export class WorkflowService {
 			const opts = (payload.options ?? {}) as Record<string, unknown>;
 			if (!stepKey) throw new Error("Missing workflow agent stepKey");
 			if (!/^[a-f0-9]{64}$/.test(workspaceKey)) throw new Error("Invalid workflow agent workspace key");
+			const phase = stepPhase(payload.phases, stepKey);
 
 			// Deterministic journal replay: already-completed steps return cached outcome without re-spawning
 			const cached = record.journal[stepKey];
 			if (cached && cached.status === "completed") {
+				this.trackStep(record, {
+					stepKey, label: record.steps[stepKey]?.label ?? stepDescription(opts, stepKey), ...(phase ? { phase } : {}), status: "replayed",
+					startedAt: cached.completedAt, completedAt: cached.completedAt,
+					...(cached.taskId ? { taskId: cached.taskId } : {}),
+					...(cached.usage ? { usage: cached.usage } : {}),
+				});
 				return {
 					taskId: cached.taskId ?? "",
 					...(cached.worktreeId ? { worktreeId: cached.worktreeId } : {}),
@@ -744,7 +820,19 @@ export class WorkflowService {
 				};
 			}
 
-			const entry = await this.executeAgentWithSchemaRetries(record, opts, stepKey, workspaceKey, signal);
+			const entry = await this.executeAgentWithSchemaRetries(record, opts, stepKey, workspaceKey, phase, signal).catch((error) => {
+				// A stopped run already settled its rows; a late rejection must not overwrite the row a
+				// resumed run has since written for the same step.
+				if (signal.aborted) throw error;
+				const message = error instanceof Error ? error.message : String(error);
+				const existing = record.steps[stepKey];
+				this.trackStep(record, {
+					stepKey, label: existing?.label ?? stepDescription(opts, stepKey), ...(phase ? { phase } : {}), status: "failed",
+					startedAt: existing?.startedAt ?? Date.now(), completedAt: Date.now(), error: message.slice(0, 500),
+					...(existing?.taskId ? { taskId: existing.taskId } : {}),
+				});
+				throw error;
+			});
 			await this.serialize(record.id, async () => {
 				record.journal[stepKey] = entry;
 				record.updatedAt = Date.now();

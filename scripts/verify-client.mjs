@@ -1952,6 +1952,29 @@ try {
 	await agentGroup.getByText("并行展示子任务：问候函数", { exact: true }).waitFor();
 	checks.push("parallel Agent calls render as one tree-branch block with live metrics and an expandable brief");
 
+	await page.evaluate(
+		(proj) => window.pi.permissions.upsert({ id: "e2e-allow-wf", scope: "project", project: proj, action: "allow", tool: "WorkflowRun" }),
+		originalSession.project,
+	);
+	await submit("工作流进度树验证");
+	const wfTree = page.locator(".cc-wf-tree").last();
+	await wfTree.locator(".cc-wf-title").filter({ hasText: "三段式审查" }).waitFor();
+	await wfTree.locator(".cc-wf-metrics").filter({ hasText: /完成 · 3 个 Agent/ }).waitFor({ timeout: 60000 });
+	await idle();
+	// A finished run collapses to its summary line; expand it to read the tree.
+	assert.equal(await wfTree.getByText("开始分阶段审查", { exact: true }).count(), 0);
+	await wfTree.locator(".cc-wf-head").click();
+	await wfTree.getByText("开始分阶段审查", { exact: true }).waitFor();
+	const phaseGroup = wfTree.locator(".cc-wf-group").filter({ hasText: "审查" }).first();
+	assert.equal(await phaseGroup.locator(".cc-wf-step").count(), 2, "both parallel steps sit under their phase");
+	await wfTree.locator(".cc-wf-step").filter({ hasText: "汇总结论" }).waitFor();
+	assert.match(await wfTree.locator(".cc-wf-step").first().locator(".cc-wf-step-metrics").textContent(), /tokens · \d+s|\d+s/);
+	if (process.env.PI_WORKFLOW_TREE_SCREENSHOT) await wfTree.screenshot({ path: process.env.PI_WORKFLOW_TREE_SCREENSHOT, scale: "css", animations: "disabled" });
+	// Workflow steps belong to the run's tree, not the subagent panel.
+	assert.equal(await page.locator(".cc-subagent-row").filter({ hasText: "审查 csv" }).count(), 0);
+	await page.evaluate(() => window.pi.permissions.remove("e2e-allow-wf"));
+	checks.push("a model-started workflow renders a live phase tree at its tool call and keeps its steps out of the subagent panel");
+
 	checks.push(...await verifyWorkspaceNavigation({ page, root, agentDir, cliFixtures, ready, workspaceScreenshots }));
 	checks.push(await verifyCommitDraft(executable));
 	if (process.platform === "darwin") checks.push(await verifyWerewolf(executable, workspaceScreenshots ? join(workspaceScreenshots, "werewolf-evidence.png") : undefined));

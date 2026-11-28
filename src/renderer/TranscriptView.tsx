@@ -21,6 +21,8 @@ import { isDesktopWorkspaceContext } from "../file-references.ts";
 import { toolOutputReference } from "../tool-output-types.ts";
 import { ArchivedToolOutput } from "./ArchivedToolOutput.tsx";
 import { AgentRows, type AgentCall } from "./AgentRows.tsx";
+import { WorkflowTree } from "./WorkflowTree.tsx";
+import type { WorkflowRecord } from "../workflow-types.ts";
 
 export interface TodoItem {
 	id: string;
@@ -420,9 +422,12 @@ export function TranscriptView({
 	tasks = [],
 	externalTasks = [],
 	taskProgressMap = {},
+	workflows = [],
 	onOpenTask,
 	onBackgroundTask,
 	onStopTask,
+	onStopWorkflow,
+	onResumeWorkflow,
 	onRewindPrompt,
 	onForkPrompt,
 	onEditPrompt,
@@ -446,9 +451,13 @@ export function TranscriptView({
 	tasks?: DesktopTask[];
 	externalTasks?: ExternalTask[];
 	taskProgressMap?: Record<string, TaskProgress>;
+	/** Workflow runs of this conversation; a run is rendered at its WorkflowRun tool call. */
+	workflows?: WorkflowRecord[];
 	onOpenTask?: (taskId: string) => void;
 	onBackgroundTask?: (taskId: string) => void;
 	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
+	onStopWorkflow?: (workflowId: string) => void;
+	onResumeWorkflow?: (workflowId: string) => void;
 	onRewindPrompt?: (checkpointId: string) => void;
 	onForkPrompt?: (entryId: string) => void;
 	onEditPrompt?: (entryId: string) => void;
@@ -714,9 +723,12 @@ export function TranscriptView({
 									tasks,
 									externalTasks,
 									taskProgressMap,
+									workflows,
 									onOpenTask,
 									onBackgroundTask,
 									onStopTask,
+									onStopWorkflow,
+									onResumeWorkflow,
 									onOpenPreview,
 									onRerunCheck,
 									onOpenFile,
@@ -818,9 +830,12 @@ function turnItems({
 	tasks,
 	externalTasks,
 	taskProgressMap,
+	workflows,
 	onOpenTask,
 	onBackgroundTask,
 	onStopTask,
+	onStopWorkflow,
+	onResumeWorkflow,
 	onOpenPreview,
 	onRerunCheck,
 	onOpenFile,
@@ -833,9 +848,12 @@ function turnItems({
 	tasks: DesktopTask[];
 	externalTasks: ExternalTask[];
 	taskProgressMap: Record<string, TaskProgress>;
+	workflows: WorkflowRecord[];
 	onOpenTask?: (taskId: string) => void;
 	onBackgroundTask?: (taskId: string) => void;
 	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
+	onStopWorkflow?: (workflowId: string) => void;
+	onResumeWorkflow?: (workflowId: string) => void;
 	onOpenPreview?: (url: string) => void;
 	onRerunCheck?: (command: string) => void;
 	onOpenFile?: OpenFileHandler;
@@ -875,6 +893,26 @@ function turnItems({
 				items.push(agentBlock.item);
 			}
 			return;
+		}
+		if (block.type === "toolCall" && block.name === "WorkflowRun") {
+			const match = workflows.find((wf) => wf.toolCallId === block.id);
+			if (match) {
+				agentBlock = undefined;
+				items.push({
+					key: block.id,
+					block,
+					node: (
+						<WorkflowTree
+							key={block.id}
+							record={match}
+							onOpenTask={onOpenTask}
+							onStop={onStopWorkflow}
+							onResume={onResumeWorkflow}
+						/>
+					),
+				});
+				return;
+			}
 		}
 		// Text or thinking between two Agent calls still ends the block; empty text does not.
 		const invisible = (block.type === "text" && !block.text.trim()) || (block.type === "thinking" && !block.thinking);

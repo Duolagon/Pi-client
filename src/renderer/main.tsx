@@ -88,6 +88,7 @@ import { ControlsDialog, type ControlsTab } from "./ControlsDialog.tsx";
 import { CheckpointsDialog } from "./CheckpointsDialog.tsx";
 import { TasksDrawer } from "./TasksDrawer.tsx";
 import { backgroundWork } from "./agent-row.ts";
+import { plannedPhases } from "./workflow-tree.ts";
 import { SessionsDialog } from "./SessionsDialog.tsx";
 import { TerminalPanel } from "./TerminalPanel.tsx";
 import { MemoryStatusDialog } from "./MemoryStatusDialog.tsx";
@@ -265,6 +266,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [checkpointsOpen, setCheckpointsOpen] = useState(false);
 	const [rewindTarget, setRewindTarget] = useState<{ checkpointId: string; path?: string }>();
 	const [tasksOpen, setTasksOpen] = useState(false);
+	// A request, not a value: each one switches the drawer's tab even while it is already open.
+	const [tasksTab, setTasksTab] = useState<{ tab: "tasks" | "workflows"; seq: number }>();
+	const requestTasksTab = (tab: "tasks" | "workflows") => setTasksTab((prev) => ({ tab, seq: (prev?.seq ?? 0) + 1 }));
 	const [taskInitialId, setTaskInitialId] = useState<string | undefined>(undefined);
 	const [sessionsOpen, setSessionsOpen] = useState(false);
 	const [memoryTab, setMemoryTab] = useState<"memory" | "context" | "status" | null>(null);
@@ -824,6 +828,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		}
 		setTaskInitialId(taskId);
 		setTasksOpen(true);
+		if (tasksOpen) requestTasksTab("tasks");
 	};
 	const blocked = running || changing || bashBusy || planApplying;
 	const activePermMode = snapshot?.active?.permissionMode ?? snapshot?.settings.permission;
@@ -1035,6 +1040,12 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		}
 	};
 	const handleBuiltinSlash = (action: BuiltinSlashAction, argument = "") => {
+		if (action === "workflows") {
+			setTaskInitialId(undefined);
+			setTasksOpen(true);
+			requestTasksTab("workflows");
+			return;
+		}
 		if (action === "ultracode") {
 			if (!snapshot?.active) return;
 			if (snapshot.active.kind === "subagent") return app.setNotice("请在主会话切换档位。");
@@ -1704,6 +1715,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		{ id: "plan", label: inPlanMode ? "退出 Plan 计划模式" : "进入 Plan 计划模式", keywords: "plan mode readonly", disabled: blocked, run: () => void togglePlanMode() },
 		{ id: "rewind", label: "检查点与代码回滚 (/rewind)", keywords: "git checkpoint restore", disabled: !snapshot.active, run: () => { openCheckpoint(); } },
 		{ id: "tasks", label: "后台任务、子 Agent 与 Worktree (/tasks)", keywords: "subagent external codex claude kimi antigravity agy", run: () => { setTaskInitialId(undefined); setTasksOpen(true); } },
+		{ id: "workflows", label: "Workflow 运行记录 (/workflows)", keywords: "workflow orchestration fanout 工作流 编排", run: () => { setTaskInitialId(undefined); setTasksOpen(true); requestTasksTab("workflows"); } },
 		{ id: "werewolf", label: werewolfToggleLabel, keywords: `werewolf audit verifier verification 幻觉 独立验收 ${werewolfHelp}`, disabled: !werewolf || togglingWerewolf, run: changeWerewolf },
 		{ id: "agents", label: "Agents 与子 Agent (/agents)", keywords: "agents subagent custom reviewer", run: () => setAgentsOpen(true) },
 		{ id: "mcp", label: "MCP 服务器管理 (/mcp)", keywords: "mcp servers oauth", run: () => setMcpOpen(true) },
@@ -2813,7 +2825,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											tasks={Object.values(tasksMap)}
 											externalTasks={Object.values(externalTasksMap)}
 											taskProgressMap={taskProgressMap}
+											workflows={workflows}
 											onOpenTask={openSubagent}
+											onStopWorkflow={(id) => void api.workflow.stop(id).catch(app.fail)}
+											onResumeWorkflow={(id) => void api.workflow.resume(id).catch(app.fail)}
 											onBackgroundTask={(id) => void backgroundSubagent(id)}
 											onStopTask={(id, kind) => void stopSubagent(id, kind)}
 											onOpenFile={openInEditor}
@@ -3224,11 +3239,28 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							.filter((wf) => wf.pendingApproval)
 							.map((wf) => {
 								const req = wf.pendingApproval!;
+								const phases = plannedPhases(wf.script);
+								const limits = [
+									wf.budget.maxAgents !== undefined ? `最多 ${wf.budget.maxAgents} 个 Agent` : "",
+									wf.budget.maxCost !== undefined ? `上限 $${wf.budget.maxCost}` : "",
+								].filter(Boolean).join(" · ");
 								return (
 									<div key={req.id} className="cc-plan-bar" role="region" aria-label="工作流执行审批">
 										<div className="cc-plan-bar-row">
-											<span>
-												<strong>{req.title}</strong> · {req.detail.slice(0, 140)}
+											<span className="cc-wf-approval">
+												<strong>{req.title}</strong>
+												{limits && <small>{limits}</small>}
+												{phases.length > 0 && (
+													<small>
+														计划阶段：{phases.map((name, index) => `${index + 1}. ${name}`).join("　")}
+													</small>
+												)}
+												{req.kind === "agent_step" && <small>{req.detail.slice(0, 160)}</small>}
+												<details>
+													<summary>查看脚本</summary>
+													{/* Approval covers the whole script, so show all of it; the box scrolls. */}
+													<pre>{wf.script}</pre>
+												</details>
 											</span>
 											<div className="cc-plan-bar-actions">
 												<button
@@ -3986,7 +4018,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					conversationId={snapshot.active?.id}
 					agentTeams={snapshot.settings.agentTeams === true}
 					initialTaskId={taskInitialId}
-					close={() => setTasksOpen(false)}
+					tabRequest={tasksTab}
+					close={() => { setTasksOpen(false); setTasksTab(undefined); }}
 					onNotice={(msg) => app.setNotice(msg)}
 					fail={app.fail}
 				/>

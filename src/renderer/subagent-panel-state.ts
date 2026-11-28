@@ -47,6 +47,7 @@ export function isActiveTaskStatus(status: string): boolean {
  * - Active children always stay visible.
  * - Completed children are removed immediately and produce a 30s `/tasks` hint.
  * - Failed / cancelled / interrupted children remain visible for 30s, then disappear.
+ * - Workflow steps are excluded; they appear in the workflow's own progress tree.
  */
 export function buildSubagentPanelState(
 	tasks: DesktopTask[],
@@ -71,7 +72,8 @@ export function buildSubagentPanelState(
 
 	const piByParent = new Map<string, DesktopTask[]>();
 	for (const task of tasks) {
-		if (!task.parentConversationId) continue;
+		// Workflow steps live in their run's progress tree; listing each one here would bury the rest.
+		if (!task.parentConversationId || task.workflowId) continue;
 		const list = piByParent.get(task.parentConversationId) ?? [];
 		list.push(task);
 		piByParent.set(task.parentConversationId, list);

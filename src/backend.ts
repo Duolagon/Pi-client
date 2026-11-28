@@ -764,6 +764,7 @@ export class DesktopService {
 					);
 					// The task is now in the store and counts toward the cap by its own status.
 					releaseSlot();
+					req.onTaskStarted?.(task.id);
 					const finished = await this.waitTaskSettled(
 						task.id,
 						(t) => !["queued", "running", "waiting_for_input"].includes(t.status),
@@ -3037,6 +3038,7 @@ export class DesktopService {
 				input: {
 					title: typeof input.title === "string" ? input.title : undefined,
 					script: String(input.script),
+					...(context.toolCallId ? { toolCallId: context.toolCallId } : {}),
 					budget: workflowBudgetFor(codingTierOf(this.conversation(this.rootConversationId(conv.id, false)).codingTier), input.budget as WorkflowRunInput["budget"]),
 				},
 			});

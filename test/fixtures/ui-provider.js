@@ -148,6 +148,16 @@ export default function uiProvider(pi) {
 			} else if (prompt === "读取用于定位的工作树文件") {
 				response = results.length ? fauxAssistantMessage("已读取工作树文件。")
 					: fauxAssistantMessage(fauxToolCall("read", { path: "src/greeting.mjs" }), { stopReason: "toolUse" });
+			} else if (prompt === "工作流进度树验证") {
+				response = results.length
+					? fauxAssistantMessage("工作流已完成。")
+					: fauxAssistantMessage(fauxToolCall("WorkflowRun", {
+						title: "三段式审查",
+						script: 'log("开始分阶段审查");\nawait phase("审查", () => parallel([() => agent({ prompt: "工作流子步骤：csv", description: "审查 csv" }), () => agent({ prompt: "工作流子步骤：ledger", description: "审查 ledger" })]));\nreturn (await agent({ prompt: "工作流子步骤：汇总", description: "汇总结论" })).output;',
+					}), { stopReason: "toolUse" });
+			} else if (prompt.startsWith("工作流子步骤：")) {
+				response = results.length ? fauxAssistantMessage(`${prompt.slice(7)} 已完成。`)
+					: fauxAssistantMessage(fauxToolCall("read", { path: "src/greeting.mjs" }), { stopReason: "toolUse" });
 			} else if (prompt === "并行子Agent展示验证") {
 				// Three read-only agents launched in one message render as one grouped block.
 				response = results.length

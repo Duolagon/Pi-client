@@ -77,7 +77,8 @@ export type BuiltinSlashAction =
 	| "goal"
 	| "verify"
 	| "grail"
-	| "ultracode";
+	| "ultracode"
+	| "workflows";
 
 const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[] = [
 	{ name: "compact", description: "压缩上下文（支持 /compact <聚焦指令>）" },
@@ -112,6 +113,7 @@ const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[
 	{ name: "add-dir", description: "附加工作目录并放行读写与沙箱（/add-dir <目录> 或 /add-dir rm <目录>）" },
 	{ name: "grail", description: "鉴定本次需求的全部改动（测试、作弊扫描、独立评审；结果不发给 Agent）" },
 	{ name: "goal", description: "设定目标自动续跑（/goal [--max-turns 8] [--max-cost 2] <目标>，/goal stop 停止）" },
+	{ name: "workflows", description: "查看本会话的 Workflow 运行记录（实时进度、停止与恢复）" },
 	{ name: "ultracode", description: "切换 ultracode 档位：模型默认用子 Agent 并行编排并逐条复核（/ultracode on|off）" },
 	{ name: "verify", description: "让模型用 PreviewCheck 自动验证本地网页（启动服务、操作 DOM、截图与检查报错）" },
 ];
@@ -133,7 +135,7 @@ const CLAUDE_ONLY_COMMANDS = new Set([
 	"insights", "install-github-app", "keybindings", "login", "logout", "mobile", "model",
 	"plugin", "pr-comments", "privacy-settings", "quit", "recap", "release-notes", "remote-control",
 	"resume", "run", "schedule", "statusline",
-	"subtask", "teleport", "terminal-setup", "upgrade", "usage", "vim", "voice", "workflows",
+	"subtask", "teleport", "terminal-setup", "upgrade", "usage", "vim", "voice",
 	"config",
 ]);
 

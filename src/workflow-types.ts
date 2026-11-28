@@ -40,6 +40,21 @@ export interface WorkflowJournalEntry {
 	completedAt: number;
 }
 
+/** One agent() call of a run, written when it starts so the UI can show it running. */
+export interface WorkflowStepRecord {
+	stepKey: string;
+	/** agent() description, or the step key when the script gave none. */
+	label: string;
+	/** Enclosing phase() name, derived from the step key; absent at the top level. */
+	phase?: string;
+	status: "running" | "completed" | "failed" | "replayed";
+	startedAt: number;
+	completedAt?: number;
+	taskId?: string;
+	error?: string;
+	usage?: { totalTokens: number; cost: number };
+}
+
 export interface WorkflowPhaseRecord {
 	name: string;
 	status: "running" | "completed" | "failed";
@@ -66,6 +81,10 @@ export interface WorkflowRecord {
 	phases: WorkflowPhaseRecord[];
 	logs: WorkflowLogRecord[];
 	journal: Record<string, WorkflowJournalEntry>;
+	/** Live per-step rows for the progress tree, keyed by step key. */
+	steps: Record<string, WorkflowStepRecord>;
+	/** The WorkflowRun tool call that started this run, so the transcript can anchor its tree. */
+	toolCallId?: string;
 	result?: unknown;
 	error?: string;
 	pendingApproval?: WorkflowApprovalRequest;
@@ -76,6 +95,8 @@ export interface WorkflowRecord {
 export interface WorkflowRunInput {
 	title?: string;
 	script: string;
+	/** Tool call that started the run; absent when the user started it. */
+	toolCallId?: string;
 	budget?: {
 		maxCost?: number;
 		maxTokens?: number;

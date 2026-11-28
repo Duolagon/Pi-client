@@ -106,7 +106,7 @@ async function main() {
 		});
 	};
 
-	const scopeStorage = new AsyncLocalStorage<{ prefix: string; counter: { value: number }; workspace: string }>();
+	const scopeStorage = new AsyncLocalStorage<{ prefix: string; counter: { value: number }; workspace: string; phases?: string[] }>();
 	const workspaceKey = (prefix: string) => createHash("sha256").update(prefix).digest("hex");
 	const nextStepKey = (explicitKey?: string): string => {
 		const scope = scopeStorage.getStore();
@@ -116,7 +116,7 @@ async function main() {
 		return `${prefix}#${index}`;
 	};
 
-	const rootScope = { prefix: "root", counter: { value: 0 }, workspace: workspaceKey("root") };
+	const rootScope: { prefix: string; counter: { value: number }; workspace: string; phases?: string[] } = { prefix: "root", counter: { value: 0 }, workspace: workspaceKey("root") };
 
 	const executeScript = async (script: string) => {
 		const sandbox: Record<string, unknown> = {
@@ -127,7 +127,9 @@ async function main() {
 				const opts = input as Record<string, unknown>;
 				const explicitKey = typeof opts.key === "string" && opts.key.trim() ? opts.key.trim() : undefined;
 				const stepKey = nextStepKey(explicitKey);
-				return rpc("agent", { stepKey, workspaceKey: (scopeStorage.getStore() ?? rootScope).workspace, options: opts });
+				const scope = scopeStorage.getStore() ?? rootScope;
+				// The phase path travels with the call: names may contain any character, so the key cannot carry them.
+				return rpc("agent", { stepKey, workspaceKey: scope.workspace, phases: scope.phases ?? [], options: opts });
 			},
 			parallel: async (items: unknown[]) => {
 				if (!Array.isArray(items)) throw new Error("parallel(tasks) requires an array");
@@ -137,7 +139,7 @@ async function main() {
 					items.map((item, idx) => {
 						if (typeof item === "function") {
 							const prefix = `${base}[${idx}]`;
-							return scopeStorage.run({ prefix, counter: { value: 0 }, workspace: workspaceKey(prefix) }, () =>
+							return scopeStorage.run({ prefix, counter: { value: 0 }, workspace: workspaceKey(prefix), phases: parent.phases }, () =>
 								Promise.resolve((item as () => unknown)()),
 							);
 						}
@@ -170,7 +172,7 @@ async function main() {
 				await rpc("phase_start", { name: cleanName });
 				try {
 					const result = await scopeStorage.run(
-						{ prefix: `${parent.prefix}/phase:${cleanName}#${seq}`, counter: { value: 0 }, workspace: parent.workspace },
+						{ prefix: `${parent.prefix}/phase:${cleanName}#${seq}`, counter: { value: 0 }, workspace: parent.workspace, phases: [...(parent.phases ?? []), cleanName] },
 						() => Promise.resolve((fn as () => unknown)()),
 					);
 					await rpc("phase_end", { name: cleanName, status: "completed" });

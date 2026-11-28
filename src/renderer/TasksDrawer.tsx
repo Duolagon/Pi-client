@@ -55,6 +55,7 @@ export function TasksDrawer({
 	conversationId,
 	agentTeams = false,
 	initialTaskId,
+	tabRequest,
 	close,
 	onNotice,
 	fail,
@@ -64,11 +65,16 @@ export function TasksDrawer({
 	conversationId?: string;
 	agentTeams?: boolean;
 	initialTaskId?: string;
+	/** Latest tab request; a new `seq` switches tabs even while the drawer is open. */
+	tabRequest?: { tab: "tasks" | "workflows"; seq: number };
 	close: () => void;
 	onNotice: (msg: string) => void;
 	fail: (error: unknown) => void;
 }) {
-	const [tab, setTab] = useState<"tasks" | "remote" | "todos" | "cron" | "workflows" | "teams" | "worktrees">("tasks");
+	const [tab, setTab] = useState<"tasks" | "remote" | "todos" | "cron" | "workflows" | "teams" | "worktrees">(tabRequest?.tab ?? "tasks");
+	useEffect(() => {
+		if (tabRequest) setTab(tabRequest.tab);
+	}, [tabRequest?.seq]);
 	const [armedAction, setArmedAction] = useState<string | null>(null);
 	useEffect(() => {
 		if (!armedAction) return;
