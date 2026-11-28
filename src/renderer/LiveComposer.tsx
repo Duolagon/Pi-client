@@ -168,6 +168,8 @@ export function LiveComposer({
 	inputRef,
 	gitBranch,
 	dockStatus,
+	backgroundWork,
+	onOpenBackgroundWork,
 	fail,
 }: {
 	snapshot: Snapshot;
@@ -208,6 +210,9 @@ export function LiveComposer({
 		label: string;
 		detail?: string;
 	};
+	/** Work still running in the background for this conversation; drives the footer pill. */
+	backgroundWork?: { agents: number; workflows: number; shells: number };
+	onOpenBackgroundWork?: () => void;
 	fail: (error: unknown) => void;
 }) {
 	const [sending, setSending] = useState(false);
@@ -713,6 +718,21 @@ export function LiveComposer({
 							)}
 						</div>
 						<div className="cc-dock-header-right">
+							{backgroundWork && backgroundWork.agents + backgroundWork.workflows + backgroundWork.shells > 0 && (
+								<button
+									type="button"
+									className="cc-bg-pill"
+									title={[
+										backgroundWork.agents ? `${backgroundWork.agents} 个后台子 Agent` : "",
+										backgroundWork.workflows ? `${backgroundWork.workflows} 个工作流` : "",
+										backgroundWork.shells ? `${backgroundWork.shells} 个后台命令` : "",
+									].filter(Boolean).join("，") + "。点击查看任务列表"}
+									onClick={onOpenBackgroundWork}
+								>
+									<span className="cc-dot run" aria-hidden="true" />
+									{backgroundWork.agents + backgroundWork.workflows + backgroundWork.shells} 个后台任务
+								</button>
+							)}
 							<StatusLine
 								snapshot={snapshot}
 								running={running}

@@ -109,6 +109,7 @@ export class ExternalAgents {
 					throw new Error("外部任务存档无效。");
 				if (task.nativeSessionId !== undefined && (typeof task.nativeSessionId !== "string" || task.nativeSessionId.length > 500 || task.nativeSessionId.includes("\0"))) throw new Error("外部会话标识无效。");
 				task.pendingApprovals = [];
+				task.runInBackground = Boolean(record.notify);
 				if (record.notifiedTurn !== undefined && (!Number.isSafeInteger(record.notifiedTurn) || record.notifiedTurn < 1 || record.notifiedTurn > task.turn)) throw new Error("外部任务通知状态无效。");
 				if (record.stopReason !== undefined && !stopReasons.includes(record.stopReason)) throw new Error("外部任务停止原因无效。");
 				// A turn the app lost while it ran is reported to a background parent as stopped.
@@ -217,7 +218,7 @@ export class ExternalAgents {
 			const now = Date.now();
 			const task: ExternalTask = { id: `external-${randomUUID()}`, executor: input.executor, parentConversationId: owner, parentToolCallId: toolCallId,
 				title: input.description, project, workingDirectory, worktreeId: tree?.id, subagentType, readOnly, status: "queued", createdAt: now, updatedAt: now,
-				revision: 0, turn: 1, eventSequence: 0, output: "", truncated: false, pendingApprovals: [] };
+				revision: 0, turn: 1, eventSequence: 0, output: "", truncated: false, pendingApprovals: [], runInBackground: input.run_in_background ?? false };
 			this.tasks.set(task.id, { task, policy, prompt: input.prompt, notify: input.run_in_background ?? false });
 			this.update(task, "queued"); await this.persist(); this.pump(); return structuredClone(task);
 		});
@@ -232,6 +233,7 @@ export class ExternalAgents {
 			await this.runtimes.get(task.id)?.running;
 			await realpath(task.workingDirectory);
 			record.prompt = input.message; record.notify = input.runInBackground ?? false; record.stopReason = undefined;
+			task.runInBackground = record.notify;
 			task.turn++; task.output = ""; task.error = undefined; task.truncated = false;
 			this.update(task, "queued"); await this.persist(); this.pump(); return structuredClone(task);
 		});
@@ -260,6 +262,7 @@ export class ExternalAgents {
 			if (active.has(result.status)) {
 				// The parent stops waiting; the result now reaches it through the outbox.
 				this.record(id, owner).notify = true;
+				this.record(id, owner).task.runInBackground = true;
 				await this.persist();
 				this.options.flushNotifications(owner);
 			}

@@ -88,6 +88,8 @@ export interface ExternalTask {
 	truncated: boolean;
 	error?: string;
 	pendingApprovals: ExternalApprovalRequest[];
+	/** True when the parent does not wait and the result arrives as a notification. */
+	runInBackground?: boolean;
 }
 export interface ExternalTaskStartInput {
 	executor: ExternalProvider;

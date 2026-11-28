@@ -1938,6 +1938,20 @@ try {
 	await idle();
 	checks.push("opening a tool path in a child transcript resolves through its actual Worktree");
 
+	await submit("并行子Agent展示验证");
+	const agentGroup = page.locator(".cc-subagent-run-group").filter({ hasText: "调查问候函数" }).last();
+	// The calls stream in one by one; wait for the finished three-agent header before counting.
+	await agentGroup.locator(".cc-subagent-run-group-head").filter({ hasText: "3 个 Agent 完成" }).waitFor();
+	await idle();
+	assert.equal(await agentGroup.locator(".cc-subagent-run-row.in-group").count(), 3, "three agents of one message share one block");
+	assert.equal(await agentGroup.locator(".cc-subagent-run-branch").last().textContent(), "└");
+	for (const row of await agentGroup.locator(".cc-subagent-run-row.in-group").all())
+		assert.match(await row.locator(".cc-subagent-run-metrics").textContent(), /次工具 · .*tokens · \d+s/);
+	if (process.env.PI_AGENT_ROWS_SCREENSHOT) await agentGroup.screenshot({ path: process.env.PI_AGENT_ROWS_SCREENSHOT, scale: "css", animations: "disabled" });
+	await agentGroup.locator(".cc-subagent-run-head").first().click();
+	await agentGroup.getByText("并行展示子任务：问候函数", { exact: true }).waitFor();
+	checks.push("parallel Agent calls render as one tree-branch block with live metrics and an expandable brief");
+
 	checks.push(...await verifyWorkspaceNavigation({ page, root, agentDir, cliFixtures, ready, workspaceScreenshots }));
 	checks.push(await verifyCommitDraft(executable));
 	if (process.platform === "darwin") checks.push(await verifyWerewolf(executable, workspaceScreenshots ? join(workspaceScreenshots, "werewolf-evidence.png") : undefined));

@@ -148,6 +148,16 @@ export default function uiProvider(pi) {
 			} else if (prompt === "读取用于定位的工作树文件") {
 				response = results.length ? fauxAssistantMessage("已读取工作树文件。")
 					: fauxAssistantMessage(fauxToolCall("read", { path: "src/greeting.mjs" }), { stopReason: "toolUse" });
+			} else if (prompt === "并行子Agent展示验证") {
+				// Three read-only agents launched in one message render as one grouped block.
+				response = results.length
+					? fauxAssistantMessage("三个只读子 Agent 已完成。")
+					: fauxAssistantMessage(["问候函数", "测试文件", "说明文档"].map((topic) => fauxToolCall("Agent", {
+						description: `调查${topic}`, prompt: `并行展示子任务：${topic}`, subagent_type: "Explore", run_in_background: false,
+					})), { stopReason: "toolUse" });
+			} else if (prompt.startsWith("并行展示子任务：")) {
+				response = results.length ? fauxAssistantMessage(`已读完${prompt.slice(8)}。`)
+					: fauxAssistantMessage(fauxToolCall("read", { path: "src/greeting.mjs" }), { stopReason: "toolUse" });
 			} else if (prompt.includes("审批拒绝验证")) {
 				response = results.length ? fauxAssistantMessage(results[0].isError ? "写入已按你的选择取消。" : "写入已执行。")
 					: fauxAssistantMessage(fauxToolCall("write", { path: "denied.txt", content: "should be denied\n" }), { stopReason: "toolUse" });

@@ -20,6 +20,7 @@ import { OmenGlyph } from "./GrailIcons.tsx";
 import { isDesktopWorkspaceContext } from "../file-references.ts";
 import { toolOutputReference } from "../tool-output-types.ts";
 import { ArchivedToolOutput } from "./ArchivedToolOutput.tsx";
+import { AgentRows, type AgentCall } from "./AgentRows.tsx";
 
 export interface TodoItem {
 	id: string;
@@ -841,8 +842,43 @@ function turnItems({
 	onZoomImage?: (image: ImagePreview) => void;
 }): TurnItem[] {
 	const items: TurnItem[] = [];
+	// Consecutive Agent calls of one message render as one block, like a parallel fan-out in Claude Code.
+	let agentBlock: { item: TurnItem; calls: AgentCall[] } | undefined;
+	const renderAgentBlock = (calls: AgentCall[]) => (
+		<AgentRows key={calls[0].id} calls={calls} onOpenTask={onOpenTask} onBackgroundTask={onBackgroundTask} onStopTask={onStopTask} />
+	);
 	message.content.forEach((block, part) => {
 		const key = `${message.timestamp}-${part}`;
+		if (block.type === "toolCall" && block.name === "Agent") {
+			const result = state.messages.find(
+				(item): item is Extract<Message, { role: "toolResult" }> => item.role === "toolResult" && item.toolCallId === block.id,
+			);
+			const task =
+				tasks.find((t) => t.parentToolCallId === block.id || t.turnCalls?.includes(block.id)) ??
+				externalTasks.find((t) => t.parentToolCallId === block.id);
+			const call: AgentCall = {
+				id: block.id,
+				args: block.arguments,
+				progress: state.tools[block.id],
+				result,
+				task,
+				taskProgress: task ? taskProgressMap[task.id] : undefined,
+				waitingForApproval: block.id === waitingToolId,
+				// A call from a finished message with no result, task or live progress was cut off.
+				orphaned: !isStreaming && !result && !task && !state.tools[block.id],
+			};
+			if (agentBlock) {
+				agentBlock.calls.push(call);
+				agentBlock.item.node = renderAgentBlock(agentBlock.calls);
+			} else {
+				agentBlock = { item: { key: block.id, block, node: renderAgentBlock([call]) }, calls: [call] };
+				items.push(agentBlock.item);
+			}
+			return;
+		}
+		// Text or thinking between two Agent calls still ends the block; empty text does not.
+		const invisible = (block.type === "text" && !block.text.trim()) || (block.type === "thinking" && !block.thinking);
+		if (!invisible) agentBlock = undefined;
 		if (block.type === "text") {
 			if (!block.text.trim()) return;
 			const activeStreamText = isStreaming && part === message.content.length - 1;

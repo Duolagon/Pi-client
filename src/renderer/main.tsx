@@ -87,6 +87,7 @@ import { WorkspacePanel } from "./WorkspacePanel.tsx";
 import { ControlsDialog, type ControlsTab } from "./ControlsDialog.tsx";
 import { CheckpointsDialog } from "./CheckpointsDialog.tsx";
 import { TasksDrawer } from "./TasksDrawer.tsx";
+import { backgroundWork } from "./agent-row.ts";
 import { SessionsDialog } from "./SessionsDialog.tsx";
 import { TerminalPanel } from "./TerminalPanel.tsx";
 import { MemoryStatusDialog } from "./MemoryStatusDialog.tsx";
@@ -1362,6 +1363,20 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				if (hasForeground) {
 					event.preventDefault();
 					void backgroundForegroundSubagents();
+					return;
+				}
+				// Shared-directory writers stay in the foreground so two agents never edit the same files.
+				const blockedWriters = Boolean(
+					activeId &&
+						Object.values(tasksMap).some(
+							(t) => t.parentConversationId === activeId && !t.runInBackground && isActiveTaskStatus(t.status),
+						),
+				);
+				const target = event.target as HTMLElement | null;
+				const typing = Boolean(target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)));
+				if (blockedWriters && !typing) {
+					event.preventDefault();
+					app.setNotice("前台子 Agent 在共享目录里改文件，不能转到后台，以免和主会话同时修改。只读或在独立 Worktree 里运行的子 Agent 才能转后台。");
 					return;
 				}
 			}
@@ -3399,6 +3414,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 							onFocusSubagentPanel={() => subagentPanelRef.current?.focusFirst() ?? false}
 							inputRef={composerInputRef}
 							gitBranch={gitSummary?.isGit && gitSummary.branch ? gitSummary.branch : undefined}
+							backgroundWork={(() => {
+								const work = backgroundWork(Object.values(tasksMap), Object.values(externalTasksMap), snapshot.active?.id);
+								return { ...work, shells: activeShellRecords.filter((shell) => shell.status === "running").length };
+							})()}
+							onOpenBackgroundWork={() => { setTaskInitialId(undefined); setTasksOpen(true); }}
 							dockStatus={(() => {
 								const doneTodos = latestTodos.filter((t) => t.status === "completed").length;
 								const activeTodo = latestTodos.find((t) => t.status === "in_progress");
