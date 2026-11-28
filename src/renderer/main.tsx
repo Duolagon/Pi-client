@@ -2832,6 +2832,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 											externalTasks={Object.values(externalTasksMap)}
 											taskProgressMap={taskProgressMap}
 											workflows={workflows}
+							ultracodeTurns={snapshot.active?.ultracodeTurns}
 											onOpenTask={openSubagent}
 											onStopWorkflow={(id) => void api.workflow.stop(id).catch(app.fail)}
 											onResumeWorkflow={(id) => void api.workflow.resume(id).catch(app.fail)}

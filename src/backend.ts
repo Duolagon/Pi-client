@@ -142,7 +142,7 @@ import { planRelativePath } from "./plan-path.ts";
 import { buildLaunchShellCommand, launchConfigUrl, readLaunchConfigurations, validateLocalPreviewUrl } from "./launch-config.ts";
 import { DEFAULT_LOCAL_PREVIEW_URL, formatPreviewInspectSummary, type PreviewInspectInput, type PreviewInspectResult, type PreviewInteraction } from "./preview-check-types.ts";
 import { detectProjectTrustResources } from "./project-trust.ts";
-import { codingTierOf, codingTierPromptSection, WORKFLOW_LIMITS, workflowBudgetFor } from "./coding-tier.ts";
+import { codingTierOf, codingTierPromptSection, mentionsUltracode, recordTierSpan, WORKFLOW_LIMITS, workflowBudgetFor } from "./coding-tier.ts";
 import { DEFAULT_OUTPUT_STYLE, discoverOutputStyles, findOutputStyle, outputStylePromptSection, validOutputStyleName } from "./output-styles.ts";
 import { EDITOR_CHOICES, type EditorChoice } from "./editor-open.ts";
 import { UsageStatsCollector } from "./usage-stats.ts";
@@ -185,7 +185,7 @@ import { buildContextReport, deleteProjectMemoryRule, writeProjectMemoryFile, ty
 import { buildSeatbeltProfile, probeSeatbeltSupport, resolveGitWorktreeWritablePaths } from "./sandbox.ts";
 import { readClaudeProjectPermissionsDetailed, writeClaudeProjectPermissions } from "./claude-settings-sync.ts";
 import { createForkedSessionSnapshot, findSessionFileById } from "./session-fork.ts";
-import type { BtwResult, ClaudePermissionsSyncResult, ConversationMetaPatch, DoctorCheck, DoctorReport, OutputStyleInfo, PlanFileState, PullRequestMergeMethod, SandboxStatus, UsageStatsReport } from "./shared.ts";
+import type { BtwResult, ClaudePermissionsSyncResult, CodingTier, ConversationMetaPatch, DoctorCheck, DoctorReport, OutputStyleInfo, PlanFileState, PullRequestMergeMethod, SandboxStatus, UsageStatsReport } from "./shared.ts";
 import { ExternalAgents } from "./external-agents.ts";
 import { readToolOutputPage, toolOutputDirectory } from "./tool-output-archive.ts";
 import { CodexAdapter } from "./external-codex.ts";
@@ -333,6 +333,8 @@ interface SessionRuntime {
 	outputStyleFile?: string;
 	/** Coding tier prompt read by the permission extension each turn; main conversations only. */
 	codingTierFile?: string;
+	/** Set while a standard conversation runs one turn on ultracode because its prompt said so. */
+	turnTier?: CodingTier;
 	metaWritten?: boolean;
 	controlWrites?: Promise<void>;
 	/**
@@ -1289,10 +1291,31 @@ export class DesktopService {
 	/** Writes the tier prompt section (empty for standard) read by the permission extension each turn. */
 	private async writeCodingTier(runtime: SessionRuntime): Promise<void> {
 		if (!runtime.codingTierFile) return;
-		const tier = this.store.conversations.find((item) => item.id === runtime.conversationId)?.codingTier;
+		const standing = this.store.conversations.find((item) => item.id === runtime.conversationId)?.codingTier;
+		const turnOnly = standing !== "ultracode" && runtime.turnTier === "ultracode";
 		const temporary = `${runtime.codingTierFile}.${randomBytes(4).toString("hex")}.tmp`;
-		await writeFile(temporary, codingTierPromptSection(tier), { mode: 0o600 });
+		await writeFile(temporary, codingTierPromptSection(turnOnly ? "ultracode" : standing, turnOnly), { mode: 0o600 });
 		await rename(temporary, runtime.codingTierFile);
+	}
+
+	/**
+	 * The tier a conversation's work runs on now: its root's standing tier, or ultracode while the
+	 * root's running turn asked for it. Workflow budgets of the root and its children follow this.
+	 */
+	private effectiveTier(conversationId: string): CodingTier {
+		const root = this.rootConversationId(conversationId, false);
+		const standing = this.store.conversations.find((item) => item.id === root)?.codingTier;
+		return codingTierOf(standing === "ultracode" || this.runtimes.get(root)?.turnTier === "ultracode" ? "ultracode" : standing);
+	}
+
+	/** Start or end a keyword turn: rewrite the prompt section and record the span for the transcript. */
+	private async setTurnTier(runtime: SessionRuntime, tier: CodingTier | undefined): Promise<void> {
+		if (runtime.turnTier === tier) return;
+		runtime.turnTier = tier;
+		const conversation = this.store.conversations.find((item) => item.id === runtime.conversationId);
+		if (conversation && conversation.codingTier !== "ultracode")
+			conversation.ultracodeTurns = recordTierSpan(conversation.ultracodeTurns, tier === "ultracode", Date.now());
+		await this.writeCodingTier(runtime).catch(() => {});
 	}
 
 	editorSetting(): EditorChoice | undefined {
@@ -1990,8 +2013,13 @@ export class DesktopService {
 			if (patch.codingTier !== undefined) {
 				// The tier steers the main conversation; delegated children never read it.
 				if (this.rootConversationId(id, false) !== id) throw new Error("请在主会话切换档位。");
-				conversation.codingTier = patch.codingTier === "ultracode" ? "ultracode" : undefined;
+				const on = patch.codingTier === "ultracode";
 				const runtime = this.runtimes.get(id);
+				// Turning it on during a keyword turn continues that turn's open span; turning it off closes
+				// whichever span is open, and ends a keyword turn too.
+				conversation.ultracodeTurns = recordTierSpan(conversation.ultracodeTurns, on, Date.now());
+				conversation.codingTier = on ? "ultracode" : undefined;
+				if (runtime && !on) runtime.turnTier = undefined;
 				if (runtime) await this.writeCodingTier(runtime);
 			}
 			await this.persist();
@@ -2572,7 +2600,7 @@ export class DesktopService {
 			conversationId: conv.id,
 			rootConversationId: this.rootConversationId(conv.id),
 			project: conv.project,
-			input: { ...input, budget: workflowBudgetFor(codingTierOf(this.conversation(this.rootConversationId(conv.id, false)).codingTier), input.budget) },
+			input: { ...input, budget: workflowBudgetFor(this.effectiveTier(conv.id), input.budget) },
 		});
 	}
 	async resumeWorkflow(id: string): Promise<WorkflowRecord> {
@@ -3039,7 +3067,7 @@ export class DesktopService {
 					title: typeof input.title === "string" ? input.title : undefined,
 					script: String(input.script),
 					...(context.toolCallId ? { toolCallId: context.toolCallId } : {}),
-					budget: workflowBudgetFor(codingTierOf(this.conversation(this.rootConversationId(conv.id, false)).codingTier), input.budget as WorkflowRunInput["budget"]),
+					budget: workflowBudgetFor(this.effectiveTier(conv.id), input.budget as WorkflowRunInput["budget"]),
 				},
 			});
 			if (input.run_in_background === true) {
@@ -3562,6 +3590,10 @@ export class DesktopService {
 					hook.additionalContext && !command.message.includes(hook.additionalContext)
 						? { ...command, message: `${command.message}\n\n[Hook Context]\n${hook.additionalContext}` }
 						: command;
+				// "ultracode" in a new turn's prompt runs that turn on ultracode; a steering message mid-run does not.
+				if (!alreadyRunning && runtime.codingTierFile && active.codingTier !== "ultracode" &&
+					!command.message.trimStart().startsWith("/") && mentionsUltracode(command.message))
+					await this.setTurnTier(runtime, "ultracode");
 				if (!alreadyRunning) await this.startCheckpoint(runtime, command.message, true);
 				// Definitions edited outside the app take effect on this run's agent listing.
 				if (!alreadyRunning) await this.writeAgentListing(runtime).catch(() => {});
@@ -7085,6 +7117,12 @@ export class DesktopService {
 
 	private async finishRuntime(runtime: SessionRuntime, aborted: boolean, error?: string): Promise<void> {
 		this.clearTaskProgressTimer(runtime);
+		// Every way a turn ends comes through here (settled, handled, failed, process error), so the
+		// keyword turn ends here too; otherwise the next plain turn would still run on ultracode.
+		if (runtime.turnTier) {
+			await this.setTurnTier(runtime, undefined).catch(() => {});
+			await this.persist().catch(() => {});
+		}
 		try {
 			let sealedCheckpoint: GitCheckpoint | undefined;
 			if (runtime.checkpointId) {
@@ -7234,6 +7272,7 @@ export class DesktopService {
 		runtime.shellEnv = undefined;
 		if (runtime.settling) await runtime.settling;
 		if (runtime.checkpointId) await this.finishRuntime(runtime, true);
+		if (runtime.turnTier) await this.setTurnTier(runtime, undefined).catch(() => {});
 		runtime.pendingUI.clear();
 		const stoppedTask = this.store.tasks.find((item) => item.conversationId === runtime.conversationId);
 		if (stoppedTask) delete stoppedTask.pendingApprovals;
@@ -8174,7 +8213,9 @@ export class DesktopService {
 		for (const item of this.store.tasks) {
 			if (item.parentConversationId) delegatedParents.set(item.conversationId, item.parentConversationId);
 		}
-		const annotateConversation = (conv: Conversation): Conversation => {
+		const annotateConversation = (stored: Conversation): Conversation => {
+			const turnTier = this.runtimes.get(stored.id)?.turnTier;
+			const conv = turnTier ? { ...stored, turnTier } : stored;
 			const parentId = delegatedParents.get(conv.id);
 			if (!parentId) return conv;
 			return { ...conv, kind: "subagent", parentConversationId: conv.parentConversationId ?? parentId };
@@ -8425,6 +8466,16 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 			...conversation,
 			permissionMode: permissionModes.has(conversation.permissionMode) ? conversation.permissionMode : undefined,
 			codingTier: conversation.codingTier === "ultracode" ? "ultracode" : undefined,
+			ultracodeTurns: Array.isArray(conversation.ultracodeTurns)
+				? conversation.ultracodeTurns
+					.filter((span) => span && typeof span.from === "number" && (span.to === undefined || typeof span.to === "number"))
+					.slice(-200)
+					// No turn survives a restart: a span left open by a crash ends where it began, unless
+					// the conversation is on the standing tier, whose span stays open.
+					.map((span, index, list) => span.to === undefined && (conversation.codingTier !== "ultracode" || index < list.length - 1)
+						? { from: span.from, to: span.from } : span)
+				: undefined,
+			turnTier: undefined,
 		})),
 		activeId: value.activeId,
 		settings: {

@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ultracodeKeywordRanges } from "../coding-tier.ts";
 import { ArrowUp, Brain, Eye, File, Folder, Paperclip, ShieldCheck, Square, X } from "lucide-react";
 import { Modal } from "../prototype/ui.tsx";
 import type { Command, FileEntry, FileReferenceAvailability, Message, CodingTier, PermissionMode, Project, SandboxStatus, Snapshot, ThinkingLevel } from "../shared.ts";
@@ -338,6 +339,15 @@ export function LiveComposer({
 		}
 	};
 	const unknownConfirmed = useRef("");
+	const mirrorRef = useRef<HTMLDivElement>(null);
+	// The keyword starts a new turn of a main conversation. It does nothing in a standing ultracode
+	// conversation, a subagent's conversation, a slash command, or a message sent while a turn runs.
+	const keywordRanges = snapshot.active?.codingTier === "ultracode" || snapshot.active?.kind === "subagent" || running ||
+		draft.trimStart().startsWith("/") ? [] : ultracodeKeywordRanges(draft);
+	// The mirror mounts when the keyword appears; start it at the textarea's scroll position.
+	useLayoutEffect(() => {
+		if (mirrorRef.current && textarea.current) mirrorRef.current.scrollTop = textarea.current.scrollTop;
+	});
 	const submit = async () => {
 		const trimmed = draft.trim();
 		if (trimmed.startsWith("/") && !attachments.length) {
@@ -708,6 +718,16 @@ export function LiveComposer({
 						{dockStatus?.active && <span className="cc-dock-beam" aria-hidden="true" />}
 						<div className="cc-dock-header-left">
 							<span className={`cc-dock-orb ${dockStatus?.active ? "live" : "idle"}`} aria-hidden="true" />
+							{(snapshot.active?.codingTier === "ultracode" || snapshot.active?.turnTier === "ultracode") && (
+								<span
+									className="cc-ultracode-badge"
+									title={snapshot.active?.codingTier === "ultracode"
+										? "本会话为 ultracode 档位：模型默认并行编排子 Agent 并逐条复核"
+										: "本轮因提示词含 ultracode 而按 ultracode 运行，结束后回到标准档位"}
+								>
+									{snapshot.active?.codingTier === "ultracode" ? "ultracode" : "本轮 ultracode"}
+								</span>
+							)}
 							{dockStatus?.stepBadge && <span className="cc-dock-step">{dockStatus.stepBadge}</span>}
 							<span className={`cc-dock-state-label ${dockStatus?.active ? "cc-shimmer-text" : ""}`}>
 								{dockStatus?.label ?? "就绪"}
@@ -807,7 +827,18 @@ export function LiveComposer({
 						</div>
 					)}
 				</SurfacePresence>
+				<div className="cc-input-wrap">
+				{/* Mirrors the draft behind the textarea so the ultracode keyword can glow in place. */}
+				{keywordRanges.length > 0 && (
+					<div className="cc-keyword-mirror" aria-hidden="true" ref={mirrorRef}>
+						{keywordSegments(draft, keywordRanges).map((segment, index) =>
+							segment.keyword ? <mark key={index} className="cc-ultracode-word">{segment.text}</mark> : <span key={index}>{segment.text}</span>)}
+						{"\u200b"}
+					</div>
+				)}
 				<textarea
+					className={keywordRanges.length ? "has-keyword" : undefined}
+					onScroll={(event) => { if (mirrorRef.current) mirrorRef.current.scrollTop = event.currentTarget.scrollTop; }}
 					ref={(el) => {
 						textarea.current = el;
 						if (inputRef) inputRef.current = el;
@@ -972,6 +1003,8 @@ export function LiveComposer({
 						}
 					}}
 				/>
+				{keywordRanges.length > 0 && <span className="cc-keyword-hint">本轮按 ultracode 运行</span>}
+				</div>
 				<div className="cc-dock-toolbar">
 					<div className="cc-dock-left">
 						<button className="cl-icon-btn" type="button" aria-label="添加附件" title="添加图片或代码附件" onClick={() => fileInput.current?.click()}>
@@ -1183,4 +1216,17 @@ export function LiveComposer({
 			)}
 		</div>
 	);
+}
+
+/** Split a draft into plain and keyword runs for the highlight mirror. */
+function keywordSegments(text: string, ranges: ReadonlyArray<[number, number]>): Array<{ text: string; keyword: boolean }> {
+	const segments: Array<{ text: string; keyword: boolean }> = [];
+	let cursor = 0;
+	for (const [from, to] of ranges) {
+		if (from > cursor) segments.push({ text: text.slice(cursor, from), keyword: false });
+		segments.push({ text: text.slice(from, to), keyword: true });
+		cursor = to;
+	}
+	if (cursor < text.length) segments.push({ text: text.slice(cursor), keyword: false });
+	return segments;
 }

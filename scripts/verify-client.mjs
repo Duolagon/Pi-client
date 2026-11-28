@@ -1978,6 +1978,33 @@ try {
 	await pinned.waitFor({ state: "detached" });
 	checks.push("TodoWrite calls show one-line deltas in the transcript and a pinned, expanded ☐/☒ checklist with the activeForm of the current item");
 
+	// ultracode keyword: it glows while typed, runs only that turn, and marks the prompt afterwards.
+	const composerBox = page.getByRole("textbox", { name: "输入任务", exact: true });
+	await composerBox.fill("请用 ultracode 检查标记");
+	await page.locator(".cc-keyword-mirror .cc-ultracode-word").filter({ hasText: "ultracode" }).waitFor();
+	await page.locator(".cc-keyword-hint").filter({ hasText: "本轮按 ultracode 运行" }).waitFor();
+	await composerBox.fill("/ultracode on");
+	assert.equal(await page.locator(".cc-keyword-mirror").count(), 0, "the slash command is not the keyword");
+	await submit("请用 ultracode 检查标记");
+	await idle();
+	const markedPrompt = page.locator(".cl-msg-user").filter({ hasText: "请用 ultracode 检查标记" }).last();
+	await markedPrompt.locator(".cc-prompt-tier").waitFor();
+	const afterKeyword = await snapshot();
+	assert.equal(afterKeyword.active.codingTier, undefined, "the keyword does not change the standing tier");
+	assert.equal(afterKeyword.active.turnTier, undefined, "the keyword turn has ended");
+	assert.equal(await page.locator(".cc-dock-header .cc-ultracode-badge").count(), 0, "no badge once the keyword turn ended");
+	const plainPrompt = page.locator(".cl-msg-user").filter({ hasText: "任务清单展示验证" }).last();
+	assert.equal(await plainPrompt.locator(".cc-prompt-tier").count(), 0, "earlier standard prompts carry no marker");
+	await selectValue(selectControl("编排档位"), "ultracode");
+	await page.locator(".cc-dock-header .cc-ultracode-badge").filter({ hasText: /^ultracode$/ }).waitFor();
+	await composerBox.fill("ultracode 再来一次");
+	assert.equal(await page.locator(".cc-keyword-mirror").count(), 0, "a standing ultracode conversation needs no keyword");
+	await composerBox.fill("");
+	if (process.env.PI_ULTRACODE_SCREENSHOT) await page.locator(".cl-conversation").screenshot({ path: process.env.PI_ULTRACODE_SCREENSHOT, scale: "css", animations: "disabled" });
+	await selectValue(selectControl("编排档位"), "standard");
+	await page.locator(".cc-dock-header .cc-ultracode-badge").waitFor({ state: "detached" });
+	checks.push("the ultracode keyword glows while typed, runs only its own turn, marks that prompt, and a standing ultracode conversation shows a dock badge");
+
 	await page.evaluate(
 		(proj) => window.pi.permissions.upsert({ id: "e2e-allow-wf", scope: "project", project: proj, action: "allow", tool: "WorkflowRun" }),
 		originalSession.project,

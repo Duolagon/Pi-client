@@ -22,6 +22,7 @@ import { toolOutputReference } from "../tool-output-types.ts";
 import { ArchivedToolOutput } from "./ArchivedToolOutput.tsx";
 import { AgentRows, type AgentCall } from "./AgentRows.tsx";
 import { WorkflowTree } from "./WorkflowTree.tsx";
+import { ranOnUltracode } from "../coding-tier.ts";
 import { TodoUpdateRow } from "./TodoChecklist.tsx";
 import { previousTodoLists, todoDelta, type TodoLike } from "./todo-list.ts";
 import type { WorkflowRecord } from "../workflow-types.ts";
@@ -427,6 +428,7 @@ export function TranscriptView({
 	externalTasks = [],
 	taskProgressMap = {},
 	workflows = [],
+	ultracodeTurns,
 	onOpenTask,
 	onBackgroundTask,
 	onStopTask,
@@ -457,6 +459,8 @@ export function TranscriptView({
 	taskProgressMap?: Record<string, TaskProgress>;
 	/** Workflow runs of this conversation; a run is rendered at its WorkflowRun tool call. */
 	workflows?: WorkflowRecord[];
+	/** When the conversation ran on ultracode, so the prompts sent then carry a marker. */
+	ultracodeTurns?: ReadonlyArray<{ from: number; to?: number }>;
 	onOpenTask?: (taskId: string) => void;
 	onBackgroundTask?: (taskId: string) => void;
 	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
@@ -642,6 +646,9 @@ export function TranscriptView({
 									&gt;
 								</span>
 								<div className="cc-prompt-body">
+									{message.role === "user" && typeof message.timestamp === "number" && ranOnUltracode(ultracodeTurns, message.timestamp) && (
+										<span className="cc-ultracode-badge cc-prompt-tier" title="这一轮按 ultracode 档位运行">ultracode</span>
+									)}
 									{typeof message.content === "string" ? (
 										<p>{message.content}</p>
 									) : (

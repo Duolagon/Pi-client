@@ -158,6 +158,8 @@ export default function uiProvider(pi) {
 			} else if (prompt.startsWith("工作流子步骤：")) {
 				response = results.length ? fauxAssistantMessage(`${prompt.slice(7)} 已完成。`)
 					: fauxAssistantMessage(fauxToolCall("read", { path: "src/greeting.mjs" }), { stopReason: "toolUse" });
+			} else if (prompt === "请用 ultracode 检查标记") {
+				response = fauxAssistantMessage("这一轮按 ultracode 运行。");
 			} else if (prompt === "任务清单展示验证") {
 				// Two TodoWrite calls: the transcript shows what each changed, the pinned list the latest state.
 				const list = (statuses) => ({ todos: [

@@ -236,6 +236,13 @@ export interface Conversation {
 	goal?: GoalState;
 	/** "ultracode" makes orchestrating subagents the default for substantive work; absent means standard. */
 	codingTier?: CodingTier;
+	/**
+	 * Turns that ran on ultracode, by the time their prompt was sent: the standing tier's spans
+	 * and single turns the keyword switched on. The transcript marks those prompts. Newest last.
+	 */
+	ultracodeTurns?: Array<{ from: number; to?: number }>;
+	/** The running turn uses ultracode because its prompt said so; cleared when it settles. */
+	turnTier?: CodingTier;
 	updatedAt: number;
 }
 export type CodingTier = "standard" | "ultracode";

@@ -159,3 +159,97 @@ test("crossing the cost cap cancels the workflow's running agents, and resume cl
 		await rm(dir, { recursive: true, force: true });
 	}
 });
+
+test("the ultracode keyword must stand alone among Latin text; Chinese may touch it", async () => {
+	const { ultracodeKeywordRanges, mentionsUltracode } = await import("../src/coding-tier.ts");
+	assert.deepEqual(ultracodeKeywordRanges("ultracode 审查这个仓库"), [[0, 9]]);
+	assert.deepEqual(ultracodeKeywordRanges("请用ultracode做"), [[2, 11]]);
+	assert.deepEqual(ultracodeKeywordRanges("Ultracode! and ULTRACODE"), [[0, 9], [15, 24]]);
+	assert.equal(mentionsUltracode("用 ultracode."), true, "a sentence may end with it");
+	for (const text of ["/ultracode on", "ultracode-ish", "myultracode", "src/ultracode/x.ts", "foo.ultracode", "see ultracode.ts", "@ultracode.md"])
+		assert.equal(mentionsUltracode(text), false, text);
+});
+
+test("tier spans open and close once and answer which prompts ran on ultracode", async () => {
+	const { recordTierSpan, ranOnUltracode } = await import("../src/coding-tier.ts");
+	let spans = recordTierSpan(undefined, true, 10);
+	assert.deepEqual(recordTierSpan(spans, true, 15), spans, "an open span is not reopened");
+	spans = recordTierSpan(spans, false, 20);
+	assert.deepEqual(spans, [{ from: 10, to: 20 }]);
+	assert.deepEqual(recordTierSpan(spans, false, 25), spans, "a closed span is not closed again");
+	assert.equal(ranOnUltracode(spans, 10), true);
+	assert.equal(ranOnUltracode(spans, 21), false);
+	assert.equal(ranOnUltracode(recordTierSpan(spans, true, 30), 99), true, "an open span covers everything after it");
+	assert.equal(recordTierSpan(Array.from({ length: 300 }, (_, i) => ({ from: i, to: i })), true, 400).length, 200);
+});
+
+test("a prompt that says ultracode runs that one turn on ultracode and then returns to standard", { timeout: 20000 }, async () => {
+	const fixture = await createCoreFixture();
+	const service = new DesktopService({
+		dataDir: fixture.dataDir, executable: process.execPath, entry: fixture.entry,
+		permissionExtension: resolve(here, "../src/permission-extension.ts"),
+		toolControlExtension: resolve(here, "../src/tool-control-extension.ts"),
+		workflowWorker: resolve(here, "../src/workflow-worker-entry.ts"),
+		env: { ...fixture.env, HOME: fixture.root },
+		initialProject: fixture.project,
+	});
+	try {
+		const snapshot = await service.initialize();
+		await service.setProjectTrust({ project: fixture.project, decision: "trusted" });
+		const id = snapshot.active!.id;
+		const tierFile = async () => {
+			const name = (await readdir(fixture.dataDir)).find((file) => file.startsWith(`tier-${id}-`) && file.endsWith(".md"));
+			return readFile(join(fixture.dataDir, name!), "utf8");
+		};
+		const events: { conversationId: string; event: { type: string } }[] = [];
+		service.subscribe((packet) => events.push(packet as never));
+		const settled = async (count: number) => {
+			for (let i = 0; i < 400 && events.filter((p) => p.conversationId === id && p.event.type === "agent_settled").length < count; i++)
+				await new Promise((done) => setTimeout(done, 25));
+		};
+		const before = Date.now();
+		await service.command({ type: "prompt", message: "用 ultracode 审查一下" }, id);
+		await settled(1);
+		await new Promise((done) => setTimeout(done, 200));
+		const after = await service.snapshot();
+		assert.equal(after.active?.codingTier, undefined, "the standing tier is unchanged");
+		assert.equal(after.active?.turnTier, undefined, "the keyword turn ends when it settles");
+		assert.match(await tierFile(), /standard tier/, "the prompt section returns to standard");
+		const spans = after.active?.ultracodeTurns ?? [];
+		assert.equal(spans.length, 1);
+		assert.ok(spans[0].from >= before && spans[0].to !== undefined, "the turn's span is recorded and closed");
+
+		// While a keyword turn runs, workflow budgets follow ultracode.
+		const runtime = (service as never as { runtimes: Map<string, { turnTier?: string }> }).runtimes.get(id)!;
+		runtime.turnTier = "ultracode";
+		const wf = await service.startWorkflow(id, { script: "return 1;", budget: { maxAgents: 90 } });
+		assert.equal(wf.budget.maxAgents, 90);
+		runtime.turnTier = undefined;
+		const capped = await service.startWorkflow(id, { script: "return 1;", budget: { maxAgents: 90 } });
+		assert.equal(capped.budget.maxAgents, WORKFLOW_LIMITS.standard.maxAgents);
+
+		// A plain prompt adds no span.
+		await service.command({ type: "prompt", message: "普通的一轮" }, id);
+		await settled(2);
+		assert.equal((await service.snapshot()).active?.ultracodeTurns?.length, 1);
+
+		// A slash command that mentions the word is not the keyword.
+		await service.command({ type: "prompt", message: "/no-such-command ultracode" }, id).catch(() => {});
+		await new Promise((done) => setTimeout(done, 300));
+		assert.equal(runtime.turnTier, undefined);
+
+		// Switching the standing tier off during a keyword turn closes its span and ends the turn.
+		const internal = service as never as { setTurnTier(runtime: unknown, tier?: string): Promise<void> };
+		await internal.setTurnTier(runtime, "ultracode");
+		assert.equal((await service.snapshot()).active?.ultracodeTurns?.at(-1)?.to, undefined);
+		await service.updateConversationMeta(id, { codingTier: "ultracode" });
+		await service.updateConversationMeta(id, { codingTier: "standard" });
+		const closed = (await service.snapshot()).active!;
+		assert.equal(runtime.turnTier, undefined);
+		assert.ok(closed.ultracodeTurns!.every((span) => span.to !== undefined), "no span is left open");
+		assert.match(await tierFile(), /standard tier/);
+	} finally {
+		await service.close();
+		await fixture.cleanup();
+	}
+});

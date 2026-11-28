@@ -656,3 +656,53 @@
 .cc-todo-update-line .cc-tree-arm { display: inline; }
 .cc-todo-update-text { min-width: 0; overflow-wrap: anywhere; }
 .cc-todo-update-body .cc-todo-list { border-top: 0; padding-left: 22px; }
+
+/* ultracode: the badge on the dock and on prompts that ran on it, and the keyword glow while typing. */
+.cc-ultracode-badge {
+	display: inline-flex;
+	align-items: center;
+	flex-shrink: 0;
+	padding: 0 7px;
+	border-radius: 999px;
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 1.6;
+	letter-spacing: 0.02em;
+	color: #fff;
+	background: linear-gradient(90deg, #c2410c, #db2777 50%, #7c3aed);
+	background-size: 200% 100%;
+	animation: cc-ultracode-flow 6s linear infinite;
+}
+.cc-prompt-tier { display: flex; width: fit-content; margin: 0 0 4px; }
+@keyframes cc-ultracode-flow { to { background-position: 200% 0; } }
+.cc-input-wrap { position: relative; }
+.cc-keyword-mirror {
+	position: absolute;
+	inset: 0;
+	overflow: hidden;
+	pointer-events: none;
+	padding: 0 2px;
+	font-size: var(--fs-lg);
+	line-height: var(--lh-body);
+	white-space: pre-wrap;
+	overflow-wrap: break-word;
+	color: transparent;
+}
+.cc-ultracode-word {
+	border-radius: 3px;
+	color: transparent;
+	background: linear-gradient(90deg, rgba(194, 65, 12, 0.22), rgba(219, 39, 119, 0.22), rgba(124, 58, 237, 0.22));
+	box-shadow: 0 0 0 1px rgba(219, 39, 119, 0.35);
+}
+.cl-composer-box textarea.has-keyword { position: relative; background: transparent; }
+/* Both boxes reserve the same scrollbar gutter, so lines wrap at the same points. */
+.cl-composer-box textarea.has-keyword,
+.cc-keyword-mirror { scrollbar-gutter: stable; }
+@media (prefers-reduced-motion: reduce) { .cc-ultracode-badge { animation: none; } }
+.cc-keyword-hint {
+	display: block;
+	text-align: right;
+	font-size: 11px;
+	color: #db2777;
+	pointer-events: none;
+}
