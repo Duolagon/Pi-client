@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
 	HostResourceGuard,
@@ -59,6 +61,7 @@ test("HostResourceGuard kills the heaviest group on RSS cap breach and critical 
 		sampleGroupRss: async () => rssMap,
 		sampleMemoryPressure: async () => pressure,
 		killGroup: (pgid) => killed.push({ pgid, reason: "killed" }),
+		registryDir: null,
 	});
 	const reasons: string[] = [];
 	guard.register(1000, { label: "small", onKill: (r) => reasons.push(`1000:${r}`) });
@@ -81,6 +84,34 @@ test("HostResourceGuard kills the heaviest group on RSS cap breach and critical 
 	assert.equal(await guard.checkNow(), true);
 	assert.deepEqual(killed.map((k) => k.pgid), [2000, 1000]);
 	guard.stop();
+});
+
+test("HostResourceGuard applies the cap to groups tracked by other guards", async () => {
+	const GB = 1024 * 1024 * 1024;
+	const registryDir = await mkdtemp(join(tmpdir(), "pi-guard-registry-"));
+	const rss = new Map<number, number>([[3000, 5 * GB], [4000, 4 * GB]]);
+	const killed: number[] = [];
+	const options = {
+		pollMs: 60_000, totalMemBytes: 16 * GB, maxRssBytes: 8 * GB, registryDir,
+		sampleGroupRss: async () => rss, sampleMemoryPressure: async () => 1,
+		killGroup: (pgid: number) => killed.push(pgid),
+	};
+	const main = new HostResourceGuard(options);
+	const agent = new HostResourceGuard(options);
+	try {
+		main.register(3000, { label: "main", onKill: () => {} });
+		agent.register(4000, { label: "agent", onKill: () => {} });
+		// Each group alone is under 8 GB, together they are 9 GB. Only the owner of the heaviest acts.
+		assert.equal(await agent.checkNow(), false);
+		assert.equal(await main.checkNow(), true);
+		assert.deepEqual(killed, [3000]);
+		rss.delete(3000);
+		assert.equal(await agent.checkNow(), false);
+	} finally {
+		main.stop();
+		agent.stop();
+		await rm(registryDir, { recursive: true, force: true });
+	}
 });
 
 test("createGuardedBashOperations runs commands at nice>=10 and cleans up on abort", async () => {

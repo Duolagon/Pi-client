@@ -5421,3 +5421,13 @@ body.cc-resizing iframe {
 	background: color-mix(in srgb, var(--cl-text) 85%, var(--cl-surface));
 	color: var(--cl-surface);
 }
+
+/* Inline caution under a settings field, e.g. a reviewer model equal to the coding model. */
+.field-label .field-warning {
+	display: block;
+	margin-top: 4px;
+	padding: 4px 8px;
+	border-radius: 6px;
+	color: var(--cl-amber);
+	background: var(--cl-amber-soft);
+}

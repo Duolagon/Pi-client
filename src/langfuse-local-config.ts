@@ -5,9 +5,17 @@ import { managedFile, writeManagedFile } from "./managed-path.ts";
 const directory = ["observability"];
 const filename = "langfuse.json";
 const maxConfigBytes = 32_768;
-const invalidConfig = "Langfuse 配置无效。请检查地址和两把密钥。";
+const invalidConfig = "Langfuse 配置无效。请检查地址（非本机地址须使用 https）和两把密钥。";
 
 export type LocalLangfuseConfig = { baseUrl: string; publicKey: string; secretKey: string; captureContent?: boolean };
+
+/** Keys and captured conversation text travel in the clear over http, so only loopback may use it. */
+export function langfuseTransportAllowed(url: URL): boolean {
+	if (url.protocol === "https:") return true;
+	if (url.protocol !== "http:") return false;
+	const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+	return host === "localhost" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host);
+}
 
 export function validateLocalLangfuseConfig(raw: unknown): LocalLangfuseConfig {
 	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(invalidConfig);
@@ -24,7 +32,7 @@ export function validateLocalLangfuseConfig(raw: unknown): LocalLangfuseConfig {
 	const urlValue = baseUrl.trim().replace("\\:", ":");
 	const publicValue = publicKey.trim(), secretValue = secretKey.trim();
 	const url = urlValue.length <= 2048 ? URL.parse(urlValue) : null;
-	if (!url || !["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash ||
+	if (!url || !langfuseTransportAllowed(url) || url.username || url.password || url.search || url.hash ||
 		!publicValue || !secretValue || publicValue.length > 4096 || secretValue.length > 4096 ||
 		/[\s\u0000-\u001f\u007f:]/u.test(publicValue) || /[\s\u0000-\u001f\u007f]/u.test(secretValue) ||
 		/[\n\r\t]/u.test(urlValue)) throw new Error(invalidConfig);

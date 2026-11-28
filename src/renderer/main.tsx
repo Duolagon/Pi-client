@@ -1223,7 +1223,10 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			setUsageOpen(true);
 		} else if (action === "grail") {
 			if (blocked) app.setNotice("请等待当前任务结束后再发起鉴定。");
-			else if (grail?.running) app.setNotice("当前鉴定尚未结束。");
+			else if (grail?.running) {
+				app.setNotice("重新开始鉴定。");
+				startGrail();
+			}
 			else if (grail?.readiness === "not-git" || grail?.readiness === "no-checkpoint") app.setNotice(grail.readinessReason ?? "当前需求暂时无法鉴定。");
 			else startGrail();
 		}
@@ -1259,7 +1262,11 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		} else if (action === "toggle-sidebar") {
 			setSidebar((open) => !open);
 		} else if (action === "toggle-terminal") {
-			if (snapshot?.active) setTerminalOpen((open) => !open);
+			// Opening on purpose hands typing to the terminal; InteractiveTerminal only refuses passive remounts.
+			if (snapshot?.active) {
+				if (!terminalOpen) (document.activeElement as HTMLElement | null)?.blur?.();
+				setTerminalOpen((open) => !open);
+			}
 		} else if (action === "toggle-changes") {
 			if (snapshot?.active) setPane(pane === "changes" ? null : "changes");
 		}
@@ -3587,6 +3594,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 					settings={snapshot.settings}
 					presets={snapshot.providerPresets}
 					models={snapshot.models}
+					sessionModel={snapshot.state?.model ? { provider: snapshot.state.model.provider, id: snapshot.state.model.id } : undefined}
 					busy={blocked}
 					connectionOnly={connecting}
 					close={() => { setSettings(false); setConnecting(false); }}

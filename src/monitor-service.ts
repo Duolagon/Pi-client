@@ -88,7 +88,8 @@ function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-// 198.18.0.0/15 is what proxy tools hand out as fake-ip DNS answers; allowed only for resolved names.
+// 198.18.0.0/15 is what proxy tools hand out as fake-ip DNS answers. The real destination is then
+// unknown, so it is allowed only for resolved names and only when the user turns on allowProxyFakeIp.
 function blockedIpv4(ip: string, allowLoopback: boolean, allowFakeIp = false): boolean {
 	const parts = ip.split(".").map(Number);
 	if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) return true;
@@ -131,7 +132,7 @@ export function isLoopbackHostname(hostname: string): boolean {
 }
 
 /** Validate a Monitor WebSocket URL: allows `wss://` (non-private DNS) or strictly loopback `ws://`. */
-export async function validateMonitorWebSocketUrl(raw: string): Promise<URL> {
+export async function validateMonitorWebSocketUrl(raw: string, allowFakeIp = false): Promise<URL> {
 	let parsed: URL;
 	try {
 		parsed = new URL(raw.trim());
@@ -167,7 +168,7 @@ export async function validateMonitorWebSocketUrl(raw: string): Promise<URL> {
 		return parsed;
 	}
 	const resolved = (await lookup(cleanHost, { all: true, verbatim: true }).catch(() => [])) as Array<{ address: string }>;
-	if (!resolved.length || resolved.some((item) => blockedAddress(item.address, false, true))) {
+	if (!resolved.length || resolved.some((item) => blockedAddress(item.address, false, allowFakeIp))) {
 		throw new Error("Monitor wss:// target resolved to a blocked private or metadata address");
 	}
 	return parsed;
@@ -218,8 +219,11 @@ export class MonitorService {
 	private coalesceMs: number;
 	private guard: HostResourceGuard;
 
-	constructor(options: { deliver: MonitorDeliverFn; coalesceMs?: number; guard?: HostResourceGuard }) {
+	private readonly allowFakeIp: () => boolean;
+
+	constructor(options: { deliver: MonitorDeliverFn; coalesceMs?: number; guard?: HostResourceGuard; allowFakeIp?: () => boolean }) {
 		this.deliver = options.deliver;
+		this.allowFakeIp = options.allowFakeIp ?? (() => false);
 		this.coalesceMs = options.coalesceMs ?? COALESCE_MS;
 		this.guard = options.guard ?? new HostResourceGuard();
 	}
@@ -293,7 +297,7 @@ export class MonitorService {
 		let target: string;
 		let wsUrl: URL | undefined;
 		if (hasUrl) {
-			wsUrl = await validateMonitorWebSocketUrl(params.input.url!);
+			wsUrl = await validateMonitorWebSocketUrl(params.input.url!, this.allowFakeIp());
 			target = wsUrl.toString();
 		} else {
 			target = params.input.command!.trim();

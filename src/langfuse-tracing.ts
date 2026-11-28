@@ -4,6 +4,7 @@ import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
 import { redactLogText } from "./desktop-log.ts";
+import { langfuseTransportAllowed } from "./langfuse-local-config.ts";
 import { visiblePromptText } from "./file-references.ts";
 import type { DesktopEvent } from "./shared.ts";
 
@@ -263,7 +264,7 @@ export function createPiTracing(env: NodeJS.ProcessEnv, onConfigurationError: ()
 	if (!publicKey && !secretKey) return;
 	const configuredUrl = env.LANGFUSE_BASE_URL?.trim() || env.LANGFUSE_HOST?.trim() || env.LANGFUSE_BASEURL?.trim();
 	const baseUrl = configuredUrl ? URL.parse(configuredUrl.replace("\\:", ":")) : null;
-	if (!publicKey || !secretKey || !baseUrl || !["http:", "https:"].includes(baseUrl.protocol) ||
+	if (!publicKey || !secretKey || !baseUrl || !langfuseTransportAllowed(baseUrl) ||
 		baseUrl.username || baseUrl.password || baseUrl.search || baseUrl.hash) {
 		onConfigurationError();
 		return;

@@ -51,30 +51,35 @@ function verdict(conversationId: string, run: ReviewRun): GrailVerdict {
 	};
 }
 
-test("concurrent Grail starts share one operation and cancel waits for cleanup", { timeout: 10000 }, async (t) => {
+test("a new Grail start cancels the running one and cancel waits for cleanup", { timeout: 10000 }, async (t) => {
 	const { service, internals, id, events } = await setup(t);
-	const entered = Promise.withResolvers<AbortSignal>();
+	const signals: AbortSignal[] = [];
 	const cleanup = Promise.withResolvers<void>();
-	let launched = 0;
+	const second = Promise.withResolvers<void>();
 	internals.runGrail = async (conversation, run) => {
-		launched++;
-		entered.resolve(run.controller.signal);
-		await cleanup.promise;
+		signals.push(run.controller.signal);
+		if (signals.length === 1) {
+			await cleanup.promise;
+			run.controller.signal.throwIfAborted();
+		} else second.resolve();
 		return verdict(conversation.id, run);
 	};
 	try {
-		const [first, second] = await Promise.all([service.startGrail(id), service.startGrail(id)]);
-		assert.deepEqual(first, second);
-		const signal = await entered.promise;
-		assert.equal(launched, 1);
-		const cancelled = service.cancelGrail(id);
-		assert.equal(signal.aborted, true);
-		assert.equal(events.length, 0);
-		await assert.rejects(service.startGrail(id), /仍在清理/);
+		const first = await service.startGrail(id);
+		while (!signals.length) await new Promise((resolve) => setImmediate(resolve));
+		// The replacement waits until the first run has finished cleaning up.
+		const restart = service.startGrail(id);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(signals[0].aborted, true);
+		assert.equal(signals.length, 1);
 		cleanup.resolve();
-		assert.equal(await cancelled, true);
-		assert.deepEqual(events, [{ type: "grail_failed", conversationId: id, id: first.id, error: "鉴定已取消。", cancelled: true }]);
-		assert.deepEqual((await service.grailState(id)).verdicts, []);
+		const next = await restart;
+		assert.notEqual(next.id, first.id);
+		await second.promise;
+		while (!events.some((event) => event.type === "grail_verdict")) await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(events[0], { type: "grail_failed", conversationId: id, id: first.id, error: "鉴定已取消。", cancelled: true });
+		assert.equal(await service.cancelGrail(id), false);
+		assert.deepEqual((await service.grailState(id)).verdicts.map((item) => item.id), [next.id]);
 	} finally {
 		cleanup.resolve();
 	}

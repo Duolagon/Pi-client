@@ -293,6 +293,21 @@ test("#15 LSP: tool validation, permission policy, and diagnostic formatting", a
 		{ toolName: "LSP", input: { operation: "diagnostics", filePath: "a.ts" } },
 	);
 	assert.equal(decision.action, "allow");
+	const denied = await evaluatePermission(
+		{ version: 1, mode: "read", rules: [{ id: "no-secrets", scope: "project", tool: "read", action: "deny", path: "secrets/**" }], disabledTools: [], project: "/tmp" },
+		{ toolName: "LSP", input: { operation: "inspect", filePath: "secrets/config.ts" } },
+	);
+	assert.equal(denied.action, "deny");
+	const outside = await evaluatePermission(
+		{ version: 1, mode: "ask", rules: [], disabledTools: [], project: "/tmp/pi-lsp-project" },
+		{ toolName: "LSP", input: { operation: "inspect", filePath: "/etc/hosts" } },
+	);
+	assert.notEqual(outside.action, "allow");
+	const atPrefixed = await evaluatePermission(
+		{ version: 1, mode: "read", rules: [{ id: "no-at", scope: "project", tool: "read", action: "deny", path: "@private/**" }], disabledTools: [], project: "/tmp" },
+		{ toolName: "LSP", input: { operation: "documentSymbol", filePath: "@private/key.ts" } },
+	);
+	assert.equal(atPrefixed.action, "deny");
 });
 
 test("#23 Skill context: fork frontmatter parsing, save round-trip, and prompt formatting", async () => {

@@ -45,7 +45,8 @@ Expressions:
   {"call":{"module":"relative/path.ts","exportName":"actualExport","args":[expression,...]}}
   {"pick":{"from":expression,"path":["actualField",0]}}
 Only real JS or TypeScript function exports in the snapshot can be invoked. No shell, scripts of your own, network, or writable files.
-For equality checks, prefer two genuinely different inputs or compare a real result to the original input after a round trip.
+When the quoted text writes out an expected result, make one side that exact {"literal": ...} value and the other the call on the input the text names. That is the shape a stated outcome binds to; deriving the same fact another way (comparing two calls, picking a length, omitting a substring) leaves the claim unverified.
+For equality checks with no stated outcome, prefer two genuinely different inputs or compare a real result to the original input after a round trip.
 Quote the whole assertion and retain the actual function or module reference if it appears in the original text. A supported check binds the asserted outcome to its exact observed output or the round-trip or isolation property to the corresponding calls.
 For contains/omits, use a string substring or an array item. A missing export, thrown error, or nondeterministic output is unverified.
 For a direct source inspection use {"kind":"source","file":"relative/path","exact":"a short literal excerpt"}.
@@ -151,7 +152,7 @@ function inputMatches(observed: Expression, expected: Json): boolean {
 }
 
 function exactLiteralExpectation(actual: Json, words: string): boolean {
-	const asserted = /(?:返回(?:值)?|固定(?:为|是)|输出(?:值)?|应当?为|等于|结果(?:为|是)|returns?(?:\s+exactly)?|equals?|outputs?(?:\s+exactly)?)\s*[：:=]?\s*([\x60"'“‘][^\r\n]{1,100}?[\x60"'”’]|-?\d+(?:\.\d+)?(?![a-zA-Z\d.%])|\b(?:true|false)\b)/gi;
+	const asserted = /(?:返回(?:值)?|固定(?:为|是)|输出(?:值)?|应当?为|等于|结果(?:为|是)|returns?(?:\s+exactly)?|equals?|outputs?(?:\s+exactly)?)\s*[：:=]?\s*([\x60"'“‘]?\[[^[\]\r\n]{0,160}\][\x60"'”’]?|[\x60"'“‘]?\{[^{}\r\n]{0,160}\}[\x60"'”’]?|[\x60"'“‘][^\r\n]{1,100}?[\x60"'”’]|-?\d+(?:\.\d+)?(?![a-zA-Z\d.%])|\b(?:true|false)\b)/gi;
 	const candidates: Json[] = [];
 	for (const match of words.matchAll(asserted)) {
 		const cursor = match.index ?? 0;
@@ -168,10 +169,30 @@ function exactLiteralExpectation(actual: Json, words: string): boolean {
 		} else if (typeof actual === "string") {
 			const value = /^[`"'“‘]([^`"'”’]*)[`"'”’]/u.exec(statement)?.[1];
 			if (value !== undefined) candidates.push(value);
+		} else if (actual !== null && typeof actual === "object") {
+			// "返回 [1, 2]" and "返回 {ok: true}" name a whole structure; only a literal one counts.
+			const written = /^[`"'“‘]?([[{][\s\S]*[\]}])[`"'”’]?$/u.exec(statement.trim())?.[1];
+			if (written === undefined) continue;
+			try {
+				// Unquoted object keys are common in prose; JSON5 is not available here.
+				candidates.push(JSON.parse(written.replace(/([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)/g, '$1"$2"$3')) as Json);
+			} catch { continue; }
 		}
 	}
-	return candidates.length > 0 && candidates.every((item) => item === actual);
+	return candidates.length > 0 && candidates.every((item) => isDeepStrictEqual(item, actual));
 }
+
+/**
+ * Inputs a sentence can name in words rather than write out. Each pattern must name one exact value,
+ * so the probe's own argument decides the match; a vague description ("带空白的串") names none.
+ */
+const describedInput: { pattern: RegExp; matches: (value: Json | undefined) => boolean }[] = [
+	{ pattern: /空字符串|空串|空(?:的)?输入|empty (?:string|input)/i, matches: (value) => value === "" },
+	{ pattern: /纯空白|只有空白|全是空格|whitespace[\s-]*only|blank (?:string|input)/i, matches: (value) => typeof value === "string" && value !== "" && value.trim() === "" },
+	{ pattern: /(?:传入|给|遇到|对于)?\s*(?:null|空值)/i, matches: (value) => value === null },
+	{ pattern: /零|\b(?:zero)\b/i, matches: (value) => value === 0 },
+	{ pattern: /负数|negative (?:number|value)/i, matches: (value) => typeof value === "number" && value < 0 },
+];
 
 function literalInputScope(actual: Expression, quote: string): boolean {
 	const call = operation(actual);
@@ -185,6 +206,11 @@ function literalInputScope(actual: Expression, quote: string): boolean {
 	}
 	if (/(?:空(?:列表|数组)|empty (?:list|array))/i.test(quote))
 		return args.length === 1 && Array.isArray(args[0]) && args[0].length === 0;
+	// An honest reply usually names its input in words ("空字符串直接返回 []") instead of writing the
+	// call. One argument that is exactly the input the sentence names is as bound as a literal example.
+	// Naming an input also narrows the sentence to it, so a probe on anything else is not what it claims.
+	const described = args.length === 1 ? describedInput.filter(({ pattern }) => pattern.test(quote)) : [];
+	if (described.length) return described.some(({ matches }) => matches(args[0]));
 	if (/(?:开始(?:时间)?\s*(?:等于|[=＝]+)\s*结束(?:时间)?|\bstart\s*(?:equals|={2,3})\s*end\b)/i.test(quote))
 		return typeof args[0] === "number" && args[0] === args[1];
 	if (/(?:时返回|时输出|(?:遇到|对于|当).+?返回|不足|少于|多于|大于|小于|\b(?:when|if|unless)\b)/i.test(quote))

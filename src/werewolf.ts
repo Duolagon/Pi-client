@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { executeWerewolfProbe, parseWerewolfProbe, werewolfProbeBinding, werewolfProbeInstructions } from "./werewolf-probes.ts";
 import { redactLogText } from "./desktop-log.ts";
+import { judgePassClaim, passClaimKind, passClaimSentences, type HostEvidence } from "./host-evidence.ts";
 import type { WerewolfClaim, WerewolfEvidence, WerewolfReview, WerewolfState } from "./werewolf-types.ts";
 
 export interface WerewolfReceipt {
@@ -16,6 +17,8 @@ export interface WerewolfInput {
 	requirements: string[];
 	reply: string;
 	receipts: WerewolfReceipt[];
+	/** What the host recorded this turn; decides "tests pass" claims without the planner. Not sent to the model. */
+	evidence?: HostEvidence;
 }
 
 type Planner = (input: { prompt: string; snapshot: string; signal: AbortSignal }) => Promise<string>;
@@ -37,7 +40,7 @@ export function buildWerewolfPrompt(input: WerewolfInput): string {
 		"只有回执的命令确实逐字写在 quote 内，且陈述的是该命令这一次的退出结果，才可用 receipt: {id, expectedExitCode}。省略 probe 和 receipt 会留作待核验。请勿给最终判定。",
 		werewolfProbeInstructions,
 		"以下 JSON 是待验收材料。",
-		JSON.stringify(input),
+		JSON.stringify({ requirements: input.requirements, reply: input.reply, receipts: input.receipts }),
 	].join("\n");
 }
 
@@ -84,7 +87,8 @@ function receiptEvidence(input: WerewolfInput, quote: string, receipt: unknown) 
 
 export async function evaluateWerewolfPlan(input: WerewolfInput, output: string, snapshot: string, signal: AbortSignal): Promise<WerewolfClaim[]> {
 	const claims: WerewolfClaim[] = [];
-	for (const proposal of modelClaims(output)) {
+	const proposals = modelClaims(output);
+	for (const proposal of proposals) {
 		signal.throwIfAborted();
 		if (!object(proposal)) continue;
 		const quote = proposal.quote;
@@ -117,13 +121,52 @@ export async function evaluateWerewolfPlan(input: WerewolfInput, output: string,
 			evidence,
 		});
 	}
-	return claims;
+	return hostPassClaims(input, claims);
+}
+
+/**
+ * "测试全部通过" and similar sentences are decided from the host's records, whether or not the planner
+ * listed them. A planner result that is already decided from a receipt or probe is kept.
+ */
+export function hostPassClaims(input: WerewolfInput, claims: WerewolfClaim[]): WerewolfClaim[] {
+	if (!input.evidence) return claims;
+	const result = [...claims];
+	for (const { quote, kind, partial } of passClaimSentences(input.reply)) {
+		if (!assertedInReply(input.reply, quote)) continue;
+		const judged = judgePassClaim(kind, input.evidence, quote, partial === true);
+		const evidence: WerewolfEvidence = {
+			summary: judged.summary, expected: judged.expected, actual: judged.actual,
+			...(judged.source ? { source: judged.source } : {}), ...(judged.reproduction ? { reproduction: judged.reproduction } : {}),
+		};
+		// The planner often quotes just the clause ("测试全部通过") of a longer sentence. Merging the
+		// other way needs its quote to assert the same check, so an unrelated short quote stays apart.
+		const index = result.findIndex((claim) => claim.quote &&
+			(claim.quote.includes(quote) || (quote.includes(claim.quote) && passClaimKind(claim.quote) === kind)));
+		if (index >= 0) {
+			if (result[index].status === "unverified") result[index] = { ...result[index], status: judged.status, evidence };
+			continue;
+		}
+		if (result.length >= maximumClaims + 4) break;
+		result.push({ id: String(result.length + 1), quote, description: "宿主核对：回复声称检查已通过。", status: judged.status, evidence });
+	}
+	return result;
 }
 
 export function werewolfVerdict(claims: WerewolfClaim[]): WerewolfReview["status"] {
 	if (claims.some((claim) => claim.status === "contradicted")) return "contradicted";
 	if (claims.length && claims.every((claim) => claim.status === "verified")) return "verified";
 	return "unverified";
+}
+
+/** Keep the newest reviews; "not reviewed" notes are dropped before any real review. */
+function capReviews(reviews: WerewolfReview[]): WerewolfReview[] {
+	const skipped = (item: WerewolfReview) => !item.claims.length && item.status === "unverified" && item.error?.startsWith("未核验：") === true;
+	const kept = [...reviews];
+	while (kept.length > maximumReviews) {
+		const index = kept.findIndex(skipped);
+		kept.splice(index >= 0 && index < kept.length - 1 ? index : 0, 1);
+	}
+	return kept;
 }
 
 export class WerewolfService {
@@ -205,6 +248,23 @@ export class WerewolfService {
 		});
 	}
 
+	/**
+	 * Record why a turn that changed code was not reviewed, so the reply shows "待核验" with a reason
+	 * instead of silently having no badge.
+	 */
+	recordSkipped(conversationId: string, reply: { entryId: string; timestamp: number; checkpointId: string }, reason: string): Promise<void> {
+		if (this.closed) return Promise.resolve();
+		const review: WerewolfReview = {
+			id: randomUUID(), replyEntryId: reply.entryId, replyTimestamp: reply.timestamp, checkpointId: reply.checkpointId,
+			createdAt: Date.now(), status: "unverified", claims: [], error: `未核验：${reason}`,
+		};
+		return this.update(conversationId, (state) => {
+			if (!state.enabled || state.reviews.some((item) => item.replyEntryId === review.replyEntryId)) return false;
+			state.reviews = capReviews([...state.reviews, review]);
+			return true;
+		}).then(() => {});
+	}
+
 	start(
 		conversationId: string,
 		reply: { entryId: string; timestamp: number; checkpointId: string },
@@ -234,7 +294,7 @@ export class WerewolfService {
 		let started = false;
 		await this.update(conversationId, (state) => {
 			if (!state.enabled || state.reviews.some((item) => item.replyEntryId === review.replyEntryId)) return false;
-			state.reviews = [...state.reviews, review].slice(-maximumReviews);
+			state.reviews = capReviews([...state.reviews, review]);
 			started = true;
 			return true;
 		});

@@ -20,7 +20,11 @@ import type {
 
 export { GRAIL_CRITERIA };
 const criteria = Object.keys(GRAIL_CRITERIA) as GrailCriterion[];
-const requiredCriteria = ["requirement", "broken", "removable", "missing", "flawless"] as const;
+// Failing one of these means the wish is not done. "无可删" and "无可挑" are matters of taste: a
+// reviewer can always name a smaller spelling, so they only separate 圣杯 from 愿望达成.
+const requiredCriteria = ["requirement", "broken", "missing"] as const;
+// Every criterion still has to be judged with a citation; a missing conclusion is unjudgeable.
+const citedCriteria = [...requiredCriteria, "removable", "flawless"] as const;
 const objectiveCheckNames = ["test", "check", "lint"] as const;
 
 export interface DiffLine {
@@ -100,8 +104,21 @@ export function annotateDiff(files: { path: string; diff: string }[], maxChars =
 
 const sourceFile = /\.(?:[cm]?[jt]sx?|vue|svelte)$/i;
 const testFile = /(?:^|\/)(?:test|tests|__tests__|spec)\/|\.(?:test|spec)\.[cm]?[jt]sx?$/i;
+/** Whether a repository path is a test file by the conventions the distortion scan uses. */
+export function isTestFile(path: string): boolean {
+	return testFile.test(path);
+}
 const assertion = /\b(?:assert(?:\.\w+)?|expect)\s*\(|\.should\b|\bt\.(?:is|not|deepEqual|equal|true|false|throws|like|snapshot)\s*\(/;
 const quotedLiteral = /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/g;
+/** Same check, same expectation: ignore spacing, strict/loose twins and a trailing message argument. */
+function assertionKey(text: string): string {
+	return text
+		.replace(/\b(deep)?[Ss]trict(Equal)\b/g, (_match, deep: string | undefined) => (deep ? "deepEqual" : "equal"))
+		.replace(/\bstrictEqual\b/g, "equal")
+		.replace(/,\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`[^`$]*`)\s*\)\s*;?\s*$/, ")")
+		.replace(/\s+/g, "")
+		.replace(/;$/, "");
+}
 const addedRules: { rule: string; pattern: RegExp; tests?: boolean }[] = [
 	{ rule: "新增 .skip / .only", pattern: /\b(?:describe|it|test|context|suite)\.(?:skip|only)\b|\b(?:xit|xdescribe|fit|fdescribe)\s*\(|\{\s*(?:skip|only)\s*:\s*true\b/ },
 	{ rule: "新增 @ts-ignore / @ts-expect-error", pattern: /@ts-(?:ignore|expect-error|nocheck)\b/ },
@@ -113,10 +130,11 @@ const addedRules: { rule: string; pattern: RegExp; tests?: boolean }[] = [
 ];
 
 /** Regex scan of changed lines for cheating traces; every hit carries file and line. */
-export function scanDistortions(lines: DiffLine[]): GrailDistortionHit[] {
+export function scanDistortions(lines: DiffLine[], deleted: ReadonlySet<string> = new Set()): GrailDistortionHit[] {
 	const hits: GrailDistortionHit[] = [];
 	for (const item of lines) {
-		if (!sourceFile.test(item.file)) continue;
+		// A deleted file is reported once by the integrity scan and left to the reviewer.
+		if (!sourceFile.test(item.file) || deleted.has(item.file)) continue;
 		const hit = (rule: string, review?: true) => hits.push({ file: item.file, line: item.line, side: item.side, rule, text: item.text.trim().slice(0, 200), ...(review ? { review } : {}) });
 		if (item.side === "+") {
 			// Inline examples are often data, for instance a help string that shows console.log().
@@ -124,8 +142,9 @@ export function scanDistortions(lines: DiffLine[]): GrailDistortionHit[] {
 			for (const { rule, pattern } of addedRules) if (pattern.test(code)) hit(rule);
 		} else if (testFile.test(item.file) && assertion.test(item.text)) {
 			const replacements = lines.filter((other) => other.file === item.file && other.side === "+" && assertion.test(other.text));
-			if (replacements.some((other) => other.text.trim() === item.text.trim())) continue;
-			if (replacements.some((other) => other.hunk === item.hunk)) hit("测试期望值被修改", true);
+			if (replacements.some((other) => assertionKey(other.text) === assertionKey(item.text))) continue;
+			// Plan 5.2 vetoes a changed expectation just like a deleted assertion.
+			if (replacements.some((other) => other.hunk === item.hunk)) hit("测试期望值被修改");
 			else hit("删除断言");
 		}
 	}
@@ -133,7 +152,7 @@ export function scanDistortions(lines: DiffLine[]): GrailDistortionHit[] {
 }
 
 /** Runner totals include skipped tests. Only a passing test proves that a check actually ran. */
-function parseTestSummary(output: string): { total: number; passed?: number; failed?: number; skipped?: number } | undefined {
+export function parseTestSummary(output: string): { total: number; passed?: number; failed?: number; skipped?: number } | undefined {
 	const text = output.replace(/\x1b\[[0-9;]*m/g, "");
 	const node = [...text.matchAll(/^\s*(?:#|ℹ)\s*tests\s+(\d+)\s*$/gm)];
 	if (node.length) {
@@ -155,6 +174,15 @@ function parseTestSummary(output: string): { total: number; passed?: number; fai
 		failed: Number(/\b(\d+)\s+failed\b/.exec(summary[1])?.[1] ?? 0),
 		skipped: Number(/\b(\d+)\s+skipped\b/.exec(summary[1])?.[1] ?? 0),
 	};
+	// pytest closes with a banner such as "===== 3 passed, 1 failed, 2 skipped in 0.12s =====".
+	const pytest = /^=+ (.*\b(?:passed|failed|error|errors|skipped|no tests ran)\b.* in [\d.]+s(?:\s*\([^)]*\))?) =+\s*$/m.exec(text)?.[1];
+	if (pytest) {
+		const count = (word: string) => Number(new RegExp(`\\b(\\d+) ${word}\\b`).exec(pytest)?.[1] ?? 0);
+		const passed = count("passed");
+		const failed = count("failed") + count("errors?");
+		const skipped = count("skipped");
+		return { total: passed + failed + skipped, passed, failed, skipped };
+	}
 	const passing = /^\s*(\d+)\s+passing\b/m.exec(text);
 	if (passing) {
 		const failing = /^\s*(\d+)\s+failing\b/m.exec(text);
@@ -380,9 +408,11 @@ export async function runObjectiveChecks(options: {
 		check.status = "pass";
 		delete check.reason;
 	}
+	// A project without check or lint can still be judged on its tests; gradeVerdict withholds the grail,
+	// since "无可挑" needs all three to pass.
 	const missingChecks = (["check", "lint"] as const).filter((name) => !declared.has(name));
 	if (missingChecks.length)
-		return finish("unavailable", `package.json 缺少可执行脚本：${missingChecks.map((name) => labels[name]).join("、")}。`);
+		return finish("pass", `package.json 没有${missingChecks.map((name) => labels[name]).join("、")}脚本，这几项未检查。`);
 	return finish("pass");
 }
 
@@ -446,7 +476,11 @@ export function parseBlindSolution(output: string): GrailBlindResult {
 }
 
 /** Step 5.4 prompt: requirement, blind solution and the numbered diff; every conclusion must cite. */
-export function buildComparisonPrompt(requirement: string[], solution: GrailBlindSolution, diff: string, objective?: GrailObjectiveResult): string {
+export function buildComparisonPrompt(
+	requirement: string[], solution: GrailBlindSolution, diff: string, objective?: GrailObjectiveResult, reviewHits: GrailDistortionHit[] = [],
+): string {
+	const unchecked = (objective?.checks ?? []).filter((check) => check.name !== "test" && check.status === "skipped")
+		.map((check) => check.name === "check" ? "类型检查" : "lint");
 	const objectiveEvidence = objective?.runs.map(({ command, exitCode, passedCount, failedCount, skippedCount }) => ({
 		command, exitCode, passedCount, failedCount, skippedCount,
 	}));
@@ -455,9 +489,15 @@ export function buildComparisonPrompt(requirement: string[], solution: GrailBlin
 		"标准（criterion: 含义）：",
 		...criteria.map((key) => `- ${key}: ${GRAIL_CRITERIA[key]}`),
 		"要点：下刀点只有比盲解更深或一样深、而且代码相同或更少，才算接近\"道\"。最关键的一问：能不能用更少的代码做到同样好或更好？能，lessCode 就判 false，并在 note 里写出更好的写法。",
+		// missing decides the grade on its own, so it must mean a real functional gap, not the reviewer's
+		// wish list. Test coverage and undefined behaviour belong to hardSpots and flawless.
+		"missing 只判需求范围内的功能缺口：用户明确要求的行为有没有漏掉。需求没有要求补测试时，不要因为\"没有新增测试\"或\"没有锁住边界用例\"判 missing 失败；测试覆盖算在 hardSpots，需求未定义的行为算在 flawless。",
 		"每条结论都必须引用 diff 中具体的改动行：file 为文件路径，side 为 \"+\"（新增行，用新行号）或 \"-\"（删除行，用旧行号），line 为 diff 中标注的行号。没有引用的结论会被丢弃。",
 		"只输出一个 JSON 对象，不要输出其他内容：",
 		'{"findings":[{"criterion":"requirement","pass":true,"note":"理由","citations":[{"file":"src/a.ts","side":"+","line":12}]}]}',
+		// Half the criteria are phrased as negatives ("无可删", "没有弄坏已有行为"), which invites a
+		// reviewer to write the boolean backwards while the note argues the opposite.
+		"pass 的方向：pass=true 表示这条标准成立（例如 broken 的 true 意思是\"没有弄坏已有行为\"，removable 的 true 意思是\"没有可删的代码\"）。pass=false 只用于这条标准不成立。写完每条请对一遍：note 的结论和 pass 必须同向。",
 		"",
 		"用户要求：",
 		requirementBlock(requirement),
@@ -468,6 +508,14 @@ export function buildComparisonPrompt(requirement: string[], solution: GrailBlin
 			"",
 			"客观检查执行记录（仅证明这些命令已运行，仍需用 diff 判断覆盖范围）：",
 			JSON.stringify(objectiveEvidence),
+		] : []),
+		...(reviewHits.length ? [
+			"",
+			"宿主发现以下改动会影响\"检查通过\"的含义（检查脚本、测试配置、快照或测试文件）。判断 broken 和 flawless 时必须逐条考虑，属于需求要求的合理改动才算通过：",
+			...reviewHits.slice(0, 40).map((hit) => `- ${hit.file}:${hit.side}${hit.line} ${hit.rule}：${hit.text}`),
+		] : []),
+		...(unchecked.length ? [
+			`项目没有${unchecked.join("、")}脚本，这几项没有运行。系统已另行把结论上限定为"愿望达成"，请不要因为缺少这几项而判 flawless 失败，只按 diff 本身判断。`,
 		] : []),
 		"",
 		"实际 diff（行首 + / - 后的数字是行号）：",
@@ -525,7 +573,7 @@ export function gradeVerdict(steps: GrailStepResults): { grade: GrailGrade; reas
 	if (verdicts.get("broken")?.pass === false) return { grade: "twisted", reasons: failed("broken") };
 	const failedRequired = requiredCriteria.filter((key) => verdicts.get(key)?.pass === false);
 	if (failedRequired.length) return { grade: "unfulfilled", reasons: failedRequired.flatMap(failed) };
-	const missingRequired = requiredCriteria.filter((key) => !verdicts.has(key));
+	const missingRequired = citedCriteria.filter((key) => !verdicts.has(key));
 	if (missingRequired.length)
 		return { grade: "unjudgeable", reasons: missingRequired.map((key) => `${GRAIL_CRITERIA[key]}：评审没有给出带代码引用的底线结论。`) };
 	const reasons = criteria.flatMap((key) => {
@@ -533,6 +581,9 @@ export function gradeVerdict(steps: GrailStepResults): { grade: GrailGrade; reas
 		if (!verdict) return [`${GRAIL_CRITERIA[key]}：评审没有给出带代码引用的结论。`];
 		return verdict.pass ? [] : failed(key);
 	});
+	// "无可挑" needs test, type check and lint to pass; a check the project lacks was never proven.
+	const unchecked = (objective.checks ?? []).filter((check) => check.name !== "test" && check.status === "skipped");
+	if (unchecked.length) reasons.push(`无可挑：项目没有${unchecked.map((check) => check.name === "check" ? "类型检查" : "lint").join("、")}脚本，无法证明全部通过。`);
 	if (!reasons.length) return { grade: "grail", reasons: ["底线全过，对照达到\"道\"，评审指不出更好的刀法。"] };
 	return { grade: "granted", reasons };
 }

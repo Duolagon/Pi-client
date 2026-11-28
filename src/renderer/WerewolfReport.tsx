@@ -98,10 +98,10 @@ export function WerewolfCalloutStrip({
 	onOpenReport: () => void;
 	onConfront?: (prompt: string) => void;
 }) {
+	const confrontPrompt = useMemo(() => buildWerewolfConfrontPrompt(review), [review]);
 	if (review.status !== "contradicted") return null;
 	const contradictedClaims = review.claims.filter((c) => c.status === "contradicted");
 	const first = contradictedClaims[0];
-	const confrontPrompt = useMemo(() => buildWerewolfConfrontPrompt(review), [review]);
 	return (
 		<div className="cc-werewolf-callout" role="region" aria-label="独立证据警示">
 			<div className="cc-werewolf-callout-icon" aria-hidden="true">

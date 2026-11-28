@@ -640,6 +640,15 @@ export async function evaluatePermission(
 	const input = call.input && typeof call.input === "object" && !Array.isArray(call.input)
 		? (call.input as Record<string, unknown>)
 		: {};
+	// LSP returns file contents (hover types, symbols), so it must pass the same checks as reading that path.
+	if (call.toolName === "LSP" && !policy.readScope && typeof input.filePath === "string" && input.filePath) {
+		// The language service opens resolve(project, filePath) verbatim, without read's "@", "~" or file:// rewriting.
+		// Hand read an absolute path so both check the same file; refuse spellings read would still rewrite.
+		if (/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/u.test(input.filePath))
+			return { action: "deny", reason: "LSP 文件路径包含特殊空白字符，无法安全核对读取权限。" };
+		const asRead = await evaluatePermission(policy, { toolName: "read", input: { path: resolve(project, input.filePath) } });
+		if (asRead.action !== "allow") return { ...asRead, reason: `LSP 会读取文件内容，按读取权限处理：${asRead.reason}` };
+	}
 	let scopedTarget: string | undefined;
 	// ReadToolOutput checks branch ownership and re-evaluates the source tool's scope before reading.
 	if (policy.readScope && call.toolName !== "ReadToolOutput") {

@@ -120,11 +120,14 @@ interface Connection {
 
 
 const maxFetchBytes = 2 * 1024 * 1024;
+const fakeIpRefusal =
+	"目标域名解析到了代理的 fake-ip 地址（198.18.0.0/15），无法确认真实目的地是否为内网，已拒绝。如果你在用 Clash / Surge 等代理的 fake-ip 模式，可在设置 → 网络中打开「允许代理 fake-ip 地址」。";
 const maxRedirects = 5;
 
 // 198.18.0.0/15 is the benchmarking range that proxy tools (Clash, Surge, sing-box)
-// hand out as fake-ip DNS answers. Allow it only when it comes from DNS resolution,
-// never as a literal IP in the URL.
+// hand out as fake-ip DNS answers. The proxy then resolves the real destination, which
+// this check cannot see (it may be private). Allow it only from DNS resolution, never as
+// a literal IP, and only when the user turned on allowProxyFakeIp.
 function blockedIpv4(ip: string, allowFakeIp = false): boolean {
 	const parts = ip.split(".").map(Number);
 	if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return true;
@@ -181,8 +184,12 @@ async function publicAddresses(hostname: string): Promise<{ address: string; fam
 	} catch {
 		throw new Error("无法解析目标主机。");
 	}
-	if (!addresses.length || addresses.some(({ address }) => blockedAddress(address, true)))
-		throw new Error("Refusing to fetch private or loopback network addresses.");
+	const allowFakeIp = process.env.PI_DESKTOP_ALLOW_FAKE_IP === "1";
+	if (!addresses.length || addresses.some(({ address }) => blockedAddress(address, allowFakeIp))) {
+		// Only fake-ip answers blocked us: tell the user which setting unlocks it instead of a generic refusal.
+		const onlyFakeIp = addresses.length > 0 && !allowFakeIp && addresses.every(({ address }) => !blockedAddress(address, true));
+		throw new Error(onlyFakeIp ? fakeIpRefusal : "Refusing to fetch private or loopback network addresses.");
+	}
 	return addresses;
 }
 

@@ -138,7 +138,13 @@ export function InteractiveTerminal({ id, readOnly, fail }: { id: string; readOn
 			void window.pi.terminals.resize(id, term.cols, term.rows).catch(() => {});
 			if (!readOnly && replay.terminal.status !== "exited") {
 				requestAnimationFrame(() => {
-					if (!disposed) term.focus();
+					if (disposed) return;
+					// Remounts happen on session/view switches; never pull keystrokes away from a field the user is typing in.
+					const focused = document.activeElement as HTMLElement | null;
+					const panel = host.current?.closest(".terminal-panel");
+					const typingElsewhere = Boolean(focused && !panel?.contains(focused) &&
+						(focused.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(focused.tagName)));
+					if (!typingElsewhere) term.focus();
 				});
 			}
 		}).catch((error) => { if (!disposed) fail(error); });

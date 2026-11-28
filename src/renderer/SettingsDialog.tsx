@@ -102,6 +102,7 @@ export function SettingsDialog({
 	settings,
 	presets,
 	models = [],
+	sessionModel,
 	connectionOnly = false,
 	busy,
 	close,
@@ -113,6 +114,8 @@ export function SettingsDialog({
 	presets: ProviderPreset[];
 	/** Models the active conversation can reach; routing choices are limited to these. */
 	models?: Array<{ provider: string; id: string; name: string }>;
+	/** Model the active conversation writes code with; reviews fall back to it. */
+	sessionModel?: { provider: string; id: string };
 	busy: boolean;
 	connectionOnly?: boolean;
 	close: () => void;
@@ -159,6 +162,7 @@ export function SettingsDialog({
 	const [proxy, setProxy] = useState(settings.proxy ?? "");
 	const [noProxy, setNoProxy] = useState(settings.noProxy ?? "");
 	const [caFile, setCaFile] = useState(settings.caFile ?? "");
+	const [allowProxyFakeIp, setAllowProxyFakeIp] = useState(settings.allowProxyFakeIp === true);
 	const [apiKey, setApiKey] = useState("");
 	const [keyCommand, setKeyCommand] = useState(initial.keyCommand);
 	const [headerText, setHeaderText] = useState("");
@@ -203,6 +207,13 @@ export function SettingsDialog({
 		settings.defaultModel && !settings.defaultModel.provider.startsWith("desktop-")
 			? `${settings.defaultModel.provider}/${settings.defaultModel.id}`
 			: undefined;
+	// An independent judgement needs a reviewer other than the model that wrote the code.
+	const writer = sessionModel ?? settings.defaultModel;
+	const mainModelKey = writer ? `${writer.provider}/${writer.id}` : "";
+	const reachable = (value: string) => models.some((m) => `${m.provider}/${m.id}` === value);
+	// An empty choice, or one this session cannot reach, falls back to the session model.
+	const sameAsMain = (value: string, fallsBackWhenUnreachable = false) =>
+		!value || value === mainModelKey || (fallsBackWhenUnreachable && !reachable(value));
 	const original = connectionValues(settings, preset);
 	const model = preset.models.find((item) => item.id === modelId);
 	const pending = saving || testing || checkingBalance;
@@ -232,6 +243,7 @@ export function SettingsDialog({
 		proxy.trim() !== (settings.proxy ?? "") ||
 		noProxy.trim() !== (settings.noProxy ?? "") ||
 		caFile.trim() !== (settings.caFile ?? "") ||
+		allowProxyFakeIp !== (settings.allowProxyFakeIp === true) ||
 		maxCostText.trim() !== (settings.maxCostUsd ? String(settings.maxCostUsd) : "") ||
 		minBalanceText.trim() !== (settings.minBalance ? String(settings.minBalance) : "") ||
 		disableAllHooks !== (settings.disableAllHooks === true) ||
@@ -439,6 +451,7 @@ export function SettingsDialog({
 			if (proxy.trim() !== (settings.proxy ?? "")) update.proxy = proxy.trim();
 			if (noProxy.trim() !== (settings.noProxy ?? "")) update.noProxy = noProxy.trim();
 			if (caFile.trim() !== (settings.caFile ?? "")) update.caFile = caFile.trim();
+			if (allowProxyFakeIp !== (settings.allowProxyFakeIp === true)) update.allowProxyFakeIp = allowProxyFakeIp;
 			if (connectionChanged) Object.assign(update, connectionInput, { useAsDefault });
 			const next = await window.pi.saveSettings(update);
 			apply(next);
@@ -903,6 +916,19 @@ export function SettingsDialog({
 							/>
 							<small>PEM 文件的绝对路径，公司网络做 HTTPS 解密时需要。保存后会重启当前会话的模型进程。</small>
 						</label>
+						<label className="live-setting-toggle">
+							<input
+								type="checkbox"
+								aria-label="允许代理 fake-ip 地址"
+								checked={allowProxyFakeIp}
+								disabled={pending || busy}
+								onChange={(event) => setAllowProxyFakeIp(event.target.checked)}
+							/>
+							<span>
+								允许代理 fake-ip 地址（198.18.0.0/15）。Clash / Surge / sing-box 开启 fake-ip 模式时，WebFetch 和 Monitor 需要打开它才能访问外网。
+								打开后无法核实域名的真实目的地：如果代理把内网地址设为直连，模型（或网页里的提示注入）可能借此访问内网或云元数据服务。
+							</span>
+						</label>
 					</div>
 				)}
 				{activeSection === "appearance" && (
@@ -1298,6 +1324,11 @@ export function SettingsDialog({
 									onChange={(val) => setGrailModel(val)}
 								/>
 								<small>建议选当前最强、且不同于写代码的模型。鉴定只在你主动发起时运行，结果不会发给写代码的 Agent。</small>
+								{sameAsMain(grailModel) && (
+									<small className="field-warning" role="note">
+										{grailModel ? "评审模型与当前会话写代码的模型相同" : "当前跟随会话模型，评审和写代码会是同一个模型"}，同一模型容易认可自己的写法，鉴定的独立性会打折扣。
+									</small>
+								)}
 							</div>
 							<div className="cc-settings-grid-2">
 								<label className="field-label">
@@ -1358,6 +1389,11 @@ export function SettingsDialog({
 											onChange={(val) => setRouting((current) => ({ ...current, [role]: val }))}
 										/>
 										<small>{ROUTING_LABELS[role].hint}</small>
+										{role === "review" && sameAsMain(value, true) && (
+											<small className="field-warning" role="note">
+												狼人核验也使用这里的模型。现在它和写代码的是同一个模型，核验更容易放过自己的错误说法。
+											</small>
+										)}
 									</div>
 								);
 							})}

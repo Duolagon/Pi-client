@@ -575,6 +575,8 @@ function installHandlers() {
 		if (settings.proxy !== undefined) string(settings.proxy, "代理地址", 2048);
 		if (settings.noProxy !== undefined) string(settings.noProxy, "代理例外", 4096);
 		if (settings.caFile !== undefined) string(settings.caFile, "CA 证书路径", 4096);
+		if (settings.allowProxyFakeIp !== undefined && typeof settings.allowProxyFakeIp !== "boolean")
+			throw new Error("代理 fake-ip 开关格式错误。");
 		if (
 			settings.maxCostUsd !== undefined &&
 			settings.maxCostUsd !== null &&

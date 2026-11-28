@@ -50,6 +50,8 @@ test("local tracing configuration is optional and stores credentials and collect
 
 test("local tracing rejects invalid addresses and malformed credential objects", () => {
 	assert.equal(validateLocalLangfuseConfig({ ...sample, baseUrl: " http\\://127.0.0.1:3100/ " }).baseUrl, "http://127.0.0.1:3100");
+	assert.equal(validateLocalLangfuseConfig({ ...sample, baseUrl: "https://langfuse.example.com/" }).baseUrl, "https://langfuse.example.com");
+	assert.equal(validateLocalLangfuseConfig({ ...sample, baseUrl: "http://localhost:3000" }).baseUrl, "http://localhost:3000");
 	for (const raw of [
 		[sample], {}, { ...sample, extra: true }, { ...sample, publicKey: "two:parts" }, { ...sample, secretKey: "" },
 		{ ...sample, secretKey: "with\nnewline" }, { ...sample, baseUrl: "file:///tmp/local.json" },
@@ -57,7 +59,8 @@ test("local tracing rejects invalid addresses and malformed credential objects",
 		{ ...sample, baseUrl: "https://localhost/#anchor" }, { ...sample, captureContent: "true" },
 		{ ...sample, captureContent: 1 }, { ...sample, captureContent: undefined },
 		{ ...sample, captureContent: true, extra: true },
-	]) assert.throws(() => validateLocalLangfuseConfig(raw), { message: "Langfuse 配置无效。请检查地址和两把密钥。" });
+		{ ...sample, baseUrl: "http://langfuse.example.com/" }, { ...sample, baseUrl: "http://10.0.0.5:3000/" },
+	]) assert.throws(() => validateLocalLangfuseConfig(raw), { message: "Langfuse 配置无效。请检查地址（非本机地址须使用 https）和两把密钥。" });
 });
 
 test("local tracing content capture requires an explicit encrypted opt-in", async (t) => {

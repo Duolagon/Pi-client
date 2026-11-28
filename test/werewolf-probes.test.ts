@@ -131,3 +131,35 @@ test("werewolf execution denies live filesystem, environment, and subprocess acc
 		}
 	});
 });
+
+test("an array or object expectation written in the reply can bind a behavior probe", () => {
+	const call = (arg: string) => ({ call: { module: "src/parse.mjs", exportName: "parseList", args: [{ literal: arg }] } });
+	const probe = (arg: string, expected: unknown) =>
+		({ kind: "behavior" as const, op: "equal" as const, left: call(arg), right: { literal: expected } }) as never;
+	assert.equal(werewolfProbeBinding(probe("1,,2", [1, 2]), '它会跳过空项：parseList("1,,2") 返回 [1, 2]。'), true);
+	// The reverse order, and an object expectation with unquoted keys.
+	assert.equal(werewolfProbeBinding({ kind: "behavior", op: "equal", left: { literal: [4, 5] }, right: call("4, 5") } as never,
+		'例如 parseList("4, 5") 返回 [4, 5]'), true);
+	assert.equal(werewolfProbeBinding({ kind: "behavior", op: "equal",
+		left: { call: { module: "src/parse.mjs", exportName: "info", args: [{ literal: "x" }] } }, right: { literal: { ok: true } } } as never,
+		'info("x") 返回 {ok: true}'), true);
+	// A different structure, a negated claim and a non-literal expectation stay unbound.
+	assert.equal(werewolfProbeBinding(probe("1,,2", [1, 0, 2]), '它会跳过空项：parseList("1,,2") 返回 [1, 2]。'), false);
+	assert.equal(werewolfProbeBinding(probe("1,,2", [1, 2]), 'parseList("1,,2") 不会返回 [1, 2]。'), false);
+	assert.equal(werewolfProbeBinding(probe("1,,2", [1, 2]), 'parseList("1,,2") 返回去掉空项的结果。'), false);
+});
+
+test("a sentence that names its input in words binds, and only to that input", () => {
+	const call = (arg: unknown) => ({ call: { module: "src/parse.mjs", exportName: "parseList", args: [{ literal: arg }] } });
+	const probe = (arg: unknown, expected: unknown) =>
+		({ kind: "behavior" as const, op: "equal" as const, left: call(arg), right: { literal: expected } }) as never;
+	const requirement = "每一项先去掉两侧空白再转成数字；空字符串返回 []";
+	assert.equal(werewolfProbeBinding(probe("", []), "parseList 对空字符串直接返回 []", requirement), true);
+	assert.equal(werewolfProbeBinding(probe("   ", []), "parseList 对纯空白串也返回 []", requirement), true);
+	// Naming an input narrows the sentence to it: a probe on any other input is not what it claims.
+	assert.equal(werewolfProbeBinding(probe(" 1, 2 ", []), "parseList 对空字符串直接返回 []", requirement), false);
+	// A description that names no exact input stays unbound, however confident it sounds.
+	assert.equal(werewolfProbeBinding(probe(" 7 , 42 ", [7, 42]), "parseList 会先去掉每一项两侧的空白再转成数字", requirement), false);
+	// The probe's target still has to be named in the sentence or the requirement.
+	assert.equal(werewolfProbeBinding(probe("", []), "空字符串直接返回 []", "空字符串返回 []"), false);
+});

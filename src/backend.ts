@@ -19,7 +19,7 @@ import { GitSnapshots, MAX_CHECKPOINT_FILE_BYTES } from "./git-snapshots.ts";
 import { WerewolfService, type WerewolfReceipt } from "./werewolf.ts";
 import type { WerewolfState } from "./werewolf-types.ts";
 import { executeWerewolfProbe, parseWerewolfProbe } from "./werewolf-probes.ts";
-import { isVerifyCommand } from "./verification-command.ts";
+import { collectHostEvidence, scanTestIntegrity, type EvidenceMessage } from "./host-evidence.ts";
 import {
 	annotateDiff,
 	buildBlindPrompt,
@@ -521,7 +521,10 @@ export class DesktopService {
 		});
 		this.skills = new SkillRegistry({ agentDir: () => this.store.settings.agentDir ?? this.defaultAgentDir() });
 		this.todos = new TodoService({ dataDir: () => this.options.dataDir });
-		this.monitors = new MonitorService({ deliver: (id, params) => this.deliverToConversation(id, params) });
+		this.monitors = new MonitorService({
+			deliver: (id, params) => this.deliverToConversation(id, params),
+			allowFakeIp: () => this.store.settings.allowProxyFakeIp === true,
+		});
 		this.remoteJobs = new RemoteJobsService({
 			statePath: join(options.dataDir, "remote-jobs.json"),
 			canQuery: () => process.env.PI_OFFLINE !== "1" && !this.store.settings.sandboxOffline,
@@ -2101,6 +2104,8 @@ export class DesktopService {
 			}
 			if (this.terminals.list(id).some((terminal) => terminal.status !== "exited"))
 				throw new Error("请先关闭此会话的终端，再移除。");
+			if (this.external.hasActive(id))
+				throw new Error("此会话还有运行中的外部 Agent，请先停止，再移除。");
 			await this.cancelGrail(id);
 			await this.monitors.stopForConversation([id], "user_stop", { includeRoot: true });
 			for (const job of this.remoteJobs.list(id)) await this.remoteJobs.untrack(job.id);
@@ -3328,12 +3333,35 @@ export class DesktopService {
 			const next = draftPrompt(draft);
 			if (runId) await this.stopCurrentTurn(conversationId, runId);
 			else await this.command({ type: "abort" }, conversationId);
+			// The abort reply can arrive before agent_settled; a prompt sent in that window is rejected.
+			await this.waitForTurnInactive(runtime);
 			await runtime.settling;
 			await this.command(next, conversationId, undefined, draft);
 			return { drafts: [] };
 		} catch (error) {
 			return { drafts, error: error instanceof Error ? error.message : String(error) };
 		}
+	}
+
+	/** Resolve once the stopped turn has settled (or errored), bounded so a stuck engine cannot hang the caller. */
+	private waitForTurnInactive(runtime: SessionRuntime, timeoutMs = 15_000): Promise<void> {
+		if (!runtime.workingTurn?.active) return Promise.resolve();
+		return new Promise((resolve) => {
+			const done = () => {
+				clearTimeout(timer);
+				clearInterval(poll);
+				unsubscribe();
+				resolve();
+			};
+			const unsubscribe = this.subscribe((event) => {
+				if (event.conversationId !== runtime.conversationId) return;
+				const type = (event.event as { type?: string }).type;
+				if (type === "agent_settled" || type === "desktop_error" || !runtime.workingTurn?.active) done();
+			});
+			const timer = setTimeout(done, timeoutMs);
+			// Some stop paths (a prompt aborted before the engine ran it) clear the turn without emitting an event.
+			const poll = setInterval(() => { if (!runtime.workingTurn?.active) done(); }, 100);
+		});
 	}
 
 	private requestQueuedInput(
@@ -3992,6 +4020,7 @@ export class DesktopService {
 		proxy?: string;
 		noProxy?: string;
 		caFile?: string;
+		allowProxyFakeIp?: boolean;
 		maxCostUsd?: number | null;
 		minBalance?: number | null;
 		grailModel?: { provider: string; id: string } | null;
@@ -4149,6 +4178,11 @@ export class DesktopService {
 				if (value) next.settings.proxy = value;
 				else delete next.settings.proxy;
 			}
+			if (settings.allowProxyFakeIp !== undefined) {
+				if (typeof settings.allowProxyFakeIp !== "boolean") throw new Error("代理 fake-ip 开关设置无效。");
+				if (settings.allowProxyFakeIp) next.settings.allowProxyFakeIp = true;
+				else delete next.settings.allowProxyFakeIp;
+			}
 			if (settings.noProxy !== undefined) {
 				const value = settings.noProxy.trim();
 				if (/[\r\n\0]/.test(value) || value.length > 4096) throw new Error("代理例外格式错误。");
@@ -4246,6 +4280,7 @@ export class DesktopService {
 				next.settings.agentDir !== this.store.settings.agentDir ||
 				next.settings.proxy !== this.store.settings.proxy ||
 				next.settings.noProxy !== this.store.settings.noProxy ||
+				Boolean(next.settings.allowProxyFakeIp) !== Boolean(this.store.settings.allowProxyFakeIp) ||
 				next.settings.caFile !== this.store.settings.caFile ||
 				next.settings.maxCostUsd !== this.store.settings.maxCostUsd ||
 				next.settings.minBalance !== this.store.settings.minBalance ||
@@ -4475,13 +4510,22 @@ export class DesktopService {
 		branch.reverse();
 		const from = branch.findIndex((entry) => entry.id === checkpoint.userEntryId);
 		if (from < 0) return;
+		// A turn that changed code but cannot be reviewed says why on its last reply, rather than showing nothing.
+		const lastReply = branch.findLast((entry, index) => index > from && entry.type === "message" && entry.message.role === "assistant");
+		const skip = async (reason: string) => {
+			if (!checkpoint.changes.length || !lastReply || lastReply.type !== "message") return;
+			await this.werewolf.recordSkipped(runtime.conversationId,
+				{ entryId: lastReply.id, timestamp: lastReply.message.timestamp, checkpointId: checkpoint.id }, reason);
+		};
 		const reply = branch.findLast((entry) => entry.type === "message" && entry.message.role === "assistant" &&
 			entry.message.stopReason === "stop");
-		if (!reply || reply.type !== "message" || reply.message.role !== "assistant" || branch.indexOf(reply) <= from) return;
+		if (!reply || reply.type !== "message" || reply.message.role !== "assistant" || branch.indexOf(reply) <= from)
+			return skip("这一轮的回复没有正常结束（例如达到长度上限或出错）。");
 		const replyText = reply.message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n").trim();
-		if (!replyText) return;
+		if (!replyText) return skip("最终回复没有文字内容，没有可核验的声明。");
 		const prefix = branch.slice(0, branch.indexOf(reply));
-		if (prefix.findLastIndex((entry) => entry.type === "message" && entry.message.role === "user") < from) return;
+		if (prefix.findLastIndex((entry) => entry.type === "message" && entry.message.role === "user") < from)
+			return skip("没有找到这一轮的用户要求。");
 		const requirements = prefix.slice(from).flatMap((entry) => {
 			if (entry.type !== "message" || entry.message.role !== "user") return [];
 			const content = entry.message.content;
@@ -4489,32 +4533,17 @@ export class DesktopService {
 				block.type === "text" && !(index > 0 && isDesktopWorkspaceContext(block.text)) ? [block.text] : []).join("\n");
 			return text.trim() ? [text.slice(0, 8000)] : [];
 		}).slice(-8);
-		if (!requirements.length) return;
-		const commands = new Map<string, string>();
-		const receipts: WerewolfReceipt[] = [];
-		for (const item of prefix.slice(from)) {
-			if (item.type !== "message") continue;
-			const message = item.message;
-			if (message.role === "assistant") {
-				for (const block of message.content) {
-					if (block.type === "toolCall" && block.name.toLowerCase() === "bash" &&
-						typeof block.arguments.command === "string" && block.arguments.command.length <= 400 &&
-						isVerifyCommand(block.arguments.command)) commands.set(block.id, block.arguments.command);
-				}
-			} else if (message.role === "toolResult") {
-				const command = commands.get(message.toolCallId);
-				const details = message.details as { exitCode?: unknown; background?: unknown } | undefined;
-				if (command && details?.background !== true && Number.isInteger(details?.exitCode))
-					receipts.push({ id: message.toolCallId, command, exitCode: details!.exitCode as number });
-			}
-		}
+		if (!requirements.length) return skip("这一轮的用户要求没有文字内容。");
+		// Everything the host itself recorded this turn: verification runs with their counts, and every write.
+		const evidence = collectHostEvidence(prefix.slice(from).flatMap((item) => item.type === "message" ? [item.message as EvidenceMessage] : []));
+		const receipts: WerewolfReceipt[] = evidence.runs.map(({ id, command, exitCode }) => ({ id, command, exitCode }));
 		const routed = this.store.settings.modelRouting?.review;
 		const model = routed && runtime.models.some((item) => item.provider === routed.provider && item.id === routed.id)
 			? routed : runtime.state?.model;
 		const trusted = this.isProjectTrusted(conversation.project);
 		const replyAnchor = { entryId: reply.id, timestamp: reply.message.timestamp, checkpointId: checkpoint.id };
 		void this.werewolf.start(conversation.id, replyAnchor,
-			{ requirements, reply: replyText.slice(0, 32000), receipts: receipts.slice(-40) },
+			{ requirements, reply: replyText.slice(0, 32000), receipts: receipts.slice(-40), evidence },
 			(target, signal) => this.git.materializeAfter(conversation.project, checkpoint.id, conversation.id, target, signal),
 			async ({ prompt, snapshot, signal }) => {
 				if (!trusted) throw new Error("请先信任项目，再自动验收该项目的代码。");
@@ -4675,12 +4704,13 @@ export class DesktopService {
 	startGrail(conversationId: string): Promise<{ id: string }> {
 		return this.serialize(async () => {
 			const conversation = this.conversation(conversationId);
-			const existing = this.grailRuns.get(conversation.id);
-			if (existing?.controller.signal.aborted) throw new Error("上一次鉴定仍在清理，请稍后重试。");
-			if (existing) return { id: existing.id };
+			// Plan 9: one judgement per conversation; a new request replaces the running one.
+			// A run that is already publishing its report finishes first, so its result is kept.
+			// Refuse before cancelling, so a request that cannot start does not cost the running one.
 			const active = this.runtimes.get(conversation.id);
 			if (active?.checkpointId || active?.checkpointStarting) throw new Error("请等待当前任务结束后再发起鉴定。");
 			if (active) this.assertRuntimeIdle(active);
+			if (this.grailRuns.has(conversation.id)) await this.cancelGrail(conversation.id);
 			const startedAt = Date.now();
 			const run: GrailRun = {
 				id: randomUUID(), controller: new AbortController(), step: "diff", startedAt,
@@ -4817,7 +4847,9 @@ export class DesktopService {
 		if (steps.objective.status !== "pass") return finish();
 
 		step("distortion");
-		steps.distortion = { hits: scanDistortions(lines) };
+		// Source-line traces plus changes to check scripts, test configuration, snapshots and test files.
+		const deleted = new Set(diff.files.filter((file) => file.status === "deleted").map((file) => file.path));
+		steps.distortion = { hits: [...scanDistortions(lines, deleted), ...scanTestIntegrity(lines, diff.files)] };
 		if (steps.distortion.hits.some((hit) => !hit.review)) return finish();
 
 		if (!model?.provider || !model.id) {
@@ -4842,7 +4874,8 @@ export class DesktopService {
 
 		step("comparison");
 		try {
-			const prompt = buildComparisonPrompt(requirement, steps.blind.solution!, annotated.text, steps.objective);
+			const prompt = buildComparisonPrompt(requirement, steps.blind.solution!, annotated.text, steps.objective,
+				steps.distortion.hits.filter((hit) => hit.review));
 			steps.comparison = parseComparison(await this.grailModelRun(workspace, model, prompt, budget, deadline, signal, conversation.id), lines);
 		} catch (error) {
 			if (signal.aborted) throw error;
@@ -7464,6 +7497,8 @@ export class DesktopService {
 			}
 			runtime.policyFile = join(this.options.dataDir, `policy-${conversation.id}-${randomBytes(8).toString("hex")}.json`);
 			env.PI_DESKTOP_POLICY_FILE = runtime.policyFile;
+			// Set explicitly so an inherited shell environment cannot widen WebFetch.
+			env.PI_DESKTOP_ALLOW_FAKE_IP = this.store.settings.allowProxyFakeIp === true ? "1" : "0";
 			if (!delegated) {
 				runtime.escalationFile = runtime.policyFile + ".verification";
 				env.PI_DESKTOP_ESCALATION_FILE = runtime.escalationFile;
@@ -8403,6 +8438,7 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 			proxy: storedText(value.settings.proxy, 2048),
 			noProxy: storedText(value.settings.noProxy, 4096),
 			caFile: storedText(value.settings.caFile, 4096, true),
+			allowProxyFakeIp: value.settings.allowProxyFakeIp === true ? true : undefined,
 			defaultModel: value.settings.defaultModel,
 			connections: value.settings.connections ?? {},
 			agentDir: value.settings.agentDir,

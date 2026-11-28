@@ -166,6 +166,11 @@ export class ExternalAgents {
 			overlaps(path, task.workingDirectory));
 	}
 	list(owner?: string): ExternalTask[] { return structuredClone([...this.tasks.values()].map(({ task }) => task).filter((task) => !owner || task.parentConversationId === owner).reverse()); }
+	/** True while any task of this owner is queued/running or still shutting down after a cancel. */
+	hasActive(owner: string): boolean {
+		return [...this.tasks.values()].some(({ task }) => task.parentConversationId === owner &&
+			(active.has(task.status) || this.runtimes.get(task.id)?.executing === true));
+	}
 	snapshot(id: string): ExternalTask { return structuredClone(this.record(id).task); }
 	async executors(): Promise<ExternalExecutor[]> {
 		if (!this.executorsCache || Date.now() - this.executorsCache.at > 10000) this.executorsCache = { at: Date.now(), values: await discoverExecutors(this.settings, this.options.env) };

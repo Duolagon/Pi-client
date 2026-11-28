@@ -13,6 +13,7 @@ import {
 	parseComparison,
 	parseDiffLines,
 	parseTestCount,
+	parseTestSummary,
 	parseTscErrors,
 	runObjectiveChecks,
 	runProcess,
@@ -141,7 +142,7 @@ test("objective checks require a passed test and distinguish missing evidence fr
 
 	await writeFile(testFile, "import { test } from 'node:test';\ntest('passing example', () => {});\n");
 	const missingChecks = await run();
-	assert.equal(missingChecks.status, "unavailable");
+	assert.equal(missingChecks.status, "pass");
 	assert.match(missingChecks.reason!, /类型检查.*lint/);
 	assert.equal(missingChecks.runs[0].exitCode, 0);
 	assert.deepEqual(missingChecks.checks?.map(({ status }) => status), ["pass", "skipped", "skipped"]);
@@ -261,8 +262,18 @@ test("grade function covers every grade and stops at the first veto", () => {
 		diff("test/x.test.ts", "@@ -1,2 +1,2 @@\n-  assert.equal(x, 1);\n+    assert.equal(x, 1);\n-  expect(y).toBe(2);\n+  expect(y).toBe(3);\n"),
 	]));
 	assert.equal(assertionChanges.length, 1);
-	assert.equal(assertionChanges[0].review, true);
-	assert.equal(gradeVerdict({ ...passing, distortion: { hits: assertionChanges } }).grade, "grail");
+	assert.equal(assertionChanges[0].review, undefined);
+	assert.equal(gradeVerdict({ ...passing, distortion: { hits: assertionChanges } }).grade, "twisted");
+	// Equivalent rewrites keep the expectation and are not vetoed.
+	assert.deepEqual(scanDistortions(parseDiffLines([
+		diff("test/y.test.ts", "@@ -1,3 +1,3 @@\n-assert.equal(x,1);\n-assert.deepEqual(y, [1]);\n-assert.equal(z, 2)\n+assert.strictEqual(x, 1);\n+assert.deepStrictEqual(y, [1]);\n+assert.equal(z, 2, 'z is two');\n"),
+	])), []);
+	// Missing type check or lint scripts still allow a judgement, but never the grail.
+	const noLint = gradeVerdict({ ...passing, objective: { status: "pass", runs: [], checks: [
+		{ name: "test", status: "pass" }, { name: "check", status: "pass" }, { name: "lint", status: "skipped", reason: "x" },
+	] } });
+	assert.equal(noLint.grade, "granted");
+	assert.match(noLint.reasons.join(), /lint/);
 	const granted = gradeVerdict({ ...passing, comparison: comparison({ lessCode: false }) });
 	assert.equal(granted.grade, "granted");
 	assert.match(granted.reasons.join(), /lessCode note/);
@@ -270,10 +281,16 @@ test("grade function covers every grade and stops at the first veto", () => {
 	// A criterion without a cited conclusion is not proven, so no grail.
 	assert.equal(gradeVerdict({ ...passing, comparison: comparison({}, ["beyond"]) }).grade, "granted");
 	assert.equal(gradeVerdict({ ...passing, comparison: comparison({ broken: false }) }).grade, "twisted");
-	for (const criterion of ["removable", "missing", "flawless"] as const) {
-		assert.equal(gradeVerdict({ ...passing, comparison: comparison({ [criterion]: false }) }).grade, "unfulfilled");
-		assert.equal(gradeVerdict({ ...passing, comparison: comparison({}, [criterion]) }).grade, "unjudgeable");
+	// "无可缺" is a gap in the wish itself; "无可删" and "无可挑" are taste, so they only cap the grade.
+	assert.equal(gradeVerdict({ ...passing, comparison: comparison({ missing: false }) }).grade, "unfulfilled");
+	for (const criterion of ["removable", "flawless"] as const) {
+		const judged = gradeVerdict({ ...passing, comparison: comparison({ [criterion]: false }) });
+		assert.equal(judged.grade, "granted", criterion);
+		assert.match(judged.reasons.join(), new RegExp(`${criterion} note`));
 	}
+	// Each of them still has to be judged with a citation.
+	for (const criterion of ["removable", "missing", "flawless"] as const)
+		assert.equal(gradeVerdict({ ...passing, comparison: comparison({}, [criterion]) }).grade, "unjudgeable");
 	const onePositiveFinding = { ...comparison(), findings: comparison().findings.filter((item) => item.criterion === "requirement") };
 	assert.equal(gradeVerdict({ ...passing, comparison: onePositiveFinding }).grade, "unjudgeable");
 	const twisted = gradeVerdict({ ...passing, distortion: { hits: [{ file: "a.ts", line: 3, side: "+", rule: "新增 as any", text: "x as any" }] } });
@@ -289,4 +306,15 @@ test("grade function covers every grade and stops at the first veto", () => {
 	assert.equal(gradeVerdict({ objective: passing.objective }).grade, "unjudgeable");
 	// Veto order: a failing check wins over a distortion hit.
 	assert.equal(gradeVerdict({ ...passing, objective: { status: "fail", runs: [] }, distortion: twisted as never }).grade, "unfulfilled");
+});
+
+test("a deleted test file is left to the reviewer instead of vetoed as deleted assertions", () => {
+	const lines = parseDiffLines([{ path: "test/b.test.ts", diff: "@@ -1,2 +0,0 @@\n-test('b', () => {\n-  assert.equal(1, 1);\n" }]);
+	assert.ok(scanDistortions(lines).length > 0);
+	assert.deepEqual(scanDistortions(lines, new Set(["test/b.test.ts"])), []);
+});
+
+test("pytest summaries need the timing suffix", () => {
+	assert.deepEqual(parseTestSummary("===== 3 passed, 1 failed in 0.12s ====="), { total: 4, passed: 3, failed: 1, skipped: 0 });
+	assert.equal(parseTestSummary("====== skipped section ======"), undefined);
 });

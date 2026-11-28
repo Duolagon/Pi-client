@@ -1,8 +1,8 @@
 // Imported by the CommonJS main process (via monitor-service). Do not import @earendil-works/pi-coding-agent
 // here: its config module needs import.meta.url and crashes main.cjs at startup. See host-guard-bash.ts.
 import { execFile, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { cpus, totalmem } from "node:os";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { cpus, tmpdir, totalmem, userInfo } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
@@ -157,6 +157,46 @@ export interface HostResourceGuardOptions {
 	sampleGroupRss?: () => Promise<Map<number, number>>;
 	sampleMemoryPressure?: () => Promise<number>;
 	killGroup?: (pgid: number) => void;
+	/**
+	 * Directory where every guard (main process and each agent process) publishes the process
+	 * groups it tracks, so the memory cap applies to their combined RSS. `null` disables sharing.
+	 */
+	registryDir?: string | null;
+}
+
+let guardInstances = 0;
+
+function defaultRegistryDir(): string | null {
+	// Test runs must not see (or be seen by) a running desktop app's guards.
+	if (process.env.NODE_TEST_CONTEXT) return null;
+	let uid = "user";
+	try {
+		uid = String(userInfo().uid);
+	} catch {}
+	return join(tmpdir(), `pi-desktop-host-guard-${uid}`);
+}
+
+/** tmpdir() can be a shared /tmp, so only use a real directory that this user owns and nobody else can write. */
+function privateDirectory(dir: string): boolean {
+	try {
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		const info = lstatSync(dir);
+		if (!info.isDirectory() || info.isSymbolicLink()) return false;
+		if (process.platform === "win32") return true;
+		return info.uid === process.getuid?.() && (info.mode & 0o077) === 0;
+	} catch {
+		return false;
+	}
+}
+
+function ownerAlive(pid: number): boolean {
+	if (pid === process.pid) return true;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
 }
 
 function formatGb(bytes: number): string {
@@ -176,6 +216,8 @@ export class HostResourceGuard {
 	private readonly sampleGroupRss: () => Promise<Map<number, number>>;
 	private readonly sampleMemoryPressure: () => Promise<number>;
 	private readonly killGroup: (pgid: number) => void;
+	private readonly registryDir: string | null;
+	private readonly registryFile: string | null;
 	private timer?: NodeJS.Timeout;
 	private polling = false;
 
@@ -186,11 +228,59 @@ export class HostResourceGuard {
 		this.sampleGroupRss = options.sampleGroupRss ?? defaultSampleGroupRss;
 		this.sampleMemoryPressure = options.sampleMemoryPressure ?? defaultSampleMemoryPressure;
 		this.killGroup = options.killGroup ?? killProcessGroup;
+		const registryDir = options.registryDir === undefined ? defaultRegistryDir() : options.registryDir;
+		this.registryDir = registryDir && privateDirectory(registryDir) ? registryDir : null;
+		this.registryFile = this.registryDir ? join(this.registryDir, `${process.pid}-${++guardInstances}.json`) : null;
+	}
+
+	private publish(): void {
+		if (!this.registryDir || !this.registryFile) return;
+		try {
+			if (this.entries.size === 0) {
+				rmSync(this.registryFile, { force: true });
+				return;
+			}
+			if (!privateDirectory(this.registryDir)) return;
+			// Write then rename, so readers never see a truncated list.
+			const temporary = `${this.registryFile}.tmp`;
+			rmSync(temporary, { force: true });
+			writeFileSync(temporary, JSON.stringify([...this.entries.keys()]), { mode: 0o600, flag: "wx" });
+			renameSync(temporary, this.registryFile);
+		} catch {}
+	}
+
+	/** Process groups tracked by other guards (other agent processes or other guards in this process). */
+	private foreignGroups(): Set<number> {
+		const groups = new Set<number>();
+		if (!this.registryDir) return groups;
+		let names: string[];
+		try {
+			names = readdirSync(this.registryDir);
+		} catch {
+			return groups;
+		}
+		for (const name of names) {
+			const match = /^(\d+)-\d+\.json$/.exec(name);
+			if (!match || join(this.registryDir, name) === this.registryFile) continue;
+			const path = join(this.registryDir, name);
+			if (!ownerAlive(Number(match[1]))) {
+				try {
+					rmSync(path, { force: true });
+				} catch {}
+				continue;
+			}
+			try {
+				const pgids: unknown = JSON.parse(readFileSync(path, "utf8"));
+				if (Array.isArray(pgids)) for (const pgid of pgids) if (Number.isInteger(pgid) && pgid > 0 && !this.entries.has(pgid)) groups.add(pgid);
+			} catch {}
+		}
+		return groups;
 	}
 
 	register(pgid: number, entry: Omit<GuardEntry, "pgid">): void {
 		if (!Number.isInteger(pgid) || pgid <= 0 || this.maxRssBytes <= 0) return;
 		this.entries.set(pgid, { pgid, ...entry });
+		this.publish();
 		if (!this.timer) {
 			this.timer = setInterval(() => {
 				void this.checkNow();
@@ -201,6 +291,7 @@ export class HostResourceGuard {
 
 	unregister(pgid: number): void {
 		this.entries.delete(pgid);
+		this.publish();
 		if (this.entries.size === 0 && this.timer) {
 			clearInterval(this.timer);
 			this.timer = undefined;
@@ -209,6 +300,7 @@ export class HostResourceGuard {
 
 	stop(): void {
 		this.entries.clear();
+		this.publish();
 		if (this.timer) {
 			clearInterval(this.timer);
 			this.timer = undefined;
@@ -229,11 +321,23 @@ export class HostResourceGuard {
 				if (!heaviest || rss > heaviest.rss) heaviest = { entry, rss };
 			}
 			if (!heaviest || heaviest.rss <= 0) return false;
+			// The cap covers every Pi process group on this host, not just the ones this guard tracks.
+			let foreignHeaviest = { pgid: 0, rss: 0 };
+			for (const pgid of this.foreignGroups()) {
+				const rss = rssByGroup.get(pgid) ?? 0;
+				totalAgentRss += rss;
+				if (rss > foreignHeaviest.rss || (rss === foreignHeaviest.rss && pgid < foreignHeaviest.pgid)) foreignHeaviest = { pgid, rss };
+			}
 
 			const criticalThreshold = Math.floor(this.totalMemBytes * CRITICAL_PRESSURE_RSS_RATIO);
 			const overCap = heaviest.rss >= this.maxRssBytes || totalAgentRss >= this.maxRssBytes;
 			const criticalPressure = pressure >= MACOS_CRITICAL_PRESSURE && totalAgentRss >= criticalThreshold;
 			if (!overCap && !criticalPressure) return false;
+			// Over a shared limit, the guard that owns the heaviest group acts, so one breach kills one tree.
+			// Equal sizes break on the lower pgid, so exactly one guard acts.
+			const yieldsToForeign = heaviest.rss < foreignHeaviest.rss ||
+				(heaviest.rss === foreignHeaviest.rss && foreignHeaviest.pgid > 0 && foreignHeaviest.pgid < heaviest.entry.pgid);
+			if (heaviest.rss < this.maxRssBytes && yieldsToForeign) return false;
 
 			const reason = criticalPressure
 				? `[Host Safety Guard] 已强制终止命令（${heaviest.entry.label}）：系统内存压力达到危急级别（pressure=${pressure}），当前任务进程组占用 ${formatGb(heaviest.rss)}（Agent 总占用 ${formatGb(totalAgentRss)}）。为防止本机卡死或断网已中止进程树，请降低并发数（--jobs）或限制单进程内存后重试。`

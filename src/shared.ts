@@ -284,6 +284,11 @@ export interface Settings {
 	noProxy?: string;
 	/** Absolute path to an extra PEM certificate bundle (NODE_EXTRA_CA_CERTS). */
 	caFile?: string;
+	/**
+	 * Let WebFetch / Monitor accept DNS answers in 198.18.0.0/15 (proxy fake-ip mode). The real
+	 * destination is then unknown to the private-address check; absent means false.
+	 */
+	allowProxyFakeIp?: boolean;
 	configuredProviders: Provider[];
 	connections: Partial<
 		Record<
@@ -472,7 +477,7 @@ export interface GrailDistortionHit {
 	side: "+" | "-";
 	rule: string;
 	text: string;
-	/** A changed assertion needs review and does not determine the verdict on its own. */
+	/** The reviewer must weigh this hit (e.g. a changed test config); it does not decide the verdict alone. */
 	review?: true;
 }
 export interface GrailDistortionResult {
@@ -873,6 +878,7 @@ export interface DesktopAPI {
 		proxy?: string;
 		noProxy?: string;
 		caFile?: string;
+		allowProxyFakeIp?: boolean;
 		maxCostUsd?: number | null;
 		minBalance?: number | null;
 		/** null clears; the conversation model is used then. */
