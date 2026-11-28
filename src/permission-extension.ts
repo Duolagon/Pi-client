@@ -456,7 +456,7 @@ export default function permissions(pi: ExtensionAPI) {
 	}
 	const forkChild = process.env.PI_DESKTOP_FORK_CHILD === "1";
 	const isChild = process.env.PI_DESKTOP_CHILD === "1" || process.env.PI_DESKTOP_READ_ONLY_CHILD === "1";
-	let activeTodoWriteItems: Array<{ id: string; content: string; status: string; estimatedSeconds?: number }> = [];
+	let activeTodoWriteItems: Array<{ id: string; content: string; activeForm?: string; status: string; estimatedSeconds?: number }> = [];
 	const sharedTodoItems = new Map<string, { content: string; status: string }>();
 	let checklist: "simple" | "shared" = "simple";
 	let callsSinceTodoUpdate = 0;
@@ -468,7 +468,8 @@ export default function permissions(pi: ExtensionAPI) {
 				"Manage a structured task checklist for multi-step work so the user can track progress. " +
 				"The user sees only the latest call, so call it again every time a step finishes or starts: " +
 				"mark finished items completed right away (do not batch them), keep exactly one item in_progress, " +
-				"and rewrite the list when the plan changes. Include estimatedSeconds when a step may take noticeable time so the user sees an ETA. Always pass the whole list.",
+				"and rewrite the list when the plan changes. Give each item content in imperative form (\"Run the tests\") and activeForm in present-continuous form (\"Running the tests\"); the in_progress item shows its activeForm. " +
+				"Include estimatedSeconds when a step may take noticeable time so the user sees an ETA. Always pass the whole list.",
 			promptSnippet: "Track multi-step task progress with a structured checklist",
 			parameters: {
 				type: "object",
@@ -485,6 +486,12 @@ export default function permissions(pi: ExtensionAPI) {
 							properties: {
 								id: { type: "string", minLength: 1, maxLength: 100 },
 								content: { type: "string", minLength: 1, maxLength: 500 },
+								activeForm: {
+									type: "string",
+									minLength: 1,
+									maxLength: 500,
+									description: "Present-continuous form shown while the item is in_progress, e.g. \"Running the tests\"",
+								},
 								status: { type: "string", enum: ["pending", "in_progress", "completed"] },
 								estimatedSeconds: {
 									type: "integer",
@@ -501,7 +508,7 @@ export default function permissions(pi: ExtensionAPI) {
 			defaultActive: true,
 			executionMode: "sequential",
 			async execute(_toolCallId, input) {
-				const rec = input as { todos?: Array<{ id: string; content: string; status: string; estimatedSeconds?: number }> };
+				const rec = input as { todos?: Array<{ id: string; content: string; activeForm?: string; status: string; estimatedSeconds?: number }> };
 				const todos = Array.isArray(rec?.todos) ? rec.todos.slice(0, 50) : [];
 				activeTodoWriteItems = todos;
 				checklist = "simple";

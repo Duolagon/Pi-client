@@ -70,6 +70,8 @@ import { grailWording, latestVerdict, revealDecision } from "./grail-view.ts";
 import { IconButton, Modal, PiMark, menuKeyNav } from "../prototype/ui.tsx";
 import { useDesktop } from "./useDesktop.ts";
 import { TranscriptView, type TodoItem } from "./TranscriptView.tsx";
+import { TodoChecklist } from "./TodoChecklist.tsx";
+import { todoLabel } from "./todo-list.ts";
 import { computeChecklistEta, computeTodoTiming, isChecklistStale } from "../task-eta.ts";
 import { LiveComposer, type BuiltinSlashAction } from "./LiveComposer.tsx";
 import { parseGoalCommand } from "../goal-mode.ts";
@@ -309,7 +311,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 	const [trustBusy, setTrustBusy] = useState(false);
 	const [agentsOpen, setAgentsOpen] = useState(false);
 	const [mcpOpen, setMcpOpen] = useState(false);
-	const [todoExpanded, setTodoExpanded] = useState(false);
+	// The checklist starts expanded, like Claude Code; collapsing it is the user's choice.
+	const [todoExpanded, setTodoExpanded] = useState(true);
 	const [dismissedTodoSig, setDismissedTodoSig] = useState<Record<string, string>>({});
 	const [sharedTodos, setSharedTodos] = useState<TodoRecord[]>([]);
 	const [workflows, setWorkflows] = useState<WorkflowRecord[]>([]);
@@ -1458,13 +1461,15 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		let latestWrite: TodoItem[] = [];
 		let latestWriteTs = 0;
 		let latestWriteMsgIndex = -1;
+		// A rejected call stored nothing, so it must not become the pinned list.
+		const rejectedCalls = new Set(history.messages.flatMap((item) => item.role === "toolResult" && item.isError ? [item.toolCallId] : []));
 		for (let i = 0; i < history.messages.length; i++) {
 			const msg = history.messages[i];
 			if (msg.role !== "assistant") continue;
 			const ts = typeof msg.timestamp === "number" && msg.timestamp > 0 ? msg.timestamp : i + 1;
 			for (let j = 0; j < msg.content.length; j++) {
 				const block = msg.content[j];
-				if (block.type === "toolCall" && block.name === "TodoWrite" && block.arguments && typeof block.arguments === "object") {
+				if (block.type === "toolCall" && block.name === "TodoWrite" && !rejectedCalls.has(block.id) && block.arguments && typeof block.arguments === "object") {
 					const todos = (block.arguments as { todos?: TodoItem[] }).todos;
 					if (Array.isArray(todos)) {
 						for (const item of todos) {
@@ -1497,17 +1502,19 @@ function Desktop({ api }: { api: DesktopAPI }) {
 		const latestSharedTs = sharedTodos.reduce((max, item) => Math.max(max, item.updatedAt || item.createdAt || 0), 0);
 		const useShared = sharedTodos.length > 0 && latestSharedTs >= latestWriteTs;
 		const items: TodoItem[] = useShared
-			? sharedTodos.map((item) => ({
+			? sharedTodos.map((item) => {
+				// Owner and blockers belong to both forms: the current step is where they matter most.
+				const suffix = (item.owner ? ` (@${item.owner})` : "") + (item.blockedBy.length ? ` [阻塞于 #${item.blockedBy.join(", #")}]` : "");
+				return {
 				id: item.id,
-				content:
-					(item.status === "in_progress" && item.activeForm ? item.activeForm : item.subject) +
-					(item.owner ? ` (@${item.owner})` : "") +
-					(item.blockedBy.length ? ` [阻塞于 #${item.blockedBy.join(", #")}]` : ""),
+				content: item.subject + suffix,
+				...(item.activeForm ? { activeForm: item.activeForm + suffix } : {}),
 				status: item.status === "completed" ? "completed" : item.status === "in_progress" ? "in_progress" : "pending",
 				estimatedSeconds: item.estimatedSeconds,
 				startedAt: item.startedAt,
 				completedAt: item.completedAt,
-			}))
+				};
+			})
 			: latestWrite.map((item) => ({
 				...item,
 				startedAt: item.startedAt ?? startedById.get(item.id),
@@ -1565,7 +1572,6 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				.catch(() => {});
 		}
 		setDismissedTodoSig((prev) => ({ ...prev, [convId]: pinnedTodoState.sig }));
-		setTodoExpanded(false);
 	};
 	const currentTurnData = turnData?.conversationId === snapshot?.active?.id ? turnData : undefined;
 	const entryIds = useMemo(() => currentTurnData ? matchUserEntries(history.messages, currentTurnData.entries) : {}, [history.messages, currentTurnData]);
@@ -3120,7 +3126,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 										<span className="cc-pinned-todos-title">
 											<span>
 												任务进度 ({doneCount}/{latestTodos.length})
-												{activeTodo ? ` · ${activeTodo.content}` : ""}
+												{activeTodo ? ` · ${todoLabel(activeTodo)}` : ""}
 											</span>
 											{activeTiming?.label && (
 												<span className={`cc-eta-pill ${activeTiming.overdue ? "overdue" : ""}`}>
@@ -3147,28 +3153,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									)}
 								</div>
 								<SmoothCollapse open={todoExpanded}>
-									<div className="cc-pinned-todos-list">
-										{latestTodos.map((item) => {
-											const timing = computeTodoTiming(item, todoClock, running);
-											return (
-												<div key={item.id} className={`cc-todo-row ${item.status}`}>
-													{item.status === "completed" ? (
-														<Check size={12} className="ok" />
-													) : item.status === "in_progress" ? (
-														<LoaderCircle size={12} className={running ? "spin run" : "pending"} />
-													) : (
-														<Circle size={11} className="pending" />
-													)}
-													<span className="cc-todo-row-text">{item.content}</span>
-													{timing.label && (
-														<span className={`cc-eta-pill ${timing.overdue ? "overdue" : ""}`}>
-															{timing.label}
-														</span>
-													)}
-												</div>
-											);
-										})}
-									</div>
+									<TodoChecklist items={latestTodos} running={running} now={todoClock} />
 								</SmoothCollapse>
 							</div>
 							);
@@ -3465,7 +3450,7 @@ function Desktop({ api }: { api: DesktopAPI }) {
 									return {
 										active: running || activeChildren > 0,
 										stepBadge: `步骤 ${Math.min(doneTodos + 1, latestTodos.length)}/${latestTodos.length}`,
-										label: activeTodo.content,
+										label: todoLabel(activeTodo),
 										detail: childSuffix,
 									};
 								}

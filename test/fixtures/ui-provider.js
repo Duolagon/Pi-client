@@ -158,6 +158,18 @@ export default function uiProvider(pi) {
 			} else if (prompt.startsWith("工作流子步骤：")) {
 				response = results.length ? fauxAssistantMessage(`${prompt.slice(7)} 已完成。`)
 					: fauxAssistantMessage(fauxToolCall("read", { path: "src/greeting.mjs" }), { stopReason: "toolUse" });
+			} else if (prompt === "任务清单展示验证") {
+				// Two TodoWrite calls: the transcript shows what each changed, the pinned list the latest state.
+				const list = (statuses) => ({ todos: [
+					{ id: "read", content: "读取问候函数", activeForm: "正在读取问候函数", status: statuses[0] },
+					{ id: "test", content: "运行测试", activeForm: "正在运行测试", status: statuses[1] },
+					{ id: "docs", content: "更新说明文档", activeForm: "正在更新说明文档", status: statuses[2] },
+				] });
+				response = results.length === 0
+					? fauxAssistantMessage(fauxToolCall("TodoWrite", list(["in_progress", "pending", "pending"])), { stopReason: "toolUse" })
+					: results.length === 1
+						? fauxAssistantMessage(fauxToolCall("TodoWrite", list(["completed", "in_progress", "pending"])), { stopReason: "toolUse" })
+						: fauxAssistantMessage("清单已更新。");
 			} else if (prompt === "并行子Agent展示验证") {
 				// Three read-only agents launched in one message render as one grouped block.
 				response = results.length

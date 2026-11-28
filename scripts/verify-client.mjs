@@ -1952,6 +1952,32 @@ try {
 	await agentGroup.getByText("并行展示子任务：问候函数", { exact: true }).waitFor();
 	checks.push("parallel Agent calls render as one tree-branch block with live metrics and an expandable brief");
 
+	await submit("任务清单展示验证");
+	await idle();
+	const todoRows = page.locator(".cc-todo-update").filter({ hasText: "更新任务清单" });
+	await todoRows.nth(1).waitFor();
+	assert.match(await todoRows.nth(0).locator(".cc-todo-update-text").textContent(), /^创建了 3 项任务 · 0\/3$/);
+	assert.match(await todoRows.nth(1).locator(".cc-todo-update-text").textContent(), /^完成「读取问候函数」，开始「运行测试」 · 1\/3$/);
+	const pinned = page.locator(".cc-pinned-todos");
+	await pinned.locator(".cc-todo-list").waitFor();
+	assert.match(await pinned.locator(".cc-pinned-todos-title").textContent(), /任务进度 \(1\/3\) · 正在运行测试/);
+	const pinnedItems = pinned.locator(".cc-todo-item");
+	assert.equal(await pinnedItems.count(), 3, "the pinned list starts expanded");
+	assert.equal(await pinnedItems.nth(0).locator(".cc-todo-box").textContent(), "☒");
+	assert.equal(await pinnedItems.nth(0).evaluate((node) => getComputedStyle(node.querySelector(".cc-todo-text")).textDecorationLine), "line-through");
+	assert.equal(await pinnedItems.nth(1).getAttribute("aria-current"), "step");
+	assert.equal(await pinnedItems.nth(1).locator(".cc-todo-text").textContent(), "正在运行测试", "the current item shows its activeForm");
+	assert.equal(await pinnedItems.nth(2).locator(".cc-todo-box").textContent(), "☐");
+	if (process.env.PI_TODO_SCREENSHOT) {
+		await todoRows.nth(1).locator(".cc-todo-update-head").click();
+		await todoRows.nth(1).locator(".cc-todo-list").waitFor();
+		await page.locator(".cl-conversation").screenshot({ path: process.env.PI_TODO_SCREENSHOT, scale: "css", animations: "disabled" });
+		await todoRows.nth(1).locator(".cc-todo-update-head").click();
+	}
+	await pinned.getByRole("button", { name: "完成并收起" }).click();
+	await pinned.waitFor({ state: "detached" });
+	checks.push("TodoWrite calls show one-line deltas in the transcript and a pinned, expanded ☐/☒ checklist with the activeForm of the current item");
+
 	await page.evaluate(
 		(proj) => window.pi.permissions.upsert({ id: "e2e-allow-wf", scope: "project", project: proj, action: "allow", tool: "WorkflowRun" }),
 		originalSession.project,

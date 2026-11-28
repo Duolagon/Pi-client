@@ -22,11 +22,15 @@ import { toolOutputReference } from "../tool-output-types.ts";
 import { ArchivedToolOutput } from "./ArchivedToolOutput.tsx";
 import { AgentRows, type AgentCall } from "./AgentRows.tsx";
 import { WorkflowTree } from "./WorkflowTree.tsx";
+import { TodoUpdateRow } from "./TodoChecklist.tsx";
+import { previousTodoLists, todoDelta, type TodoLike } from "./todo-list.ts";
 import type { WorkflowRecord } from "../workflow-types.ts";
 
 export interface TodoItem {
 	id: string;
 	content: string;
+	/** Present-continuous form shown while the item is in progress. */
+	activeForm?: string;
 	status: "pending" | "in_progress" | "completed";
 	estimatedSeconds?: number;
 	startedAt?: number;
@@ -486,6 +490,19 @@ export function TranscriptView({
 		onOpenWerewolfChange?.(next);
 	};
 	const werewolfReport = werewolfReviews?.find((review) => review.id === werewolfReportId);
+	const todoHistory = useMemo(() => previousTodoLists(function* () {
+		const failedIds = new Set(state.messages.flatMap((item) => item.role === "toolResult" && item.isError ? [item.toolCallId] : []));
+		const resultIds = new Set(state.messages.flatMap((item) => item.role === "toolResult" ? [item.toolCallId] : []));
+		for (const message of state.messages) {
+			if (message.role !== "assistant") continue;
+			for (const block of message.content) {
+				if (block.type !== "toolCall" || block.name !== "TodoWrite") continue;
+				const todos = todoArgs(block.arguments);
+				// Only a call that returned changed the list; one still running or cut off did not.
+				if (todos && resultIds.has(block.id) && !failedIds.has(block.id)) yield { id: block.id, todos };
+			}
+		}
+	}()), [state.messages]);
 	const [unitWindowLimit, setUnitWindowLimit] = useState(64);
 	const scrollAnchorRef = useRef<{ el: HTMLElement; prevHeight: number; prevTop: number } | null>(null);
 	useLayoutEffect(() => {
@@ -724,6 +741,8 @@ export function TranscriptView({
 									externalTasks,
 									taskProgressMap,
 									workflows,
+									todoHistory,
+									expandAll: forceExpandAll,
 									onOpenTask,
 									onBackgroundTask,
 									onStopTask,
@@ -831,6 +850,8 @@ function turnItems({
 	externalTasks,
 	taskProgressMap,
 	workflows,
+	todoHistory,
+	expandAll,
 	onOpenTask,
 	onBackgroundTask,
 	onStopTask,
@@ -849,6 +870,10 @@ function turnItems({
 	externalTasks: ExternalTask[];
 	taskProgressMap: Record<string, TaskProgress>;
 	workflows: WorkflowRecord[];
+	/** The list each TodoWrite call replaced, so its row can say what changed. */
+	todoHistory: Map<string, readonly TodoLike[] | undefined>;
+	/** Transcript search is open: rows that hide content open so it can be found. */
+	expandAll: boolean;
 	onOpenTask?: (taskId: string) => void;
 	onBackgroundTask?: (taskId: string) => void;
 	onStopTask?: (taskId: string, kind: "pi" | "external") => void;
@@ -946,6 +971,29 @@ function turnItems({
 			return;
 		}
 		if (block.type !== "toolCall") return;
+		const todos = block.name === "TodoWrite" ? todoArgs(block.arguments) : undefined;
+		if (todos) {
+			const todoResult = state.messages.find(
+				(item): item is Extract<Message, { role: "toolResult" }> => item.role === "toolResult" && item.toolCallId === block.id,
+			);
+			// A rejected or failed call changed nothing; the generic card shows its error.
+			if (!todoResult?.isError) {
+				items.push({
+					key: block.id,
+					block,
+					node: (
+						<TodoUpdateRow
+							key={block.id}
+							todos={todos}
+							delta={todoDelta(todoHistory.get(block.id), todos)}
+							state={todoResult ? "ok" : isStreaming || state.tools[block.id] ? "run" : "stopped"}
+							forceOpen={expandAll}
+						/>
+					),
+				});
+				return;
+			}
+		}
 		const result = state.messages.find(
 			(item): item is Extract<Message, { role: "toolResult" }> => item.role === "toolResult" && item.toolCallId === block.id,
 		);
@@ -976,6 +1024,15 @@ function turnItems({
 		});
 	});
 	return items;
+}
+
+/** The checklist a TodoWrite call wrote, or undefined when its arguments are not a list yet. */
+function todoArgs(args: unknown): TodoItem[] | undefined {
+	const todos = args && typeof args === "object" ? (args as { todos?: unknown }).todos : undefined;
+	if (!Array.isArray(todos)) return undefined;
+	return todos.filter((item): item is TodoItem =>
+		Boolean(item) && typeof item === "object" && typeof (item as TodoItem).id === "string" && typeof (item as TodoItem).content === "string" &&
+		["pending", "in_progress", "completed"].includes((item as TodoItem).status));
 }
 
 /** Tools whose calls fold into a summary row instead of listing raw commands, like Claude. */

@@ -581,3 +581,78 @@
 	white-space: pre-wrap;
 	word-break: break-word;
 }
+
+/* Claude Code style checklist: ☐ pending, ☒ done and struck through, the current item highlighted. */
+.cc-todo-list {
+	margin: 0;
+	padding: 6px 12px 8px;
+	list-style: none;
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	border-top: 1px solid var(--cl-line-soft);
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: var(--fs-sm);
+}
+.cc-todo-item {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	min-width: 0;
+	color: var(--cl-2);
+}
+.cc-todo-box {
+	flex-shrink: 0;
+	width: 1.1em;
+	/* The mono stack draws ☐/☒ tiny; a system font gives them their full size. */
+	font-family: -apple-system, "Segoe UI Symbol", system-ui, sans-serif;
+	font-size: 1.15em;
+	line-height: 1;
+	color: var(--cl-3);
+}
+.cc-todo-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.cc-todo-item.completed .cc-todo-text { text-decoration: line-through; color: var(--cl-3); }
+.cc-todo-item.completed .cc-todo-box { color: var(--cl-green); }
+.cc-todo-item.in_progress .cc-todo-text { color: var(--cl-clay); font-weight: 600; }
+.cc-todo-item.in_progress .cc-todo-box { color: var(--cl-clay); }
+.cc-todo-item.is-live .cc-todo-text { animation: cc-todo-pulse 1.6s ease-in-out infinite; }
+@keyframes cc-todo-pulse { 50% { opacity: 0.62; } }
+@media (prefers-reduced-motion: reduce) { .cc-todo-item.is-live .cc-todo-text { animation: none; } }
+.cc-todo-more { color: var(--cl-3); font-size: var(--fs-xs); }
+.cc-visually-hidden {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip: rect(0 0 0 0);
+	white-space: nowrap;
+}
+
+/* A TodoWrite call in the transcript: one line of what changed, the list behind a toggle. */
+.cc-todo-update { margin: 2px 0; }
+.cc-todo-update-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 2px 0;
+	background: none;
+	border: 0;
+	color: var(--cl-1);
+	font-size: var(--fs-sm);
+	cursor: pointer;
+}
+.cc-todo-update-verb { font-weight: 600; }
+.cc-todo-update .cl-tool-chevron { opacity: 0; transition: transform 160ms ease, opacity 120ms ease; }
+.cc-todo-update:hover .cl-tool-chevron,
+.cc-todo-update-head:focus-visible .cl-tool-chevron { opacity: 1; }
+.cc-todo-update.is-open .cl-tool-chevron { transform: rotate(90deg); opacity: 1; }
+.cc-todo-update-line {
+	display: flex;
+	gap: 6px;
+	padding-left: 4px;
+	color: var(--cl-3);
+	font-size: var(--fs-sm);
+}
+.cc-todo-update-line .cc-tree-arm { display: inline; }
+.cc-todo-update-text { min-width: 0; overflow-wrap: anywhere; }
+.cc-todo-update-body .cc-todo-list { border-top: 0; padding-left: 22px; }
