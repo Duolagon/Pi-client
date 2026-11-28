@@ -5431,3 +5431,12 @@ body.cc-resizing iframe {
 	color: var(--cl-amber);
 	background: var(--cl-amber-soft);
 }
+
+/* multi tier settings: one row per external executor (model + effort). */
+.live-multi-row {
+	display: grid;
+	grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+	gap: 8px;
+	margin-top: 4px;
+}
+.live-multi-row input { min-width: 0; }

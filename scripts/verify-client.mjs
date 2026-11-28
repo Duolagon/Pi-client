@@ -2005,6 +2005,98 @@ try {
 	await page.locator(".cc-dock-header .cc-ultracode-badge").waitFor({ state: "detached" });
 	checks.push("the ultracode keyword glows while typed, runs only its own turn, marks that prompt, and a standing ultracode conversation shows a dock badge");
 
+	const multiDialog = page.getByRole("dialog", { name: "设置与模型连接", exact: true });
+	const multiSettingsGroup = multiDialog.getByRole("group", { name: "multi 档位：外部 Agent 协作", exact: true });
+	const openMultiSettings = async () => {
+		await page.getByRole("button", { name: "设置", exact: true }).click();
+		await multiDialog.getByRole("searchbox", { name: "搜索设置项", exact: true }).fill("multi");
+		await multiSettingsGroup.waitFor();
+	};
+	const saveMultiSettings = async () => {
+		await multiDialog.getByRole("button", { name: "保存设置", exact: true }).click();
+		await multiDialog.waitFor({ state: "detached" });
+	};
+	const controllerModel = selectControl("主控模型");
+	const controllerThinking = selectControl("主控思考强度");
+	const executorModels = [
+		["Codex", "gpt-5.4"],
+		["Claude Code", "sonnet"],
+		["Kimi Code", "kimi-k2.7-code"],
+	];
+	const kimiThinking = multiDialog.getByLabel("Kimi Code 思考强度", { exact: true });
+	const selectedModel = selectControl("选择模型");
+	if ((await snapshot()).state?.model?.id !== "desktop-demo-1") {
+		await (await selectListbox(selectedModel)).getByRole("option", { name: "本地演示模型", exact: true }).click();
+		await until(async () => (await snapshot()).state?.model?.id === "desktop-demo-1", "the baseline conversation model");
+	}
+	await selectValue(selectControl("思考强度"), "low");
+	await until(async () => (await snapshot()).state?.thinkingLevel === "low", "the baseline conversation effort");
+	await openMultiSettings();
+	await selectValue(controllerModel, "desktop-demo/desktop-demo-2");
+	await selectValue(controllerThinking, "high");
+	for (const [name, model] of executorModels) await multiDialog.getByLabel(`${name} 模型`, { exact: true }).fill(model);
+	await selectValue(selectControl("Codex 思考强度"), "high");
+	await selectValue(selectControl("Claude Code 思考强度"), "medium");
+	await kimiThinking.fill("high");
+	await saveMultiSettings();
+	assert.deepEqual((await snapshot()).settings.multiAgent, {
+		controller: { model: { provider: "desktop-demo", id: "desktop-demo-2" }, thinkingLevel: "high" },
+		executors: {
+			codex: { model: "gpt-5.4", effort: "high" },
+			claude: { model: "sonnet", effort: "medium" },
+			kimi: { model: "kimi-k2.7-code", effort: "high" },
+		},
+	});
+	await openMultiSettings();
+	assert.match(await controllerModel.textContent(), /本地演示模型 · 备用/);
+	assert.equal((await controllerThinking.textContent()).trim(), "高");
+	for (const [name, model] of executorModels) assert.equal(await multiDialog.getByLabel(`${name} 模型`, { exact: true }).inputValue(), model);
+	assert.equal((await selectControl("Codex 思考强度").textContent()).trim(), "high");
+	assert.equal((await selectControl("Claude Code 思考强度").textContent()).trim(), "medium");
+	assert.equal(await kimiThinking.inputValue(), "high");
+	if (workspaceScreenshots) await multiSettingsGroup.screenshot({ path: join(workspaceScreenshots, "multi-settings.png"), scale: "css", animations: "disabled" });
+	await kimiThinking.fill("max");
+	await multiDialog.getByRole("button", { name: "取消", exact: true }).click();
+	await page.getByRole("dialog", { name: "放弃未保存的设置更改？", exact: true }).getByRole("button", { name: "放弃更改", exact: true }).click();
+	await multiDialog.waitFor({ state: "detached" });
+	assert.equal((await snapshot()).settings.multiAgent.executors.kimi.effort, "high");
+	checks.push("multi-only settings save and reopen all controller and executor fields and prompt before discarding a draft");
+
+	await selectValue(selectControl("编排档位"), "multi");
+	const multiBadge = page.locator(".cc-dock-header .cc-multi-badge").filter({ hasText: /^multi$/ });
+	await multiBadge.waitFor();
+	if (workspaceScreenshots) await page.locator(".cl-composer-box").screenshot({ path: join(workspaceScreenshots, "multi-tier.png"), scale: "css", animations: "disabled" });
+	await submit("/ultracode off");
+	await page.getByText("ultracode 档位当前未开启。", { exact: true }).waitFor();
+	assert.equal((await snapshot()).active.codingTier, "multi");
+	await submit("验证 multi 主控");
+	await page.getByText("本地主控验证 multi/desktop-demo-2/high", { exact: true }).waitFor();
+	await idle();
+	const afterMulti = await snapshot();
+	assert.equal(afterMulti.state?.model?.id, "desktop-demo-1");
+	assert.equal(afterMulti.state?.thinkingLevel, "low");
+	await submit("验证 multi 主控 ultracode");
+	await page.getByText("本地主控验证 ultracode/desktop-demo-1/low", { exact: true }).waitFor();
+	await idle();
+	await multiBadge.waitFor();
+	await submit("/multi off");
+	await multiBadge.waitFor({ state: "detached" });
+	await submit("验证 multi 主控关闭");
+	await page.getByText("本地主控验证 standard/desktop-demo-1/low", { exact: true }).waitFor();
+	await idle();
+	checks.push("multi tier selector, independent slash toggle, local controller model and effort, and baseline routing outside multi turns");
+
+	await openMultiSettings();
+	await selectValue(controllerModel, "");
+	await selectValue(controllerThinking, "");
+	for (const [name] of executorModels) await multiDialog.getByLabel(`${name} 模型`, { exact: true }).fill("");
+	await selectValue(selectControl("Codex 思考强度"), "");
+	await selectValue(selectControl("Claude Code 思考强度"), "");
+	await kimiThinking.fill("");
+	await saveMultiSettings();
+	assert.equal((await snapshot()).settings.multiAgent, undefined);
+	checks.push("restoring all multi settings to defaults clears the persisted overrides");
+
 	await page.evaluate(
 		(proj) => window.pi.permissions.upsert({ id: "e2e-allow-wf", scope: "project", project: proj, action: "allow", tool: "WorkflowRun" }),
 		originalSession.project,

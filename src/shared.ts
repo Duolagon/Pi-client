@@ -245,7 +245,19 @@ export interface Conversation {
 	turnTier?: CodingTier;
 	updatedAt: number;
 }
-export type CodingTier = "standard" | "ultracode";
+export type CodingTier = "standard" | "ultracode" | "multi";
+/** External executors the multi tier coordinates. */
+export type MultiExecutorId = "codex" | "claude" | "kimi";
+export const MULTI_EXECUTORS: readonly MultiExecutorId[] = ["codex", "claude", "kimi"];
+/**
+ * The multi tier: the main conversation (controller) runs on its own model and thinking level and
+ * hands work to Codex / Claude Code / Kimi Code. Each executor may pin a native model and effort;
+ * absent fields keep the executor's own configuration.
+ */
+export interface MultiAgentSettings {
+	controller?: { model?: { provider: string; id: string }; thinkingLevel?: ThinkingLevel };
+	executors?: Partial<Record<MultiExecutorId, { model?: string; effort?: string }>>;
+}
 export interface ConversationMetaPatch {
 	pinned?: boolean;
 	archived?: boolean;
@@ -289,6 +301,8 @@ export interface Settings {
 	 * definition name none. A missing role, or a model the parent cannot reach, inherits.
 	 */
 	modelRouting?: ModelRouting;
+	/** Controller and executor models for the multi tier. */
+	multiAgent?: MultiAgentSettings;
 	/** HTTP(S) proxy URL for model and web requests; overrides the shell's HTTPS_PROXY. */
 	proxy?: string;
 	/** Comma-separated hosts that bypass the proxy (NO_PROXY). */
@@ -886,6 +900,8 @@ export interface DesktopAPI {
 		cronEnabled?: boolean;
 		agentTeams?: boolean;
 		modelRouting?: ModelRouting;
+		/** null clears the multi tier configuration. */
+		multiAgent?: MultiAgentSettings | null;
 		proxy?: string;
 		noProxy?: string;
 		caFile?: string;

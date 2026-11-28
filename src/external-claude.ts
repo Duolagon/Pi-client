@@ -2,8 +2,9 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import type { ClaudeHelperPacket, ClaudeHelperRequest } from "./external-claude-helper.ts";
+import type { ClaudeHelperConfig, ClaudeHelperPacket, ClaudeHelperRequest } from "./external-claude-helper.ts";
 import type { ExternalAdapter, ExternalSession, ExternalSessionOptions, ExternalTurnResult } from "./external-types.ts";
+import { redactDiagnostic, withDiagnostics } from "./external-errors.ts";
 
 export class ClaudeAdapter implements ExternalAdapter {
 	async open(options: ExternalSessionOptions): Promise<ExternalSession> {
@@ -11,7 +12,7 @@ export class ClaudeAdapter implements ExternalAdapter {
 		if (!isAbsolute(options.executable) || !isAbsolute(options.cwd)) throw new Error("Claude executable and working directory must be absolute paths");
 		const session = new ClaudeSession(options);
 		try { await session.initialize(); return session; }
-		catch (error) { await session.close(); throw error; }
+		catch (error) { await session.close(); throw withDiagnostics(error, session.diagnostics()); }
 	}
 }
 
@@ -43,8 +44,9 @@ class ClaudeSession implements ExternalSession {
 		this.exit = new Promise((resolve) => this.child.once("close", () => { this.ended = true; resolve(); }));
 		this.child.once("error", (error) => this.fail(error));
 		this.child.stdin.on("error", (error) => this.fail(error));
-		this.child.once("exit", (code, signal) => this.fail(new Error(`Claude helper exited (${code ?? signal}). ${this.stderr}`)));
-		this.child.stderr.on("data", (data: Buffer) => { this.stderr = redact((this.stderr + data.toString()).slice(-8000), options.env); });
+		this.child.once("close", (code, signal) => this.fail(new Error(`Claude helper exited (${code ?? signal}). ${this.diagnostics()}`)));
+		const errors = new StringDecoder("utf8");
+		this.child.stderr.on("data", (data: Buffer) => { this.stderr = (this.stderr + errors.write(data)).slice(-16000); });
 		const decoder = new StringDecoder("utf8");
 		let buffer = "";
 		this.child.stdout.on("data", (data: Buffer) => {
@@ -56,17 +58,23 @@ class ClaudeSession implements ExternalSession {
 				const line = buffer.slice(0, boundary).replace(/\r$/, "");
 				buffer = buffer.slice(boundary + 1);
 				if (!line) continue;
-				try { this.receive(JSON.parse(line)); }
-				catch (error) { this.fail(new Error(`Claude helper protocol error: ${error instanceof Error ? error.message : String(error)}`)); this.kill("SIGTERM"); }
+				let value: unknown;
+				try { value = JSON.parse(line); }
+				catch { this.fail(new Error("Claude helper returned an invalid JSONL protocol message")); this.kill("SIGTERM"); return; }
+				try { this.receive(value); }
+				catch (error) { this.fail(new Error(`Claude helper protocol error: ${error instanceof Error ? error.message : String(error)}`)); this.kill("SIGTERM"); return; }
 			}
 		});
 	}
 	get sessionId(): string | undefined { return this.nativeSessionId; }
+	diagnostics(): string { return redactDiagnostic(this.stderr, this.options.env).slice(-8000); }
 	async initialize(): Promise<void> {
 		await this.request({ type: "init", id: randomUUID(), config: {
 			executable: this.options.executable, cwd: this.options.cwd, policy: this.options.policy, resumeSessionId: this.options.resumeSessionId,
 			projectTrusted: this.options.projectTrusted === true,
 			maxBudgetUsd: this.options.maxBudgetUsd,
+			...(this.options.model ? { model: this.options.model } : {}),
+			...(this.options.effort ? { effort: this.options.effort as ClaudeHelperConfig["effort"] } : {}),
 		} }, 15000);
 	}
 	async run(prompt: string, signal?: AbortSignal): Promise<ExternalTurnResult> {
@@ -139,7 +147,8 @@ class ClaudeSession implements ExternalSession {
 			const pending = this.pending.get(packet.id);
 			if (!pending) return;
 			this.pending.delete(packet.id); clearTimeout(pending.timer);
-			if (packet.ok) pending.resolve(packet.value); else pending.reject(new Error(packet.error));
+			if (packet.ok) pending.resolve(packet.value);
+			else pending.reject(new Error(typeof packet.error === "string" ? redactDiagnostic(packet.error, this.options.env).slice(0, 8000) : "Claude helper request failed"));
 		} else if (packet.type === "event") {
 			if (!packet.event || typeof packet.event.type !== "string") throw new Error("Invalid event");
 			if (packet.event.type === "session") this.nativeSessionId = packet.event.sessionId;
@@ -191,8 +200,4 @@ async function bounded(promise: Promise<void> | undefined, timeout: number, erro
 	let timer: NodeJS.Timeout | undefined;
 	try { await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(error)), timeout); })]); }
 	finally { clearTimeout(timer); }
-}
-function redact(text: string, env: NodeJS.ProcessEnv): string {
-	for (const [key, value] of Object.entries(env)) if (/(?:API_KEY|TOKEN|SECRET|PASSWORD)/i.test(key) && value && value.length >= 8) text = text.split(value).join("[REDACTED]");
-	return text;
 }

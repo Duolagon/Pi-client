@@ -56,6 +56,10 @@ class FakeAdapter implements ExternalAdapter {
 					}
 					if (prompt === "many-events") for (let index = 0; index < 2100; index++) options.onEvent({ type: "tool_update", id: `tool-${index}`, text: `event-${index}` });
 					if (prompt === "large-output") options.onEvent({ type: "tool_update", id: "large", text: "x".repeat(300 * 1024) });
+					if (prompt === "diagnostic-failure") {
+						options.onEvent({ type: "diagnostic", message: `Native diagnostic: ${options.env.SAMPLE_AUTH_TOKEN}` });
+						throw new Error(`Native request failed: ${options.env.SAMPLE_AUTH_TOKEN}`);
+					}
 					const text = prompt === "large-output" ? "x".repeat(60 * 1024) : `result:${prompt}`;
 					options.onEvent({ type: "text_delta", text });
 					return { status: interrupted || signal?.aborted ? "cancelled" : "completed", sessionId: id, text };
@@ -121,6 +125,39 @@ async function until<T>(get: () => T | Promise<T>, check: (value: T) => boolean,
 	}
 }
 const terminal = (task: ExternalTask) => ["completed", "cancelled", "failed", "interrupted"].includes(task.status);
+
+test("a queued follow-up has no change summary from the previous turn, even if cancelled", async () => {
+	let canStart = true;
+	const data = await setup({ canStart: () => canStart });
+	try {
+		const changes = { files: [], truncated: false, additions: 0, deletions: 0 };
+		data.options.beginCheckpoint = async () => async () => changes;
+		const task = await data.manager.start({ executor: "codex", description: "Changes", prompt: "first" }, "parent-a");
+		await until(() => data.manager.snapshot(task.id), terminal, "first turn");
+		assert.deepEqual((await data.manager.result(task.id)).changes, changes);
+		canStart = false;
+		assert.equal((await data.manager.send({ taskId: task.id, message: "second" })).status, "queued");
+		await data.manager.cancel(task.id);
+		const cancelled = await data.manager.result(task.id);
+		assert.equal(cancelled.status, "cancelled");
+		assert.equal(cancelled.changes, undefined);
+	} finally { await data.cleanup(); }
+});
+
+test("diagnostics and task errors redact credentials from the native environment", async () => {
+	const data = await setup();
+	try {
+		const value = "fixture-value-1234";
+		data.options.networkEnv = () => ({ SAMPLE_AUTH_TOKEN: value });
+		const task = await data.manager.start({ executor: "codex", description: "Diagnostics", prompt: "diagnostic-failure" }, "parent-a");
+		const failed = await until(() => data.manager.snapshot(task.id), terminal, "native failure");
+		assert.equal(failed.status, "failed");
+		assert.equal(failed.error, "Native request failed: [REDACTED]");
+		const events = await data.manager.replay(task.id);
+		assert.ok(events.events.some(({ event }) => event.type === "diagnostic" && event.message === "Native diagnostic: [REDACTED]"));
+		assert.ok(!JSON.stringify(events).includes(value));
+	} finally { await data.cleanup(); }
+});
 
 test("external manager queues work by capacity, binds ownership and restores the exact native session for continuation", async () => {
 	const data = await setup({ maxConcurrent: 1 });
@@ -469,4 +506,32 @@ test("external children under a dontAsk parent deny unapproved commands without 
 		assert.deepEqual(data.adapter.decisions, ["deny"]);
 		assert.equal(state.pendingApprovals.length, 0);
 	} finally { await data.cleanup(); }
+});
+
+test("native settings are scoped to the originating multi task and are re-read after restart", async () => {
+	const data = await setup();
+	let usesMultiSettings = true;
+	let pin = { model: "configured-model", effort: "high" };
+	data.options.usesMultiSettings = () => usesMultiSettings;
+	data.options.executorModel = () => pin;
+	const resumed = new ExternalAgents(data.options);
+	try {
+		const first = await data.manager.start({ executor: "codex", description: "Multi", prompt: "first" }, "parent-a");
+		await until(() => data.manager.snapshot(first.id), terminal, "first multi turn");
+		assert.equal(data.adapter.opens[0].model, pin.model);
+		assert.equal(data.adapter.opens[0].effort, pin.effort);
+		await data.manager.close();
+		usesMultiSettings = false;
+		pin = { model: "updated-model", effort: "medium" };
+		await resumed.initialize();
+		await resumed.send({ taskId: first.id, message: "continue" }, "parent-a");
+		await until(() => resumed.snapshot(first.id), terminal, "continued multi turn");
+		assert.equal(data.adapter.opens[1].resumeSessionId, "native-session-1");
+		assert.equal(data.adapter.opens[1].model, pin.model);
+		assert.equal(data.adapter.opens[1].effort, pin.effort);
+		const standard = await resumed.start({ executor: "codex", description: "Standard", prompt: "ordinary" }, "parent-a");
+		await until(() => resumed.snapshot(standard.id), terminal, "ordinary turn");
+		assert.equal(data.adapter.opens[2].model, undefined);
+		assert.equal(data.adapter.opens[2].effort, undefined);
+	} finally { await resumed.close(); await data.cleanup(); }
 });

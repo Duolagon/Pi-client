@@ -164,7 +164,7 @@ export class GitSnapshots {
 	}
 
 	/** Return unified before/after differences, including binary and mode summaries. */
-	async diff(project: string, id: string, path?: string, conversationId?: string): Promise<GitCheckpointDiff> {
+	async diff(project: string, id: string, path?: string, conversationId?: string, maxFiles?: number): Promise<GitCheckpointDiff> {
 		const root = await this.queryRoot(project);
 		return this.serialize(root, async () => {
 			const manifest = await this.load(root, id, conversationId);
@@ -176,7 +176,7 @@ export class GitSnapshots {
 					: manifest.checkpoint.changes.filter((item) => item.path === path);
 			if (path !== undefined && !selected.length) throw new Error("此路径不在该快照的修改列表中。");
 			const files: GitCheckpointDiff["files"] = [];
-			for (const change of selected) {
+			for (const change of selected.slice(0, maxFiles ?? selected.length)) {
 				const result = await this.fileDiff(
 					change.path,
 					manifest.before[change.path] ?? missing,
@@ -184,7 +184,12 @@ export class GitSnapshots {
 				);
 				files.push({ ...change, ...result });
 			}
-			return { checkpointId: id, files };
+			return {
+				checkpointId: id,
+				files,
+				...(manifest.checkpoint.excludedFiles ? { excludedFiles: manifest.checkpoint.excludedFiles } : {}),
+				...(files.length < selected.length ? { truncated: true } : {}),
+			};
 		});
 	}
 
@@ -712,15 +717,16 @@ export class GitSnapshots {
 				else throw error;
 			}
 			let inHunk = false;
+			const displayPath = /[\r\n]/.test(path) ? JSON.stringify(path).slice(1, -1) : path;
 			output = output
 				.split("\n")
 				.map((line) => {
 					if (line.startsWith("@@ ")) inHunk = true;
 					if (inHunk) return line;
-					if (line.startsWith("diff --git ")) return `diff --git a/${path} b/${path}`;
-					if (line.startsWith("--- ") && before.kind !== "missing") return `--- a/${path}`;
-					if (line.startsWith("+++ ") && after.kind !== "missing") return `+++ b/${path}`;
-					if (line.startsWith("Binary files ")) return `Binary files a/${path} and b/${path} differ`;
+					if (line.startsWith("diff --git ")) return `diff --git a/${displayPath} b/${displayPath}`;
+					if (line.startsWith("--- ") && before.kind !== "missing") return `--- a/${displayPath}`;
+					if (line.startsWith("+++ ") && after.kind !== "missing") return `+++ b/${displayPath}`;
+					if (line.startsWith("Binary files ")) return `Binary files a/${displayPath} and b/${displayPath} differ`;
 					return line;
 				})
 				.join("\n");

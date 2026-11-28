@@ -44,7 +44,12 @@ export default function uiProvider(pi) {
 				return slow.provider.streamSimple(model, context, streamOptions);
 			}
 			let response;
-			if (prompt.includes("模型上下文验证")) {
+			if (prompt.startsWith("验证 multi 主控")) {
+				const system = [context.systemPrompt, ...context.messages.filter((message) => message.role === "system")
+					.flatMap((message) => [message.content, ...Object.values(message.sections ?? {})])].join("\n");
+				const tier = [...system.matchAll(/# Orchestration \((\w+) tier\)/g)].at(-1)?.[1];
+				response = fauxAssistantMessage(`本地主控验证 ${tier}/${model.id}/${streamOptions?.reasoning ?? "off"}`);
+			} else if (prompt.includes("模型上下文验证")) {
 				const system = [context.systemPrompt, ...context.messages.filter((message) => message.role === "system")
 					.flatMap((message) => [message.content, ...Object.values(message.sections ?? {})])].join("\n");
 				response = fauxAssistantMessage(["PI_PRIVATE_MEMORY_FIXTURE", "PI_RULE_FIXTURE"].every((marker) => system.includes(marker)) &&

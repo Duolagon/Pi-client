@@ -6,6 +6,7 @@ import { query, type Options, type Query, type SDKMessage, type SDKUserMessage }
 import { evaluatePermission, validateRuntimePolicy } from "./permission-policy.ts";
 import type { RuntimePermissionPolicy } from "./permission-types.ts";
 import type { ExternalAdapterEvent, ExternalApprovalRequest, ExternalApprovalResponse, ExternalTurnResult } from "./external-types.ts";
+import { redactDiagnostic } from "./external-errors.ts";
 
 export interface ClaudeHelperConfig {
 	executable: string;
@@ -14,6 +15,9 @@ export interface ClaudeHelperConfig {
 	policy: RuntimePermissionPolicy;
 	projectTrusted?: boolean;
 	maxBudgetUsd?: number;
+	/** Native model id or alias (e.g. `opus`, `claude-sonnet-5-5`); absent keeps the CLI default. */
+	model?: string;
+	effort?: "low" | "medium" | "high" | "xhigh" | "max";
 }
 export type ClaudeHelperRequest =
 	| { type: "init"; id: string; config: ClaudeHelperConfig }
@@ -98,7 +102,11 @@ export class ClaudeSdkHelper {
 				if (config.projectTrusted !== undefined && typeof config.projectTrusted !== "boolean") throw new Error("Invalid Claude project trust");
 				if (config.maxBudgetUsd !== undefined && (typeof config.maxBudgetUsd !== "number" || !Number.isFinite(config.maxBudgetUsd) || config.maxBudgetUsd <= 0))
 					throw new Error("Invalid Claude budget");
+				if (config.model !== undefined && (typeof config.model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]{0,199}$/.test(config.model)))
+					throw new Error("Invalid Claude model");
+				if (config.effort !== undefined && !["low", "medium", "high", "xhigh", "max"].includes(config.effort as string)) throw new Error("Invalid Claude effort");
 				this.config = { executable: config.executable, cwd: config.cwd, policy: validateRuntimePolicy(config.policy),
+					model: config.model as string | undefined, effort: config.effort as ClaudeHelperConfig["effort"],
 					resumeSessionId: config.resumeSessionId as string | undefined, projectTrusted: config.projectTrusted === true,
 					maxBudgetUsd: config.maxBudgetUsd as number | undefined };
 				this.sessionId = this.config.resumeSessionId;
@@ -163,6 +171,8 @@ export class ClaudeSdkHelper {
 			permissionMode: readonly ? "plan" : "default",
 			settingSources: config.projectTrusted ? ["user", "project", "local"] : ["user"],
 			maxBudgetUsd: config.maxBudgetUsd,
+			...(config.model ? { model: config.model } : {}),
+			...(config.effort ? { effort: config.effort } : {}),
 			...(readonly ? { tools: ["Read", "Grep", "Glob", "LS"] } : {}),
 			// SDK hooks remain in force even when native permission settings would auto-allow.
 			hooks: {
@@ -275,7 +285,8 @@ export class ClaudeSdkHelper {
 			if (item.is_error && !this.current.cancelled) {
 				const id = this.current.id;
 				this.current = undefined;
-				this.send({ type: "response", id, ok: false, error: Array.isArray(item.errors) ? item.errors.map(String).join("\n").slice(0, 8000) : `Claude returned ${String(item.subtype)}` });
+				const failure = [`Claude returned ${String(item.subtype)}`, ...(Array.isArray(item.errors) ? item.errors.map(String) : [])].join("\n");
+				this.send({ type: "response", id, ok: false, error: message(failure) });
 				return;
 			}
 			const text = typeof item.result === "string" ? item.result : this.current.text;
@@ -305,10 +316,7 @@ function permissionResponse(value: unknown): ExternalApprovalResponse {
 	}
 	return { decision: input.decision as ExternalApprovalResponse["decision"], answers: input.answers as ExternalApprovalResponse["answers"] };
 }
-function redact(text: string): string {
-	for (const [name, value] of Object.entries(process.env)) if (/(?:API_KEY|TOKEN|SECRET|PASSWORD)/i.test(name) && value && value.length >= 8) text = text.split(value).join("[REDACTED]");
-	return text;
-}
+function redact(text: string): string { return redactDiagnostic(text, process.env); }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
 	let writes = Promise.resolve();

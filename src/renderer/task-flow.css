@@ -658,7 +658,8 @@
 .cc-todo-update-body .cc-todo-list { border-top: 0; padding-left: 22px; }
 
 /* ultracode: the badge on the dock and on prompts that ran on it, and the keyword glow while typing. */
-.cc-ultracode-badge {
+.cc-ultracode-badge,
+.cc-multi-badge {
 	display: inline-flex;
 	align-items: center;
 	flex-shrink: 0;
@@ -672,6 +673,9 @@
 	background: linear-gradient(90deg, #c2410c, #db2777 50%, #7c3aed);
 	background-size: 200% 100%;
 	animation: cc-ultracode-flow 6s linear infinite;
+}
+.cc-multi-badge {
+	background-image: linear-gradient(90deg, #0f766e, #1d4ed8 50%, #0f766e);
 }
 .cc-prompt-tier { display: flex; width: fit-content; margin: 0 0 4px; }
 @keyframes cc-ultracode-flow { to { background-position: 200% 0; } }
@@ -698,7 +702,9 @@
 /* Both boxes reserve the same scrollbar gutter, so lines wrap at the same points. */
 .cl-composer-box textarea.has-keyword,
 .cc-keyword-mirror { scrollbar-gutter: stable; }
-@media (prefers-reduced-motion: reduce) { .cc-ultracode-badge { animation: none; } }
+@media (prefers-reduced-motion: reduce) {
+	.cc-ultracode-badge, .cc-multi-badge { animation: none; }
+}
 .cc-keyword-hint {
 	display: block;
 	text-align: right;

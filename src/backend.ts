@@ -142,7 +142,9 @@ import { planRelativePath } from "./plan-path.ts";
 import { buildLaunchShellCommand, launchConfigUrl, readLaunchConfigurations, validateLocalPreviewUrl } from "./launch-config.ts";
 import { DEFAULT_LOCAL_PREVIEW_URL, formatPreviewInspectSummary, type PreviewInspectInput, type PreviewInspectResult, type PreviewInteraction } from "./preview-check-types.ts";
 import { detectProjectTrustResources } from "./project-trust.ts";
-import { codingTierOf, codingTierPromptSection, mentionsUltracode, recordTierSpan, WORKFLOW_LIMITS, workflowBudgetFor } from "./coding-tier.ts";
+import { codingTierOf, codingTierPromptSection, mentionsUltracode, recordTierSpan, WORKFLOW_LIMITS, workflowBudgetFor, type CodingTierRuntimeConfig } from "./coding-tier.ts";
+import { parseMultiAgentSettings, sanitizeMultiAgentSettings } from "./multi-agent.ts";
+import { MAX_SUMMARY_FILES, summarizeCheckpoint } from "./external-changes.ts";
 import { DEFAULT_OUTPUT_STYLE, discoverOutputStyles, findOutputStyle, outputStylePromptSection, validOutputStyleName } from "./output-styles.ts";
 import { EDITOR_CHOICES, type EditorChoice } from "./editor-open.ts";
 import { UsageStatsCollector } from "./usage-stats.ts";
@@ -185,6 +187,7 @@ import { buildContextReport, deleteProjectMemoryRule, writeProjectMemoryFile, ty
 import { buildSeatbeltProfile, probeSeatbeltSupport, resolveGitWorktreeWritablePaths } from "./sandbox.ts";
 import { readClaudeProjectPermissionsDetailed, writeClaudeProjectPermissions } from "./claude-settings-sync.ts";
 import { createForkedSessionSnapshot, findSessionFileById } from "./session-fork.ts";
+import { MULTI_EXECUTORS, type MultiAgentSettings, type MultiExecutorId } from "./shared.ts";
 import type { BtwResult, ClaudePermissionsSyncResult, CodingTier, ConversationMetaPatch, DoctorCheck, DoctorReport, OutputStyleInfo, PlanFileState, PullRequestMergeMethod, SandboxStatus, UsageStatsReport } from "./shared.ts";
 import { ExternalAgents } from "./external-agents.ts";
 import { readToolOutputPage, toolOutputDirectory } from "./tool-output-archive.ts";
@@ -331,10 +334,13 @@ interface SessionRuntime {
 	shellEnv?: NodeJS.ProcessEnv;
 	/** Output style prompt read by the permission extension each turn; main conversations only. */
 	outputStyleFile?: string;
-	/** Coding tier prompt read by the permission extension each turn; main conversations only. */
+	/** Coding tier configuration read by the permission extension each turn; main conversations only. */
 	codingTierFile?: string;
-	/** Set while a standard conversation runs one turn on ultracode because its prompt said so. */
+	codingTierWrite?: Promise<void>;
+	/** Set while a conversation runs one turn on ultracode because its prompt said so. */
 	turnTier?: CodingTier;
+	/** The tier of an active run, even if the user selects a different tier for the next one. */
+	runningTier?: CodingTier;
 	metaWritten?: boolean;
 	controlWrites?: Promise<void>;
 	/**
@@ -849,8 +855,17 @@ export class DesktopService {
 			},
 			beginCheckpoint: async (task) => {
 				const checkpoint = await this.git.begin(task.workingDirectory, task.id, `${task.title} · 第 ${task.turn} 轮`);
-				return async () => { await this.git.finish(task.workingDirectory, checkpoint.id, { conversationId: task.id }); };
+				return async () => {
+					await this.git.finish(task.workingDirectory, checkpoint.id, { conversationId: task.id });
+					// The checkpoint covers untracked files too, so new files appear in the summary.
+					// A summary failure must not turn a finished task into a failed one.
+				return this.git.diff(task.workingDirectory, checkpoint.id, undefined, task.id, MAX_SUMMARY_FILES)
+					.then(summarizeCheckpoint).catch(() => undefined);
+				};
 			},
+			executorModel: (executor) => executor === "codex" || executor === "claude" || executor === "kimi"
+				? this.store.settings.multiAgent?.executors?.[executor] : undefined,
+			usesMultiSettings: (owner) => this.effectiveTier(owner) === "multi",
 			checkBudget: (executor) => {
 				if (this.store.settings.minBalance)
 					throw new Error("外部执行器使用独立账号，无法核对 Pi 设置的最低余额。");
@@ -1288,14 +1303,35 @@ export class DesktopService {
 		await rename(temporary, runtime.outputStyleFile);
 	}
 
-	/** Writes the tier prompt section (empty for standard) read by the permission extension each turn. */
+	/** Writes the active tier configuration read by the permission extension each turn. */
 	private async writeCodingTier(runtime: SessionRuntime): Promise<void> {
-		if (!runtime.codingTierFile) return;
+		const file = runtime.codingTierFile;
+		if (!file) return;
+		const tier = this.configuredTier(runtime.conversationId);
 		const standing = this.store.conversations.find((item) => item.id === runtime.conversationId)?.codingTier;
-		const turnOnly = standing !== "ultracode" && runtime.turnTier === "ultracode";
-		const temporary = `${runtime.codingTierFile}.${randomBytes(4).toString("hex")}.tmp`;
-		await writeFile(temporary, codingTierPromptSection(turnOnly ? "ultracode" : standing, turnOnly), { mode: 0o600 });
-		await rename(temporary, runtime.codingTierFile);
+		const settings = this.store.settings.multiAgent;
+		const write = (runtime.codingTierWrite ?? Promise.resolve()).catch(() => {}).then(async () => {
+			const multi = tier === "multi" ? { settings, available: await this.multiExecutorsAvailable() } : undefined;
+			const config: CodingTierRuntimeConfig = {
+				prompt: codingTierPromptSection(tier, tier === "ultracode" && standing !== tier, multi),
+				controller: multi?.settings?.controller,
+			};
+			await this.atomicJson(file, config);
+		});
+		runtime.codingTierWrite = write;
+		await write;
+	}
+
+	/** Multi tier executors that are installed and enabled now. */
+	private async multiExecutorsAvailable(): Promise<MultiExecutorId[]> {
+		const executors = await this.external.executors().catch(() => []);
+		return MULTI_EXECUTORS.filter((id) => executors.some((item) => item.id === id && item.enabled && item.available));
+	}
+
+	private async refreshMultiTierFiles(): Promise<void> {
+		for (const runtime of this.runtimes.values())
+			if (runtime.codingTierFile && !runtime.runningTier && this.configuredTier(runtime.conversationId) === "multi")
+				await this.writeCodingTier(runtime).catch(() => {});
 	}
 
 	/**
@@ -1304,6 +1340,10 @@ export class DesktopService {
 	 */
 	private effectiveTier(conversationId: string): CodingTier {
 		const root = this.rootConversationId(conversationId, false);
+		return this.runtimes.get(root)?.runningTier ?? this.configuredTier(root);
+	}
+
+	private configuredTier(root: string): CodingTier {
 		const standing = this.store.conversations.find((item) => item.id === root)?.codingTier;
 		return codingTierOf(standing === "ultracode" || this.runtimes.get(root)?.turnTier === "ultracode" ? "ultracode" : standing);
 	}
@@ -2013,14 +2053,15 @@ export class DesktopService {
 			if (patch.codingTier !== undefined) {
 				// The tier steers the main conversation; delegated children never read it.
 				if (this.rootConversationId(id, false) !== id) throw new Error("请在主会话切换档位。");
+				if (!["standard", "ultracode", "multi"].includes(patch.codingTier)) throw new Error("未知档位。");
 				const on = patch.codingTier === "ultracode";
 				const runtime = this.runtimes.get(id);
 				// Turning it on during a keyword turn continues that turn's open span; turning it off closes
 				// whichever span is open, and ends a keyword turn too.
 				conversation.ultracodeTurns = recordTierSpan(conversation.ultracodeTurns, on, Date.now());
-				conversation.codingTier = on ? "ultracode" : undefined;
+				conversation.codingTier = patch.codingTier === "standard" ? undefined : patch.codingTier;
 				if (runtime && !on) runtime.turnTier = undefined;
-				if (runtime) await this.writeCodingTier(runtime);
+				if (runtime && !runtime.runningTier) await this.writeCodingTier(runtime);
 			}
 			await this.persist();
 			return this.buildSnapshot();
@@ -3357,7 +3398,11 @@ export class DesktopService {
 
 	subscribeExternal(listener: (event: ExternalEvent) => void): () => void { return this.external.subscribe(listener); }
 	externalExecutors() { return this.external.executors(); }
-	configureExternal(input: ExternalExecutorInput) { return this.external.configure(input); }
+	async configureExternal(input: ExternalExecutorInput) {
+		const executors = await this.external.configure(input);
+		await this.refreshMultiTierFiles();
+		return executors;
+	}
 	async startExternal(input: ExternalTaskStartInput) { await this.operation; return this.external.start(input, this.conversation(input.conversationId).id); }
 	listExternal(conversationId?: string) { if (conversationId) this.conversation(conversationId); return this.external.list(conversationId); }
 	externalSnapshot(id: string) { return this.external.snapshot(id); }
@@ -3590,10 +3635,14 @@ export class DesktopService {
 					hook.additionalContext && !command.message.includes(hook.additionalContext)
 						? { ...command, message: `${command.message}\n\n[Hook Context]\n${hook.additionalContext}` }
 						: command;
-				// "ultracode" in a new turn's prompt runs that turn on ultracode; a steering message mid-run does not.
-				if (!alreadyRunning && runtime.codingTierFile && active.codingTier !== "ultracode" &&
-					!command.message.trimStart().startsWith("/") && mentionsUltracode(command.message))
-					await this.setTurnTier(runtime, "ultracode");
+				if (!alreadyRunning && runtime.codingTierFile) {
+					const selected = this.configuredTier(active.id);
+					// The keyword can override the standing tier only at the start of a new run.
+					const keyword = selected !== "ultracode" && !command.message.trimStart().startsWith("/") && mentionsUltracode(command.message);
+					runtime.runningTier = keyword ? "ultracode" : selected;
+					if (keyword) await this.setTurnTier(runtime, "ultracode");
+					else if (selected === "multi") await this.writeCodingTier(runtime).catch(() => {});
+				}
 				if (!alreadyRunning) await this.startCheckpoint(runtime, command.message, true);
 				// Definitions edited outside the app take effect on this run's agent listing.
 				if (!alreadyRunning) await this.writeAgentListing(runtime).catch(() => {});
@@ -4084,6 +4133,7 @@ export class DesktopService {
 		cronEnabled?: boolean;
 		agentTeams?: boolean;
 		modelRouting?: ModelRouting;
+		multiAgent?: MultiAgentSettings | null;
 		proxy?: string;
 		noProxy?: string;
 		caFile?: string;
@@ -4158,6 +4208,11 @@ export class DesktopService {
 			if (settings.agentTeams !== undefined) {
 				if (typeof settings.agentTeams !== "boolean") throw new Error("实验性 Agent Teams 开关设置无效。");
 				next.settings.agentTeams = settings.agentTeams;
+			}
+			if (settings.multiAgent !== undefined) {
+				const multi = settings.multiAgent === null ? {} : parseMultiAgentSettings(settings.multiAgent);
+				if (multi.controller || multi.executors) next.settings.multiAgent = multi;
+				else delete next.settings.multiAgent;
 			}
 			if (settings.modelRouting !== undefined) {
 				const routing = parseModelRoutingUpdate(settings.modelRouting);
@@ -4363,6 +4418,7 @@ export class DesktopService {
 			// Running main conversations pick up the new style on their next turn.
 			if (styleChanged && !needsRestart)
 				for (const runtime of this.runtimes.values()) await this.writeOutputStyle(runtime).catch(() => {});
+			if (settings.multiAgent !== undefined && !needsRestart) await this.refreshMultiTierFiles();
 			if (needsRestart) {
 				for (const runtime of [...this.runtimes.values()]) await this.stopRuntime(runtime);
 				const active = this.active();
@@ -5814,6 +5870,15 @@ export class DesktopService {
 		const prepared = existing ? undefined : runtime.checkpointId;
 		let delivery: NotificationDisposition | undefined;
 		try {
+			// Settings or standing tier can change while the checkpoint is starting. The extension
+			// reads the tier file when the wakeup starts, so wait for the latest pending write.
+			let published: Promise<void> | undefined;
+			while (published !== runtime.codingTierWrite) {
+				published = runtime.codingTierWrite;
+				await published;
+			}
+			if (this.closed || runtime.stopping || this.runtimes.get(conversation.id) !== runtime ||
+				runtime.busy || runtime.bashBusy || runtime.state?.isStreaming || runtime.state?.isCompacting) return "deferred";
 			delivery = await send();
 			return delivery;
 		} finally {
@@ -6270,6 +6335,8 @@ export class DesktopService {
 			error: task.error,
 			stopReason,
 			durationMs: task.updatedAt - task.createdAt,
+			...(task.changes ? { changes: task.changes } : {}),
+			...(task.worktreeId ? { worktreePath: task.workingDirectory } : {}),
 		});
 		return { key: `${task.id}:${task.turn}`, source: "external", taskId: task.id, turn: task.turn, content, details, updatedAt: task.updatedAt };
 	}
@@ -7117,12 +7184,15 @@ export class DesktopService {
 
 	private async finishRuntime(runtime: SessionRuntime, aborted: boolean, error?: string): Promise<void> {
 		this.clearTaskProgressTimer(runtime);
+		const runningTier = runtime.runningTier;
+		runtime.runningTier = undefined;
 		// Every way a turn ends comes through here (settled, handled, failed, process error), so the
 		// keyword turn ends here too; otherwise the next plain turn would still run on ultracode.
 		if (runtime.turnTier) {
 			await this.setTurnTier(runtime, undefined).catch(() => {});
 			await this.persist().catch(() => {});
-		}
+		} else if (runningTier && (runningTier === "multi" || runningTier !== this.configuredTier(runtime.conversationId)))
+			await this.writeCodingTier(runtime).catch(() => {});
 		try {
 			let sealedCheckpoint: GitCheckpoint | undefined;
 			if (runtime.checkpointId) {
@@ -7285,7 +7355,10 @@ export class DesktopService {
 		if (runtime.sandboxProfileFile) await rm(runtime.sandboxProfileFile, { force: true });
 		if (runtime.escalationFile) await rm(runtime.escalationFile, { force: true });
 		if (runtime.outputStyleFile) await rm(runtime.outputStyleFile, { force: true });
-		if (runtime.codingTierFile) await rm(runtime.codingTierFile, { force: true });
+		if (runtime.codingTierFile) {
+			await runtime.codingTierWrite?.catch(() => {});
+			await rm(runtime.codingTierFile, { force: true });
+		}
 		await this.releaseRuntimeCost(runtime);
 		if (runtime.costLimitFile) await this.serializeCost(() => rm(runtime.costLimitFile!, { force: true }));
 		if (this.runtimes.get(runtime.conversationId) === runtime) this.runtimes.delete(runtime.conversationId);
@@ -7610,7 +7683,7 @@ export class DesktopService {
 				runtime.outputStyleFile = join(this.options.dataDir, `style-${conversation.id}-${randomBytes(8).toString("hex")}.md`);
 				await this.writeOutputStyle(runtime);
 				env.PI_DESKTOP_OUTPUT_STYLE_FILE = runtime.outputStyleFile;
-				runtime.codingTierFile = join(this.options.dataDir, `tier-${conversation.id}-${randomBytes(8).toString("hex")}.md`);
+				runtime.codingTierFile = join(this.options.dataDir, `tier-${conversation.id}-${randomBytes(8).toString("hex")}.json`);
 				await this.writeCodingTier(runtime);
 				env.PI_DESKTOP_CODING_TIER_FILE = runtime.codingTierFile;
 			}
@@ -8005,6 +8078,7 @@ export class DesktopService {
 		}
 		if (event.type === "agent_start") {
 			runtime.busy = true;
+			if (runtime.codingTierFile) runtime.runningTier ??= this.configuredTier(conversationId);
 			if (!runtime.workingTurn?.active && !runtime.workingTurn?.stopOperation)
 				runtime.workingTurn = { id: randomUUID(), active: true };
 			runtime.stopHookRanThisTurn = false;
@@ -8465,7 +8539,7 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 		conversations: value.conversations.map((conversation) => ({
 			...conversation,
 			permissionMode: permissionModes.has(conversation.permissionMode) ? conversation.permissionMode : undefined,
-			codingTier: conversation.codingTier === "ultracode" ? "ultracode" : undefined,
+			codingTier: conversation.codingTier === "ultracode" || conversation.codingTier === "multi" ? conversation.codingTier : undefined,
 			ultracodeTurns: Array.isArray(conversation.ultracodeTurns)
 				? conversation.ultracodeTurns
 					.filter((span) => span && typeof span.from === "number" && (span.to === undefined || typeof span.to === "number"))
@@ -8508,6 +8582,7 @@ function validateStore(input: unknown, promptDir?: string): { state: StoredState
 			cronEnabled: typeof value.settings.cronEnabled === "boolean" ? value.settings.cronEnabled : undefined,
 			agentTeams: typeof value.settings.agentTeams === "boolean" ? value.settings.agentTeams : undefined,
 			modelRouting: sanitizeModelRouting(value.settings.modelRouting),
+			multiAgent: sanitizeMultiAgentSettings(value.settings.multiAgent),
 			maxCostUsd:
 				typeof value.settings.maxCostUsd === "number" &&
 				Number.isFinite(value.settings.maxCostUsd) &&

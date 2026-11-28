@@ -25,9 +25,24 @@ const complete = (text, status = "completed") => {
 };
 async function run(prompt, turnId) {
 	const base = { threadId, turnId };
-	if (prompt === "invalid") { process.stdout.write("NOT_JSON\n"); return; }
+	if (prompt === "invalid") { process.stdout.write("NOT_JSON private stdout\n"); return; }
 	if (prompt === "exit") process.exit(3);
 	if (prompt === "fail") { complete("", "failed"); return; }
+	if (prompt === "quota") {
+		notification("error", { ...base, willRetry: true, error: { message: "temporary 503", codexErrorInfo: "serverOverloaded", additionalDetails: null } });
+		notification("turn/completed", { threadId, turn: { id: turnId, status: "failed", error: { message: "You've hit your usage limit", codexErrorInfo: "usageLimitExceeded", additionalDetails: "resets at 5pm" } } });
+		active = undefined; return;
+	}
+	if (prompt === "stderr-exit") {
+		process.stderr.write("fatal: config broken sk-abcdefghijklmnop");
+		setTimeout(() => process.stderr.write("qrstuvwx\n", () => process.exit(5)), 20);
+		return;
+	}
+	if (prompt === "usage") {
+		notification("thread/tokenUsage/updated", { ...base, tokenUsage: { total: { inputTokens: 1010, outputTokens: 220 }, last: { inputTokens: 10, outputTokens: 20 } } });
+		notification("thread/tokenUsage/updated", { ...base, tokenUsage: { total: { inputTokens: 1040, outputTokens: 250 }, last: { inputTokens: 30, outputTokens: 30 } } });
+		complete("usage reported"); return;
+	}
 	if (prompt === "foreign") {
 		const result = await request("item/commandExecution/requestApproval", { ...base, threadId: "another-thread", itemId: "foreign", command: "touch foreign.txt" });
 		complete(result?.error ? "foreign denied" : "foreign accepted");
@@ -93,7 +108,16 @@ input.on("line", (line) => {
 		else if (message.method === "initialized") return;
 		else if (["thread/start", "thread/resume"].includes(message.method)) {
 			threadId = message.params.threadId ?? "thread-fixture";
-			response(message.id, { thread: { id: threadId }, sandbox: { type: process.env.CODEX_FIXTURE_BAD_SANDBOX ? "dangerFullAccess" : message.params.sandbox === "read-only" ? "readOnly" : "workspaceWrite" }, approvalPolicy: "untrusted", approvalsReviewer: "user" });
+			const model = process.env.CODEX_FIXTURE_EFFECTIVE_MODEL ?? message.params.model ?? "fixture-large";
+			response(message.id, { thread: { id: threadId }, model, modelProvider: "fixture-provider", sandbox: { type: process.env.CODEX_FIXTURE_BAD_SANDBOX ? "dangerFullAccess" : message.params.sandbox === "read-only" ? "readOnly" : "workspaceWrite" }, approvalPolicy: "untrusted", approvalsReviewer: "user" });
+		} else if (message.method === "model/list") {
+			if (process.env.CODEX_FIXTURE_NO_MODEL_LIST) send({ id: message.id, error: { code: -32601, message: "Unknown method" } });
+			else response(message.id, { data: [
+				{ id: "m1", model: "fixture-large", displayName: "Large", hidden: false, isDefault: true, defaultReasoningEffort: "medium",
+					supportedReasoningEfforts: [{ reasoningEffort: "low", description: "" }, { reasoningEffort: "high", description: "" }, { reasoningEffort: "max", description: "" }] },
+				{ id: "m2", model: "fixture-small", displayName: "Small", hidden: false, isDefault: false, defaultReasoningEffort: "low",
+					supportedReasoningEfforts: [{ reasoningEffort: "low", description: "" }] },
+			], nextCursor: null });
 		} else if (message.method === "mcpServerStatus/list") response(message.id, { data: process.env.CODEX_FIXTURE_MCP ? [{ name: "native-mcp", tools: {} }] : [], nextCursor: null });
 		else if (message.method === "turn/start") {
 			active = { id: `turn-${++serial}` };

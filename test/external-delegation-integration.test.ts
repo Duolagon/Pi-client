@@ -203,7 +203,10 @@ test("background native results reach the parent once and another conversation c
 		await run(data.service, "EXTERNAL_BACKGROUND codex", "EXTERNAL_BACKGROUND_LAUNCHED");
 		const completed = await until(() => data.service.snapshot(), (value) => contains(value, "EXTERNAL_HANDBACK_COMPLETE") && !value.state?.isStreaming, "native background handback");
 		const [task] = data.service.listExternal(data.parentId); assert.equal(task.status, "completed");
-		assert.equal(completed.messages.filter((message) => "customType" in message && message.customType === "desktop_task_notification").length, 1);
+		const notifications = completed.messages.filter((message) => "customType" in message && message.customType === "desktop_task_notification");
+		assert.equal(notifications.length, 1);
+		assert.match(text(notifications[0]), /<changes files="1" additions="1" deletions="0">[\s\S]+added\s+external-result\.txt \+1 -0/);
+		assert.deepEqual(task.changes?.files, [{ path: "external-result.txt", status: "added", additions: 1, deletions: 0 }]);
 		await data.service.newConversation();
 		const denied = await run(data.service, `EXTERNAL_FOREIGN ${task.id}`, "EXTERNAL_FOREIGN_COMPLETE DENIED");
 		assert.ok(contains(denied, "没有该外部子任务"));

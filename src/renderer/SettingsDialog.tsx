@@ -23,6 +23,7 @@ import { SelectPopover } from "./SelectPopover.tsx";
 import { SmoothCollapse } from "./SmoothCollapse.tsx";
 import { parseForegroundMinutes } from "./settings-input.ts";
 import { MODEL_ROUTING_ROLES, type ModelRoutingRole } from "../agent-types.ts";
+import { MultiAgentSettingsFields, multiAgentDraft, multiAgentFromDraft, type MultiAgentDraft } from "./MultiAgentSettingsFields.tsx";
 
 const ROUTING_LABELS: Record<ModelRoutingRole, { title: string; hint: string }> = {
 	explore: { title: "Explore（检索）", hint: "只读找代码，适合便宜快速的模型" },
@@ -146,6 +147,7 @@ export function SettingsDialog({
 	const [agentTeams, setAgentTeams] = useState<boolean>(settings.agentTeams === true);
 	const initialRouting = routingKeys(settings.modelRouting);
 	const [routing, setRouting] = useState<Record<ModelRoutingRole, string>>(initialRouting);
+	const [multiDraft, setMultiDraft] = useState<MultiAgentDraft>(() => multiAgentDraft(settings.multiAgent));
 	const initialFallback = settings.fallbackModel ? `${settings.fallbackModel.provider}/${settings.fallbackModel.id}` : "";
 	const [fallbackModel, setFallbackModel] = useState(initialFallback);
 	const initialGrailModel = settings.grailModel ? `${settings.grailModel.provider}/${settings.grailModel.id}` : "";
@@ -220,6 +222,8 @@ export function SettingsDialog({
 	const storedKey = settings.configuredProviders.includes(provider);
 	const hasKey = Boolean(apiKey.trim()) || storedKey || Boolean(keyCommand.trim());
 	const isDefaultProvider = settings.defaultModel?.provider === `desktop-${provider}`;
+	const multiAgent = multiAgentFromDraft(multiDraft);
+	const multiAgentChanged = JSON.stringify(multiAgent) !== JSON.stringify(multiAgentFromDraft(multiAgentDraft(settings.multiAgent)));
 	const generalSettingsChanged =
 		permission !== settings.permission ||
 		theme !== settings.theme ||
@@ -235,6 +239,7 @@ export function SettingsDialog({
 		cronEnabled !== (settings.cronEnabled !== false) ||
 		agentTeams !== (settings.agentTeams === true) ||
 		MODEL_ROUTING_ROLES.some((role) => routing[role] !== initialRouting[role]) ||
+		multiAgentChanged ||
 		fallbackModel !== initialFallback ||
 		grailModel !== initialGrailModel ||
 		grailCostText.trim() !== initialGrailCost ||
@@ -443,6 +448,7 @@ export function SettingsDialog({
 				}
 				update.modelRouting = next;
 			}
+			if (multiAgentChanged) update.multiAgent = multiAgent.controller || multiAgent.executors ? multiAgent : null;
 			if (fallbackModel !== initialFallback) update.fallbackModel = parseRoutingKey(fallbackModel) ?? null;
 			if (grailModel !== initialGrailModel) update.grailModel = parseRoutingKey(grailModel) ?? null;
 			if (grailCostText.trim() !== initialGrailCost) update.grailMaxCost = grailCost;
@@ -520,7 +526,7 @@ export function SettingsDialog({
 		{ id: "connection" as const, label: "连接与模型", keywords: "api key provider anthropic openai gemini deepseek openrouter base url", icon: Plug },
 		{ id: "appearance" as const, label: "权限与外观", keywords: "theme light dark grail sandbox seatbelt editor output style 主题 沙箱 编辑器", icon: ShieldCheck },
 		{ id: "agents" as const, label: "Agent 与自动化", keywords: "subagent fork concurrent depth cron teams hooks 子agent 并发 定时", icon: Bot },
-		{ id: "routing" as const, label: "模型路由与评审", keywords: "explore plan review fallback grail 路由 备用 鉴定", icon: Route },
+		{ id: "routing" as const, label: "模型路由与评审", keywords: "explore plan review fallback grail multi codex claude kimi 路由 备用 鉴定 主控 思考强度", icon: Route },
 		{ id: "budget" as const, label: "预算与通知", keywords: "cost budget balance notification web search 预算 余额 通知 联网", icon: Bell },
 		{ id: "network" as const, label: "网络与证书", keywords: "proxy noproxy ca cert agentdir 代理 证书", icon: Globe },
 	];
@@ -1398,6 +1404,7 @@ export function SettingsDialog({
 								);
 							})}
 						</fieldset>
+						<MultiAgentSettingsFields draft={multiDraft} setDraft={setMultiDraft} models={models} presets={presets} disabled={pending} />
 					</div>
 				)}
 				</div>

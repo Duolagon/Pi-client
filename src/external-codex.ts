@@ -1,6 +1,7 @@
 import { isAbsolute } from "node:path";
 import type { ExternalAdapter, ExternalApprovalRequest, ExternalApprovalResponse, ExternalSession, ExternalSessionOptions, ExternalTurnResult } from "./external-types.ts";
 import { JsonLineProcess, type RpcId } from "./external-rpc.ts";
+import { codexErrorKind, ExternalFailure, redactDiagnostic, withDiagnostics } from "./external-errors.ts";
 
 const desktopTools = new Set(["Agent", "SendMessage", "AgentSend", "AgentExecutors", "AgentMessage", "TaskOutput", "TaskStop", "TaskList", "WorktreeCreate", "WorktreeList", "WorktreeMerge", "WorktreeRemove"]);
 const limit = 1024 * 1024;
@@ -15,6 +16,8 @@ interface Turn {
 	text: Map<string, string>;
 	final: Map<string, string>;
 	cancelled: boolean;
+	/** Cumulative thread usage before this turn, to report this turn's own tokens. */
+	baseline?: { input: number; output: number };
 }
 
 /** Codex keeps its native authentication local and exposes a bidirectional App Server session. */
@@ -24,7 +27,7 @@ export class CodexAdapter implements ExternalAdapter {
 		if (!isAbsolute(options.executable) || !isAbsolute(options.cwd)) throw new Error("Codex executable and project must use absolute paths");
 		const session = new CodexSession(options);
 		try { await session.initialize(); return session; }
-		catch (error) { await session.close(); throw error; }
+		catch (error) { await session.close(); throw withDiagnostics(error, session.diagnostics()); }
 	}
 }
 
@@ -50,6 +53,7 @@ class CodexSession implements ExternalSession {
 	private closed = false;
 	private interruption?: Promise<void>;
 	get sessionId(): string | undefined { return this.nativeId; }
+	diagnostics(): string { return this.rpc.stderrTail; }
 
 	constructor(options: ExternalSessionOptions) {
 		this.options = options;
@@ -71,6 +75,7 @@ class CodexSession implements ExternalSession {
 			cwd: this.options.cwd, approvalPolicy: "untrusted", approvalsReviewer: "user",
 			sandbox: this.readOnly ? "read-only" : "workspace-write",
 			config: { "features.multi_agent": false },
+			...(this.options.model ? { model: this.options.model } : {}),
 		};
 		const response = await this.rpc.request<RecordValue>(this.options.resumeSessionId ? "thread/resume" : "thread/start", {
 			...parameters, ...(this.options.resumeSessionId ? { threadId: this.options.resumeSessionId, excludeTurns: true } : {}),
@@ -83,6 +88,8 @@ class CodexSession implements ExternalSession {
 			throw new Error("unsupported_policy: Codex did not confirm the requested sandbox");
 		if (response.approvalPolicy !== "untrusted" || (response.approvalsReviewer !== undefined && response.approvalsReviewer !== "user"))
 			throw new Error("unsupported_policy: Codex did not confirm user-routed untrusted approvals");
+		await this.checkModel(typeof response.model === "string" ? response.model : undefined,
+			typeof response.modelProvider === "string" ? response.modelProvider : undefined);
 		this.nativeId = id;
 		this.options.onEvent({ type: "session", sessionId: id });
 		if (this.readOnly) {
@@ -90,6 +97,40 @@ class CodexSession implements ExternalSession {
 			if (!Array.isArray(servers.data) || servers.data.length || servers.nextCursor)
 				throw new Error("unsupported_policy: read-only Codex tasks require a native configuration without MCP servers");
 		}
+	}
+
+	/**
+	 * Reject a pinned model or effort the installed Codex does not offer, before any turn starts.
+	 * An App Server without `model/list` keeps the request; Codex then reports modelNotFound itself.
+	 */
+	private async checkModel(threadModel: string | undefined, modelProvider: string | undefined): Promise<void> {
+		const { model, effort } = this.options;
+		const effective = model ?? threadModel;
+		if (!effective || (!model && !effort)) return;
+		const models: RecordValue[] = [];
+		let cursor: unknown = null;
+		try {
+			for (let page = 0; page < 10; page++) {
+				const response = await this.rpc.request<RecordValue>("model/list", {
+					includeHidden: true, limit: 100, ...(modelProvider ? { modelProvider } : {}), ...(cursor ? { cursor } : {}),
+				}, 10000);
+				if (Array.isArray(response.data)) models.push(...response.data.filter((item): item is RecordValue => Boolean(item) && typeof item === "object"));
+				cursor = response.nextCursor;
+				if (!cursor) break;
+			}
+		} catch { return; }
+		if (!models.length) return;
+		const selected = models.find((item) => item.model === effective || item.id === effective);
+		if (model && !selected && !cursor)
+			throw new ExternalFailure("model", `Codex 没有模型 ${model}。可用模型：${models.filter((item) => item.hidden !== true).map((item) => String(item.model ?? item.id)).slice(0, 20).join("、")}`);
+		if (model && selected && threadModel && threadModel !== model && threadModel !== selected.model)
+			throw new ExternalFailure("model", `Codex 未确认使用模型 ${model}，它返回了 ${threadModel}。`);
+		const supported = selected?.supportedReasoningEfforts;
+		const efforts = Array.isArray(supported)
+			? supported.map((item) => item && typeof item === "object" ? (item as RecordValue).reasoningEffort : item).filter((item): item is string => typeof item === "string")
+			: [];
+		if (effort && efforts.length && !efforts.includes(effort))
+			throw new ExternalFailure("model", `Codex 模型 ${effective} 不支持思考强度 ${effort}；可选：${efforts.join("、")}`);
 	}
 
 	async run(prompt: string, signal?: AbortSignal): Promise<ExternalTurnResult> {
@@ -113,6 +154,8 @@ class CodexSession implements ExternalSession {
 			const response = await this.rpc.request<RecordValue>("turn/start", {
 				threadId: this.nativeId, cwd: this.options.cwd,
 				input: [{ type: "text", text: prompt }], approvalPolicy: "untrusted", approvalsReviewer: "user",
+				...(this.options.model ? { model: this.options.model } : {}),
+				...(this.options.effort ? { effort: this.options.effort } : {}),
 				sandboxPolicy: this.readOnly ? { type: "readOnly", networkAccess: false }
 					: { type: "workspaceWrite", writableRoots: [this.options.cwd], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true },
 			});
@@ -202,16 +245,33 @@ class CodexSession implements ExternalSession {
 		} else if (["item/commandExecution/outputDelta", "item/fileChange/outputDelta"].includes(method)) {
 			this.options.onEvent({ type: "tool_update", id: text(params.itemId), text: text(params.delta, true) });
 		} else if (method === "thread/tokenUsage/updated") {
-			const usage = object(object(params.tokenUsage).last ?? {});
-			this.options.onEvent({ type: "usage", inputTokens: numeric(usage.inputTokens), outputTokens: numeric(usage.outputTokens) });
+			// `total` is cumulative for the thread (a resumed one included); report this turn's share.
+			const usage = object(params.tokenUsage);
+			const total = object(usage.total ?? {});
+			const last = object(usage.last ?? {});
+			const input = numeric(total.inputTokens), output = numeric(total.outputTokens);
+			if (input === undefined || output === undefined) {
+				this.options.onEvent({ type: "usage", inputTokens: numeric(last.inputTokens), outputTokens: numeric(last.outputTokens) });
+				return;
+			}
+			turn.baseline ??= { input: Math.max(0, input - (numeric(last.inputTokens) ?? 0)), output: Math.max(0, output - (numeric(last.outputTokens) ?? 0)) };
+			this.options.onEvent({ type: "usage", inputTokens: Math.max(0, input - turn.baseline.input), outputTokens: Math.max(0, output - turn.baseline.output) });
+		} else if (method === "error") {
+			// A retried error is progress information; a final one arrives with turn/completed.
+			const error = object(params.error ?? {});
+			const message = typeof error.message === "string" ? redactDiagnostic(error.message, this.options.env).slice(0, 2000) : "Codex reported an error";
+			this.options.onEvent({ type: "diagnostic", message: params.willRetry === true ? `Codex 正在重试：${message}` : `Codex 错误：${message}` });
 		} else if (method === "turn/completed") {
 			const completed = object(params.turn);
 			if (turn.id && completed.id !== turn.id) return;
 			this.active = undefined;
 			this.cancelPermissions();
 			if (completed.status === "failed") {
-				const error = completed.error && typeof completed.error === "object" ? object(completed.error).message : undefined;
-				turn.reject(new Error(typeof error === "string" ? error.slice(0, 4000) : "Codex turn failed"));
+				const error = completed.error && typeof completed.error === "object" ? object(completed.error) : {};
+				const message = typeof error.message === "string" ? redactDiagnostic(error.message, this.options.env).slice(0, 4000) : "Codex turn failed";
+				const details = typeof error.additionalDetails === "string" ? `\n${redactDiagnostic(error.additionalDetails, this.options.env).slice(0, 2000)}` : "";
+				const kind = codexErrorKind(error.codexErrorInfo);
+				turn.reject(kind ? new ExternalFailure(kind, message + details) : new Error(message + details));
 			} else turn.resolve({ status: turn.cancelled || completed.status === "interrupted" ? "cancelled" : "completed", text: this.output(turn), sessionId: this.nativeId });
 		}
 	}

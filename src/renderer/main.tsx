@@ -1037,7 +1037,9 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			app.apply(next);
 			app.setNotice(tier === "ultracode"
 				? "已开启 ultracode：从下一轮起，模型默认用子 Agent 并行编排并逐条复核（每个工作流最多 100 个 Agent、$3）。"
-				: "已切回标准档位：模型按需委派子 Agent（每个工作流最多 24 个 Agent、$0.5）。");
+				: tier === "multi"
+					? "已开启 multi：从下一轮起，主控模型拆分任务并交给 Codex / Claude Code / Kimi Code 执行。主控与子 Agent 的模型、思考强度在设置 → 模型路由与评审里配置。"
+					: "已切回标准档位：模型按需委派子 Agent（每个工作流最多 24 个 Agent、$0.5）。");
 		} catch (error) {
 			app.fail(error);
 		}
@@ -1049,13 +1051,18 @@ function Desktop({ api }: { api: DesktopAPI }) {
 			requestTasksTab("workflows");
 			return;
 		}
-		if (action === "ultracode") {
+		if (action === "ultracode" || action === "multi") {
 			if (!snapshot?.active) return;
 			if (snapshot.active.kind === "subagent") return app.setNotice("请在主会话切换档位。");
 			const arg = argument.trim().toLowerCase();
-			if (arg && arg !== "on" && arg !== "off") return app.setNotice("用法：/ultracode on | off（不带参数时切换）。");
+			if (arg && arg !== "on" && arg !== "off") return app.setNotice(`用法：/${action} on | off（不带参数时切换）。`);
 			const current = snapshot.active.codingTier ?? "standard";
-			const wanted: CodingTier = arg === "on" ? "ultracode" : arg === "off" ? "standard" : current === "ultracode" ? "standard" : "ultracode";
+			if (arg === "off" && current !== action) {
+				if (action === "ultracode" && snapshot.active.turnTier === "ultracode") void saveCodingTier(current);
+				else app.setNotice(`${action} 档位当前未开启。`);
+				return;
+			}
+			const wanted: CodingTier = arg === "on" || current !== action ? action : "standard";
 			void saveCodingTier(wanted);
 			return;
 		}

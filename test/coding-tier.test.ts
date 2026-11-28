@@ -42,7 +42,7 @@ test("registerCodingTier writes the tier file as a prompt section each turn", as
 		const handlers: Array<(event: Event) => Promise<unknown>> = [];
 		registerCodingTier({ on: (name: string, handler: (event: Event) => Promise<unknown>) => { if (name === "before_agent_start") handlers.push(handler); } } as never, file);
 		assert.equal(handlers.length, 1);
-		await writeFile(file, codingTierPromptSection("ultracode"));
+		await writeFile(file, JSON.stringify({ prompt: codingTierPromptSection("ultracode") }));
 		const event: Event = { systemPromptOptions: { sections: { other: "x" } } };
 		assert.equal(await handlers[0](event), undefined, "never forces a whole system prompt");
 		assert.match(event.systemPromptOptions.sections.coding_tier, /ultracode tier/);
@@ -76,7 +76,7 @@ test("a conversation's tier persists, rewrites the runtime file and clamps workf
 		await service.setProjectTrust({ project: fixture.project, decision: "trusted" });
 		const id = snapshot.active!.id;
 		const tierFile = async () => {
-			const name = (await readdir(fixture.dataDir)).find((file) => file.startsWith(`tier-${id}-`) && file.endsWith(".md"));
+			const name = (await readdir(fixture.dataDir)).find((file) => file.startsWith(`tier-${id}-`) && file.endsWith(".json"));
 			assert.ok(name, "main conversation gets a tier file");
 			return readFile(join(fixture.dataDir, name), "utf8");
 		};
@@ -103,7 +103,7 @@ test("a conversation's tier persists, rewrites the runtime file and clamps workf
 			await new Promise((done) => setTimeout(done, 25));
 		const clone = await service.cloneSession({ conversationId: id, title: "tier clone" });
 		assert.equal(clone.conversation?.codingTier, "ultracode");
-		const moved = (await readdir(fixture.dataDir)).filter((file) => file.startsWith("tier-") && file.endsWith(".md"));
+		const moved = (await readdir(fixture.dataDir)).filter((file) => file.startsWith("tier-") && file.endsWith(".json"));
 		for (const file of moved) assert.match(await readFile(join(fixture.dataDir, file), "utf8"), /ultracode tier/, "the clone's prompt matches its tier");
 		await service.selectConversation(id);
 
@@ -198,7 +198,7 @@ test("a prompt that says ultracode runs that one turn on ultracode and then retu
 		await service.setProjectTrust({ project: fixture.project, decision: "trusted" });
 		const id = snapshot.active!.id;
 		const tierFile = async () => {
-			const name = (await readdir(fixture.dataDir)).find((file) => file.startsWith(`tier-${id}-`) && file.endsWith(".md"));
+			const name = (await readdir(fixture.dataDir)).find((file) => file.startsWith(`tier-${id}-`) && file.endsWith(".json"));
 			return readFile(join(fixture.dataDir, name!), "utf8");
 		};
 		const events: { conversationId: string; event: { type: string } }[] = [];
@@ -248,6 +248,102 @@ test("a prompt that says ultracode runs that one turn on ultracode and then retu
 		assert.equal(runtime.turnTier, undefined);
 		assert.ok(closed.ultracodeTurns!.every((span) => span.to !== undefined), "no span is left open");
 		assert.match(await tierFile(), /standard tier/);
+	} finally {
+		await service.close();
+		await fixture.cleanup();
+	}
+});
+
+test("the multi controller and its effort are scoped to multi prompts and background wakeups", { timeout: 20000 }, async () => {
+	const fixture = await createCoreFixture();
+	const calls = join(fixture.root, "model-calls.jsonl");
+	const settingsPath = join(fixture.agentDir, "settings.json");
+	const settings = JSON.parse(await readFile(settingsPath, "utf8"));
+	await writeFile(settingsPath, JSON.stringify({ ...settings, defaultThinkingLevel: "low" }));
+	await writeFile(calls, "");
+	const providerPath = join(fixture.agentDir, "extensions", "faux-provider.js");
+	const provider = await readFile(providerPath, "utf8");
+	const marker = "streamSimple(model, context, streamOptions) {";
+	assert.ok(provider.includes(marker));
+	await writeFile(providerPath, provider.replace(marker, `${marker}
+			appendFileSync(${JSON.stringify(calls)}, JSON.stringify([model.id, streamOptions.reasoning ?? "off"]) + "\\n");`));
+	const service = new DesktopService({
+		dataDir: fixture.dataDir, executable: process.execPath, entry: fixture.entry,
+		permissionExtension: resolve(here, "../src/permission-extension.ts"),
+		toolControlExtension: resolve(here, "../src/tool-control-extension.ts"),
+		workflowWorker: resolve(here, "../src/workflow-worker-entry.ts"),
+		env: { ...fixture.env, HOME: fixture.root }, initialProject: fixture.project,
+	});
+	try {
+		const snapshot = await service.initialize();
+		const id = snapshot.active!.id;
+		const ordinaryModel = "desktop-test-1";
+		const controllerModel = "desktop-test-2";
+		await service.setProjectTrust({ project: fixture.project, decision: "trusted" });
+		await service.command({ type: "set_thinking_level", level: "high" }, id);
+		const model = { provider: "desktop-test", id: controllerModel };
+		await service.saveSettings({ multiAgent: { controller: { model, thinkingLevel: "high" } } });
+		await service.updateConversationMeta(id, { codingTier: "multi" });
+		let settled = 0;
+		service.subscribe((packet) => { if (packet.conversationId === id && packet.event.type === "agent_settled") settled++; });
+		const wait = async (predicate: () => boolean | Promise<boolean>) => {
+			for (let attempt = 0; attempt < 200; attempt++) {
+				if (await predicate()) return;
+				await new Promise((done) => setTimeout(done, 25));
+			}
+			assert.fail("the expected provider call or run settlement did not arrive");
+		};
+		const observed = async () => (await readFile(calls, "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+
+		await service.command({ type: "prompt", message: "multi controller" }, id);
+		await wait(() => settled === 1);
+		assert.deepEqual(await observed(), [[controllerModel, "high"]], "the model switch must apply configured effort after the new model's default");
+		const restored = (await service.snapshot()).state!;
+		assert.equal(restored.model?.id, ordinaryModel);
+		assert.equal(restored.thinkingLevel, "high");
+
+		await service.command({ type: "prompt", message: "ultracode one turn" }, id);
+		await wait(() => settled === 2);
+		assert.deepEqual((await observed()).at(-1), [ordinaryModel, "high"]);
+		assert.equal((await service.snapshot()).active?.codingTier, "multi");
+
+		const { external } = service as unknown as { external: { executors: typeof service.externalExecutors } };
+		const discover = external.executors;
+		const writing = Promise.withResolvers<void>();
+		const releaseWrite = Promise.withResolvers<void>();
+		external.executors = async () => {
+			writing.resolve();
+			await releaseWrite.promise;
+			return discover.call(external);
+		};
+		const saving = service.saveSettings({ multiAgent: { controller: { model, thinkingLevel: "low" } } });
+		await writing.promise;
+		const wakeup = service.deliverToConversation(id, {
+			customType: "desktop_task_notification", content: "Background work complete", details: {},
+		});
+		try {
+			const pending = await Promise.race([wakeup, new Promise((done) => setTimeout(() => done("pending"), 150))]);
+			assert.equal(pending, "pending", "a background wakeup waits for the current tier settings");
+		} finally {
+			external.executors = discover;
+			releaseWrite.resolve();
+			await saving;
+		}
+		assert.equal(await wakeup, "sent");
+		await wait(() => settled === 3);
+		assert.deepEqual((await observed()).at(-1), [controllerModel, "low"]);
+
+		await service.command({ type: "prompt", message: "slow-stream" }, id);
+		await wait(async () => (await observed()).length === 4);
+		await service.updateConversationMeta(id, { codingTier: "ultracode" });
+		const workflow = await service.startWorkflow(id, { script: "return 1;", budget: { maxAgents: 90 } });
+		assert.equal(workflow.budget.maxAgents, WORKFLOW_LIMITS.multi.maxAgents, "a running turn keeps its original tier");
+		await service.command({ type: "abort" }, id);
+		await wait(() => settled === 4);
+
+		await service.command({ type: "prompt", message: "ordinary model" }, id);
+		await wait(() => settled === 5);
+		assert.deepEqual((await observed()).at(-1), [ordinaryModel, "high"]);
 	} finally {
 		await service.close();
 		await fixture.cleanup();

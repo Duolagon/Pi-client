@@ -130,7 +130,7 @@ test("Kimi ignores another session's output and rejects refusal, malformed event
 	const session = await new KimiAdapter().open(data.options);
 	try {
 		assert.equal((await session.run("wrong-session")).text, "correct session");
-		await assert.rejects(session.run("refusal"), /did not complete/);
+		await assert.rejects(session.run("refusal"), /refused/);
 		await assert.rejects(session.run("malformed"), /invalid JSONL|Invalid Kimi/);
 	} finally { await session.close(); await data.cleanup(); }
 	const next = await fixture();
@@ -148,5 +148,46 @@ test("Kimi fails closed before spawning for unsupported readonly or fine-grained
 		await assert.rejects(new KimiAdapter().open({ ...data.options, policy: { ...data.options.policy, disabledTools: ["bash"] } }), /fine-grained/);
 		await assert.rejects(new KimiAdapter().open({ ...data.options, policy: { ...data.options.policy, rules: [{ id: "deny-env", scope: "global", action: "deny", tool: "read", path: "**\/.env" }] } }), /fine-grained/);
 		await assert.rejects(readFile(join(data.root, "protocol.jsonl")), /ENOENT/);
+	} finally { await data.cleanup(); }
+});
+
+test("Kimi applies the pinned model and thinking level through ACP config options", async () => {
+	const data = await fixture({ env: { ACP_TEST_CONFIG: "1" } });
+	const session = await new KimiAdapter().open({ ...data.options, model: "kimi-k3", effort: "high" });
+	try {
+		const sets = (await data.records()).filter((record) => record.method === "session/set_config_option").map((record) => record.params);
+		assert.deepEqual(sets.map(({ configId, value }) => [configId, value]), [["model", "kimi-k3"], ["thinking", "high"]]);
+	} finally { await session.close(); await data.cleanup(); }
+	const wrong = await fixture({ env: { ACP_TEST_CONFIG: "1" } });
+	try { await assert.rejects(new KimiAdapter().open({ ...wrong.options, model: "nope" }), /没有 nope.*kimi-k3/); }
+	finally { await wrong.cleanup(); }
+	const ignored = await fixture({ env: { ACP_TEST_CONFIG: "1", ACP_TEST_IGNORE_CONFIG: "thinking" } });
+	try {
+		await assert.rejects(new KimiAdapter().open({ ...ignored.options, resumeSessionId: "saved-kimi-session", model: "kimi-k3", effort: "high" }), /未确认将思考强度设为 high/);
+		assert.ok(!(await ignored.records()).some((record) => record.method === "session/prompt"));
+	} finally { await ignored.cleanup(); }
+	// A CLI without config options cannot honor a pinned model; the task fails instead of using another one.
+	const old = await fixture();
+	try { await assert.rejects(new KimiAdapter().open({ ...old.options, effort: "high" }), /不支持通过 ACP 选择思考强度/); }
+	finally { await old.cleanup(); }
+});
+
+test("Kimi confirms an existing legacy model without rewriting global CLI settings", async () => {
+	const data = await fixture({ env: { ACP_TEST_LEGACY_MODEL: "1" } });
+	try {
+		const session = await new KimiAdapter().open({ ...data.options, model: "legacy,thinking" });
+		await session.close();
+		await assert.rejects(new KimiAdapter().open({ ...data.options, model: "legacy" }), /不支持通过 ACP 选择模型/);
+		assert.ok(!(await data.records()).some((record) => record.method === "session/set_model"));
+	} finally { await data.cleanup(); }
+});
+
+test("Kimi maps ACP auth_required to a structured login failure", async () => {
+	const { ExternalFailure } = await import("../src/external-errors.ts");
+	const data = await fixture({ env: { ACP_TEST_AUTH: "1" } });
+	try {
+		const error = await new KimiAdapter().open(data.options).catch((value: unknown) => value);
+		assert.ok(error instanceof ExternalFailure);
+		assert.equal(error.kind, "auth");
 	} finally { await data.cleanup(); }
 });

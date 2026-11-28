@@ -79,6 +79,7 @@ export type BuiltinSlashAction =
 	| "verify"
 	| "grail"
 	| "ultracode"
+	| "multi"
 	| "workflows";
 
 const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[] = [
@@ -115,12 +116,13 @@ const BUILTIN_SLASH_COMMANDS: { name: BuiltinSlashAction; description: string }[
 	{ name: "grail", description: "鉴定本次需求的全部改动（测试、作弊扫描、独立评审；结果不发给 Agent）" },
 	{ name: "goal", description: "设定目标自动续跑（/goal [--max-turns 8] [--max-cost 2] <目标>，/goal stop 停止）" },
 	{ name: "workflows", description: "查看本会话的 Workflow 运行记录（实时进度、停止与恢复）" },
+	{ name: "multi", description: "切换 multi 档位：主控模型调度 Codex / Claude Code / Kimi Code 协作（/multi on|off）" },
 	{ name: "ultracode", description: "切换 ultracode 档位：模型默认用子 Agent 并行编排并逐条复核（/ultracode on|off）" },
 	{ name: "verify", description: "让模型用 PreviewCheck 自动验证本地网页（启动服务、操作 DOM、截图与检查报错）" },
 ];
 
 /** Builtins that accept an argument after the name, plus Claude Code aliases. */
-const BUILTIN_WITH_ARGS = new Set<BuiltinSlashAction>(["theme", "rename", "copy", "export", "fork", "output-style", "add-dir", "goal", "verify", "ultracode"]);
+const BUILTIN_WITH_ARGS = new Set<BuiltinSlashAction>(["theme", "rename", "copy", "export", "fork", "output-style", "add-dir", "goal", "verify", "ultracode", "multi"]);
 const BUILTIN_ALIASES: Record<string, BuiltinSlashAction> = { branch: "fork" };
 /** Argument-free builtins added later that also yield to a Pi command or skill of the same name. */
 const YIELDING_BUILTINS = new Set<BuiltinSlashAction>(["doctor", "stats", "grail"]);
@@ -723,10 +725,13 @@ export function LiveComposer({
 									className="cc-ultracode-badge"
 									title={snapshot.active?.codingTier === "ultracode"
 										? "本会话为 ultracode 档位：模型默认并行编排子 Agent 并逐条复核"
-										: "本轮因提示词含 ultracode 而按 ultracode 运行，结束后回到标准档位"}
+										: "本轮因提示词含 ultracode 而按 ultracode 运行，结束后恢复会话档位"}
 								>
 									{snapshot.active?.codingTier === "ultracode" ? "ultracode" : "本轮 ultracode"}
 								</span>
+							)}
+							{snapshot.active?.codingTier === "multi" && snapshot.active?.turnTier !== "ultracode" && (
+								<span className="cc-multi-badge" title="本会话为 multi 档位：主控模型拆分任务，交给 Codex / Claude Code / Kimi Code 执行">multi</span>
 							)}
 							{dockStatus?.stepBadge && <span className="cc-dock-step">{dockStatus.stepBadge}</span>}
 							<span className={`cc-dock-state-label ${dockStatus?.active ? "cc-shimmer-text" : ""}`}>
@@ -1059,12 +1064,13 @@ export function LiveComposer({
 						<SelectPopover
 							ariaLabel="编排档位"
 							pillClassName="ghost"
-							title="ultracode：模型默认用子 Agent 并行编排并逐条复核，更彻底也更费额度"
+							title="ultracode：模型默认用子 Agent 并行编排并逐条复核；multi：主控模型把改代码交给外部 Code Agent"
 							value={snapshot.active?.codingTier ?? "standard"}
 							disabled={changing || !snapshot.active || snapshot.active?.kind === "subagent"}
 							options={[
 								{ value: "standard", label: "标准", shortLabel: "标准", hint: "按需委派子 Agent" },
 								{ value: "ultracode", label: "ultracode", shortLabel: "ultracode", hint: "默认并行编排、对抗复核" },
+								{ value: "multi", label: "multi", shortLabel: "multi", hint: "主控模型调度 Codex / Claude Code / Kimi Code" },
 							]}
 							onChange={(val) => setCodingTier(val as CodingTier)}
 						/>

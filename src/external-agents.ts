@@ -9,10 +9,12 @@ import { evaluatePermission, validateRuntimePolicy } from "./permission-policy.t
 import type { PermissionRule, RuntimePermissionPolicy } from "./permission-types.ts";
 import type { WorktreeCreateInput, WorktreeInfo } from "./worktree-types.ts";
 import { localDay, type UsageRecord } from "./usage-stats.ts";
+import { MAX_SUMMARY_FILES } from "./external-changes.ts";
+import { describeExternalFailure, diagnosticsOf, redactDiagnostic } from "./external-errors.ts";
 import type {
 	ExternalAdapter, ExternalAdapterEvent, ExternalApprovalRequest, ExternalApprovalResponse, ExternalEvent,
 	ExternalExecutor, ExternalExecutorInput, ExternalProvider, ExternalReplay, ExternalSession,
-	ExternalTask, ExternalTaskResult, ExternalTaskSendInput, ExternalTaskStartInput,
+	ExternalTask, ExternalTaskResult, ExternalTaskSendInput, ExternalTaskStartInput, ExternalChangeSummary,
 } from "./external-types.ts";
 
 const active = new Set(["queued", "running", "waiting_for_input"]);
@@ -34,7 +36,16 @@ interface StoredNativeUsage {
 	costUsd: number;
 	days: Record<string, { input: number; output: number; cost: number; turns: number }>;
 }
-interface StoredTask { task: ExternalTask; policy: RuntimePermissionPolicy; prompt: string; notify: boolean; notifiedTurn?: number; stopReason?: ExternalStopReason; usage?: StoredNativeUsage }
+interface StoredTask {
+	task: ExternalTask;
+	policy: RuntimePermissionPolicy;
+	prompt: string;
+	notify: boolean;
+	notifiedTurn?: number;
+	stopReason?: ExternalStopReason;
+	usage?: StoredNativeUsage;
+	usesMultiSettings?: true;
+}
 /** A finished background turn whose result the parent has not received yet. */
 export interface ExternalNotification { task: ExternalTask; stopReason?: ExternalStopReason }
 interface Runtime {
@@ -65,7 +76,11 @@ export interface ExternalAgentOptions {
 	createWorktree(input: WorktreeCreateInput): Promise<WorktreeInfo>;
 	listWorktrees(): Promise<WorktreeInfo[]>;
 	canStart(task: ExternalTask): boolean;
-	beginCheckpoint?(task: ExternalTask): Promise<() => Promise<void>>;
+	/** Start a checkpoint; the returned function finishes it and summarizes the turn's changes. */
+	beginCheckpoint?(task: ExternalTask): Promise<() => Promise<ExternalChangeSummary | void>>;
+	/** Native model and effort the user pinned for an executor. */
+	executorModel?(executor: ExternalProvider): { model?: string; effort?: string } | undefined;
+	usesMultiSettings?(conversationId: string): boolean;
 	checkBudget?(executor: ExternalProvider): void;
 	reserveBudget?(task: ExternalTask): Promise<{ maxBudgetUsd: number; release(): Promise<void> } | undefined>;
 	capacity(): number;
@@ -110,13 +125,14 @@ export class ExternalAgents {
 				if (task.nativeSessionId !== undefined && (typeof task.nativeSessionId !== "string" || task.nativeSessionId.length > 500 || task.nativeSessionId.includes("\0"))) throw new Error("外部会话标识无效。");
 				task.pendingApprovals = [];
 				task.runInBackground = Boolean(record.notify);
+				task.changes = validatedChanges(task.changes);
 				if (record.notifiedTurn !== undefined && (!Number.isSafeInteger(record.notifiedTurn) || record.notifiedTurn < 1 || record.notifiedTurn > task.turn)) throw new Error("外部任务通知状态无效。");
 				if (record.stopReason !== undefined && !stopReasons.includes(record.stopReason)) throw new Error("外部任务停止原因无效。");
 				// A turn the app lost while it ran is reported to a background parent as stopped.
 				// Records interrupted before stop reasons existed carry none and are never replayed.
 				if (active.has(task.status)) { task.status = "interrupted"; task.error = "应用已重启；未重放任务，可显式发送新指令恢复原生会话。"; record.stopReason = "restart"; }
 				this.tasks.set(task.id, { task, policy: validateRuntimePolicy(record.policy), prompt: record.prompt, notify: Boolean(record.notify), notifiedTurn: record.notifiedTurn, stopReason: record.stopReason,
-					usage: validatedUsage(record.usage) });
+					usage: validatedUsage(record.usage), ...(record.usesMultiSettings === true ? { usesMultiSettings: true } : {}) });
 				// The event log can be newer than the last atomic task snapshot after a crash.
 				const recovered = await this.replay(task.id);
 				task.eventSequence = Math.max(task.eventSequence, recovered.latestSequence);
@@ -191,6 +207,7 @@ export class ExternalAgents {
 	}
 
 	start(input: ExternalTaskStartInput, owner: string, toolCallId?: string): Promise<ExternalTask> {
+		const usesMultiSettings = this.options.usesMultiSettings?.(owner) === true;
 		return this.serialize(async () => {
 			if (this.options.delegated(owner)) throw new Error("子任务不能再委派外部 Agent。");
 			validatePrompt(input.prompt); validateDescription(input.description);
@@ -219,7 +236,8 @@ export class ExternalAgents {
 			const task: ExternalTask = { id: `external-${randomUUID()}`, executor: input.executor, parentConversationId: owner, parentToolCallId: toolCallId,
 				title: input.description, project, workingDirectory, worktreeId: tree?.id, subagentType, readOnly, status: "queued", createdAt: now, updatedAt: now,
 				revision: 0, turn: 1, eventSequence: 0, output: "", truncated: false, pendingApprovals: [], runInBackground: input.run_in_background ?? false };
-			this.tasks.set(task.id, { task, policy, prompt: input.prompt, notify: input.run_in_background ?? false });
+			this.tasks.set(task.id, { task, policy, prompt: input.prompt, notify: input.run_in_background ?? false,
+				...(usesMultiSettings ? { usesMultiSettings: true } : {}) });
 			this.update(task, "queued"); await this.persist(); this.pump(); return structuredClone(task);
 		});
 	}
@@ -234,7 +252,7 @@ export class ExternalAgents {
 			await realpath(task.workingDirectory);
 			record.prompt = input.message; record.notify = input.runInBackground ?? false; record.stopReason = undefined;
 			task.runInBackground = record.notify;
-			task.turn++; task.output = ""; task.error = undefined; task.truncated = false;
+			task.turn++; task.output = ""; task.error = undefined; task.truncated = false; task.changes = undefined;
 			this.update(task, "queued"); await this.persist(); this.pump(); return structuredClone(task);
 		});
 	}
@@ -250,7 +268,8 @@ export class ExternalAgents {
 		signal?.throwIfAborted();
 		return { task_id: task.id, executor: task.executor, parent_conversation_id: task.parentConversationId, parent_tool_call_id: task.parentToolCallId,
 			status: task.status, turn: task.turn, native_session_id: task.nativeSessionId, worktree_id: task.worktreeId, working_directory: task.workingDirectory,
-			output: task.output, truncated: task.truncated, error: task.error, pending_approvals: task.pendingApprovals.length };
+			output: task.output, truncated: task.truncated, error: task.error, pending_approvals: task.pendingApprovals.length,
+			...(task.changes && !active.has(task.status) ? { changes: structuredClone(task.changes) } : {}) };
 	}
 	async awaitModelResult(id: string, owner: string, background: boolean, signal?: AbortSignal): Promise<ExternalTaskResult> {
 		if (background) return this.result(id, {}, owner, signal);
@@ -395,10 +414,11 @@ export class ExternalAgents {
 
 	private async run(record: StoredTask, runtime: Runtime): Promise<void> {
 		const task = record.task;
-		let finishCheckpoint: (() => Promise<void>) | undefined;
+		let finishCheckpoint: (() => Promise<ExternalChangeSummary | void>) | undefined;
 		let budget: Awaited<ReturnType<NonNullable<ExternalAgentOptions["reserveBudget"]>>>;
 		let status: ExternalTask["status"] = "completed";
 		let failure: string | undefined;
+		let env = this.options.env;
 		const resumed = task.nativeSessionId !== undefined;
 		runtime.usage = undefined;
 		try {
@@ -412,14 +432,20 @@ export class ExternalAgents {
 			runtime.abort!.signal.throwIfAborted();
 			if (policy.mode !== "read" && policy.mode !== "plan") finishCheckpoint = await this.options.beginCheckpoint?.(task);
 			runtime.abort!.signal.throwIfAborted();
-			const env = { ...this.options.env, ...this.options.networkEnv?.() };
+			env = { ...this.options.env, ...this.options.networkEnv?.() };
 			for (const key of Object.keys(env)) if (key.startsWith("PI_DESKTOP_") || key.startsWith("PI_CODING_")) delete env[key];
+			const pinned = record.usesMultiSettings ? this.options.executorModel?.(task.executor) : undefined;
 			if (!runtime.session) runtime.session = await this.options.adapters[task.executor].open({
+				...(pinned?.model ? { model: pinned.model } : {}), ...(pinned?.effort ? { effort: pinned.effort } : {}),
 				executable: executor.executable, cwd: task.workingDirectory, env, resumeSessionId: task.nativeSessionId,
 				policy: this.policyFor(record), helperPath: this.options.claudeHelperPath, nodeExecutable: this.options.nodeExecutable,
 				projectTrusted: this.options.isProjectTrusted(task.project),
 				maxBudgetUsd: budget?.maxBudgetUsd,
-				onEvent: (event) => this.adapterEvent(task, event), onPermission: (request, signal) => this.permission(record, runtime, request, signal),
+				onEvent: (event) => {
+					if (event.type === "diagnostic") event = { ...event, message: redactDiagnostic(event.message, env).slice(0, 4000) };
+					this.adapterEvent(task, event);
+				},
+				onPermission: (request, signal) => this.permission(record, runtime, request, signal),
 			});
 			if (runtime.session.sessionId) task.nativeSessionId = runtime.session.sessionId;
 			await this.persist(); // Save the native ID before submitting a prompt whenever the protocol provides it.
@@ -429,18 +455,25 @@ export class ExternalAgents {
 			if (result.text) { task.output = result.text.slice(0, outputLimit); task.truncated = result.text.length > outputLimit; }
 			await runtime.session.close();
 			runtime.session = undefined;
-			await finishCheckpoint?.();
+			const changes = await finishCheckpoint?.();
 			finishCheckpoint = undefined;
+			if (changes) task.changes = changes;
 			status = result.status;
 		} catch (error) {
 			status = runtime.abort?.signal.aborted ? "cancelled" : "failed";
-			failure = error instanceof Error ? error.message : String(error);
+			if (status === "cancelled") failure = redactDiagnostic(error instanceof Error ? error.message : String(error), env).slice(0, 4000);
+			else {
+				const described = describeExternalFailure(task.executor, error, diagnosticsOf(error) ?? runtime.session?.diagnostics?.(), env);
+				failure = described.message;
+				this.event(task, { type: "diagnostic", message: `失败类型：${described.kind}` });
+			}
 		} finally {
 			this.clearApprovals(task, runtime);
 			await runtime.session?.close().catch(() => {}); runtime.session = undefined;
-			await finishCheckpoint?.().catch((error: unknown) => {
+			const changes = await finishCheckpoint?.().catch((error: unknown) => {
 				this.event(task, { type: "diagnostic", message: `无法完成恢复点：${error instanceof Error ? error.message : String(error)}` });
 			});
+			if (changes) task.changes = changes;
 			if (runtime.usage) this.recordUsage(record, runtime.usage, resumed);
 			await budget?.release().catch(() => {});
 			if (active.has(task.status)) {
@@ -606,4 +639,22 @@ function overlaps(left: string, right: string): boolean { return contains(left, 
 function normalizeCall(request: ExternalApprovalRequest) {
 	const names: Record<string, string> = { Read: "read", Write: "write", Edit: "edit", MultiEdit: "edit", Bash: "bash", Shell: "bash", Grep: "grep", Glob: "find", List: "ls", LS: "ls" };
 	return { toolName: names[request.toolName] ?? request.toolName, input: { ...request.input, ...(typeof request.input.file_path === "string" ? { path: request.input.file_path } : {}) } };
+}
+
+const changeStatuses = new Set(["added", "modified", "deleted", "type-changed"]);
+/** A stored change summary, or undefined when it is malformed. */
+function validatedChanges(value: unknown): ExternalChangeSummary | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const input = value as Record<string, unknown>;
+	const count = (item: unknown) => Number.isSafeInteger(item) && (item as number) >= 0;
+	if (!Array.isArray(input.files) || input.files.length > MAX_SUMMARY_FILES || typeof input.truncated !== "boolean" || !count(input.additions) || !count(input.deletions)) return undefined;
+	const files = input.files.filter((file): file is ExternalChangeSummary["files"][number] => Boolean(file) && typeof file === "object" &&
+		typeof file.path === "string" && file.path.length <= 4096 && changeStatuses.has(file.status) &&
+		(file.binary === undefined || typeof file.binary === "boolean") &&
+		(file.additions === undefined || count(file.additions)) && (file.deletions === undefined || count(file.deletions)));
+	if (files.length !== input.files.length) return undefined;
+	return {
+		files: files.map(({ path, status, binary, additions, deletions }) => ({ path, status, binary, additions, deletions })),
+		truncated: input.truncated, additions: input.additions as number, deletions: input.deletions as number,
+		...(typeof input.checkpointId === "string" && input.checkpointId.length <= 200 ? { checkpointId: input.checkpointId } : {}) };
 }

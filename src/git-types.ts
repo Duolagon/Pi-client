@@ -34,6 +34,7 @@ export interface GitCheckpoint {
 export interface GitCheckpointDiff {
 	checkpointId: string;
 	excludedFiles?: number;
+	truncated?: boolean;
 	files: (GitSnapshotChange & { diff: string; truncated: boolean })[];
 }
 

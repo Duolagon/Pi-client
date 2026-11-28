@@ -1,3 +1,5 @@
+import { formatChangeSummary } from "./external-changes.ts";
+import type { ExternalChangeSummary } from "./external-types.ts";
 import { isTaskReadPath, MAX_AGENT_OUTPUT, MAX_NOTIFICATION, MAX_TASK_READ_PATHS, truncateText } from "./delegation-limits.ts";
 import type { DesktopTask, TaskProgress } from "./task-types.ts";
 import type { DelegatedTaskResult } from "./delegation-types.ts";
@@ -36,6 +38,9 @@ export interface TaskNotificationInput {
 	/** Child tokens and tool calls of this run, when the host measured them. */
 	totalTokens?: number;
 	toolUses?: number;
+	/** External executors: files the turn changed, and the worktree holding them. */
+	changes?: ExternalChangeSummary;
+	worktreePath?: string;
 }
 
 /** Structured copy of the notification for the renderer; never shown to the model. */
@@ -57,6 +62,8 @@ export interface TaskNotificationDetails {
 	total_tokens?: number;
 	tool_uses?: number;
 	flagged?: string[];
+	changes?: ExternalChangeSummary;
+	worktree_path?: string;
 }
 
 export interface EscapedOutput {
@@ -68,7 +75,7 @@ export interface EscapedOutput {
 
 // Envelope, harness and role tags. Escaping the `<` keeps the text readable while making
 // it inert: the child cannot close <result>, open a new <status> or forge a reminder.
-const markupTag = /<(\s*\/?\s*)(system[\w-]*|task-notification|task-id|tool-use-id|status|summary|result|read-coverage|usage|subagent_tokens|tool_uses|duration_ms|human|assistant|user|function_calls|invoke|parameter)(?=[\s>/]|$)/gi;
+const markupTag = /<(\s*\/?\s*)(system[\w-]*|task-notification|task-id|tool-use-id|status|summary|result|changes|read-coverage|usage|subagent_tokens|tool_uses|duration_ms|human|assistant|user|function_calls|invoke|parameter)(?=[\s>/]|$)/gi;
 const harnessTag = /<\s*\/?\s*(system[\w-]*|task-notification)(?=[\s>/]|$)/i;
 const rolePrefix = /^([ \t>]*)(Human|Assistant|User|System)([ \t]*):/gim;
 const instructionPatterns: Array<[string, RegExp]> = [
@@ -158,6 +165,7 @@ export function formatTaskNotification(input: TaskNotificationInput): { content:
 		`<summary>${summary}</summary>`,
 		...(readPaths?.length ? [formatReadCoverage(readPaths)] : []),
 		`<result>\n${escaped.text || "(Subagent returned no output.)"}\n</result>`,
+		...(input.changes ? [formatChangeSummary(input.changes, input.worktreePath)] : []),
 	];
 	let content = `${lines.join("\n")}\n${usage}</task-notification>`;
 	if (Buffer.byteLength(content, "utf8") > MAX_NOTIFICATION) content = truncateText(content, Math.floor(MAX_NOTIFICATION / 4));
@@ -179,6 +187,8 @@ export function formatTaskNotification(input: TaskNotificationInput): { content:
 		...(validCount(input.totalTokens) ? { total_tokens: Math.round(input.totalTokens!) } : {}),
 		...(validCount(input.toolUses) ? { tool_uses: Math.round(input.toolUses!) } : {}),
 		...(escaped.flagged.length ? { flagged: escaped.flagged } : {}),
+		...(input.changes ? { changes: input.changes } : {}),
+		...(input.worktreePath ? { worktree_path: input.worktreePath } : {}),
 	};
 	return { content, details };
 }

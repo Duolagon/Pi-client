@@ -1,7 +1,13 @@
-import type { CodingTier } from "./shared.ts";
+import type { CodingTier, MultiAgentSettings, MultiExecutorId } from "./shared.ts";
+import { multiTierPromptSection } from "./multi-agent.ts";
 
 /** Prompt section name the permission extension writes the tier text into. */
 export const CODING_TIER_SECTION = "coding_tier";
+
+export interface CodingTierRuntimeConfig {
+	prompt: string;
+	controller?: MultiAgentSettings["controller"];
+}
 
 /**
  * Host-enforced ceilings for one WorkflowRun. A script may ask for less; it cannot ask for more.
@@ -10,6 +16,8 @@ export const CODING_TIER_SECTION = "coding_tier";
 export const WORKFLOW_LIMITS: Record<CodingTier, { maxAgents: number; maxCost: number }> = {
 	standard: { maxAgents: 24, maxCost: 0.5 },
 	ultracode: { maxAgents: 100, maxCost: 3 },
+	// The multi tier delegates to external executors; their own accounts pay for them.
+	multi: { maxAgents: 24, maxCost: 0.5 },
 };
 
 /**
@@ -46,7 +54,7 @@ export function ranOnUltracode(spans: ReadonlyArray<{ from: number; to?: number 
 }
 
 export function codingTierOf(value: unknown): CodingTier {
-	return value === "ultracode" ? "ultracode" : "standard";
+	return value === "ultracode" || value === "multi" ? value : "standard";
 }
 
 /** Clamp a script's requested budget to the tier's ceiling and fill in absent limits. */
@@ -70,8 +78,13 @@ export function workflowBudgetFor(
  * Text for the main conversation's system prompt. Standard says when orchestration is worth it;
  * ultracode makes it the default. Both name the budget the host will enforce.
  */
-export function codingTierPromptSection(tier: unknown, turnOnly = false): string {
+export function codingTierPromptSection(
+	tier: unknown,
+	turnOnly = false,
+	multi?: { settings?: MultiAgentSettings; available: readonly MultiExecutorId[] },
+): string {
 	const current = codingTierOf(tier);
+	if (current === "multi") return multiTierPromptSection(multi?.settings, multi?.available ?? [], turnOnly);
 	const limits = WORKFLOW_LIMITS[current];
 	if (current === "standard") {
 		return [
@@ -85,7 +98,7 @@ export function codingTierPromptSection(tier: unknown, turnOnly = false): string
 	return [
 		"# Orchestration (ultracode tier)",
 		turnOnly
-			? "The user asked for ultracode in this message: for this turn, aim for the most exhaustive, correct result rather than the fastest or cheapest. The conversation returns to the standard tier afterwards."
+			? "The user asked for ultracode in this message: for this turn, aim for the most exhaustive, correct result rather than the fastest or cheapest. The conversation returns to its selected tier afterwards."
 			: "The user turned on ultracode for this conversation: aim for the most exhaustive, correct result rather than the fastest or cheapest. This opt-in is standing.",
 		"For every substantive task, orchestrate: scout the work list yourself first (list the files, read the diff, find the units), then write a WorkflowRun script that fans out over it. For multi-phase work (understand, design, implement, review), run one workflow per phase and read each result before writing the next.",
 		"Use the quality patterns: adversarially verify findings with independent refuters, give verifiers different lenses, use judge panels where the solution space is wide, loop until dry for discovery of unknown size, and end with a completeness critic.",

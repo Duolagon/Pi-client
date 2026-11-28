@@ -1,3 +1,4 @@
+import { parseMultiAgentSettings } from "./multi-agent.ts";
 import { maximumImageDataLength, maximumPromptLength, type ComposerAttachment, type PromptImage } from "./composer-draft.ts";
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, safeStorage, screen, shell } from "electron";
 import { readFileSync, watch, writeFileSync } from "node:fs";
@@ -407,9 +408,9 @@ function installHandlers() {
 	);
 	handle("pi:conversation:meta", (id, input) => {
 		const record = object(input);
-		const patch: { pinned?: boolean; archived?: boolean; group?: string | null; codingTier?: "standard" | "ultracode" } = {};
+		const patch: { pinned?: boolean; archived?: boolean; group?: string | null; codingTier?: "standard" | "ultracode" | "multi" } = {};
 		if (record.codingTier !== undefined) {
-			if (record.codingTier !== "standard" && record.codingTier !== "ultracode") throw new Error("档位参数无效。");
+			if (record.codingTier !== "standard" && record.codingTier !== "ultracode" && record.codingTier !== "multi") throw new Error("档位参数无效。");
 			patch.codingTier = record.codingTier;
 		}
 		if (record.pinned !== undefined) {
@@ -575,6 +576,7 @@ function installHandlers() {
 		)
 			throw new Error("前台子 Agent 等待时长格式错误。");
 		if (settings.modelRouting !== undefined) parseModelRoutingUpdate(settings.modelRouting);
+		if (settings.multiAgent !== undefined && settings.multiAgent !== null) parseMultiAgentSettings(settings.multiAgent);
 		if (settings.fallbackModel !== undefined) parseFallbackModelUpdate(settings.fallbackModel);
 		if (settings.proxy !== undefined) string(settings.proxy, "代理地址", 2048);
 		if (settings.noProxy !== undefined) string(settings.noProxy, "代理例外", 4096);

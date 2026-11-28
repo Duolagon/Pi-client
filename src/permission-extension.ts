@@ -24,6 +24,7 @@ import { HooksService } from "./hooks-service.ts";
 import type { HookEventName } from "./hook-types.ts";
 import { isVerifyCommand } from "./verification-command.ts";
 import { ESCALATION_MESSAGE_TYPE, FALLBACK_MESSAGE_TYPE, sanitizeFallbackModel } from "./model-routing.ts";
+import { CODING_TIER_SECTION, type CodingTierRuntimeConfig } from "./coding-tier.ts";
 import { readToolOutputPage, ToolOutputBudget } from "./tool-output-archive.ts";
 import { modelOutputPageBytes, toolOutputIdPattern, toolOutputReference } from "./tool-output-types.ts";
 export { ESCALATION_MESSAGE_TYPE, FALLBACK_MESSAGE_TYPE } from "./model-routing.ts";
@@ -858,7 +859,6 @@ export default function permissions(pi: ExtensionAPI) {
 	for (const [provider, connection] of Object.entries(connections))
 		registerConnection(provider as Provider, connection);
 	registerOutputStyle(pi, process.env.PI_DESKTOP_OUTPUT_STYLE_FILE);
-	registerCodingTier(pi, process.env.PI_DESKTOP_CODING_TIER_FILE);
 	const memoryRoot = process.env.PI_DESKTOP_MEMORY_ROOT;
 	const canonicalMemoryRoot = memoryRoot ? realpath(memoryRoot).catch(() => memoryRoot) : undefined;
 	const userMemoryFile = process.env.PI_DESKTOP_USER_MEMORY_FILE;
@@ -1178,6 +1178,7 @@ export default function permissions(pi: ExtensionAPI) {
 	const escalationFile = supportsEscalation ? process.env.PI_DESKTOP_ESCALATION_FILE : undefined;
 	const escalations = supportsEscalation ? escalationModels(process.env.PI_DESKTOP_ESCALATION_MODEL) : [];
 	const fallback = testingConnection ? undefined : parseFallbackModel(process.env.PI_DESKTOP_FALLBACK_MODEL);
+	const codingTierFile = process.env.PI_DESKTOP_CODING_TIER_FILE;
 	type ActiveModel = NonNullable<ExtensionContext["model"]>;
 	let temporaryModel: { origin: ActiveModel; target: ActiveModel; thinking: ReturnType<ExtensionAPI["getThinkingLevel"]> | undefined } | undefined;
 	const sameModel = (a: { provider: string; id: string } | undefined, b: { provider: string; id: string }) =>
@@ -1188,13 +1189,31 @@ export default function permissions(pi: ExtensionAPI) {
 		temporaryModel = { ...prior, target };
 		return true;
 	};
-	if (fallback || escalationFile || escalations.length) {
+	registerCodingTier(pi, codingTierFile, async (controller, ctx) => {
+		const current = ctx.model;
+		if (!current) return;
+		const ref = controller.model;
+		if (ref && !sameModel(current, ref)) {
+			const target = ctx.modelRegistry.find(ref.provider, ref.id);
+			if (!target || !await switchTemporarily(current, target))
+				ctx.ui.notify(`Multi 主控模型 ${ref.provider}/${ref.id} 当前不可用，本轮继续使用 ${current.name || current.id}。`, "warning");
+		}
+		const level = controller.thinkingLevel;
+		const thinking = pi.getThinkingLevel();
+		if (level && level !== thinking) {
+			temporaryModel ??= { origin: current, target: current, thinking };
+			pi.setThinkingLevel(level);
+			if (pi.getThinkingLevel() !== level)
+				ctx.ui.notify(`当前主控模型不支持 ${level} 思考强度，本轮使用 ${pi.getThinkingLevel()}。`, "warning");
+		}
+	});
+	if (fallback || escalationFile || escalations.length || codingTierFile) {
 		pi.on("agent_settled", async (_event, ctx) => {
 			const prior = temporaryModel;
 			temporaryModel = undefined;
 			if (!prior || !sameModel(ctx.model, prior.target)) return;
 			const origin = ctx.modelRegistry.find(prior.origin.provider, prior.origin.id);
-			if (origin && await pi.setModel(origin).catch(() => false) && prior.thinking !== undefined)
+			if (origin && (sameModel(ctx.model, origin) || await pi.setModel(origin).catch(() => false)) && prior.thinking !== undefined)
 				pi.setThinkingLevel(prior.thinking);
 		});
 	}
@@ -1609,16 +1628,24 @@ async function redactSearchResult<T extends { type: string }>(
  * Delegated children never receive the file path.
  */
 export const OUTPUT_STYLE_SECTION = "output_style";
-export const CODING_TIER_SECTION = "coding_tier";
-/** Like the output style: the tier file is re-read every turn, so a switch applies on the next turn. */
-export function registerCodingTier(pi: Pick<ExtensionAPI, "on">, file: string | undefined): void {
+/** The tier file is re-read each run, including a run started by an external task result. */
+export function registerCodingTier(
+	pi: Pick<ExtensionAPI, "on">,
+	file: string | undefined,
+	applyController?: (controller: NonNullable<CodingTierRuntimeConfig["controller"]>, ctx: ExtensionContext) => Promise<void>,
+): void {
 	if (!file) return;
-	pi.on("before_agent_start", async (event) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		const sections = event?.systemPromptOptions?.sections as Record<string, string> | undefined;
-		if (!sections) return;
-		const text = (await readFile(file, "utf8").catch(() => "")).trim();
-		if (text) sections[CODING_TIER_SECTION] = text.slice(0, 16 * 1024);
-		else delete sections[CODING_TIER_SECTION];
+		const config = await readFile(file, "utf8")
+			.then((text) => JSON.parse(text) as CodingTierRuntimeConfig)
+			.catch(() => undefined);
+		if (sections) {
+			const text = typeof config?.prompt === "string" ? config.prompt.trim() : "";
+			if (text) sections[CODING_TIER_SECTION] = text.slice(0, 16 * 1024);
+			else delete sections[CODING_TIER_SECTION];
+		}
+		if (config?.controller) await applyController?.(config.controller, ctx);
 	});
 }
 export function registerOutputStyle(pi: Pick<ExtensionAPI, "on">, file: string | undefined): void {

@@ -15,6 +15,19 @@ const update = (value, id = session) => send({ method: "session/update", params:
 const text = (value) => update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: value } });
 const modes = { currentModeId: "yolo", availableModes: [{ id: "default", name: "Default" }, { id: "plan", name: "Plan" }] };
 if (process.env.ACP_TEST_ODD_MODES === "1") modes.availableModes = [{ id: "manual", name: "Manual" }, { id: "auto", name: "Auto" }];
+let model = "kimi-default";
+let effort = "low";
+function configOptions() {
+	return [
+		{ id: "model", name: "Model", category: "model", type: "select", currentValue: model, options: [{ value: "kimi-default", name: "Default" }, { value: "kimi-k3", name: "K3" }] },
+		{ id: "thinking", name: "Thinking", category: "thought_level", type: "select", currentValue: effort, options: [{ group: "levels", name: "Levels", options: [{ value: "low", name: "Low" }, ...(model === "kimi-k3" ? [{ value: "high", name: "High" }] : [])] }] },
+	];
+}
+const sessionSettings = () => ({
+	...(process.env.ACP_TEST_NO_MODES === "1" ? {} : { modes }),
+	...(process.env.ACP_TEST_CONFIG === "1" ? { configOptions: configOptions() } : {}),
+	...(process.env.ACP_TEST_LEGACY_MODEL === "1" ? { models: { currentModelId: "legacy,thinking", availableModels: [{ modelId: "legacy,thinking" }, { modelId: "legacy" }] } } : {}),
+});
 const finish = (reason = "end_turn") => { const current = prompt; prompt = undefined; if (current) result(current.id, { stopReason: reason }); };
 const ask = (id, method, params, handler) => { callbacks.set(id, handler); send({ id, method, params: { sessionId: session, ...params } }); };
 
@@ -29,11 +42,19 @@ line.on("line", (raw) => {
 		agentInfo: { name: "Kimi Code CLI", version: "test" },
 		agentCapabilities: { loadSession: process.env.KIMI_TEST_NO_RESTORE !== "1", sessionCapabilities: { ...(process.env.KIMI_TEST_LOAD_ONLY === "1" || process.env.KIMI_TEST_NO_RESTORE === "1" ? {} : { resume: {} }), close: {} } },
 	});
-	if (message.method === "session/new") return result(message.id, process.env.ACP_TEST_NO_MODES === "1" ? { sessionId: session } : { sessionId: session, modes });
+	if (message.method === "session/set_config_option") {
+		const { configId, value } = message.params;
+		if (configId !== process.env.ACP_TEST_IGNORE_CONFIG) {
+			if (configId === "model") model = value;
+			if (configId === "thinking") effort = value;
+		}
+		return result(message.id, { configOptions: configOptions() });
+	}
+	if (message.method === "session/new") return result(message.id, { sessionId: session, ...sessionSettings() });
 	if (message.method === "session/resume" || message.method === "session/load") {
 		session = message.params.sessionId;
 		update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "old replay should not appear" } });
-		return result(message.id, { modes });
+		return result(message.id, sessionSettings());
 	}
 	if (message.method === "session/set_mode") return result(message.id, {});
 	if (message.method === "session/close") return result(message.id, {});

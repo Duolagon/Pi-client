@@ -1,6 +1,7 @@
 import { isAbsolute } from "node:path";
 import { JsonLineProcess, type RpcId } from "./external-rpc.ts";
 import { validateRuntimePolicy } from "./permission-policy.ts";
+import { ExternalFailure, ExternalRpcError, withDiagnostics } from "./external-errors.ts";
 import type {
 	ExternalAdapter, ExternalApprovalOption, ExternalApprovalResponse,
 	ExternalSession, ExternalSessionOptions, ExternalTurnResult,
@@ -58,7 +59,7 @@ export class AcpAdapter implements ExternalAdapter {
 		if (options.resumeSessionId !== undefined) validText(options.resumeSessionId, "session ID", 300, label);
 		const session = new AcpSession(options, this.profile);
 		try { await session.initialize(); return session; }
-		catch (error) { await session.close(); throw error; }
+		catch (error) { await session.close(); throw withDiagnostics(error, session.diagnostics()); }
 	}
 }
 
@@ -95,14 +96,48 @@ class AcpSession implements ExternalSession {
 		});
 	}
 	get sessionId(): string | undefined { return this.nativeId; }
+	diagnostics(): string { return this.rpc.stderrTail; }
 
 	async initialize(): Promise<void> {
 		try { await this.handshake(); }
 		catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			if (this.profile.loginHint && /authentication required/i.test(message))
-				throw new Error(`${this.profile.label} 未登录：请先在终端运行 ${this.profile.loginHint} 登录一次。`);
+			// ACP reports a missing login as error -32000 (auth_required); older CLIs only say so in text.
+			if ((error instanceof ExternalRpcError && error.code === -32000) || /authentication required|auth_required/i.test(message))
+				throw new ExternalFailure("auth", this.profile.loginHint
+					? `${this.profile.label} 未登录：请先在终端运行 ${this.profile.loginHint} 登录一次。`
+					: `${this.profile.label} 未登录：${message}`);
 			throw error;
+		}
+	}
+
+	/**
+	 * Apply the pinned model and thinking level through ACP session config options. A value the
+	 * session does not offer fails the task instead of running on a model the user did not choose.
+	 */
+	private async applyConfig(restored: Record<string, unknown>): Promise<void> {
+		const label = this.profile.label;
+		const wanted: Array<[category: "model" | "thought_level", value: string | undefined]> = [["model", this.options.model], ["thought_level", this.options.effort]];
+		if (!wanted.some(([, value]) => value)) return;
+		let options = Array.isArray(restored.configOptions) ? restored.configOptions.map(optionalRecord) : [];
+		for (const [category, value] of wanted) {
+			if (!value) continue;
+			const option = options.find((item) => item.category === category);
+			const field = category === "model" ? "模型" : "思考强度";
+			if (!option) {
+				// Legacy Kimi's session/set_model writes to the CLI's global defaults.
+				if (category === "model" && optionalRecord(restored.models).currentModelId === value) continue;
+				throw new ExternalFailure("model", `${label} 当前版本不支持通过 ACP 选择${field}；请在设置里清空该项，或升级 ${label}。`);
+			}
+			if (typeof option.id !== "string" || !option.id) throw new ExternalFailure("protocol", `${label} 未返回有效的${field}配置项。`);
+			const values = configValues(option.options);
+			if (values.length && !values.includes(value))
+				throw new ExternalFailure("model", `${label} 的${field}没有 ${value}。可选：${values.slice(0, 20).join("、")}`);
+			if (option.currentValue === value) continue;
+			const response = optionalRecord(await this.rpc.request("session/set_config_option", { sessionId: this.nativeId, configId: option.id, value }));
+			options = Array.isArray(response.configOptions) ? response.configOptions.map(optionalRecord) : [];
+			if (options.find((item) => item.id === option.id)?.currentValue !== value)
+				throw new ExternalFailure("model", `${label} 未确认将${field}设为 ${value}。`);
 		}
 	}
 
@@ -129,6 +164,7 @@ class AcpSession implements ExternalSession {
 			restored = this.record(await this.rpc.request("session/new", { cwd: this.options.cwd, mcpServers: [] }), "new session");
 			this.nativeId = this.text_(restored.sessionId, "session ID", 300);
 		}
+		await this.applyConfig(restored);
 		const modes = optionalRecord(restored.modes);
 		const advertised = Array.isArray(modes.availableModes) && modes.availableModes.length > 0;
 		const hasDefault = advertised && (modes.availableModes as unknown[]).some((mode) => optionalRecord(mode).id === "default");
@@ -161,6 +197,9 @@ class AcpSession implements ExternalSession {
 				}, 0), "prompt response");
 				const reason = result.stopReason;
 				if (this.cancelRequested || reason === "cancelled") return { status: "cancelled", text: this.text, sessionId: this.nativeId };
+				if (reason === "refusal") throw new ExternalFailure("refusal", `${this.profile.label} refused this request`);
+				if (reason === "max_tokens") throw new ExternalFailure("other", `${this.profile.label} stopped at its output token limit; send a follow-up to continue`);
+				if (reason === "max_turn_requests") throw new ExternalFailure("other", `${this.profile.label} reached its per-turn request limit; send a follow-up to continue`);
 				if (reason !== "end_turn") throw new Error(`${this.profile.label} turn did not complete: ${String(reason)}`);
 				return { status: "completed", text: this.text, sessionId: this.nativeId };
 			} catch (error) {
@@ -228,6 +267,11 @@ class AcpSession implements ExternalSession {
 			const ended = update.status === "completed" || update.status === "failed";
 			if (ended && !previous?.ended) this.options.onEvent({ type: "tool_end", id, isError: update.status === "failed", output });
 			this.toolCalls.set(id, { name, input, ended: ended || Boolean(previous?.ended) });
+		} else if (update.sessionUpdate === "usage_update") {
+			// ACP cost is cumulative for the session; only USD is comparable with the host budget.
+			const cost = optionalRecord(update.cost);
+			if (cost.currency === "USD" && typeof cost.amount === "number" && Number.isFinite(cost.amount) && cost.amount >= 0)
+				this.options.onEvent({ type: "usage", sessionCostUsd: cost.amount });
 		} else if (update.sessionUpdate === "current_mode_update") {
 			if (this.modeGuard && update.currentModeId !== "default" && update.currentModeId !== "plan")
 				throw new Error(`${this.profile.label} changed to an unattended mode outside the host approval flow`);
@@ -356,4 +400,16 @@ async function settledWithin(promise: Promise<unknown>, milliseconds: number): P
 	let timer: NodeJS.Timeout | undefined;
 	try { return await Promise.race([promise.then(() => true, () => true), new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), milliseconds); })]); }
 	finally { clearTimeout(timer); }
+}
+
+/** Values of an ACP select config option; options may be flat or grouped. */
+function configValues(options: unknown): string[] {
+	if (!Array.isArray(options)) return [];
+	const values: string[] = [];
+	for (const entry of options) {
+		const item = optionalRecord(entry);
+		if (typeof item.value === "string") values.push(item.value);
+		if (Array.isArray(item.options)) values.push(...configValues(item.options));
+	}
+	return values;
 }

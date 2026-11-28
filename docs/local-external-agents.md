@@ -29,6 +29,16 @@ capabilities 返回 transport、continuation、approvals、cancellation、readOn
 
 使用执行机器上各 CLI 自己的官方配置和认证。客户端不读取、复制或保存第三方 token，不提供第三方 claude.ai 登录入口。Claude SDK helper 调用所选本机 CLI，不分发 SDK 可选的 Claude 原生二进制。许可与认证边界见 [NOTICE](../NOTICE.md) 和 [调研](external-agents-research.md)。
 
+## multi 编排档位
+
+在会话下方的「编排档位」选择 `multi`，也可以输入 `/multi on`。在「设置 → 模型路由与评审」可为主会话选择主控模型及思考强度，为 Codex、Claude Code、Kimi Code 各自填写原生模型和思考强度。留空的选项沿用会话或对应 CLI 的设置。执行器仍需在「外部执行器」中启用，并完成本机 CLI 登录。
+
+主控配置在 `multi` 轮次期间应用。单轮 `ultracode` 指令结束后会话回到 `multi`。从 `multi` 创建的外部任务在续写时沿用同一原生会话，并读取最新的执行器配置。能力和权限校验随每轮继续生效。
+
+Kimi Code 通过 ACP 会话公布可选的模型和思考强度。旧版 CLI 可以沿用当前模型，切换模型或思考强度需要支持对应会话配置项的版本。
+
+每轮可写任务完成后，检查点提供已跟踪和未跟踪文件的变更摘要，包含文件状态、行数和 Worktree。大文件或部分差异会标记摘要不完整。主控可通过 `TaskOutput` 查看摘要，并用 `WorktreeMerge` 显式合并已审查的改动。
+
 ## 主模型调用
 
 主模型通过真正的 Pi 工具调用，而不是前端代替模型派活：
@@ -68,7 +78,7 @@ start/send 的前端 API 返回任务状态，不阻塞等待模型完成；resu
 
 任务有 id、executor、parentConversationId、parentToolCallId、title、project、workingDirectory、worktreeId、subagentType、readOnly、status、revision、turn、eventSequence、nativeSessionId、output、truncated、error、pendingApprovals。外部 ID 以 external- 开头，不能交给 Pi 的 tasks.snapshot/sessions API。
 
-结果为 task_id、executor、parent_conversation_id、parent_tool_call_id、status、turn、native_session_id、worktree_id、working_directory、output、truncated、error、pending_approvals。只返回有界结果摘要，不能把无 output 等同于成功。连续协作沿用同一 task.id，turn 递增。
+结果为 task_id、executor、parent_conversation_id、parent_tool_call_id、status、turn、native_session_id、worktree_id、working_directory、output、truncated、error、pending_approvals。可写任务的已结束轮次还会在可用时包含 changes。连续协作沿用同一 task.id，turn 递增。
 
 ## 审批、问题与取消
 

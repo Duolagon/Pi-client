@@ -217,3 +217,24 @@ test("Claude closing the host clears pending approvals and terminates native des
 		await until(() => { try { process.kill(pid!, 0); return false; } catch { return true; } }, "native descendant stopped");
 	} finally { await session.close(); await data.cleanup(); }
 });
+
+test("Claude helper passes the pinned model and effort to the SDK and rejects malformed ones", async () => {
+	const data = await fixture();
+	let seen: { model?: string; effort?: string } | undefined;
+	const factory = ({ options }: { options: { model?: string; effort?: string } }) => {
+		seen = { model: options.model, effort: options.effort };
+		const generator = (async function* () {})();
+		return Object.assign(generator, { initializationResult: async () => ({}), close() {}, interrupt: async () => {} }) as unknown as Query;
+	};
+	const helper = new ClaudeSdkHelper(() => {}, factory as never);
+	try {
+		await helper.receive({ type: "init", id: "init", config: { executable: "/fake/claude", cwd: data.cwd, policy: basePolicy(data.cwd), model: "opus", effort: "xhigh" } });
+		assert.deepEqual(seen, { model: "opus", effort: "xhigh" });
+	} finally { await helper.close(); }
+	const packets: ClaudeHelperPacket[] = [];
+	const bad = new ClaudeSdkHelper((packet) => packets.push(packet), factory as never);
+	try {
+		await bad.receive({ type: "init", id: "bad", config: { executable: "/fake/claude", cwd: data.cwd, policy: basePolicy(data.cwd), effort: "ultra" } });
+		assert.ok(packets.some((packet) => packet.type === "response" && !packet.ok && /Invalid Claude effort/.test(packet.error)));
+	} finally { await bad.close(); await data.cleanup(); }
+});

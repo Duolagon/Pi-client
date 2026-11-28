@@ -124,7 +124,13 @@ test("Codex malformed output, process exit, and native failed turns reject witho
 	for (const prompt of ["invalid", "exit", "fail"]) {
 		const data = await fixture();
 		const session = await new CodexAdapter().open(data.options);
-		try { await assert.rejects(session.run(prompt), /protocol|exited|failure/); }
+		try {
+			await assert.rejects(session.run(prompt), (error: Error) => {
+				assert.match(error.message, /protocol|exited|failure/);
+				assert.doesNotMatch(error.message, /private stdout/);
+				return true;
+			});
+		}
 		finally { await session.close(); await data.cleanup(); }
 	}
 });
@@ -142,4 +148,65 @@ test("installed Codex completes an isolated no-model App Server handshake", { ti
 	let session;
 	try { session = await new CodexAdapter().open(data.options); assert.ok(session.sessionId); }
 	finally { await session?.close(); await data.cleanup(); }
+});
+
+test("Codex passes the pinned model and effort, and rejects ones the installed CLI does not offer", async () => {
+	const log = join(await mkdtemp(join(tmpdir(), "pi-codex-log-")), "log.jsonl");
+	const data = await fixture({ CODEX_FIXTURE_LOG: log });
+	const session = await new CodexAdapter().open({ ...data.options, model: "fixture-large", effort: "max" });
+	try {
+		await session.run("hello");
+		const calls = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+		assert.equal(calls.find((call) => call.method === "thread/start").params.model, "fixture-large");
+		const turn = calls.find((call) => call.method === "turn/start").params;
+		assert.equal(turn.model, "fixture-large");
+		assert.equal(turn.effort, "max");
+		assert.equal(calls.find((call) => call.method === "model/list").params.modelProvider, "fixture-provider");
+	} finally { await session.close(); await data.cleanup(); }
+	for (const [model, effort, pattern] of [["missing-model", undefined, /没有模型 missing-model.*fixture-large/], ["fixture-small", "high", /不支持思考强度 high.*low/]] as const) {
+		const next = await fixture();
+		try { await assert.rejects(new CodexAdapter().open({ ...next.options, model, effort }), pattern); }
+		finally { await next.cleanup(); }
+	}
+	// An App Server without model/list still starts; Codex validates the model itself then.
+	const old = await fixture({ CODEX_FIXTURE_NO_MODEL_LIST: "1" });
+	const tolerant = await new CodexAdapter().open({ ...old.options, model: "anything" });
+	await tolerant.close(); await old.cleanup();
+});
+
+test("Codex checks an effort-only setting against the actual thread model", async () => {
+	const data = await fixture({ CODEX_FIXTURE_EFFECTIVE_MODEL: "fixture-small" });
+	try {
+		await assert.rejects(new CodexAdapter().open({ ...data.options, effort: "max", resumeSessionId: "saved-thread" }), /fixture-small 不支持思考强度 max/);
+		await assert.rejects(new CodexAdapter().open({ ...data.options, model: "fixture-large" }), /未确认使用模型 fixture-large/);
+	} finally { await data.cleanup(); }
+});
+
+test("Codex reports structured failures, retry diagnostics and per-turn usage", async () => {
+	const { ExternalFailure, describeExternalFailure } = await import("../src/external-errors.ts");
+	const data = await fixture();
+	const session = await new CodexAdapter().open(data.options);
+	try {
+		const error = await session.run("quota").catch((value: unknown) => value);
+		assert.ok(error instanceof ExternalFailure);
+		assert.equal(error.kind, "quota");
+		assert.match(error.message, /usage limit[\s\S]*resets at 5pm/);
+		assert.match(describeExternalFailure("codex", error).message, /额度/);
+		assert.ok(data.events.some((event) => event.type === "diagnostic" && /正在重试/.test(event.message)));
+		assert.equal((await session.run("usage")).text, "usage reported");
+		// Cumulative thread totals become this turn's share: 1040-1000 input, 250-200 output.
+		const usage = data.events.filter((event) => event.type === "usage").at(-1);
+		assert.deepEqual(usage, { type: "usage", inputTokens: 40, outputTokens: 50 });
+	} finally { await session.close(); await data.cleanup(); }
+});
+
+test("Codex keeps a redacted stderr tail for a crashed process", async () => {
+	const data = await fixture({ OPENAI_API_KEY: "sk-abcdefghijklmnopqrstuvwx" });
+	const session = await new CodexAdapter().open(data.options);
+	try {
+		await assert.rejects(session.run("stderr-exit"), /exited/);
+		const tail = session.diagnostics?.() ?? "";
+		assert.match(tail, /config broken/);
+		assert.doesNotMatch(tail, /abcdefghijklmnop|qrstuvwx/);
+	} finally { await session.close(); await data.cleanup(); }
 });

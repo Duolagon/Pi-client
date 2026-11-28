@@ -76,6 +76,7 @@ DeepSeek 默认使用 `deepseek-flash`，并提供 `deepseek-v4-pro`；模型与
 - 模型主动 `Agent` 委派、前台等待／后台结果回传、只读 Explore／Plan 与 Worktree 编码子任务；后台任务与 Worktree 弹窗支持查看详情、子任务审批、停止、快进合并与安全清理。
 - 自定义 Agent（`/agents`）：兼容读取 `.claude/agents` 与 `.pi/agents`（项目级需项目信任），支持名称、描述、提示词、工具白名单 / `disallowedTools`、模型/别名（`sonnet`/`opus`/`haiku`/`inherit`）、思考强度（`effort`/`thinkingLevel`）、`permissionMode`（含 `dontAsk`）、`maxTurns`、预加载 `skills`、`memory`（`agent-memory`）、`isolation`/`background` 与作用域 `hooks`；`Agent` 工具可按名称委派，支持 `fork: true` 继承父会话上下文快照，只读定义自动共享、可写定义默认 Worktree。
 - 本机 Codex／Claude Code／Kimi Code／Antigravity CLI 执行器：主动委派、原生会话持续协作、审批、结果回传和取消；支持在界面启用/停用、配置可执行路径并管理任务审批与续写。
+- 「编排档位」中的 `multi` 与 `ultracode` 并列。可在「设置 → 模型路由与评审」选择主控模型及思考强度，并为 Codex、Claude Code、Kimi Code 分别配置模型和思考强度。可写任务在独立 Worktree 中运行，结果附带文件变更摘要供主控审查。
 - Git 检查点（`/rewind`）：Pi 提示和直接命令自动捕获，支持弹窗差异对比、按单文件或全部安全恢复及冲突提示。
 - Git 暂存、放弃修改与提交，以及 Unified / Split（分栏）Diff 视图切换。
 - 原生交互式 PTY 终端：界面支持单次命令与交互 PTY 双页签，支持多终端创建、标准输入、Ctrl-C、输出回放与子进程清理。

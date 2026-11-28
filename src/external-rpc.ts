@@ -1,6 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
+import { ExternalRpcError, redactDiagnostic } from "./external-errors.ts";
+
+const STDERR_TAIL = 8000;
 
 export type RpcId = string | number;
 export interface JsonLineProcessOptions {
@@ -23,6 +26,9 @@ export class JsonLineProcess {
 	private exited = false;
 	private stopping = false;
 	private options: JsonLineProcessOptions;
+	private stderr = "";
+	/** Redacted tail of the program's diagnostic output, for failure reports. */
+	get stderrTail(): string { return redactDiagnostic(this.stderr, this.options.env).slice(-STDERR_TAIL); }
 
 	constructor(options: JsonLineProcessOptions) {
 		this.options = options;
@@ -41,21 +47,32 @@ export class JsonLineProcess {
 				buffer = buffer.slice(boundary + 1);
 				if (!line.trim()) continue;
 				if (Buffer.byteLength(line) > 8 * 1024 * 1024) { this.fail(new Error("External agent protocol line is too large")); return; }
-				try { this.receive(JSON.parse(line)); }
+				let value: unknown;
+				try { value = JSON.parse(line); }
 				catch { this.fail(new Error("External agent returned an invalid JSONL protocol message")); return; }
+				try { this.receive(value); }
+				catch (error) { this.fail(new Error(`External agent protocol error: ${redactDiagnostic(error instanceof Error ? error.message : String(error), options.env).slice(0, 4000)}`)); return; }
 			}
 			if (Buffer.byteLength(buffer) > 8 * 1024 * 1024) this.fail(new Error("External agent protocol line is too large"));
 		});
 		this.child.stdout.once("end", () => {
-			if (!this.stopping) this.fail(new Error(buffer.trim() ? "External agent closed with an incomplete protocol message" : "External agent closed its protocol stream"));
+			if (this.stopping) return;
+			// The process usually exits right after its stream closes; its exit status says more.
+			const message = buffer.trim() ? "External agent closed with an incomplete protocol message" : "External agent closed its protocol stream";
+			const timer = setTimeout(() => this.fail(new Error(message)), 500);
+			this.child.once("close", () => clearTimeout(timer));
 		});
-		// Drain diagnostic output without leaking a native program's authentication/configuration text.
-		this.child.stderr.on("data", () => {});
+		// Keep enough stderr to redact credentials that span chunks when the tail is read.
+		const errors = new StringDecoder("utf8");
+		this.child.stderr.on("data", (chunk: Buffer) => {
+			this.stderr = (this.stderr + errors.write(chunk)).slice(-STDERR_TAIL * 2);
+		});
 		this.child.once("error", (error) => this.fail(new Error(`External agent could not start: ${error.message}`)));
 		this.child.stdin.on("error", () => this.fail(new Error("External agent input pipe closed")));
 		this.child.once("close", (code, signal) => {
 			this.exited = true;
-			if (!this.stopping) this.fail(new Error(`External agent exited (${code ?? signal ?? "unknown"})`));
+			const tail = this.stderrTail.trim();
+			if (!this.stopping) this.fail(new Error(`External agent exited (${code ?? signal ?? "unknown"})${tail ? `: ${tail.split("\n").slice(-3).join(" | ").slice(0, 600)}` : ""}`));
 		});
 	}
 
@@ -119,7 +136,8 @@ export class JsonLineProcess {
 		this.pending.delete(String(record.id));
 		if (record.error && typeof record.error === "object") {
 			const error = record.error as Record<string, unknown>;
-			pending.reject(new Error(typeof error.message === "string" ? error.message : "External agent request failed"));
+			pending.reject(new ExternalRpcError(typeof error.message === "string" ? redactDiagnostic(error.message, this.options.env).slice(0, 4000) : "External agent request failed",
+				typeof error.code === "number" ? error.code : undefined, error.data));
 		} else if ("result" in record) pending.resolve(record.result);
 		else throw new Error("Missing response result");
 	}

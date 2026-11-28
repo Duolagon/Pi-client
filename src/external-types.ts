@@ -37,6 +37,10 @@ export interface ExternalSessionOptions {
 	policy: RuntimePermissionPolicy;
 	/** The host resolved trust for the original project, including runs in its Worktree. */
 	projectTrusted?: boolean;
+	/** Native model id the user pinned for this executor (multi tier settings); absent keeps the CLI default. */
+	model?: string;
+	/** Native reasoning effort the user pinned; absent keeps the CLI default. */
+	effort?: string;
 	/** A native USD cap for this turn, where the executor exposes one. */
 	maxBudgetUsd?: number;
 	/** SDK helper is shipped with the desktop host; never model supplied. */
@@ -49,6 +53,8 @@ export interface ExternalSessionOptions {
 export interface ExternalSession {
 	readonly sessionId: string | undefined;
 	run(prompt: string, signal?: AbortSignal): Promise<ExternalTurnResult>;
+	/** Redacted tail of the native program's diagnostic output. */
+	diagnostics?(): string;
 	interrupt(): Promise<void>;
 	close(): Promise<void>;
 }
@@ -90,6 +96,18 @@ export interface ExternalTask {
 	pendingApprovals: ExternalApprovalRequest[];
 	/** True when the parent does not wait and the result arrives as a notification. */
 	runInBackground?: boolean;
+	/** Files the last turn changed, from the host checkpoint (tracked and untracked files). */
+	changes?: ExternalChangeSummary;
+}
+export interface ExternalChangedFile { path: string; status: "added" | "modified" | "deleted" | "type-changed"; additions?: number; deletions?: number; binary?: boolean }
+export interface ExternalChangeSummary {
+	files: ExternalChangedFile[];
+	/** More files changed than `files` lists. */
+	truncated: boolean;
+	additions: number;
+	deletions: number;
+	/** Checkpoint holding the full before/after diff. */
+	checkpointId?: string;
 }
 export interface ExternalTaskStartInput {
 	executor: ExternalProvider;
@@ -116,6 +134,8 @@ export interface ExternalTaskResult {
 	truncated: boolean;
 	error?: string;
 	pending_approvals: number;
+	/** Changed files and line counts of the last turn; absent for read-only tasks. */
+	changes?: ExternalChangeSummary;
 }
 export type ExternalEvent = {
 	taskId: string;
