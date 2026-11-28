@@ -39,6 +39,13 @@ export default function externalDelegationProvider(pi) {
 				else response = fauxAssistantMessage("EXTERNAL_CONTINUE_COMPLETE " + results.map((result) => `${result.toolName}:${result.isError ? "error" : "ok"}:${textOf(result)}`).join("\n"));
 			} else if (text.startsWith("EXTERNAL_APPROVAL ")) {
 				response = !results.length ? tool("Agent", { executor, description: "Native approval", prompt: "WAIT_APPROVAL", subagent_type: "general-purpose", run_in_background: false }) : fauxAssistantMessage("EXTERNAL_APPROVAL_RETURNED " + textOf(results[0]));
+			} else if (text.startsWith("EXTERNAL_STRUCTURED ")) {
+				if (!results.length) response = tool("Agent", {
+					executor, description: "Count example results", prompt: "STRUCTURED_OUTPUT", run_in_background: false,
+					output_schema: { type: "object", properties: { count: { type: "integer" } }, required: ["count"], additionalProperties: false },
+				});
+				else if (results.length === 1 && parsed(results[0]).task_id) response = tool("TaskOutput", { task_id: parsed(results[0]).task_id });
+				else response = fauxAssistantMessage("EXTERNAL_STRUCTURED_COMPLETE " + JSON.stringify(results.map((result) => parsed(result).structured_output)));
 			} else if (text.startsWith("EXTERNAL_BACKGROUND ")) {
 				response = !results.length ? tool("Agent", { executor, description: "External background", prompt: "SLOW_DONE", subagent_type: "general-purpose", run_in_background: true }) : fauxAssistantMessage("EXTERNAL_BACKGROUND_LAUNCHED " + textOf(results[0]));
 			} else if (text.startsWith("EXTERNAL_CANCEL_TOOL ")) {
@@ -48,14 +55,24 @@ export default function externalDelegationProvider(pi) {
 			} else if (text.startsWith("EXTERNAL_BLOCK ")) {
 				response = !results.length ? tool("Agent", { executor, description: "External parent cancellation", prompt: "BLOCK", subagent_type: "general-purpose", run_in_background: true }) : fauxAssistantMessage("EXTERNAL_BLOCK_LAUNCHED " + textOf(results[0]));
 			} else if (text.startsWith("EXTERNAL_PARAMS ")) {
-				// Call-level parameters an external executor cannot honour fail visibly or warn.
 				const calls = [
-					{ executor, description: "External with model", prompt: "WRITE model", model: "opus", run_in_background: true },
+					{ executor, description: "External with model", prompt: "WRITE model", model: "fixture-model", effort: "high", run_in_background: false },
+					{ executor, description: "External with invalid model", prompt: "Invalid model", model: "invalid model", run_in_background: false },
 					{ executor, description: "External with name", prompt: "WRITE name", name: "reviewer", run_in_background: true },
 					{ executor, description: "External with team", prompt: "SLOW_DONE", model: "inherit", mode: "plan", team_name: "core", run_in_background: true },
 				];
 				response = results.length < calls.length ? tool("Agent", calls[results.length])
 					: fauxAssistantMessage("EXTERNAL_PARAMS_COMPLETE " + results.map((result) => `${result.isError ? "error" : "ok"}:${textOf(result)}`).join("\n"));
+			} else if (text.startsWith("EXTERNAL_REVIEW ")) {
+				response = !results.length ? tool("Agent", {
+					review_of: text.split(" ")[1], description: "Review original task", prompt: "REVIEW_CALLER_COMMENT",
+					model: "fixture-review-model", effort: "medium",
+					run_in_background: false,
+				}) : fauxAssistantMessage("EXTERNAL_REVIEW_COMPLETE " + (results[0].isError ? "DENIED " : "ALLOWED ") + textOf(results[0]));
+			} else if (text === "EXTERNAL_CANDIDATES") {
+				response = !results.length ? tool("Agent", {
+					description: "Compare candidates", prompt: "Implement a fixture", candidates: [{ executor: "codex" }, { executor: "claude" }],
+				}) : fauxAssistantMessage("EXTERNAL_CANDIDATES_COMPLETE " + (results[0].isError ? "DENIED " : "ALLOWED ") + textOf(results[0]));
 			} else if (text.startsWith("EXTERNAL_FOREIGN ")) {
 				response = !results.length ? tool("AgentSend", { task_id: text.split(" ")[1], message: "WRITE forbidden" }) : fauxAssistantMessage("EXTERNAL_FOREIGN_COMPLETE " + (results[0].isError ? "DENIED " : "ALLOWED ") + textOf(results[0]));
 			} else if (text.startsWith("PI_MANUAL_SLOW")) {

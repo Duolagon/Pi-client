@@ -1,3 +1,4 @@
+import { describeExternalFailure, ExternalFailure } from "../src/external-errors.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
@@ -47,7 +48,8 @@ function sdkHarness(policy: RuntimePermissionPolicy, options: { deny?: boolean; 
 				if (options.slow) await new Promise<void>((resolve) => { interrupt = () => { interrupted = true; resolve(); }; });
 				yield { type: "stream_event", session_id: "sdk-session-1", event: { type: "content_block_delta", delta: { type: "text_delta", text: "sdk text" } } };
 				yield { type: "user", session_id: "sdk-session-1", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "native-write", content: "done", is_error: false }] } };
-				yield { type: "result", subtype: "success", is_error: false, session_id: "sdk-session-1", result: String(user.message.content), usage: { input_tokens: 7, output_tokens: 3 } };
+				yield { type: "result", subtype: "success", is_error: false, session_id: "sdk-session-1", result: String(user.message.content), usage: { input_tokens: 7, output_tokens: 3 },
+					...(native.outputFormat ? { structured_output: { count: 4 } } : {}) };
 			}
 		})();
 		return Object.assign(generator, { initializationResult: async () => ({}), interrupt: async () => { interrupt?.(); }, close: () => { interrupt?.(); } }) as unknown as Query;
@@ -90,6 +92,75 @@ test("Claude SDK enables project and local settings only after explicit host tru
 		assert.deepEqual(harness.config!.settingSources, ["user", "project", "local"]);
 		assert.equal(harness.config!.maxBudgetUsd, 0.5);
 	} finally { await harness.helper.close(); await data.cleanup(); }
+});
+
+test("Claude adds input to the SDK's open stream and waits for a queued native result with cumulative model usage", async () => {
+	const data = await fixture();
+	const packets: ClaudeHelperPacket[] = [];
+	let started!: () => void;
+	const active = new Promise<void>((resolve) => { started = resolve; });
+	const helper = new ClaudeSdkHelper((packet) => packets.push(packet), ({ prompt }) => {
+		const generator = (async function* () {
+			const stream = prompt[Symbol.asyncIterator]();
+			const first = (await stream.next()).value as SDKUserMessage;
+			started();
+			const next = (await stream.next()).value as SDKUserMessage;
+			assert.equal(next.client_composed, true);
+			yield { type: "result", subtype: "success", result: first.message.content, queued_turn_count: 1 };
+			yield {
+				type: "result", subtype: "success", result: next.message.content, queued_turn_count: 0, total_cost_usd: 0.12,
+				usage: { input_tokens: 5, output_tokens: 2 },
+				modelUsage: { fixture: { inputTokens: 15, outputTokens: 6, cacheReadInputTokens: 100, cacheCreationInputTokens: 25 } },
+			};
+		})();
+		return Object.assign(generator, {
+			initializationResult: async () => ({}), close() {}, interrupt: async () => {},
+			streamInput: () => { throw new Error("A second stream would close stdin"); },
+		}) as unknown as Query;
+	});
+	try {
+		await helper.receive({ type: "init", id: "init", config: { executable: "/fake/claude", cwd: data.cwd, policy: basePolicy(data.cwd) } });
+		await helper.receive({ type: "run", id: "turn", prompt: "first" });
+		await active;
+		await helper.receive({ type: "steer", id: "steer", prompt: "more" });
+		await until(() => packets.some((entry) => entry.type === "response" && entry.id === "turn"), "finished after the extra message");
+		assert.ok(packets.some((entry) => entry.type === "response" && entry.id === "steer" && entry.ok && entry.value === true));
+		assert.deepEqual(packets.find((entry) => entry.type === "response" && entry.id === "turn"),
+			{ type: "response", id: "turn", ok: true, value: { status: "completed", text: "more", sessionId: undefined } });
+		assert.deepEqual(packets.findLast((entry) => entry.type === "event" && entry.event.type === "usage"),
+			{ type: "event", event: { type: "usage", inputTokens: 5, outputTokens: 2, cachedInputTokens: undefined, cacheWriteTokens: undefined,
+				sessionCostUsd: 0.12, sessionTokens: { inputTokens: 15, outputTokens: 6, cachedInputTokens: 100, cacheWriteTokens: 25 } } });
+	} finally { await helper.close(); await data.cleanup(); }
+});
+
+test("Claude SDK error and refusal packets retain their cause and recovery hint", async () => {
+	const data = await fixture();
+	try {
+		for (const [packet, kind] of [
+			[{ subtype: "success", is_error: true, api_error_status: 401, result: "Invalid API key" }, "auth"],
+			[{ subtype: "success", is_error: false, stop_reason: "refusal", result: "Unable to fulfill a request about an invalid API key" }, "refusal"],
+			[{ subtype: "error_max_budget_usd", is_error: true }, "quota"],
+			[{ subtype: "success", is_error: true, result: "Prompt is too long" }, "context"],
+		] as const) {
+			const packets: ClaudeHelperPacket[] = [];
+			const helper = new ClaudeSdkHelper((entry) => packets.push(entry), ({ prompt }) => {
+				const generator = (async function* () {
+					for await (const _ of prompt) yield { type: "result", ...packet };
+				})();
+				return Object.assign(generator, { initializationResult: async () => ({}), close() {}, interrupt: async () => {} }) as unknown as Query;
+			});
+			try {
+				await helper.receive({ type: "init", id: "init", config: { executable: "/fake/claude", cwd: data.cwd, policy: basePolicy(data.cwd) } });
+				await helper.receive({ type: "run", id: "run", prompt: "fixture" });
+				await until(() => packets.some(entry => entry.type === "response" && entry.id === "run"), "Claude result");
+				const response = packets.findLast(entry => entry.type === "response" && entry.id === "run");
+				assert.ok(response?.type === "response" && !response.ok);
+				const described = describeExternalFailure("claude", response.kind ? new ExternalFailure(response.kind, response.error) : new Error(response.error));
+				assert.equal(described.kind, kind);
+				assert.match(described.message, /提示/);
+			} finally { await helper.close(); }
+		}
+	} finally { await data.cleanup(); }
 });
 
 test("Claude read-only tool ceiling and denied policy cannot be bypassed by host approval", async () => {
@@ -216,6 +287,23 @@ test("Claude closing the host clears pending approvals and terminates native des
 		assert.equal(approvalCancelled, true);
 		await until(() => { try { process.kill(pid!, 0); return false; } catch { return true; } }, "native descendant stopped");
 	} finally { await session.close(); await data.cleanup(); }
+});
+
+test("Claude helper passes the output format and relays the SDK's structured output", async () => {
+	const data = await fixture();
+	const policy = basePolicy(data.cwd);
+	const harness = sdkHarness(policy);
+	const schema = { type: "object", properties: { count: { type: "integer" } }, required: ["count"], additionalProperties: false };
+	try {
+		await harness.helper.receive({ type: "init", id: "init", config: { executable: "/fake/claude", cwd: data.cwd, policy, outputSchema: schema } });
+		await harness.helper.receive({ type: "run", id: "structured", prompt: "Count files" });
+		await until(() => harness.packets.some((packet) => packet.type === "response" && packet.id === "structured"), "structured result");
+		assert.deepEqual(harness.config?.outputFormat, { type: "json_schema", schema });
+		const completed = harness.packets.find((packet) => packet.type === "response" && packet.id === "structured");
+		assert.deepEqual(completed, { type: "response", id: "structured", ok: true, value: {
+			status: "completed", text: "Count files", sessionId: "sdk-session-1", structuredOutput: { count: 4 },
+		} });
+	} finally { await harness.helper.close(); await data.cleanup(); }
 });
 
 test("Claude helper passes the pinned model and effort to the SDK and rejects malformed ones", async () => {

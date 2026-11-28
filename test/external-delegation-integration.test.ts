@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { DesktopService } from "../src/backend.ts";
 import type { DesktopEvent, Message, Snapshot } from "../src/shared.ts";
 import type { ExternalAdapter, ExternalEvent, ExternalProvider, ExternalSessionOptions, ExternalTurnResult } from "../src/external-types.ts";
+import { candidateDelta, groupExternalComparisons } from "../src/renderer/external-comparisons.ts";
 import { createCoreFixture } from "./fixtures/core-fixture.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -23,17 +24,34 @@ async function until<T>(read: () => Promise<T> | T, check: (value: T) => boolean
 }
 
 function adapters() {
-	const opened: { executor: ExternalProvider; cwd: string; resume?: string; nativeId: string; cap?: number; env: NodeJS.ProcessEnv }[] = [];
+	const opened: { executor: ExternalProvider; cwd: string; resume?: string; nativeId: string; cap?: number; env: NodeJS.ProcessEnv; model?: string; effort?: string; mode: string }[] = [];
+	const prompts: { nativeId: string; prompt: string }[] = [];
 	let serial = 0;
 	const create = (executor: ExternalProvider): ExternalAdapter => ({
 		async open(options: ExternalSessionOptions) {
 			const nativeId = options.resumeSessionId ?? `${executor}-native-${++serial}`;
-			opened.push({ executor, cwd: options.cwd, resume: options.resumeSessionId, nativeId, cap: options.maxBudgetUsd, env: options.env });
+			opened.push({ executor, cwd: options.cwd, resume: options.resumeSessionId, nativeId, cap: options.maxBudgetUsd, env: options.env,
+				model: options.model, effort: options.effort, mode: options.policy.mode });
 			options.onEvent({ type: "session", sessionId: nativeId });
 			let stopped: (() => void) | undefined;
 			return {
 				sessionId: nativeId,
 				async run(prompt, signal): Promise<ExternalTurnResult> {
+					prompts.push({ nativeId, prompt });
+					if (prompt.startsWith("Review this patch independently")) {
+						const file = join(options.cwd, "forbidden-review-write.txt");
+						const decision = await options.onPermission({ id: "review-writing", kind: "file", toolName: "write", input: { path: file, content: "fixture" } }, signal);
+						assert.equal(decision.decision, "deny", "independent review must enforce a read-only policy");
+						return { status: "completed", text: "INDEPENDENT_REVIEW_REPORT", sessionId: nativeId };
+					}
+					if (prompt.startsWith("STRUCTURED_OUTPUT")) {
+						if (executor === "claude") {
+							assert.equal(options.outputSchema?.type, "object");
+							return { status: "completed", text: "", structuredOutput: { count: 7 }, sessionId: nativeId };
+						}
+						assert.equal(executor === "codex" ? options.outputSchema?.type : prompt.includes("JSON Schema"), executor === "codex" ? "object" : true);
+						return { status: "completed", text: '{"count":7}', sessionId: nativeId };
+					}
 					if (prompt === "BLOCK") return new Promise((resolve) => {
 						stopped = () => resolve({ status: "cancelled", text: "external cancelled", sessionId: nativeId });
 						signal?.addEventListener("abort", stopped, { once: true });
@@ -44,13 +62,14 @@ function adapters() {
 						options.onEvent({ type: "usage", inputTokens: 7, outputTokens: 3, sessionCostUsd: Number(prompt.slice(5)) });
 						return { status: "completed", text: "accounted", sessionId: nativeId };
 					}
-					const path = join(options.cwd, "external-result.txt");
+					const path = join(options.cwd, prompt === "REVIEW_FOLLOWUP" ? "followup-result.txt" : "external-result.txt");
 					options.onEvent({ type: "tool_start", id: "native-write", name: "write", input: { path } });
 					const decision = await options.onPermission({ id: "native-request", kind: "file", toolName: "write", input: { path, content: prompt } }, signal);
 					if (signal?.aborted) return { status: "cancelled", text: "external cancelled", sessionId: nativeId };
-					if (decision.decision === "allow") await appendFile(path, `${executor}:${prompt}\n`);
+					if (decision.decision === "allow") await appendFile(path, prompt === "ORIGINAL_CANDIDATE_REQUIREMENT"
+						? "same candidate change\n" : `${executor}:${prompt}\n`);
 					options.onEvent({ type: "tool_end", id: "native-write", isError: decision.decision !== "allow" });
-					const result = `${executor}:${decision.decision}:${prompt}:${nativeId}`;
+					const result = `IMPLEMENTATION_REPORT ${executor}:${decision.decision}:${prompt}:${nativeId}`;
 					options.onEvent({ type: "text_delta", text: result });
 					return { status: "completed", text: result, sessionId: nativeId };
 				},
@@ -59,7 +78,7 @@ function adapters() {
 			};
 		},
 	});
-	return { values: { codex: create("codex"), claude: create("claude"), kimi: create("kimi") }, opened };
+	return { values: { codex: create("codex"), claude: create("claude"), kimi: create("kimi") }, opened, prompts };
 }
 
 async function setup(permission: "auto" | "ask" = "auto", maxConcurrentTasks = 4) {
@@ -106,6 +125,17 @@ test("real Pi model discovers local executors, delegates to each native adapter 
 			assert.ok(result.messages.some((message) => message.role === "toolResult" && message.toolName === "AgentExecutors" && !message.isError && text(message).includes("external-fixture")));
 			const replay = await data.service.replayExternal(task.id); assert.ok(replay.events.some((event) => event.event.type === "tool_start"));
 			if (provider !== "kimi") await data.service.newConversation();
+		}
+	} finally { await data.service.close(); await data.fixture.cleanup(); }
+});
+
+test("external Agent and TaskOutput return the validated structured result through the real tool host", { timeout: 45000 }, async () => {
+	const data = await setup();
+	try {
+		for (const executor of ["codex", "claude", "kimi"]) {
+			const snapshot = await run(data.service, `EXTERNAL_STRUCTURED ${executor}`, "EXTERNAL_STRUCTURED_COMPLETE");
+			assert.ok(contains(snapshot, 'EXTERNAL_STRUCTURED_COMPLETE [{"count":7},{"count":7}]'));
+			if (executor !== "kimi") await data.service.newConversation();
 		}
 	} finally { await data.service.close(); await data.fixture.cleanup(); }
 });
@@ -182,18 +212,108 @@ test("a foreground teammate settles idle and is woken by the next message after 
 	} finally { await data.service.close(); await data.fixture.cleanup(); }
 });
 
-test("an external Agent call rejects model and name it cannot honour and warns about ignored team fields", { timeout: 45000 }, async () => {
+test("an external Agent call applies its model and effort, rejects invalid identifiers and names, and warns about ignored team fields", { timeout: 45000 }, async () => {
 	const data = await setup();
 	try {
 		const result = await run(data.service, "EXTERNAL_PARAMS codex", "EXTERNAL_PARAMS_COMPLETE");
 		const answer = result.messages.filter((message) => message.role === "assistant").map(text).find((value) => value.includes("EXTERNAL_PARAMS_COMPLETE"))!;
-		const [model, name, team] = answer.replace("EXTERNAL_PARAMS_COMPLETE ", "").split("\n");
-		assert.match(model, /^error:.*External executors use their own configured model/);
+		const [model, invalidModel, name, team] = answer.replace("EXTERNAL_PARAMS_COMPLETE ", "").split("\n");
+		assert.match(model, /^ok:.*"status":"completed"/);
+		assert.ok(data.native.opened.some((item) => item.executor === "codex" && item.model === "fixture-model" && item.effort === "high"));
+		assert.match(invalidModel, /^error:.*模型标识无效/);
 		assert.match(name, /^error:.*External executors cannot be named/);
 		assert.match(team, /^ok:/);
 		assert.match(team, /Parameter 'mode' is not supported by this client and was ignored/);
 		assert.match(team, /Parameter 'team_name' is not supported by this client and was ignored/);
-		assert.equal(data.service.listExternal(data.parentId).length, 1, "only the valid call started an external task");
+		assert.equal(data.service.listExternal(data.parentId).length, 2, "only the valid calls started external tasks");
+	} finally { await data.service.close(); await data.fixture.cleanup(); }
+});
+
+test("Agent review_of gives a different read-only executor the requirement and patch and checks task ownership", { timeout: 45000 }, async () => {
+	const data = await setup();
+	try {
+		const requirement = "ORIGINAL_REVIEW_REQUIREMENT";
+		const launched = await data.service.startExternal({ executor: "codex", description: "Implement fixture", prompt: requirement });
+		await until(() => data.service.externalSnapshot(launched.id), (task) => task.status === "completed", "implementation complete");
+		await data.service.sendExternal({ taskId: launched.id, message: "REVIEW_FOLLOWUP" });
+		const implementation = await until(() => data.service.externalSnapshot(launched.id),
+			(task) => task.turn === 2 && task.status === "completed", "second change complete");
+		assert.match(implementation.output, /IMPLEMENTATION_REPORT/);
+		const reviewed = await run(data.service, `EXTERNAL_REVIEW ${implementation.id}`, "EXTERNAL_REVIEW_COMPLETE");
+		assert.ok(contains(reviewed, "EXTERNAL_REVIEW_COMPLETE ALLOWED"));
+		assert.ok(contains(reviewed, "INDEPENDENT_REVIEW_REPORT"));
+		const review = data.service.listExternal(data.parentId).find((task) => task.reviewOf === implementation.id);
+		assert.ok(review);
+		assert.equal(review.executor, "claude");
+		assert.equal(review.readOnly, true);
+		assert.equal(review.subagentType, "Explore");
+		assert.equal(review.worktreeId, undefined);
+		const native = data.native.opened.find((item) => item.nativeId === review.nativeSessionId);
+		assert.equal(native?.mode, "read");
+		assert.equal(native?.model, "fixture-review-model");
+		assert.equal(native?.effort, "medium");
+		const prompt = data.native.prompts.find((item) => item.nativeId === review.nativeSessionId)?.prompt;
+		assert.ok(prompt);
+		assert.ok(prompt.includes(JSON.stringify(requirement)));
+		assert.ok(prompt.includes("external-result.txt"));
+		assert.ok(prompt.includes(`+codex:${requirement}`));
+		assert.ok(prompt.includes("followup-result.txt"));
+		assert.ok(prompt.includes("+codex:REVIEW_FOLLOWUP"));
+		assert.doesNotMatch(prompt, /IMPLEMENTATION_REPORT|REVIEW_CALLER_COMMENT/);
+		await assert.rejects(access(join(review.workingDirectory, "forbidden-review-write.txt")));
+		await assert.rejects(data.service.reviewExternal({ taskId: implementation.id, executor: "kimi" }), /只读执行器/);
+
+		await data.service.newConversation();
+		const foreign = await run(data.service, `EXTERNAL_REVIEW ${implementation.id}`, "EXTERNAL_REVIEW_COMPLETE");
+		assert.ok(contains(foreign, "EXTERNAL_REVIEW_COMPLETE DENIED"));
+		assert.ok(contains(foreign, "没有该外部子任务"));
+		assert.equal(data.service.listExternal(data.parentId).length, 2);
+	} finally { await data.service.close(); await data.fixture.cleanup(); }
+});
+
+test("candidate comparison requires a user action, limits the batch and reuses the original requirement in separate worktrees", { timeout: 45000 }, async () => {
+	const data = await setup();
+	try {
+		const requirement = "ORIGINAL_CANDIDATE_REQUIREMENT";
+		const source = await data.service.startExternal({ executor: "codex", description: "Implement fixture", prompt: requirement });
+		await until(() => data.service.externalSnapshot(source.id), (task) => task.status === "completed", "implementation complete");
+		await data.service.sendExternal({ taskId: source.id, message: "IMPLEMENTATION_FOLLOWUP" });
+		await until(() => data.service.externalSnapshot(source.id), (task) => task.turn === 2 && task.status === "completed", "follow-up complete");
+
+		const refused = await run(data.service, "EXTERNAL_CANDIDATES", "EXTERNAL_CANDIDATES_COMPLETE");
+		assert.ok(contains(refused, "EXTERNAL_CANDIDATES_COMPLETE DENIED"));
+		assert.ok(contains(refused, "需要用户在外部任务详情中主动启动"));
+		const candidates = [
+			{ executor: "codex", model: "candidate-one", effort: "high" },
+			{ executor: "claude", model: "candidate-two", effort: "medium" },
+			{ executor: "kimi", model: "candidate-three", effort: "low" },
+		] as const;
+		await assert.rejects(data.service.compareExternal({ taskId: source.id, candidates: [...candidates, candidates[0]] }), /2 或 3 个候选/);
+		assert.equal(data.service.listExternal(data.parentId).length, 1);
+		const comparison = await data.service.compareExternal({ taskId: source.id, candidates: [...candidates] });
+		assert.equal(comparison.tasks.length, 3);
+		assert.deepEqual(comparison.errors, undefined);
+		assert.ok(comparison.tasks.every((task) => task.comparisonId === comparison.comparisonId && task.parentConversationId === data.parentId));
+		const finished = await Promise.all(comparison.tasks.map((task) => until(
+			() => data.service.externalSnapshot(task.id), (value) => value.status === "completed", "candidate complete",
+		)));
+		assert.equal(new Set([source, ...finished].map((task) => task.workingDirectory)).size, 4);
+		assert.equal(new Set([source, ...finished].map((task) => task.worktreeId)).size, 4);
+		for (const task of finished) {
+			assert.ok(task.worktreeId);
+			const launch = data.native.opened.find((item) => item.nativeId === task.nativeSessionId);
+			const candidate = candidates.find((item) => item.executor === task.executor);
+			assert.equal(launch?.model, candidate?.model);
+			assert.equal(launch?.effort, candidate?.effort);
+			assert.equal(data.native.prompts.find((item) => item.nativeId === task.nativeSessionId)?.prompt, requirement);
+			assert.equal(await readFile(join(task.workingDirectory, "external-result.txt"), "utf8"), "same candidate change\n");
+		}
+		await assert.rejects(access(join(data.project, "external-result.txt")));
+		const deltas = new Map(await Promise.all(finished.map(async task => {
+			const diff = await data.service.externalDiff(task.id, task.changes!.checkpointId!, undefined, false);
+			return [task.id, candidateDelta(diff)] as const;
+		})));
+		assert.deepEqual(groupExternalComparisons(finished, deltas).map((group) => group.length), [3], "identical patches share one rendered candidate");
 	} finally { await data.service.close(); await data.fixture.cleanup(); }
 });
 

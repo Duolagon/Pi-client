@@ -3,6 +3,11 @@ import { createInterface } from "node:readline";
 import { writeFile, appendFile } from "node:fs/promises";
 import { join } from "node:path";
 
+if (process.argv.includes("--version")) {
+	process.stdout.write("codex-cli 0.171.0\n");
+	process.exit(0);
+}
+
 const pending = new Map();
 const input = createInterface({ input: process.stdin });
 let serial = 0;
@@ -28,6 +33,10 @@ async function run(prompt, turnId) {
 	if (prompt === "invalid") { process.stdout.write("NOT_JSON private stdout\n"); return; }
 	if (prompt === "exit") process.exit(3);
 	if (prompt === "fail") { complete("", "failed"); return; }
+	if (prompt === "structured output") {
+		notification("item/completed", { ...base, item: { id: "progress", type: "agentMessage", text: "Working on the report", phase: "commentary" } });
+		complete('{"count":3}'); return;
+	}
 	if (prompt === "quota") {
 		notification("error", { ...base, willRetry: true, error: { message: "temporary 503", codexErrorInfo: "serverOverloaded", additionalDetails: null } });
 		notification("turn/completed", { threadId, turn: { id: turnId, status: "failed", error: { message: "You've hit your usage limit", codexErrorInfo: "usageLimitExceeded", additionalDetails: "resets at 5pm" } } });
@@ -126,6 +135,13 @@ input.on("line", (line) => {
 			void run(message.params.input[0].text, active.id);
 		} else if (message.method === "turn/interrupt") {
 			response(message.id, {}); complete("", "interrupted");
+		} else if (message.method === "turn/steer" && !process.env.CODEX_FIXTURE_NO_STEER) {
+			if (!active || message.params.threadId !== threadId || message.params.expectedTurnId !== active.id)
+				send({ id: message.id, error: { code: -32602, message: "No matching active turn" } });
+			else {
+				response(message.id, { turnId: active.id });
+				complete(`added: ${message.params.input[0].text}`);
+			}
 		} else send({ id: message.id, error: { code: -32601, message: "Unknown fake method" } });
 	})().catch(() => process.exit(4));
 });

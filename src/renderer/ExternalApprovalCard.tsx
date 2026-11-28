@@ -126,6 +126,12 @@ export function ExternalApprovalCard({
 							<button type="button" className="primary-button" disabled={pending}
 								onClick={() => void respond({ decision: "allow" })}>仅本次允许</button>
 						)}
+						{!question && request.kind !== "permissions" && Object.keys(request.input).length > 0 &&
+							(!request.options?.length || request.options.some((option) => option.kind === "allow_once")) && (
+							<button type="button" className="secondary-button" disabled={pending}
+								title="本会话中再次出现完全相同的操作时自动允许"
+								onClick={() => void respond({ decision: "allow", rememberForSession: true })}>本会话内允许</button>
+						)}
 					</div>
 				</>
 			)}

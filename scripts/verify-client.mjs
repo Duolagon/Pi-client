@@ -110,6 +110,7 @@ const env = {
 	PI_DESKTOP_DATA_DIR: join(root, "desktop"),
 	PI_DESKTOP_WORKSPACE: project,
 	PI_OFFLINE: "1",
+	ACP_TEST_CONFIG: "1",
 };
 for (const key of Object.keys(env))
 	if (
@@ -738,7 +739,10 @@ try {
 	await page.evaluate(() => window.pi.tools.setEnabled({ name: "grep", enabled: null }));
 	checks.push("real tool inventory, scoped enablement and permission rule preload interfaces");
 	const executors = await page.evaluate(() => window.pi.externalAgents.executors());
-	assert.deepEqual(executors.map((item) => item.id), ["codex", "claude", "kimi", "antigravity"]);
+	assert.deepEqual(executors.filter((item) => !item.id.startsWith("acp-")).map((item) => item.id), ["codex", "claude", "kimi", "antigravity"]);
+	const qwen = executors.find((item) => item.id === "acp-qwen-code");
+	assert.equal(qwen.enabled, false);
+	assert.match(qwen.installCommand, /^npm install --global @qwen-code\/qwen-code@/);
 	assert.equal(executors.find((item) => item.id === "kimi").capabilities.readOnly, false);
 	assert.equal(executors.find((item) => item.id === "antigravity").capabilities.readOnly, false);
 	assert.deepEqual(await page.evaluate(() => window.pi.externalAgents.list()), []);
@@ -767,6 +771,93 @@ try {
 	const answeredExternalQuestion = await page.evaluate((id) => window.pi.externalAgents.snapshot(id), externalQuestionTask.id);
 	assert.deepEqual(JSON.parse(answeredExternalQuestion.output), { action: "accept", content: { q0: "blue", q1: ["test"] } });
 	checks.push("external structured questions stay inline, preserve the chat focus and return native structured answers");
+	const fakeCodex = join(root, "codex-fixture");
+	await cp(join(repo, "test/fixtures/external-codex.mjs"), fakeCodex);
+	await chmod(fakeCodex, 0o700);
+	await page.evaluate((executable) => window.pi.externalAgents.configure({ id: "codex", executable, enabled: true }), fakeCodex);
+	await page.getByRole("button", { name: "后台任务与 Worktree", exact: true }).click();
+	const nativeTasksDrawer = page.getByRole("dialog", { name: "后台任务、子 Agent 与 Worktree (/tasks)", exact: true });
+	await selectValue(nativeTasksDrawer.getByRole("combobox", { name: "任务执行器", exact: true }), "kimi");
+	await nativeTasksDrawer.getByRole("textbox", { name: "新建后台任务指令", exact: true }).fill("timeline");
+	await nativeTasksDrawer.getByRole("textbox", { name: "任务模型", exact: true }).fill("kimi-k3");
+	await nativeTasksDrawer.getByRole("textbox", { name: "任务思考强度", exact: true }).fill("high");
+	await nativeTasksDrawer.getByRole("button", { name: "启动", exact: true }).click();
+	const nativeTimeline = nativeTasksDrawer.getByRole("region", { name: "执行时间线", exact: true });
+	await nativeTimeline.getByText("读取时间线演示文件", { exact: true }).waitFor();
+	await nativeTimeline.getByText("运行中", { exact: true }).waitFor();
+	const timelineQuestion = nativeTasksDrawer.getByRole("region", { name: "外部 Agent 提问", exact: true });
+	await selectValue(timelineQuestion.getByRole("combobox", { name: "q0", exact: true }), "continue");
+	await timelineQuestion.getByRole("button", { name: "提交回答", exact: true }).click();
+	await nativeTasksDrawer.getByText("本地时间线演示完成", { exact: true }).waitFor();
+	await nativeTimeline.getByText(/费用.*0[.,]012/).waitFor();
+	const timelineTask = await page.evaluate(async () => (await window.pi.externalAgents.list()).find((task) => task.title === "timeline"));
+	assert.equal(timelineTask.model, "kimi-k3");
+	assert.equal(timelineTask.effort, "high");
+	await nativeTasksDrawer.getByRole("button", { name: "返回列表", exact: true }).click();
+	await nativeTasksDrawer.locator(".cc-tool-ctrl-row").filter({ has: page.getByText("timeline", { exact: true }) })
+		.getByRole("button", { name: "详情", exact: true }).click();
+	await nativeTimeline.getByText("读取时间线演示文件", { exact: true }).waitFor();
+	await nativeTimeline.getByText(/费用.*0[.,]012/).waitFor();
+	await nativeTimeline.getByText("工具输出", { exact: true }).click();
+	await nativeTimeline.getByText("本地演示工具输出", { exact: true }).waitFor();
+	checks.push("the task launcher picks an available native executor and the external timeline streams and replays its plan, tool output and reported cost");
+
+	await nativeTasksDrawer.getByRole("textbox", { name: "新建后台任务指令", exact: true }).fill("comparison fixture");
+	await nativeTasksDrawer.getByRole("button", { name: "启动", exact: true }).click();
+	await nativeTasksDrawer.getByText("turn 1: comparison fixture", { exact: true }).waitFor();
+	assert.equal(await nativeTimeline.count(), 1);
+	assert.equal(await nativeTimeline.getByText("读取时间线演示文件", { exact: true }).count(), 0);
+	await nativeTasksDrawer.getByRole("button", { name: "比较多种方案", exact: true }).click();
+	const candidateForm = nativeTasksDrawer.getByRole("group", { name: "启动方案对比", exact: true });
+	await candidateForm.getByRole("button", { name: "添加第三种方案", exact: true }).click();
+	await candidateForm.getByRole("combobox", { name: "方案 3 执行器", exact: true }).waitFor();
+	await candidateForm.getByRole("button", { name: "移除第三种方案", exact: true }).click();
+	for (const index of [1, 2]) await candidateForm.getByRole("combobox", { name: `方案 ${index} 执行器`, exact: true }).selectOption("kimi");
+	await candidateForm.getByRole("button", { name: "运行 2 种方案", exact: true }).click();
+	await nativeTasksDrawer.getByText("相同结果 ×2", { exact: true }).waitFor();
+	const comparisonTasks = await page.evaluate(async () => (await window.pi.externalAgents.list()).filter((task) => task.comparisonId));
+	assert.equal(comparisonTasks.length, 2);
+	assert.equal(new Set(comparisonTasks.map((task) => task.comparisonId)).size, 1);
+	assert.equal(new Set(comparisonTasks.map((task) => task.worktreeId)).size, 2);
+	checks.push("explicit comparison launches separate candidate worktrees and deduplicates equivalent successful outputs in the result view");
+
+	await nativeTasksDrawer.getByRole("textbox", { name: "新建后台任务指令", exact: true }).fill("changes fixture");
+	await nativeTasksDrawer.getByRole("button", { name: "启动", exact: true }).click();
+	await nativeTasksDrawer.getByText("IMPLEMENTER_EXPLANATION_PRIVATE", { exact: true }).waitFor();
+	await nativeTasksDrawer.getByRole("textbox", { name: "外部任务补充指令", exact: true }).fill("changes follow-up");
+	await nativeTasksDrawer.getByRole("button", { name: "继续协作", exact: true }).click();
+	await nativeTasksDrawer.getByText("第二轮本地模拟改动完成", { exact: true }).waitFor();
+	const changedTask = await page.evaluate(async () => (await window.pi.externalAgents.list()).find((task) => task.title === "changes fixture"));
+	assert.equal(changedTask.turn, 2);
+	await nativeTasksDrawer.getByRole("button", { name: "独立审查", exact: true }).click();
+	const reviewTask = (id) => page.evaluate(async (source) => (await window.pi.externalAgents.list()).find((task) => task.reviewOf === source), id);
+	await until(async () => (await reviewTask(changedTask.id))?.status === "completed", "the local read-only independent review completes");
+	const independentReview = await reviewTask(changedTask.id);
+	assert.equal(independentReview.executor, "codex");
+	assert.equal(independentReview.readOnly, true);
+	assert.match(independentReview.output, /Original requirement \(JSON string\)\n\n"changes fixture"/);
+	assert.match(independentReview.output, /external-fixture-alpha\.txt/);
+	assert.match(independentReview.output, /external-fixture-beta\.txt/);
+	assert.doesNotMatch(independentReview.output, /IMPLEMENTER_EXPLANATION_PRIVATE|第二轮本地模拟改动完成/);
+	await nativeTasksDrawer.getByRole("button", { name: "查看被审查任务", exact: true }).click();
+	const externalChanges = nativeTasksDrawer.getByRole("region", { name: "外部任务改动", exact: true });
+	await externalChanges.getByLabel("改动文件").selectOption("external-fixture-alpha.txt");
+	await externalChanges.getByText("updated second turn", { exact: true }).waitFor();
+	await externalChanges.getByRole("button", { name: "应用此文件", exact: true }).click();
+	await externalChanges.getByText("已应用到项目", { exact: true }).waitFor();
+	assert.equal(await readFile(join(project, "external-fixture-alpha.txt"), "utf8"), "first change\nupdated second turn\n");
+	await externalChanges.getByRole("button", { name: "丢弃此文件改动", exact: true }).click();
+	await externalChanges.getByText("已丢弃此文件改动", { exact: true }).waitFor();
+	await assert.rejects(access(join(changedTask.workingDirectory, "external-fixture-alpha.txt")), { code: "ENOENT" });
+	await rm(join(project, "external-fixture-alpha.txt"));
+	await until(async () => (await externalChanges.getByLabel("改动文件").inputValue()) === "external-fixture-beta.txt", "discarded file leaves the actionable list");
+	await externalChanges.getByRole("button", { name: "应用到项目", exact: true }).click();
+	await externalChanges.getByText("已应用到项目", { exact: true }).waitFor();
+	assert.equal(await readFile(join(project, "external-fixture-beta.txt"), "utf8"), "second change\n");
+	await assert.rejects(access(join(project, "external-fixture-alpha.txt")), { code: "ENOENT" });
+	await rm(join(project, "external-fixture-beta.txt"));
+	await nativeTasksDrawer.getByRole("button", { name: "关闭对话框", exact: true }).click();
+	checks.push("an independent read-only CLI receives only the original requirement and cumulative diff, and the diff UI applies and discards without conflating their target directories");
 
 	// Verify Claude Code UI modals, autocomplete, and interactive PTY tab
 	await openMore("检查点与回滚");
@@ -779,7 +870,7 @@ try {
 	await page.locator(".cc-tool-ctrl-name strong").getByText("Agent", { exact: true }).waitFor();
 	await page.getByRole("tab", { name: /权限规则/ }).click();
 	await page.getByRole("tab", { name: /外部执行器/ }).click();
-	await page.locator(".cc-tool-ctrl-name strong").getByText("codex", { exact: true }).waitFor();
+	await page.locator(".cc-tool-ctrl-name strong").getByText("Codex", { exact: true }).waitFor();
 	await page.getByRole("button", { name: "关闭对话框", exact: true }).click();
 
 	await page.getByRole("button", { name: "后台任务与 Worktree", exact: true }).click();

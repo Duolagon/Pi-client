@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm, realpath } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { KimiAdapter } from "../src/external-kimi.ts";
 import { ExternalAgents, type ExternalAgentOptions } from "../src/external-agents.ts";
 import type {
 	ExternalAdapter, ExternalApprovalRequest, ExternalSession, ExternalSessionOptions,
@@ -13,6 +14,7 @@ import type { RuntimePermissionPolicy } from "../src/permission-types.ts";
 import type { WorktreeInfo } from "../src/worktree-types.ts";
 
 class FakeAdapter implements ExternalAdapter {
+	structuredReplies: Array<Pick<ExternalTurnResult, "text" | "structuredOutput">> = [];
 	opens: ExternalSessionOptions[] = [];
 	prompts: string[] = [];
 	active = 0;
@@ -38,6 +40,11 @@ class FakeAdapter implements ExternalAdapter {
 				const abort = () => { interrupted = true; release?.(); };
 				signal?.addEventListener("abort", abort, { once: true });
 				try {
+					const structured = this.structuredReplies.shift();
+					if (structured) {
+						options.onEvent({ type: "text_delta", text: structured.text });
+						return { status: "completed", sessionId: id, ...structured };
+					}
 					if (prompt.startsWith("hold")) await new Promise<void>((resolve) => { release = resolve; this.releases.set(prompt, resolve); if (signal?.aborted) abort(); });
 					if (prompt.startsWith("ask")) {
 						const write = prompt === "ask write";
@@ -45,8 +52,10 @@ class FakeAdapter implements ExternalAdapter {
 							id: "native-tool-request",
 							kind: write ? "file" : prompt.includes("question") ? "question" : "command",
 							toolName: write ? "Write" : "Bash",
-							input: write ? { file_path: join(options.cwd, "draft.txt"), content: "sample" } : { command: "npm test" },
-							options: [{ id: "native-allow", label: "Allow", kind: "allow_once" }, { id: "native-deny", label: "Deny", kind: "reject_once" }],
+								input: write ? { file_path: join(options.cwd, "draft.txt"), content: "sample" }
+									: prompt === "ask unspecified" ? {} : { command: prompt === "ask lint" ? "npm run lint" : "npm test" },
+								options: [{ id: "native-allow", label: "Allow", kind: "allow_once" }, { id: "native-deny", label: "Deny", kind: "reject_once" },
+									...(prompt === "ask session" ? [{ id: "native-always", label: "Always allow", kind: "allow_always" }] : [])],
 						};
 						this.permissionCalls.push(request);
 						const decision = await options.onPermission(request);
@@ -125,6 +134,171 @@ async function until<T>(get: () => T | Promise<T>, check: (value: T) => boolean,
 	}
 }
 const terminal = (task: ExternalTask) => ["completed", "cancelled", "failed", "interrupted"].includes(task.status);
+
+test("ACP follow-ups queue for the same native session and both background results survive restart", async () => {
+	const data = await setup();
+	data.options.flushNotifications = () => {};
+	try {
+		const first = await data.manager.start({ executor: "kimi", description: "Follow-up", prompt: "hold-next", run_in_background: true }, "parent-a");
+		const release = await until(() => data.adapter.releases.get("hold-next"), Boolean, "first turn begins");
+		assert.equal((await data.manager.send({ taskId: first.id, message: "second" })).sendDisposition, "queued");
+		assert.equal((await data.manager.send({ taskId: first.id, message: "third" })).pendingMessages, 2);
+		release!();
+		await until(() => data.manager.snapshot(first.id), (task) => task.turn === 2 && terminal(task), "follow-up completes");
+		assert.deepEqual(data.adapter.prompts, ["hold-next", "second\n\nthird"]);
+		assert.equal(data.adapter.opens[1].resumeSessionId, data.manager.snapshot(first.id).nativeSessionId);
+		assert.deepEqual(data.manager.pendingNotifications("parent-a").map((notice) => notice.task.turn), [1, 2]);
+		await data.manager.close();
+		const restored = new ExternalAgents(data.options);
+		try {
+			await restored.initialize();
+			assert.deepEqual(restored.pendingNotifications("parent-a").map((notice) => notice.task.turn), [1, 2]);
+			await restored.markNotified(first.id, 1);
+			assert.deepEqual(restored.pendingNotifications("parent-a").map((notice) => notice.task.turn), [2]);
+		} finally { await restored.close(); }
+	} finally { await data.cleanup(); }
+});
+
+test("a queued ACP follow-up uses the open native session when restoration is unavailable", async () => {
+	const data = await setup();
+	const protocolLog = join(data.root, "acp-turns.jsonl");
+	const binary = join(data.root, "kimi-fixture.mjs");
+	const fixture = new URL("./fixtures/fake-kimi-acp.mjs", import.meta.url).href;
+	data.options.adapters.kimi = new KimiAdapter();
+	Object.assign(data.options.env, { KIMI_TEST_NO_RESTORE: "1", KIMI_TEST_LOG: protocolLog });
+	try {
+		await writeFile(binary, `#!${process.execPath}\nawait import(${JSON.stringify(fixture)});\n`, { mode: 0o700 });
+		await data.manager.configure({ id: "kimi", executable: binary });
+		const initial = await data.manager.start({ executor: "kimi", description: "queue", prompt: "question" }, "parent-a");
+		const waiting = await until(() => data.manager.snapshot(initial.id), task => task.pendingApprovals.length > 0, "first prompt");
+		assert.equal((await data.manager.send({ taskId: initial.id, message: "follow-up" })).sendDisposition, "queued");
+		await data.manager.respond(initial.id, waiting.pendingApprovals[0].id, { decision: "allow", optionId: "q0_opt_0" });
+		const last = await until(() => data.manager.snapshot(initial.id), task => task.turn === 2 && terminal(task), "second result");
+		assert.equal(last.status, "completed", last.error);
+		assert.equal(last.supportsResume, false);
+		const requests = (await readFile(protocolLog, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+		assert.equal(requests.filter(item => item.method === "session/new").length, 1);
+		assert.deepEqual(requests.filter(item => item.method === "session/prompt").map(item => item.params.prompt[0].text), ["question", "follow-up"]);
+		assert.equal(requests.filter(item => item.method === "session/close").length, 1);
+		await assert.rejects(data.manager.send({ taskId: initial.id, message: "after close" }), /无法恢复/);
+		assert.equal(data.manager.snapshot(initial.id).turn, 2);
+	} finally { await data.cleanup(); }
+});
+
+test("an incompatible checked executable stays unavailable to task starts and after restart", async () => {
+	const data = await setup();
+	try {
+		const checked = (await data.manager.executors({ verifyCompatibility: true })).find(item => item.id === "claude")!;
+		assert.equal(checked.compatibility, "incompatible", "fixture implements --version but does not speak stream-json");
+		assert.equal((await data.manager.executors()).find(item => item.id === "claude")!.available, false);
+		const input = { executor: "claude" as const, prompt: "test", description: "test" };
+		await assert.rejects(data.manager.start(input, "parent-a"), /不兼容/);
+		assert.equal(data.trees.length, 0);
+		await data.manager.close();
+		const restored = new ExternalAgents(data.options);
+		try {
+			await restored.initialize();
+			await assert.rejects(restored.start(input, "parent-a"), /不兼容/);
+			const replacement = join(data.root, "upgraded-cli");
+			await writeFile(replacement, "#!/bin/sh\necho fixture-upgraded\n", { mode: 0o700 });
+			const executors = await restored.configure({ id: "claude", executable: replacement });
+			assert.equal(executors.find(item => item.id === "claude")!.compatibility, "unverified");
+			assert.equal(executors.find(item => item.id === "claude")!.available, true);
+		} finally { await restored.close(); }
+	} finally { await data.cleanup(); }
+});
+
+test("native cumulative token and cost reports are accounted as per-turn deltas", async () => {
+	const data = await setup();
+	const reports = [
+		{ inputTokens: 7, outputTokens: 3, cachedInputTokens: 50, cacheWriteTokens: 10, costUsd: 0.25 },
+		{ inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, costUsd: 0 },
+		{ inputTokens: 22, outputTokens: 11, cachedInputTokens: 130, cacheWriteTokens: 10, costUsd: 0.5 },
+	];
+	data.options.adapters.claude = {
+		async open(options) {
+			return {
+				sessionId: "cumulative-fixture",
+				async run() {
+					const { costUsd, ...sessionTokens } = reports.shift()!;
+					options.onEvent({ type: "usage", sessionTokens, sessionCostUsd: costUsd });
+					if (!costUsd) throw new Error("SDK startup error");
+					return { status: "completed", text: "complete" };
+				},
+				async interrupt() {},
+				async close() {},
+			};
+		},
+	};
+	try {
+		const task = await data.manager.start({ executor: "claude", description: "Usage", prompt: "first" }, "parent-a");
+		await until(() => data.manager.snapshot(task.id), terminal, "first usage");
+		assert.deepEqual((await data.manager.result(task.id)).usage, {
+			inputTokens: 7, outputTokens: 3, cachedInputTokens: 50, cacheWriteTokens: 10, costUsd: 0.25,
+		});
+		await data.manager.send({ taskId: task.id, message: "second" });
+		await until(() => data.manager.snapshot(task.id), (value) => value.turn === 2 && value.status === "failed", "zeroed failure");
+		await data.manager.send({ taskId: task.id, message: "retry" });
+		await until(() => data.manager.snapshot(task.id), (value) => value.turn === 3 && terminal(value), "resumed usage");
+		assert.deepEqual((await data.manager.result(task.id)).usage, {
+			inputTokens: 15, outputTokens: 8, cachedInputTokens: 80, cacheWriteTokens: 0, costUsd: 0.25,
+		});
+		const [record] = data.manager.usageRecords();
+		assert.deepEqual([record.input, record.output, record.cacheRead, record.cacheWrite, record.cost, record.samples], [22, 11, 130, 10, 0.5, 2]);
+	} finally { await data.cleanup(); }
+});
+
+const structuredSchema = {
+	type: "object", properties: { count: { type: "integer" } }, required: ["count"], additionalProperties: false,
+};
+
+test("ACP structured output prompts with the schema and retries once in the same native session", async () => {
+	const data = await setup();
+	try {
+		data.adapter.structuredReplies.push({ text: '{"count":"1"}' }, { text: '```json\n{"count":1}\n```' });
+		const task = await data.manager.start({
+			executor: "kimi", description: "Structured", prompt: "Count files", output_schema: structuredSchema,
+		}, "parent-a");
+		await until(() => data.manager.snapshot(task.id), terminal, "validated structured output");
+		const result = await data.manager.result(task.id);
+		assert.equal(result.status, "completed");
+		assert.deepEqual(result.structured_output, { count: 1 });
+		assert.equal(data.adapter.opens.length, 1);
+		assert.equal(data.adapter.opens[0].outputSchema, undefined);
+		assert.equal(data.adapter.prompts.length, 2);
+		assert.match(data.adapter.prompts[0], /^Count files[\s\S]+JSON Schema/);
+		assert.match(data.adapter.prompts[1], /Reformat your existing answer only/);
+		assert.ok(data.adapter.prompts.every((prompt) => prompt.includes(JSON.stringify(structuredSchema))));
+
+		data.adapter.structuredReplies.push({ text: "not JSON" }, { text: '{"count":"2"}' });
+		await data.manager.send({ taskId: task.id, message: "Count again" }, "parent-a");
+		await until(() => data.manager.snapshot(task.id), terminal, "invalid structured output");
+		const failed = await data.manager.result(task.id);
+		assert.equal(data.adapter.prompts.length, 4);
+		assert.equal(failed.status, "failed");
+		assert.match(failed.error!, /after one retry/);
+		assert.equal(failed.structured_output, undefined);
+	} finally { await data.cleanup(); }
+});
+
+test("native structured output uses the native schema and validates the attachment from Claude", async () => {
+	const data = await setup();
+	try {
+		data.adapter.structuredReplies.push({ text: "Claude final text", structuredOutput: { count: 3 } });
+		const resultTask = await data.manager.start({
+			executor: "claude", description: "Structured", prompt: "Count files", output_schema: structuredSchema,
+		}, "parent-a");
+		await until(() => data.manager.snapshot(resultTask.id), terminal, "native structured output");
+		assert.deepEqual((await data.manager.result(resultTask.id)).structured_output, { count: 3 });
+		assert.deepEqual(data.adapter.opens[0].outputSchema, structuredSchema);
+		assert.deepEqual(data.adapter.prompts, ["Count files"]);
+		data.adapter.structuredReplies.push({ text: "missing attachment" });
+		await data.manager.send({ taskId: resultTask.id, message: "Count again" }, "parent-a");
+		await until(() => data.manager.snapshot(resultTask.id), terminal, "native output rejection");
+		assert.equal((await data.manager.result(resultTask.id)).status, "failed");
+		assert.deepEqual(data.adapter.prompts, ["Count files", "Count again"]);
+	} finally { await data.cleanup(); }
+});
 
 test("a queued follow-up has no change summary from the previous turn, even if cancelled", async () => {
 	let canStart = true;
@@ -211,6 +385,39 @@ test("external manager exposes native approvals, preserves option IDs, and reche
 		assert.deepEqual(data.adapter.decisions, ["allow", "deny"]);
 		assert.equal(data.manager.snapshot(task.id).pendingApprovals.length, 0);
 		await assert.rejects(data.manager.respond(task.id, state.pendingApprovals[0].id, { decision: "allow" }), /已失效/);
+	} finally { await data.cleanup(); }
+});
+
+test("session approvals match exact operations and send only one-time responses to the native agent", async () => {
+	const data = await setup();
+	try {
+		const task = await data.manager.start({ executor: "claude", description: "Session approval", prompt: "ask session" }, "parent-a");
+		const waiting = (label: string) => until(() => data.manager.snapshot(task.id), (value) => value.status === "waiting_for_input", label);
+		const settled = (turn: number) => until(() => data.manager.snapshot(task.id), (value) => value.turn === turn && terminal(value), "approved turn " + turn);
+		let pending = (await waiting("session approval")).pendingApprovals[0];
+		await assert.rejects(data.manager.respond(task.id, pending.id, { decision: "allow", optionId: "native-always" }), /单次|会话|长期/);
+		await data.manager.respond(task.id, pending.id, { decision: "allow", rememberForSession: true });
+		await settled(1);
+		assert.deepEqual(data.adapter.responses, [{ decision: "allow", optionId: "native-allow" }]);
+
+		await data.manager.send({ taskId: task.id, message: "ask repeat" }, "parent-a");
+		await settled(2);
+		assert.deepEqual(data.adapter.responses[1], { decision: "allow", optionId: "native-allow" });
+
+		await data.manager.send({ taskId: task.id, message: "ask lint" }, "parent-a");
+		pending = (await waiting("different operation")).pendingApprovals[0];
+		await data.manager.respond(task.id, pending.id, { decision: "deny" });
+		await settled(3);
+		await data.manager.send({ taskId: task.id, message: "ask unspecified" }, "parent-a");
+		pending = (await waiting("operation without exact input")).pendingApprovals[0];
+		await assert.rejects(data.manager.respond(task.id, pending.id, { decision: "allow", rememberForSession: true }), /单次/);
+		await data.manager.respond(task.id, pending.id, { decision: "deny" });
+		await settled(4);
+
+		data.setPolicy({ rules: [{ id: "deny-remembered", scope: "conversation", conversationId: "parent-a", action: "deny", tool: "bash" }] });
+		await data.manager.send({ taskId: task.id, message: "ask repeat" }, "parent-a");
+		await settled(5);
+		assert.deepEqual(data.adapter.decisions, ["allow", "allow", "deny", "deny", "deny"]);
 	} finally { await data.cleanup(); }
 });
 

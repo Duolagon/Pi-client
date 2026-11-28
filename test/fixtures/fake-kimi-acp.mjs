@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createInterface } from "node:readline";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 
 if (process.argv.includes("--version")) { process.stdout.write("fake-acp 1.0\n"); process.exit(0); }
 const line = createInterface({ input: process.stdin });
@@ -14,6 +14,7 @@ const result = (id, data) => send({ id, result: data });
 const update = (value, id = session) => send({ method: "session/update", params: { sessionId: id, update: value } });
 const text = (value) => update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: value } });
 const modes = { currentModeId: "yolo", availableModes: [{ id: "default", name: "Default" }, { id: "plan", name: "Plan" }] };
+if (process.env.ACP_TEST_CATALOG_MODE === "1") modes.availableModes = [{ id: "approve", name: "Approve" }, { id: "auto", name: "Auto" }];
 if (process.env.ACP_TEST_ODD_MODES === "1") modes.availableModes = [{ id: "manual", name: "Manual" }, { id: "auto", name: "Auto" }];
 let model = "kimi-default";
 let effort = "low";
@@ -87,6 +88,32 @@ line.on("line", (raw) => {
 		ask("question-choice", "session/request_permission", { toolCall: { toolCallId: "question-tool", title: "AskUserQuestion", content: [{ type: "content", content: { type: "text", text: "Choose color" } }] }, options: [
 			{ optionId: "q0_opt_0", name: "Blue", kind: "allow_once" }, { optionId: "q0_opt_1", name: "Green", kind: "allow_once" }, { optionId: "q0_skip", name: "Skip", kind: "reject_once" },
 		] }, (response) => { text(JSON.stringify(response.result)); finish(); });
+		return;
+	}
+	if (request === "timeline") {
+		const toolCallId = `${turns}:timeline-read`;
+		const step = { content: "读取时间线演示文件", priority: "medium" };
+		update({ sessionUpdate: "plan", entries: [{ ...step, status: "in_progress" }] });
+		update({ sessionUpdate: "tool_call", toolCallId, title: "Read", kind: "read", status: "in_progress" });
+		ask("timeline-continue", "elicitation/create", {
+			mode: "form", message: "继续执行本地时间线演示", requestedSchema: {
+				type: "object", properties: { q0: { type: "string", enum: ["continue", "stop"] } }, required: ["q0"],
+			},
+		}, () => {
+			update({ sessionUpdate: "tool_call_update", toolCallId, status: "completed", content: [{ type: "content", content: { type: "text", text: "本地演示工具输出" } }] });
+			update({ sessionUpdate: "plan", entries: [{ ...step, status: "completed" }] });
+			update({ sessionUpdate: "usage_update", used: 120, size: 32000, cost: { amount: 0.012, currency: "USD" } });
+			text("本地时间线演示完成");
+			finish();
+		});
+		return;
+	}
+	if (request === "changes fixture" || request === "changes follow-up") {
+		const first = request === "changes fixture";
+		writeFileSync(first ? "external-fixture-alpha.txt" : "external-fixture-beta.txt", first ? "first change\n" : "second change\n");
+		if (!first) appendFileSync("external-fixture-alpha.txt", "updated second turn\n");
+		text(first ? "IMPLEMENTER_EXPLANATION_PRIVATE" : "第二轮本地模拟改动完成");
+		finish();
 		return;
 	}
 	if (request === "tools" || request === "hang") {

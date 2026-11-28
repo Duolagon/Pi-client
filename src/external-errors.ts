@@ -1,5 +1,6 @@
-import type { ExternalProvider } from "./external-types.ts";
+import type { BuiltinExternalProvider, ExternalProvider } from "./external-types.ts";
 import { redactLogText } from "./desktop-log.ts";
+import { externalExecutorDefinition } from "./external-registry.ts";
 
 /** Why an external turn failed, as far as the protocol or the message tells. */
 export type ExternalFailureKind = "auth" | "quota" | "rate_limit" | "context" | "model" | "refusal" | "policy" | "network" | "protocol" | "exit" | "other";
@@ -17,13 +18,14 @@ export class ExternalFailure extends Error {
 	constructor(kind: ExternalFailureKind, message: string) { super(message); this.name = "ExternalFailure"; this.kind = kind; }
 }
 
-const LOGIN: Record<ExternalProvider, string> = {
+const LOGIN: Record<BuiltinExternalProvider, string> = {
 	codex: "在终端运行 codex login",
 	claude: "在终端运行 claude 并完成 /login",
 	kimi: "在终端运行 kimi 并完成 /login",
 	antigravity: "在终端运行 agy 登录",
 };
-const LABEL: Record<ExternalProvider, string> = { codex: "Codex", claude: "Claude Code", kimi: "Kimi Code", antigravity: "Antigravity" };
+const labelOf = (provider: ExternalProvider) => externalExecutorDefinition(provider)?.label ?? provider;
+const loginFor = (provider: ExternalProvider) => LOGIN[provider as BuiltinExternalProvider] ?? `在终端打开 ${labelOf(provider)} 并完成登录`;
 
 /** Map a Codex `codexErrorInfo` value to a failure kind. */
 export function codexErrorKind(info: unknown): ExternalFailureKind | undefined {
@@ -56,16 +58,16 @@ function kindFromText(message: string): ExternalFailureKind {
 }
 
 const HINT: Record<ExternalFailureKind, (provider: ExternalProvider) => string | undefined> = {
-	auth: (provider) => `${LABEL[provider]} 未登录或登录已过期：请${LOGIN[provider]}，再用 SendMessage 继续此任务。`,
-	quota: (provider) => `${LABEL[provider]} 账号额度或预算已用完：请换一个执行器，或等额度恢复后再继续。`,
-	rate_limit: (provider) => `${LABEL[provider]} 被限流或服务繁忙：稍后用 SendMessage 继续，或换一个执行器。`,
+	auth: (provider) => `${labelOf(provider)} 未登录或登录已过期：请${loginFor(provider)}，再用 SendMessage 继续此任务。`,
+	quota: (provider) => `${labelOf(provider)} 账号额度或预算已用完：请换一个执行器，或等额度恢复后再继续。`,
+	rate_limit: (provider) => `${labelOf(provider)} 被限流或服务繁忙：稍后用 SendMessage 继续，或换一个执行器。`,
 	context: () => "上下文超出模型窗口：缩小任务范围，或开一个新任务只传必要信息。",
 	model: () => "所选模型或思考强度不可用：在设置的 multi 档位里改回该执行器的默认模型后再试。",
-	refusal: (provider) => `${LABEL[provider]} 拒绝了这个请求：调整任务描述，或换一个执行器。`,
+	refusal: (provider) => `${labelOf(provider)} 拒绝了这个请求：调整任务描述，或换一个执行器。`,
 	policy: () => "当前权限设置无法由这个执行器强制执行：换一个执行器，或调整权限模式。",
 	network: () => "网络连接失败：检查代理或网络后用 SendMessage 继续。",
-	protocol: (provider) => `${LABEL[provider]} 的协议输出不符合预期：可能是 CLI 版本不兼容，请升级 CLI 后再试。`,
-	exit: (provider) => `${LABEL[provider]} 进程意外退出：查看下方诊断输出；必要时在终端单独运行它确认能启动。`,
+	protocol: (provider) => `${labelOf(provider)} 的协议输出不符合预期：可能是 CLI 版本不兼容，请升级 CLI 后再试。`,
+	exit: (provider) => `${labelOf(provider)} 进程意外退出：查看下方诊断输出；必要时在终端单独运行它确认能启动。`,
 	other: () => undefined,
 };
 
@@ -74,7 +76,7 @@ export function classifyExternalError(error: unknown, provider?: ExternalProvide
 	if (error instanceof ExternalFailure) return error.kind;
 	if (error instanceof ExternalRpcError) {
 		// ACP auth_required; JSON-RPC parse / invalid request errors are protocol mismatches.
-		if (error.code === -32000 && (provider === "kimi" || provider === "antigravity")) return "auth";
+		if (error.code === -32000 && provider && externalExecutorDefinition(provider)?.capabilities.transport === "acp") return "auth";
 		if (error.code === -32700 || error.code === -32600 || error.code === -32601) return "protocol";
 	}
 	return kindFromText(error instanceof Error ? error.message : String(error));

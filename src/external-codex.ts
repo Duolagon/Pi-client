@@ -1,7 +1,8 @@
 import { isAbsolute } from "node:path";
 import type { ExternalAdapter, ExternalApprovalRequest, ExternalApprovalResponse, ExternalSession, ExternalSessionOptions, ExternalTurnResult } from "./external-types.ts";
 import { JsonLineProcess, type RpcId } from "./external-rpc.ts";
-import { codexErrorKind, ExternalFailure, redactDiagnostic, withDiagnostics } from "./external-errors.ts";
+import { codexErrorKind, ExternalFailure, ExternalRpcError, redactDiagnostic, withDiagnostics } from "./external-errors.ts";
+import { externalPlan } from "./external-plan.ts";
 
 const desktopTools = new Set(["Agent", "SendMessage", "AgentSend", "AgentExecutors", "AgentMessage", "TaskOutput", "TaskStop", "TaskList", "WorktreeCreate", "WorktreeList", "WorktreeMerge", "WorktreeRemove"]);
 const limit = 1024 * 1024;
@@ -17,7 +18,7 @@ interface Turn {
 	final: Map<string, string>;
 	cancelled: boolean;
 	/** Cumulative thread usage before this turn, to report this turn's own tokens. */
-	baseline?: { input: number; output: number };
+	baseline?: { input: number; output: number; cached: number };
 }
 
 /** Codex keeps its native authentication local and exposes a bidirectional App Server session. */
@@ -156,6 +157,7 @@ class CodexSession implements ExternalSession {
 				input: [{ type: "text", text: prompt }], approvalPolicy: "untrusted", approvalsReviewer: "user",
 				...(this.options.model ? { model: this.options.model } : {}),
 				...(this.options.effort ? { effort: this.options.effort } : {}),
+				...(this.options.outputSchema ? { outputSchema: this.options.outputSchema } : {}),
 				sandboxPolicy: this.readOnly ? { type: "readOnly", networkAccess: false }
 					: { type: "workspaceWrite", writableRoots: [this.options.cwd], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true },
 			});
@@ -173,6 +175,21 @@ class CodexSession implements ExternalSession {
 			signal?.removeEventListener("abort", abort);
 			if (this.active === turn) this.active = undefined;
 			this.cancelPermissions();
+		}
+	}
+
+	async steer(message: string): Promise<boolean> {
+		const turn = this.active;
+		if (!turn?.id || turn.cancelled || this.closed) return false;
+		try {
+			const result = await this.rpc.request<RecordValue>("turn/steer", {
+				threadId: this.nativeId, expectedTurnId: turn.id, input: [{ type: "text", text: message }],
+			}, 4000);
+			if (result.turnId !== turn.id) throw new Error("Codex did not confirm the target turn for additional input");
+			return true;
+		} catch (error) {
+			if (error instanceof ExternalRpcError) return false;
+			throw error;
 		}
 	}
 
@@ -244,18 +261,29 @@ class CodexSession implements ExternalSession {
 			}
 		} else if (["item/commandExecution/outputDelta", "item/fileChange/outputDelta"].includes(method)) {
 			this.options.onEvent({ type: "tool_update", id: text(params.itemId), text: text(params.delta, true) });
+		} else if (method === "turn/plan/updated") {
+			const plan = externalPlan(params.plan, "step", params.explanation);
+			if (plan) this.options.onEvent(plan);
 		} else if (method === "thread/tokenUsage/updated") {
 			// `total` is cumulative for the thread (a resumed one included); report this turn's share.
 			const usage = object(params.tokenUsage);
 			const total = object(usage.total ?? {});
 			const last = object(usage.last ?? {});
 			const input = numeric(total.inputTokens), output = numeric(total.outputTokens);
+			const cached = numeric(total.cachedInputTokens) ?? 0;
+			const lastInput = numeric(last.inputTokens);
+			const lastCached = numeric(last.cachedInputTokens) ?? 0;
 			if (input === undefined || output === undefined) {
-				this.options.onEvent({ type: "usage", inputTokens: numeric(last.inputTokens), outputTokens: numeric(last.outputTokens) });
+				this.options.onEvent({ type: "usage",
+					inputTokens: lastInput === undefined ? undefined : Math.max(0, lastInput - lastCached),
+					cachedInputTokens: lastCached || undefined, outputTokens: numeric(last.outputTokens) });
 				return;
 			}
-			turn.baseline ??= { input: Math.max(0, input - (numeric(last.inputTokens) ?? 0)), output: Math.max(0, output - (numeric(last.outputTokens) ?? 0)) };
-			this.options.onEvent({ type: "usage", inputTokens: Math.max(0, input - turn.baseline.input), outputTokens: Math.max(0, output - turn.baseline.output) });
+			turn.baseline ??= { input: Math.max(0, input - (lastInput ?? 0)), output: Math.max(0, output - (numeric(last.outputTokens) ?? 0)),
+				cached: Math.max(0, cached - lastCached) };
+			const cacheRead = Math.max(0, cached - turn.baseline.cached);
+			this.options.onEvent({ type: "usage", inputTokens: Math.max(0, input - turn.baseline.input - cacheRead),
+				outputTokens: Math.max(0, output - turn.baseline.output), ...(cacheRead ? { cachedInputTokens: cacheRead } : {}) });
 		} else if (method === "error") {
 			// A retried error is progress information; a final one arrives with turn/completed.
 			const error = object(params.error ?? {});
@@ -343,7 +371,10 @@ class CodexSession implements ExternalSession {
 		for (const cancel of this.permissionCancels) cancel();
 		this.permissionCancels.clear();
 	}
-	private output(turn: Turn): string { return [...(turn.final.size ? turn.final : turn.text).values()].join("\n").slice(0, limit); }
+	private output(turn: Turn): string {
+		const messages = [...(turn.final.size ? turn.final : turn.text).values()];
+		return (this.options.outputSchema ? messages.at(-1) ?? "" : messages.join("\n")).slice(0, limit);
+	}
 	private fail(error: Error): void { this.cancelPermissions(); this.active?.started(); this.active?.reject(error); this.active = undefined; }
 }
 

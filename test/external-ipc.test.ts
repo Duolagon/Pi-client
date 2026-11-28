@@ -95,9 +95,16 @@ const terminal = (task: ExternalTask) => ["completed", "failed", "cancelled", "i
 
 test("external IPC exposes all endpoints through the host gate, continues exact native sessions and routes parent-scoped events", { timeout: 45000 }, async (t) => {
 	const data = await setup(); t.after(data.cleanup);
-	assert.deepEqual([...data.handlers.keys()].sort(), ["pi:external:cancel", "pi:external:configure", "pi:external:executors", "pi:external:list", "pi:external:replay", "pi:external:respond", "pi:external:result", "pi:external:send", "pi:external:snapshot", "pi:external:start"]);
+	assert.deepEqual([...data.handlers.keys()].sort(), [
+		"pi:external:cancel", "pi:external:change-files", "pi:external:compare", "pi:external:configure", "pi:external:diff",
+		"pi:external:executors", "pi:external:list", "pi:external:replay", "pi:external:respond", "pi:external:result",
+		"pi:external:review", "pi:external:send", "pi:external:snapshot", "pi:external:start",
+	]);
 	const executors = await data.invoke<ExternalExecutor[]>("pi:external:executors");
-	assert.equal(executors.length, 4); assert.ok(executors.every((item) => item.available && item.version === "External fixture 1.0"));
+	const native = executors.filter((item) => !item.id.startsWith("acp-"));
+	assert.deepEqual(native.map((item) => item.id), ["codex", "claude", "kimi", "antigravity"]);
+	assert.ok(native.every((item) => item.available && item.version === "External fixture 1.0"));
+	assert.ok(executors.some((item) => item.id === "acp-qwen-code" && !item.enabled && item.installCommand));
 	data.setSender(false);
 	await assert.rejects(data.invoke("pi:external:executors"), /Untrusted renderer/);
 	data.setSender(true);

@@ -669,9 +669,8 @@ export async function evaluatePermission(
 		(call.toolName === "SendMessage" || call.toolName === "AgentSend") ||
 		(call.toolName === "Agent" &&
 			input.fork !== true &&
-			typeof input.subagent_type === "string" &&
-			input.subagent_type !== "general-purpose" &&
-			input.subagent_type !== "fork");
+			(typeof input.review_of === "string" ||
+				(typeof input.subagent_type === "string" && input.subagent_type !== "general-purpose" && input.subagent_type !== "fork")));
 	const previewReadOnly =
 		call.toolName === "PreviewCheck" &&
 		(input.action === "list_configs" || input.action === "server_logs" ||

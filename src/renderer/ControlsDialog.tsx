@@ -60,6 +60,7 @@ export function ControlsDialog({
 	const [hooks, setHooks] = useState<HookEntry[]>([]);
 	const [skills, setSkills] = useState<SkillDefinitionEntry[]>([]);
 	const [executors, setExecutors] = useState<ExecutorStatus[]>([]);
+	const [checkingExecutors, setCheckingExecutors] = useState(false);
 	const [filter, setFilter] = useState("");
 	const [scope, setScope] = useState<PermissionScope>("project");
 	const [loading, setLoading] = useState(true);
@@ -135,6 +136,17 @@ export function ControlsDialog({
 			setExecutors(await window.pi.externalAgents.configure({ id: exec.id, enabled: !exec.enabled }));
 		} catch (error) {
 			fail(error);
+		}
+	};
+
+	const checkExecutors = async () => {
+		setCheckingExecutors(true);
+		try {
+			setExecutors(await window.pi.externalAgents.executors({ verifyCompatibility: true }));
+		} catch (error) {
+			fail(error);
+		} finally {
+			setCheckingExecutors(false);
 		}
 	};
 
@@ -654,15 +666,25 @@ export function ControlsDialog({
 
 				{tab === "executors" && (
 					<div className="cc-controls-body">
+						<div className="cc-tool-ctrl-row">
+							<p className="cc-tool-ctrl-desc">兼容性检查读取本机 CLI 版本和协议，不发起模型请求。</p>
+							<button type="button" className="cc-mini-btn" disabled={checkingExecutors || !executors.some((item) => item.executable)}
+								onClick={() => void checkExecutors()}>
+								{checkingExecutors ? "检查中…" : "检查兼容性"}
+							</button>
+						</div>
 						<div className="cc-list-scroll">
 							{executors.map((exec) => (
 								<div key={exec.id} className="cc-exec-card">
 									<div className="cc-tool-ctrl-row">
 										<div className="cc-tool-ctrl-info">
 											<div className="cc-tool-ctrl-name">
-												<strong>{exec.id}</strong>
+												<strong>{exec.label ?? exec.id}</strong>
+												{exec.label && exec.label !== exec.id && <span className="cc-source-tag muted">{exec.id}</span>}
 												<span className={`cc-action-badge ${exec.available ? "allow" : "deny"}`}>
-													{exec.available ? "可用" : "未检测到"}
+													{exec.compatibility === "incompatible" ? "版本不兼容"
+														: exec.compatibility === "compatible" ? "兼容"
+															: exec.available ? "已安装" : "未检测到"}
 												</span>
 												{exec.version && <span className="cc-source-tag">{exec.version}</span>}
 												<span className="cc-source-tag muted">{exec.capabilities.transport}</span>
@@ -670,12 +692,18 @@ export function ControlsDialog({
 											<p className="cc-tool-ctrl-desc">
 												{exec.error || exec.executable || "可通过 Agent 工具的 executor 参数直接委派"}
 											</p>
+											{exec.installCommand && !exec.available && (
+												<p className="cc-tool-ctrl-desc">
+													在终端安装 <code className="cc-exec-install-command">{exec.installCommand}</code>
+												</p>
+											)}
 										</div>
 										<div className="cc-tool-ctrl-actions">
 											<button
 												type="button"
 												role="switch"
 												aria-checked={exec.enabled}
+												disabled={checkingExecutors}
 												className={`cc-toggle-btn cc-switch-pill ${exec.enabled ? "on" : "off"}`}
 												onClick={() => void toggleExecutor(exec)}
 											>
@@ -698,13 +726,14 @@ export function ControlsDialog({
 											aria-label={`${exec.id} 可执行文件路径`}
 											placeholder={exec.executable || `自定义 ${exec.id} 绝对路径…`}
 											value={execPaths[exec.id] ?? ""}
+											disabled={checkingExecutors}
 											onChange={(event) => setExecPaths((prev) => ({ ...prev, [exec.id]: event.target.value }))}
 										/>
-										<button type="submit" className="cc-mini-btn" disabled={!(execPaths[exec.id] ?? "").trim()}>
+										<button type="submit" className="cc-mini-btn" disabled={checkingExecutors || !(execPaths[exec.id] ?? "").trim()}>
 											应用路径
 										</button>
 										{exec.executable && (
-											<button type="button" className="cc-mini-btn" onClick={() => void saveExecutorPath(exec.id, null)}>
+											<button type="button" className="cc-mini-btn" disabled={checkingExecutors} onClick={() => void saveExecutorPath(exec.id, null)}>
 												恢复自动探测
 											</button>
 										)}

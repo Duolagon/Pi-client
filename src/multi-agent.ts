@@ -106,7 +106,7 @@ export function multiTierPromptSection(settings: MultiAgentSettings | undefined,
 	lines.push(
 		"Writable external tasks run in their own Git worktree. Their result notification lists the changed files and a diff stat; review the diff before you merge it with WorktreeMerge, and send fixes back with SendMessage to the same task_id instead of starting over.",
 		"Run independent pieces in parallel by launching several Agent calls in one message. For important changes, ask a different executor to review the first one's worktree diff.",
-		"Do small or tightly coupled edits yourself. Do not pass `model` to external executors; the user configured their models.",
+		"Do small or tightly coupled edits yourself. Use the configured executor defaults unless a task needs its own model or effort.",
 	);
 	return lines.join("\n");
 }

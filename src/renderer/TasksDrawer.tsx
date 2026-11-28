@@ -3,6 +3,9 @@ import { ArrowDownToLine, Check, Circle, Clock, Eye, GitBranch, GitMerge, ListTo
 import { Modal } from "../prototype/ui.tsx";
 import { TranscriptView } from "./TranscriptView.tsx";
 import { ExternalApprovalCard } from "./ExternalApprovalCard.tsx";
+import { ExternalTaskChanges } from "./ExternalTaskChanges.tsx";
+import { ExternalTaskComparisons } from "./ExternalTaskComparisons.tsx";
+import { ExternalTaskTimeline } from "./ExternalTaskTimeline.tsx";
 import { PermissionDialog } from "./PermissionDialog.tsx";
 import { CheckpointsDialog } from "./CheckpointsDialog.tsx";
 import { SlidingTabList } from "./SegmentedTabs.tsx";
@@ -13,7 +16,8 @@ import type { RemoteJobRecord } from "../remote-job-types.ts";
 import { applyEvent, transcript, type Transcript } from "./messages.ts";
 import { formatCompactDuration, formatCompactTokens, formatTaskProgressSummary } from "../delegation-format.ts";
 import { computeChecklistEta, computeMonitorTiming, computeTodoTiming } from "../task-eta.ts";
-import type { CronJobRecord, DesktopTask, ExternalTask, MonitorRecord, RpcExtensionUIRequest, TaskProgress, TeamRecord, TodoRecord, WorkflowRecord, WorktreeInfo } from "../shared.ts";
+import { truncateText } from "../delegation-limits.ts";
+import type { CronJobRecord, DesktopTask, ExternalExecutor, ExternalProvider, ExternalTask, MonitorRecord, RpcExtensionUIRequest, TaskProgress, TeamRecord, TodoRecord, WorkflowRecord, WorktreeInfo } from "../shared.ts";
 
 const TASK_STATUS_LABELS: Record<string, string> = {
 	running: "运行中",
@@ -41,6 +45,8 @@ const TASK_STOP_REASON_LABELS: Record<string, string> = {
 	error: "执行出错",
 };
 
+const EXECUTOR_LABELS: Record<string, string> = { codex: "Codex", claude: "Claude Code", kimi: "Kimi Code", antigravity: "Antigravity" };
+
 function formatStatusBadge(status: string): string {
 	return TASK_STATUS_LABELS[status] ?? status;
 }
@@ -53,6 +59,8 @@ function formatStopReason(reason?: string): string | undefined {
 export function TasksDrawer({
 	project,
 	conversationId,
+	readOnly = false,
+	delegated = false,
 	agentTeams = false,
 	initialTaskId,
 	tabRequest,
@@ -63,6 +71,8 @@ export function TasksDrawer({
 	project?: string;
 	/** Active conversation; the stop-all action is scoped to its background work. */
 	conversationId?: string;
+	readOnly?: boolean;
+	delegated?: boolean;
 	agentTeams?: boolean;
 	initialTaskId?: string;
 	/** Latest tab request; a new `seq` switches tabs even while the drawer is open. */
@@ -115,8 +125,29 @@ export function TasksDrawer({
 	const [piFollowUp, setPiFollowUp] = useState("");
 	const [notifyParent, setNotifyParent] = useState(false);
 	const [newPrompt, setNewPrompt] = useState("");
+	const [executors, setExecutors] = useState<ExternalExecutor[]>([]);
+	const [newExecutor, setNewExecutor] = useState<ExternalProvider | "pi">("pi");
+	const [nativeModel, setNativeModel] = useState("");
+	const [nativeEffort, setNativeEffort] = useState("");
 	const [isolation, setIsolation] = useState<"worktree" | "shared">("worktree");
 	const [busy, setBusy] = useState(false);
+
+	const canDelegate = Boolean(conversationId) && !delegated;
+	const executorLabel = (id: ExternalProvider) => executors.find((executor) => executor.id === id)?.label ?? EXECUTOR_LABELS[id] ?? id;
+	const executorHint = (executor: ExternalExecutor) => !canDelegate ? "请从主会话启动外部任务。"
+		: !executor.enabled ? "执行器已停用。"
+			: !executor.available ? executor.error || "本机执行器不可用。"
+				: readOnly && !executor.capabilities.readOnly ? "该执行器无法强制只读。" : undefined;
+	const externalOnly = newExecutor !== "pi";
+	const selectedExecutor = executors.find((executor) => executor.id === newExecutor);
+	const canStart = Boolean(project && newPrompt.trim() && !busy) &&
+		(!externalOnly || (selectedExecutor !== undefined && !executorHint(selectedExecutor)));
+
+	useEffect(() => {
+		let mounted = true;
+		void window.pi.externalAgents.executors().then((list) => { if (mounted) setExecutors(list); }).catch(() => {});
+		return () => { mounted = false; };
+	}, [conversationId]);
 
 	const refresh = async () => {
 		try {
@@ -183,7 +214,7 @@ export function TasksDrawer({
 					const filtered = prev.filter((t) => t.id !== updated.id);
 					return [updated, ...filtered].sort((a, b) => b.updatedAt - a.updatedAt);
 				});
-				setExtDetail((prev) => (prev?.id === updated.id ? updated : prev));
+				setExtDetail((prev) => prev?.id === updated.id && updated.eventSequence >= prev.eventSequence ? updated : prev);
 			}
 		});
 		const unsubTodos = window.pi.todos?.onEvent?.(() => {
@@ -296,12 +327,14 @@ export function TasksDrawer({
 	};
 
 	const openExternalDetail = async (task: ExternalTask) => {
+		setDetailTranscript(null);
+		setDetailPendingUI([]);
+		setDetailTask(null);
+		setExtDetail(task);
+		setExtFollowUp("");
 		try {
 			const fresh = await window.pi.externalAgents.snapshot(task.id);
-			setDetailTranscript(null);
-			setDetailPendingUI([]);
-			setDetailTask(null);
-			setExtDetail(fresh);
+			setExtDetail((previous) => previous?.id === task.id && fresh.eventSequence >= previous.eventSequence ? fresh : previous);
 		} catch (error) {
 			fail(error);
 		}
@@ -309,10 +342,21 @@ export function TasksDrawer({
 
 	const startTask = async (e: React.FormEvent) => {
 		e.preventDefault();
-		if (!newPrompt.trim()) return;
+		if (!canStart) return;
+		const prompt = newPrompt.trim();
 		setBusy(true);
 		try {
-			await window.pi.tasks.start({ project, message: newPrompt.trim(), isolation });
+			if (newExecutor === "pi") await window.pi.tasks.start({ project, message: prompt, isolation });
+			else {
+				const task = await window.pi.externalAgents.start({
+					executor: newExecutor, conversationId, prompt,
+					description: truncateText(prompt.replace(/\s+/g, " "), 160),
+					isolation: readOnly ? "shared" : "worktree",
+					...(nativeModel.trim() ? { model: nativeModel.trim() } : {}),
+					...(nativeEffort.trim() ? { effort: nativeEffort.trim() } : {}),
+				});
+				await openExternalDetail(task);
+			}
 			setNewPrompt("");
 			await refresh();
 		} catch (error) {
@@ -330,10 +374,12 @@ export function TasksDrawer({
 			const updated = await window.pi.externalAgents.send({
 				taskId: extDetail.id,
 				message: extFollowUp.trim(),
-				runInBackground: true,
+				runInBackground: extDetail.runInBackground ?? false,
 			});
-			setExtDetail(updated);
+			setExtDetail((previous) => previous?.id === updated.id && updated.eventSequence >= previous.eventSequence ? updated : previous);
 			setExtFollowUp("");
+			if (updated.sendDisposition === "steered") onNotice("补充指令已送达当前轮次。");
+			else if (updated.sendDisposition === "queued") onNotice("补充指令已排到下一轮。");
 			await refresh();
 		} catch (error) {
 			fail(error);
@@ -478,11 +524,27 @@ export function TasksDrawer({
 						<form className="cc-task-start" onSubmit={(e) => void startTask(e)}>
 							<input
 								placeholder="新建后台任务指令…"
+								aria-label="新建后台任务指令"
 								value={newPrompt}
 								onChange={(e) => setNewPrompt(e.target.value)}
 								disabled={busy || !project}
 							/>
 							<SelectPopover
+								ariaLabel="任务执行器"
+								direction="down"
+								value={newExecutor}
+								disabled={busy || !project}
+								options={[{ value: "pi", label: "Pi" }, ...executors.map((executor) => {
+									const hint = executorHint(executor);
+									return { value: executor.id, label: executor.label ?? EXECUTOR_LABELS[executor.id] ?? executor.id, disabled: Boolean(hint), hint };
+								})]}
+								onChange={(value) => {
+									setNewExecutor(value as ExternalProvider | "pi");
+									setNativeModel("");
+									setNativeEffort("");
+								}}
+							/>
+							{externalOnly ? <span className="cc-source-tag">{readOnly ? "只读 · 共享目录" : "Worktree 隔离"}</span> : <SelectPopover
 								ariaLabel="隔离模式"
 								direction="down"
 								align="right"
@@ -493,10 +555,14 @@ export function TasksDrawer({
 									{ value: "shared", label: "共享目录" },
 								]}
 								onChange={(val) => setIsolation(val as "worktree" | "shared")}
-							/>
-							<button type="submit" className="primary-button" disabled={busy || !newPrompt.trim() || !project}>
+							/>}
+							<button type="submit" className="primary-button" disabled={!canStart}>
 								<Play size={13} /> 启动
 							</button>
+							{externalOnly && <div className="cc-external-launch-options">
+								<input aria-label="任务模型" placeholder="模型 · 默认" value={nativeModel} onChange={(event) => setNativeModel(event.target.value)} disabled={busy} maxLength={200} spellCheck={false} />
+								<input aria-label="任务思考强度" placeholder="思考强度 · 默认" value={nativeEffort} onChange={(event) => setNativeEffort(event.target.value)} disabled={busy} maxLength={32} spellCheck={false} />
+							</div>}
 						</form>
 
 						{detailTranscript && detailTask ? (
@@ -573,9 +639,12 @@ export function TasksDrawer({
 								<div className="cc-rewind-head">
 									<div>
 										<strong>{extDetail.title}</strong>
-										<span className="cc-source-tag">{extDetail.executor}</span>
+										<span className="cc-source-tag">{executorLabel(extDetail.executor)}</span>
 										<span className="cc-source-tag">第 {extDetail.turn} 轮</span>
 										<span className="cc-source-tag" title={extDetail.status}>{formatStatusBadge(extDetail.status)}</span>
+										{extDetail.model && <span className="cc-source-tag">{extDetail.model}</span>}
+										{extDetail.effort && <span className="cc-source-tag">{extDetail.effort}</span>}
+										{Boolean(extDetail.pendingMessages) && <span className="cc-source-tag">{extDetail.pendingMessages} 条待追加</span>}
 									</div>
 									<div className="cc-tool-ctrl-actions">
 										{!extDetail.readOnly && (
@@ -584,26 +653,37 @@ export function TasksDrawer({
 										<button type="button" className="secondary-button" onClick={() => setExtDetail(null)}>返回列表</button>
 									</div>
 								</div>
-								{extDetail.pendingApprovals.map((req) => (
-									<ExternalApprovalCard key={req.id} task={extDetail} request={req}
-										onRespond={(response) => window.pi.externalAgents.respond(extDetail.id, req.id, response)} fail={fail} />
-								))}
-								<div className="cc-task-transcript">
-									<pre className="cc-bash-out">{extDetail.output || extDetail.error || "(暂无输出)"}</pre>
+								<div key={extDetail.id} className="cc-task-transcript cc-external-task-content">
+									{extDetail.pendingApprovals.map((req) => (
+										<ExternalApprovalCard key={req.id} task={extDetail} request={req}
+											onRespond={(response) => window.pi.externalAgents.respond(extDetail.id, req.id, response)} fail={fail} />
+									))}
+									<div className="cc-external-task-output">
+										<pre className="cc-bash-out">{extDetail.output || "(暂无输出)"}</pre>
+										{extDetail.error && <p className="subtle-note cc-external-task-error">{extDetail.error}</p>}
+										{extDetail.structuredOutput !== undefined && (
+											<details><summary>结构化结果</summary><pre className="cc-bash-out">{JSON.stringify(extDetail.structuredOutput, null, 2)}</pre></details>
+										)}
+									</div>
+									<ExternalTaskTimeline task={extDetail} />
+									<ExternalTaskChanges task={extDetail} fail={fail} />
+									<ExternalTaskComparisons task={extDetail} tasks={externalTasks} executors={executors}
+										executorLabel={executorLabel} statusLabel={formatStatusBadge} onOpenTask={openExternalDetail} fail={fail} />
 								</div>
-								{!["running", "queued", "waiting_for_input"].includes(extDetail.status) && (
-									<form className="cc-task-start" onSubmit={(e) => void sendExternalFollowUp(e)}>
-										<input
-											placeholder={`向 ${extDetail.executor} 原生会话继续发送指令…`}
-											value={extFollowUp}
-											onChange={(e) => setExtFollowUp(e.target.value)}
-											disabled={busy}
-										/>
-										<button type="submit" className="primary-button" disabled={busy || !extFollowUp.trim()}>
-											<Send size={13} /> 继续协作
-										</button>
-									</form>
-								)}
+								{extDetail.supportsResume === false && !isActive(extDetail.status) && !extDetail.pendingMessages
+									? <p className="subtle-note">此执行器无法恢复已关闭的 ACP 会话，可新建任务继续。</p>
+									: <form className="cc-task-start" onSubmit={(e) => void sendExternalFollowUp(e)}>
+									<input
+										aria-label="外部任务补充指令"
+										placeholder={isActive(extDetail.status) ? "向执行器补充指令…" : "继续原生会话…"}
+										value={extFollowUp}
+										onChange={(e) => setExtFollowUp(e.target.value)}
+										disabled={busy}
+									/>
+									<button type="submit" className="primary-button" disabled={busy || !extFollowUp.trim()}>
+										<Send size={13} /> {isActive(extDetail.status) ? "追加指令" : "继续协作"}
+									</button>
+								</form>}
 							</div>
 						) : (
 							<div className="cc-list-scroll">
@@ -612,7 +692,7 @@ export function TasksDrawer({
 										<div className="cc-tool-ctrl-info">
 											<div className="cc-tool-ctrl-name">
 												<strong>{task.title}</strong>
-												<span className="cc-source-tag">{task.executor}</span>
+												<span className="cc-source-tag">{executorLabel(task.executor)}</span>
 												<span className="cc-source-tag muted">{task.subagentType}</span>
 												<span className={`cc-action-badge ${task.status === "completed" ? "allow" : task.status === "failed" || task.status === "cancelled" ? "deny" : "ask"}`} title={task.status}>
 													{formatStatusBadge(task.status)}

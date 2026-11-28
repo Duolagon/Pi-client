@@ -1,4 +1,4 @@
-import { formatChangeSummary } from "./external-changes.ts";
+import { formatChangeSummary } from "./external-change-format.ts";
 import type { ExternalChangeSummary } from "./external-types.ts";
 import { isTaskReadPath, MAX_AGENT_OUTPUT, MAX_NOTIFICATION, MAX_TASK_READ_PATHS, truncateText } from "./delegation-limits.ts";
 import type { DesktopTask, TaskProgress } from "./task-types.ts";
@@ -41,6 +41,7 @@ export interface TaskNotificationInput {
 	/** External executors: files the turn changed, and the worktree holding them. */
 	changes?: ExternalChangeSummary;
 	worktreePath?: string;
+	structuredOutput?: unknown;
 }
 
 /** Structured copy of the notification for the renderer; never shown to the model. */
@@ -64,6 +65,7 @@ export interface TaskNotificationDetails {
 	flagged?: string[];
 	changes?: ExternalChangeSummary;
 	worktree_path?: string;
+	structured_output?: unknown;
 }
 
 export interface EscapedOutput {
@@ -75,7 +77,7 @@ export interface EscapedOutput {
 
 // Envelope, harness and role tags. Escaping the `<` keeps the text readable while making
 // it inert: the child cannot close <result>, open a new <status> or forge a reminder.
-const markupTag = /<(\s*\/?\s*)(system[\w-]*|task-notification|task-id|tool-use-id|status|summary|result|changes|read-coverage|usage|subagent_tokens|tool_uses|duration_ms|human|assistant|user|function_calls|invoke|parameter)(?=[\s>/]|$)/gi;
+const markupTag = /<(\s*\/?\s*)(system[\w-]*|task-notification|task-id|tool-use-id|status|summary|result|changes|patch|read-coverage|usage|subagent_tokens|tool_uses|duration_ms|human|assistant|user|function_calls|invoke|parameter)(?=[\s>/]|$)/gi;
 const harnessTag = /<\s*\/?\s*(system[\w-]*|task-notification)(?=[\s>/]|$)/i;
 const rolePrefix = /^([ \t>]*)(Human|Assistant|User|System)([ \t]*):/gim;
 const instructionPatterns: Array<[string, RegExp]> = [
@@ -143,7 +145,12 @@ const stopReasonText: Record<string, string> = {
 /** Build the native `<task-notification>` content and its structured renderer details. */
 export function formatTaskNotification(input: TaskNotificationInput): { content: string; details: TaskNotificationDetails } {
 	const description = oneLine(input.description || input.taskId, 300);
-	const escaped = escapeSubagentOutput(input.result, { taskId: input.taskId, truncated: input.truncated });
+	const json = input.structuredOutput !== undefined ? JSON.stringify(input.structuredOutput) : undefined;
+	const structured = json !== undefined;
+	const escaped = escapeSubagentOutput(json ?? input.result,
+		{ taskId: input.taskId, truncated: !structured && input.truncated });
+	// JSON escapes keep the notification tags inert while preserving the actual values.
+	const body = json?.replaceAll("<", "\\u003c").replaceAll(">", "\\u003e") ?? escaped.text;
 	const error = input.error ? oneLine(input.error, 2000) : undefined;
 	let summary = `Agent "${description}" `;
 	if (input.status === "completed") summary += input.partial ? "completed with a partial result (maxTurns reached)" : "completed";
@@ -164,7 +171,8 @@ export function formatTaskNotification(input: TaskNotificationInput): { content:
 		`<status>${input.status}</status>`,
 		`<summary>${summary}</summary>`,
 		...(readPaths?.length ? [formatReadCoverage(readPaths)] : []),
-		`<result>\n${escaped.text || "(Subagent returned no output.)"}\n</result>`,
+		...(structured && escaped.flagged.length ? [`[harness: structured result matched instruction-shaped patterns: ${escaped.flagged.join(", ")}]`] : []),
+		`<result${structured ? ' format="json"' : ""}>\n${body || "(Subagent returned no output.)"}\n</result>`,
 		...(input.changes ? [formatChangeSummary(input.changes, input.worktreePath)] : []),
 	];
 	let content = `${lines.join("\n")}\n${usage}</task-notification>`;
@@ -179,7 +187,7 @@ export function formatTaskNotification(input: TaskNotificationInput): { content:
 		turn: input.turn,
 		result: truncateText(input.result, MAX_AGENT_OUTPUT),
 		...(readPaths?.length ? { read_paths: readPaths } : {}),
-		truncated: escaped.truncated,
+		truncated: input.result.length > MAX_AGENT_OUTPUT || Boolean(input.truncated),
 		...(input.partial ? { partial: true as const } : {}),
 		...(input.error ? { error: truncateText(input.error, 4000) } : {}),
 		...(input.stopReason ? { stop_reason: input.stopReason } : {}),
@@ -189,6 +197,7 @@ export function formatTaskNotification(input: TaskNotificationInput): { content:
 		...(escaped.flagged.length ? { flagged: escaped.flagged } : {}),
 		...(input.changes ? { changes: input.changes } : {}),
 		...(input.worktreePath ? { worktree_path: input.worktreePath } : {}),
+		...(structured ? { structured_output: input.structuredOutput } : {}),
 	};
 	return { content, details };
 }

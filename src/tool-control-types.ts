@@ -5,6 +5,8 @@ import { MAX_BACKGROUND_SHELL_TIMEOUT_SECONDS } from "./monitor-types.ts";
 import { todoStatuses } from "./todo-types.ts";
 import { teamMessageTypes } from "./team-types.ts";
 import { validateAgentScopePaths } from "./agent-read-scope.ts";
+import { parseAgentOutputSchema } from "./agent-output-schema.ts";
+import { isExternalProvider } from "./external-registry.ts";
 
 /** Values accepted by the Agent tool's `model` parameter. */
 export const agentModelValues = ["sonnet", "opus", "haiku", "fable", "inherit"] as const;
@@ -256,7 +258,7 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 	const input = object(value);
 	const allowed: Record<HostToolName, string[]> = {
 		// `mode` and `team_name` are the only leniently accepted fields; they are ignored.
-		Agent: ["description", "prompt", "subagent_type", "model", "run_in_background", "name", "isolation", "worktree_id", "executor", "fork", "mode", "team_name", "scope_paths"],
+		Agent: ["description", "prompt", "subagent_type", "model", "effort", "run_in_background", "name", "isolation", "worktree_id", "executor", "fork", "mode", "team_name", "scope_paths", "output_schema", "review_of", "candidates"],
 		SendMessage: ["to", "message", "summary", "run_in_background", "message_type", "request_id", "approve"],
 		AgentSend: ["task_id", "message", "run_in_background"], AgentExecutors: [],
 		TaskOutput: ["task_id", "block", "timeout"], TaskStop: ["task_id"], TaskList: [],
@@ -285,11 +287,31 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 	if (Object.keys(input).some((key) => !allowed[tool].includes(key))) throw new Error("Unknown tool input field");
 	if (tool === "Agent") {
 		text(input.description, "description", 160);
-		text(input.prompt, "prompt", MAX_AGENT_PROMPT);
+		if (input.review_of === undefined || input.prompt !== undefined) text(input.prompt, "prompt", MAX_AGENT_PROMPT);
 		if (input.subagent_type !== undefined && (typeof input.subagent_type !== "string" || !input.subagent_type.trim() || exceedsLength(input.subagent_type, 100)))
 			throw new Error("Invalid subagent_type");
-		if (input.executor !== undefined && (typeof input.executor !== "string" || !["pi", "codex", "claude", "kimi", "antigravity"].includes(input.executor))) throw new Error("Invalid executor");
-		if (input.model !== undefined && !agentModelValues.includes(input.model as never)) throw new Error("Invalid model (expected sonnet, opus, haiku, fable or inherit)");
+		if (input.executor !== undefined && input.executor !== "pi" && !isExternalProvider(input.executor)) throw new Error("Invalid executor");
+		if (input.review_of !== undefined) text(input.review_of, "review_of", 200);
+		const external = isExternalProvider(input.executor) || (input.executor === undefined && input.review_of !== undefined);
+		if (input.model !== undefined) {
+			if (external) text(input.model, "model", 200);
+			else if (!agentModelValues.includes(input.model as never)) throw new Error("Invalid model (expected sonnet, opus, haiku, fable or inherit)");
+		}
+		if (input.effort !== undefined) {
+			if (!external) throw new Error("effort requires an external executor");
+			text(input.effort, "effort", 32);
+		}
+		if (input.candidates !== undefined) {
+			if (!Array.isArray(input.candidates) || input.candidates.length < 1 || input.candidates.length > 3)
+				throw new Error("candidates must have 1–3 executor selections");
+			for (const value of input.candidates) {
+				const candidate = object(value);
+				if (!isExternalProvider(candidate.executor) || Object.keys(candidate).some((key) => !["executor", "model", "effort"].includes(key)))
+					throw new Error("Invalid candidate executor selection");
+				if (candidate.model !== undefined) text(candidate.model, "model", 200);
+				if (candidate.effort !== undefined) text(candidate.effort, "effort", 32);
+			}
+		}
 		if (input.name !== undefined && (typeof input.name !== "string" || !AGENT_CALL_NAME_PATTERN.test(input.name))) throw new Error("Invalid name");
 		optionalBoolean(input.run_in_background, "run_in_background");
 		optionalBoolean(input.fork, "fork");
@@ -299,6 +321,10 @@ export function validateDesktopToolInput(tool: HostToolName, value: unknown): Re
 		if (input.team_name !== undefined) text(input.team_name, "team_name", 200);
 		if (input.worktree_id !== undefined) text(input.worktree_id, "worktree_id", 200);
 		if (input.scope_paths !== undefined) validateAgentScopePaths(input.scope_paths);
+		if (input.output_schema !== undefined) {
+			if (!external) throw new Error("output_schema requires an external executor");
+			parseAgentOutputSchema(input.output_schema);
+		}
 	} else if (tool === "SendMessage") {
 		text(input.to, "to", MAX_SEND_TARGET); text(input.message, "message", MAX_SEND_MESSAGE);
 		if (input.summary !== undefined) text(input.summary, "summary", MAX_SEND_SUMMARY);

@@ -1,7 +1,11 @@
 import type { RuntimePermissionPolicy } from "./permission-types.ts";
 import type { TaskStatus } from "./task-types.ts";
+import type { AgentOutputSchema } from "./agent-output-schema.ts";
+import type { GitCheckpointDiff, GitRestoreResult } from "./git-types.ts";
 
-export type ExternalProvider = "codex" | "claude" | "kimi" | "antigravity";
+export type BuiltinExternalProvider = "codex" | "claude" | "kimi" | "antigravity";
+/** Catalog IDs additionally require membership in the bundled ACP registry at runtime. */
+export type ExternalProvider = BuiltinExternalProvider | `acp-${string}`;
 export interface ExternalApprovalOption { id: string; label: string; kind?: string }
 export interface ExternalApprovalRequest {
 	id: string;
@@ -15,6 +19,19 @@ export interface ExternalApprovalResponse {
 	decision: "allow" | "deny" | "cancel";
 	optionId?: string;
 	answers?: Record<string, string | string[]>;
+	/** Host-only grant for the exact operation within this external task's session. */
+	rememberForSession?: boolean;
+}
+export interface ExternalUsage {
+	inputTokens?: number;
+	outputTokens?: number;
+	cachedInputTokens?: number;
+	cacheWriteTokens?: number;
+	costUsd?: number;
+}
+export interface ExternalPlanStep {
+	text: string;
+	status: "pending" | "in_progress" | "completed";
 }
 export type ExternalAdapterEvent =
 	| { type: "session"; sessionId: string }
@@ -22,12 +39,15 @@ export type ExternalAdapterEvent =
 	| { type: "tool_start"; id: string; name: string; input: unknown }
 	| { type: "tool_update"; id: string; text: string }
 	| { type: "tool_end"; id: string; isError: boolean; output?: string }
+	| { type: "plan"; steps: ExternalPlanStep[]; explanation?: string }
 	| { type: "diagnostic"; message: string }
-	| { type: "usage"; inputTokens?: number; outputTokens?: number; sessionCostUsd?: number };
+	| ({ type: "usage"; sessionCostUsd?: number; sessionTokens?: Omit<ExternalUsage, "costUsd"> } & ExternalUsage);
 export interface ExternalTurnResult {
 	status: "completed" | "cancelled";
 	text: string;
 	sessionId?: string;
+	/** Native SDK structured result. The host validates the payload independently. */
+	structuredOutput?: unknown;
 }
 export interface ExternalSessionOptions {
 	executable: string;
@@ -41,6 +61,7 @@ export interface ExternalSessionOptions {
 	model?: string;
 	/** Native reasoning effort the user pinned; absent keeps the CLI default. */
 	effort?: string;
+	outputSchema?: AgentOutputSchema;
 	/** A native USD cap for this turn, where the executor exposes one. */
 	maxBudgetUsd?: number;
 	/** SDK helper is shipped with the desktop host; never model supplied. */
@@ -52,7 +73,10 @@ export interface ExternalSessionOptions {
 }
 export interface ExternalSession {
 	readonly sessionId: string | undefined;
+	readonly supportsResume?: boolean;
 	run(prompt: string, signal?: AbortSignal): Promise<ExternalTurnResult>;
+	/** Returns false when the active native turn has definitively declined the input. */
+	steer?(message: string): Promise<boolean>;
 	/** Redacted tail of the native program's diagnostic output. */
 	diagnostics?(): string;
 	interrupt(): Promise<void>;
@@ -64,11 +88,14 @@ export interface ExternalAdapter {
 
 export interface ExternalExecutor {
 	id: ExternalProvider;
+	label?: string;
 	enabled: boolean;
 	available: boolean;
 	executable?: string;
 	version?: string;
 	error?: string;
+	installCommand?: string;
+	compatibility?: "compatible" | "incompatible" | "unverified";
 	capabilities: { transport: "app-server" | "sdk" | "acp"; continuation: boolean; approvals: boolean; cancellation: boolean; readOnly: boolean; fineGrainedPolicy: boolean; approvalSemantics: "per-tool-hook" | "native" | "agent-rules" };
 }
 export interface ExternalExecutorInput { id: ExternalProvider; executable?: string | null; enabled?: boolean }
@@ -90,14 +117,24 @@ export interface ExternalTask {
 	turn: number;
 	eventSequence: number;
 	nativeSessionId?: string;
+	supportsResume?: boolean;
 	output: string;
 	truncated: boolean;
 	error?: string;
 	pendingApprovals: ExternalApprovalRequest[];
 	/** True when the parent does not wait and the result arrives as a notification. */
 	runInBackground?: boolean;
+	model?: string;
+	effort?: string;
+	pendingMessages?: number;
+	sendDisposition?: "steered" | "queued";
+	usage?: ExternalUsage;
+	reviewOf?: string;
+	comparisonId?: string;
 	/** Files the last turn changed, from the host checkpoint (tracked and untracked files). */
 	changes?: ExternalChangeSummary;
+	/** Validated structured result of the last completed turn. */
+	structuredOutput?: unknown;
 }
 export interface ExternalChangedFile { path: string; status: "added" | "modified" | "deleted" | "type-changed"; additions?: number; deletions?: number; binary?: boolean }
 export interface ExternalChangeSummary {
@@ -108,6 +145,10 @@ export interface ExternalChangeSummary {
 	deletions: number;
 	/** Checkpoint holding the full before/after diff. */
 	checkpointId?: string;
+	/** A bounded patch for a small change. Larger changes use the checkpoint reference. */
+	patch?: string;
+	/** Stable hash of a complete nonempty patch, used to coalesce identical candidates. */
+	fingerprint?: string;
 }
 export interface ExternalTaskStartInput {
 	executor: ExternalProvider;
@@ -118,8 +159,13 @@ export interface ExternalTaskStartInput {
 	isolation?: "shared" | "worktree";
 	worktree_id?: string;
 	run_in_background?: boolean;
+	model?: string;
+	effort?: string;
+	output_schema?: AgentOutputSchema;
 }
 export interface ExternalTaskSendInput { taskId: string; message: string; runInBackground?: boolean }
+export interface ExternalCandidate { executor: ExternalProvider; model?: string; effort?: string }
+export interface ExternalComparison { comparisonId: string; tasks: ExternalTask[]; errors?: string[] }
 export interface ExternalTaskResult {
 	task_id: string;
 	executor: ExternalProvider;
@@ -134,8 +180,11 @@ export interface ExternalTaskResult {
 	truncated: boolean;
 	error?: string;
 	pending_approvals: number;
+	pending_messages?: number;
+	usage?: ExternalUsage;
 	/** Changed files and line counts of the last turn; absent for read-only tasks. */
 	changes?: ExternalChangeSummary;
+	structured_output?: unknown;
 }
 export type ExternalEvent = {
 	taskId: string;
@@ -148,7 +197,7 @@ export type ExternalEvent = {
 };
 export interface ExternalReplay { events: ExternalEvent[]; latestSequence: number; truncated: boolean }
 export interface DesktopExternalAgentsAPI {
-	executors(): Promise<ExternalExecutor[]>;
+	executors(options?: { verifyCompatibility?: boolean }): Promise<ExternalExecutor[]>;
 	configure(input: ExternalExecutorInput): Promise<ExternalExecutor[]>;
 	start(input: ExternalTaskStartInput): Promise<ExternalTask>;
 	list(conversationId?: string): Promise<ExternalTask[]>;
@@ -158,5 +207,9 @@ export interface DesktopExternalAgentsAPI {
 	cancel(taskId: string): Promise<ExternalTask>;
 	respond(taskId: string, requestId: string, response: ExternalApprovalResponse): Promise<void>;
 	replay(taskId: string, afterSequence?: number): Promise<ExternalReplay>;
+	diff(taskId: string, checkpointId: string, path?: string, includeText?: boolean): Promise<GitCheckpointDiff>;
+	changeFiles(input: { taskId: string; checkpointId: string; action: "apply" | "discard"; paths?: string[] }): Promise<GitRestoreResult>;
+	review(input: { taskId: string; executor?: ExternalProvider }): Promise<ExternalTask>;
+	compare(input: { taskId: string; candidates: ExternalCandidate[] }): Promise<ExternalComparison>;
 	onEvent(listener: (event: ExternalEvent) => void): () => void;
 }

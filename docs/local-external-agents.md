@@ -1,22 +1,25 @@
 # 本机外部 Agent 接入契约
 
-本机 Codex、Claude Code、Kimi Code、Antigravity CLI（`agy`）已接入后端；主 Pi 模型可主动委派、继续原生会话、收集结果和取消。前端只通过 `executors()` 的数据展示执行器，没有为单个执行器写专门界面。SSH 和跨机器项目映射尚未实现。
+主 Pi 模型可以委派给本机 Codex、Claude Code、Kimi Code、Antigravity CLI（`agy`）及目录中的 ACP 执行器，也可以继续原生会话、收集结果或取消任务。前端通过 `executors()` 读取目录、安装状态和能力。
 
 ## 执行器与能力探测
 
 ```ts
 const executors = await window.pi.externalAgents.executors();
-// id: codex | claude | kimi | antigravity
-// enabled, available, executable?, version?, error?, capabilities
+// id: codex | claude | kimi | antigravity | acp-<目录 ID>
+// enabled, available, executable?, version?, compatibility?, installCommand?, error?, capabilities
+const checked = await window.pi.externalAgents.executors({ verifyCompatibility: true });
 
 await window.pi.externalAgents.configure({ id: "kimi", executable: "/absolute/path/to/kimi", enabled: true });
 await window.pi.externalAgents.configure({ id: "kimi", executable: null }); // 恢复自动探测
 await window.pi.externalAgents.configure({ id: "codex", enabled: false });
 ```
 
-默认查找 PATH、macOS 常见安装目录及 Codex 的已知应用内 CLI 路径；不通过 shell 拼接命令，只运行 `--version` 探测。发现有 10 秒缓存，configure 清除缓存。执行文件必须为本机可执行普通文件的绝对路径，不接受模型提供的路径、任意 args、env、网络 endpoint 或 SSH 目标。
+默认查找 PATH、macOS 常见安装目录及 Codex 的已知应用内 CLI 路径，并以 `--version` 读取版本。发现有 10 秒缓存，configure 清除缓存。自定义路径接受本机的 CLI 可执行文件绝对路径。
 
-available 表示能找到并运行版本探测，不表示账号已经登录或当前协议可用；实际启动还会握手并验证能力。没有 Kimi 时明确返回 unavailable，不会静默改用其他执行器，也不会自动安装 CLI。
+「外部执行器」中的「检查兼容性」在空工作目录对 Codex 和 ACP CLI 发起初始化握手，并检查 Claude Code 的流式 CLI 选项。执行器卡片显示检测到的版本和具体错误。任务启动仍会校验权限、会话恢复和登录等条件。
+
+随应用内置的 ACP 目录从官方注册表提取启动参数，目前包括 Auggie、Gemini CLI、GitHub Copilot、goose、OpenCode 和 Qwen Code。目录执行器安装后可在设置中主动启用，例如 `acp-qwen-code`。设置仅展示需要手动执行的安装命令。兼容性检查结果按本机执行文件路径和版本保存，已确认不兼容的版本无法启动任务。ACP 未提供会话恢复能力时，运行中排队的指令在同一进程内继续，进程关闭后需新建任务。运行时直接启动已安装的本机 CLI，所有目录执行器共用 ACP 适配器。 [ACP 注册表](https://github.com/agentclientprotocol/registry)
 
 | 执行器 | 实际协议 | 审批语义 | 权限能力 |
 | --- | --- | --- | --- |
@@ -24,6 +27,7 @@ available 表示能找到并运行版本探测，不表示账号已经登录或�
 | Claude Code | 固定 SDK core + 独立 helper | per-tool-hook，PreToolUse 与 canUseTool | 宿主逐工具判定、只读工具上限 |
 | Kimi Code | 新版 ACP JSON-RPC | native，保留原生选项 ID 和问题表单 | 当前不提供可强制执行的只读与逐工具策略 |
 | Antigravity CLI | `agy acp --disable-telemetry`，ACP v1 | native，宿主强制 `default` 手动模式并转发审批；agy 自身规则已允许/拒绝的操作不再询问 | 不提供只读模式和逐工具策略 |
+| ACP 目录中的执行器 | 注册表提供的本机 stdio 启动参数，ACP v1 | 转发原生审批，原生规则可自行授权 | 可写任务使用 Worktree，细粒度禁用规则和 dontAsk 会阻止运行 |
 
 capabilities 返回 transport、continuation、approvals、cancellation、readOnly、fineGrainedPolicy、approvalSemantics。前端应展示限制并禁用不可用组合；这些是本适配器的能力上限，握手仍可能因本机 CLI 过旧或不兼容而拒绝启动。
 
@@ -33,11 +37,11 @@ capabilities 返回 transport、continuation、approvals、cancellation、readOn
 
 在会话下方的「编排档位」选择 `multi`，也可以输入 `/multi on`。在「设置 → 模型路由与评审」可为主会话选择主控模型及思考强度，为 Codex、Claude Code、Kimi Code 各自填写原生模型和思考强度。留空的选项沿用会话或对应 CLI 的设置。执行器仍需在「外部执行器」中启用，并完成本机 CLI 登录。
 
-主控配置在 `multi` 轮次期间应用。单轮 `ultracode` 指令结束后会话回到 `multi`。从 `multi` 创建的外部任务在续写时沿用同一原生会话，并读取最新的执行器配置。能力和权限校验随每轮继续生效。
+主控配置在 `multi` 轮次期间应用。单轮 `ultracode` 指令结束后会话回到 `multi`。从 `multi` 创建的外部任务在续写时沿用同一原生会话。任务单独填写的模型与强度优先，其余字段读取最新的执行器配置。能力和权限校验随每轮继续生效。
 
 Kimi Code 通过 ACP 会话公布可选的模型和思考强度。旧版 CLI 可以沿用当前模型，切换模型或思考强度需要支持对应会话配置项的版本。
 
-每轮可写任务完成后，检查点提供已跟踪和未跟踪文件的变更摘要，包含文件状态、行数和 Worktree。大文件或部分差异会标记摘要不完整。主控可通过 `TaskOutput` 查看摘要，并用 `WorktreeMerge` 显式合并已审查的改动。
+每轮可写任务完成后，检查点提供已跟踪和未跟踪文件的变更摘要，包含文件状态、行数和 Worktree。小差异随结果回传补丁，较大的差异保留文件及检查点引用。主控可通过 `TaskOutput` 查看摘要，并用 `WorktreeMerge` 显式合并已审查的改动。
 
 ## 主模型调用
 
@@ -51,11 +55,19 @@ Kimi Code 通过 ACP 会话公布可选的模型和思考强度。旧版 CLI 可
 {"tool":"TaskStop","input":{"task_id":"external-..."}}
 ```
 
-Agent 的 executor 为 `pi / codex / claude / kimi / antigravity`，省略仍为 Pi。AgentExecutors 返回本机可用性和限制；模型不能配置可执行文件。TaskList/TaskOutput/TaskStop 同时支持 Pi 与外部任务，外部结果带 executor 区分。SendMessage（兼容别名 AgentSend，`task_id` 即 `to`）先按 id 匹配外部任务，否则继续 Pi 子 Agent；不能给其他父会话的任务发消息。外部任务没有 name，只能按 task_id 寻址。
+Agent 的 executor 支持 `pi / codex / claude / kimi / antigravity` 与目录中以 `acp-` 开头的 ID，省略仍为 Pi。AgentExecutors 返回本机可用性和限制；模型不能配置可执行文件。TaskList/TaskOutput/TaskStop 同时支持 Pi 与外部任务，外部结果带 executor 区分。SendMessage（兼容别名 AgentSend，`task_id` 即 `to`）先按 id 匹配外部任务，否则继续 Pi 子 Agent；不能给其他父会话的任务发消息。外部任务没有 name，只能按 task_id 寻址。
 
-每个外部任务保留固定执行器、父会话、Worktree 和原生 session/thread ID。SendMessage/AgentSend 是下一轮指令，必须等待上一轮终止；若只剩进程清理会等待清理完成，若上一轮仍在运行则明确报错。它不会把消息投给“此目录最近的一段聊天”。进程按需关闭，下一轮显式恢复同一原生会话，不重放上一条 prompt。
+每个外部任务保留固定执行器、父会话、Worktree 和原生 session/thread ID。运行中使用 SendMessage 时，Codex 尝试 `turn/steer`，Claude Code 使用 Agent SDK 的现有输入流。ACP 和无法接受追加的执行器会把消息排到下一轮。同一任务的排队消息合并到下一轮，上一轮结果仍可交付。工具结果用 `delivery` 描述即时追加或排队状态。
+
+新建外部任务时可以传 `model` 和 `effort` 覆盖该任务的默认值。设置传给执行器的原生接口。结果的 `usage` 包含能核实的本轮输入、输出、缓存 token 和美元费用。客户端按原生会话的累计统计计算差额。缺少供应方报告的费用会显示为空。
 
 持续协作采用主 Agent 路由：主 Agent 可把 Claude 的复核结论发给原 Codex 任务，再让 Kimi 补测试。原生子执行器不会自行调用宿主的 SendMessage/AgentSend 或直接读取其他任务；完整父聊天也不会复制给它们。不同执行器的可写任务各用一个 Worktree，主 Agent 审核后显式整合成果，不自动同步未提交改动。
+
+### 结构化结果
+
+外部 `Agent` 和 `externalAgents.start` 接受可选的 `output_schema`。请传入 16 KiB 以内的内联 JSON Schema 对象，可用属性、类型和枚举等约束。引用和自定义正则表达式需改写为内联约束。客户端独立校验每次结果，校验通过的值通过 `structured_output` 返回给 `Agent`、`TaskOutput` 和后台完成通知。续写沿用启动时的 schema，结果大小最多 48 KiB。
+
+Codex 使用 `turn/start.outputSchema`，Claude Code 使用 Agent SDK 的 `outputFormat`。ACP 执行器从提示词读取 schema，对首个无效结果在同一原生会话中重问一次。二次校验仍失败时，任务保留最后输出并报告错误。[Codex App Server](https://developers.openai.com/codex/app-server/) · [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/structured-outputs)
 
 ## 前端 API
 
@@ -90,7 +102,7 @@ await window.pi.externalAgents.respond(task.id, pending.id, {
 });
 ```
 
-decision 为 allow/deny/cancel。pendingApprovals 给出宿主审批 ID、kind、toolName、input、description、options。options 是原生 optionId/label/kind，不能在前端重新编造；questions 保留原生问题 ID 和表单。不要把问题自动回答为 allow。一次批准不保存成永久授权；如需规则，应显式使用 permissions API。
+decision 为 allow/deny/cancel。pendingApprovals 给出宿主审批 ID、kind、toolName、input、description、options。options 是原生 optionId/label/kind，不能在前端重新编造；questions 保留原生问题 ID 和表单。不要把问题自动回答为 allow。「本会话内允许」在客户端内存中保存这个任务的完全相同操作。客户端每次向执行器发送单次许可，并继续服从最新的宿主权限规则。
 
 回应时再次检查当前宿主策略。撤销、原生超时、取消或进程退出会发 approval_resolved，旧回应被拒绝。审批期间子任务为 waiting_for_input，主 Pi 会话仍可工作。外部审批走 externalAgents.respond，不能传给原 Pi 的 respond 或 tasks.respond。
 
@@ -120,7 +132,7 @@ decision 为 allow/deny/cancel。pendingApprovals 给出宿主审批 ID、kind�
 const unsubscribe = window.pi.externalAgents.onEvent((packet) => {
   // taskId / executor / parentConversationId / sequence / turn / timestamp / event
   // task_updated, session, text_delta, tool_start/update/end,
-  // approval, approval_resolved, usage, diagnostic
+  // approval, approval_resolved, plan, usage, diagnostic
 });
 const replay = await window.pi.externalAgents.replay(task.id, lastSequence);
 // events, latestSequence, truncated
@@ -130,7 +142,15 @@ const replay = await window.pi.externalAgents.replay(task.id, lastSequence);
 
 先订阅、再 snapshot/replay，用 envelope.sequence 去重，不把 revision 当作 token 序号。revision 表示状态转换，sequence 覆盖全部事件；task_updated 内嵌快照可能比其 envelope.sequence 早一个序号。重启会从事件日志恢复最大序号及原生 ID。每个任务最多保留 2000 个内存事件、约 4 MiB，磁盘日志约 8 MiB 后轮换；truncated=true 时提示历史截断，不把缺失日志当作从未执行。
 
-输出摘要最多 48 Ki 字符，单事件大于 256 KiB 时省略为诊断提示。主模型回传、聊天卡片和任务面板用 taskId+turn 关联，避免重复追加结果。新接口尚未在当前前端建立页面或专用审批卡片，前端 Agent 需要接入上述流与回应入口。
+输出摘要最多 48 Ki 字符，单事件大于 256 KiB 时省略为诊断提示。主模型回传、聊天卡片和任务面板用 taskId+turn 关联，避免重复追加结果。「任务与 Worktree」可选择执行器并回放任务时间线，包括原生工具、计划步骤和执行器已报告的用量。
+
+## 差异与独立审查
+
+任务详情展示从任务起点到当前检查点的累计差异，可按文件查看、应用到项目或丢弃 Worktree 中的改动。应用前会对照任务的基准版本检查每个目标，遇到冲突会列出文件。丢弃决定会随检查点保存，后续应用、审查和候选对比只使用剩余改动。原始轮次检查点保留历史。可把评审意见发送给同一原生会话。
+
+`Agent({ description, review_of })` 可对当前父会话的外部任务启动独立只读审查。默认选择另一家支持只读的执行器。审查输入包含原始需求和从任务起点到当前检查点的差异，实现方的报告留在原任务中。
+
+从已完成的可写任务主动开启「比较方案」，可选 2 或 3 个候选执行器，并按候选指定模型与强度。每个候选在独立 Worktree 处理同一原始需求。对比视图按各候选从任务开始到所选检查点的累计改动去重，合并相同的完整补丁，并保留各方案的失败和用量。
 
 ## 构建与验证
 

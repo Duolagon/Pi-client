@@ -4,7 +4,7 @@ import { isAbsolute } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { ClaudeHelperConfig, ClaudeHelperPacket, ClaudeHelperRequest } from "./external-claude-helper.ts";
 import type { ExternalAdapter, ExternalSession, ExternalSessionOptions, ExternalTurnResult } from "./external-types.ts";
-import { redactDiagnostic, withDiagnostics } from "./external-errors.ts";
+import { ExternalFailure, redactDiagnostic, withDiagnostics } from "./external-errors.ts";
 
 export class ClaudeAdapter implements ExternalAdapter {
 	async open(options: ExternalSessionOptions): Promise<ExternalSession> {
@@ -75,6 +75,7 @@ class ClaudeSession implements ExternalSession {
 			maxBudgetUsd: this.options.maxBudgetUsd,
 			...(this.options.model ? { model: this.options.model } : {}),
 			...(this.options.effort ? { effort: this.options.effort as ClaudeHelperConfig["effort"] } : {}),
+			...(this.options.outputSchema ? { outputSchema: this.options.outputSchema } : {}),
 		} }, 15000);
 	}
 	async run(prompt: string, signal?: AbortSignal): Promise<ExternalTurnResult> {
@@ -101,6 +102,11 @@ class ClaudeSession implements ExternalSession {
 			if (this.active === active) this.active = undefined;
 		}
 	}
+	async steer(message: string): Promise<boolean> {
+		if (!this.active || this.ended || this.closing) return false;
+		return await this.request({ type: "steer", id: randomUUID(), prompt: message }, 4000) === true;
+	}
+
 	async interrupt(): Promise<void> {
 		if (!this.active || this.ended) return;
 		this.active.controller.abort();
@@ -148,7 +154,11 @@ class ClaudeSession implements ExternalSession {
 			if (!pending) return;
 			this.pending.delete(packet.id); clearTimeout(pending.timer);
 			if (packet.ok) pending.resolve(packet.value);
-			else pending.reject(new Error(typeof packet.error === "string" ? redactDiagnostic(packet.error, this.options.env).slice(0, 8000) : "Claude helper request failed"));
+			else {
+				const detail = typeof packet.error === "string" ? redactDiagnostic(packet.error, this.options.env).slice(0, 8000) : "Claude helper request failed";
+				pending.reject(packet.kind && ["auth", "quota", "refusal", "rate_limit", "context"].includes(packet.kind)
+					? new ExternalFailure(packet.kind, detail) : new Error(detail));
+			}
 		} else if (packet.type === "event") {
 			if (!packet.event || typeof packet.event.type !== "string") throw new Error("Invalid event");
 			if (packet.event.type === "session") this.nativeSessionId = packet.event.sessionId;

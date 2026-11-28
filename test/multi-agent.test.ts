@@ -58,6 +58,15 @@ test("change summaries count lines, list untracked files and escape paths in not
 	] });
 	assert.equal(partial.truncated, true);
 	assert.match(formatChangeSummary(partial), /large\.txt \(line counts unavailable\)/);
+	const textFile = {
+		path: "new.txt", status: "added" as const, beforeKind: "missing" as const, afterKind: "file" as const,
+		beforeSize: 0, afterSize: 8, binary: false, truncated: false,
+	};
+	const tiny = summarizeCheckpoint({ checkpointId: "tiny", files: [{ ...textFile, diff: "@@ -0,0 +1 @@\n+hi\n" }] });
+	assert.match(formatChangeSummary(tiny), /<patch>\n@@ -0,0 \+1 @@\n\+hi\n<\/patch>/);
+	const big = summarizeCheckpoint({ checkpointId: "big", files: [{ ...textFile, diff: `@@ -0,0 +1 @@\n+${"x".repeat(9000)}\n` }] });
+	assert.equal(big.patch, undefined);
+	assert.deepEqual(big.files.map((file) => file.path), ["new.txt"]);
 });
 
 test("external failures are classified from structured data first and redact secrets", () => {
@@ -66,6 +75,8 @@ test("external failures are classified from structured data first and redact sec
 	assert.equal(classifyExternalError(new Error("connect ECONNREFUSED")), "network");
 	assert.equal(classifyExternalError(new Error("Error: 429 Too Many Requests")), "rate_limit");
 	assert.equal(classifyExternalError(new Error("Claude returned error_max_budget_usd")), "quota");
+	assert.equal(classifyExternalError(new Error("maximum context exceeded")), "context");
+	assert.equal(classifyExternalError(new Error("provider refusal")), "refusal");
 	const described = describeExternalFailure("claude", new Error("Not logged in · Please run /login"), "stderr line");
 	assert.equal(described.kind, "auth");
 	assert.match(described.message, /提示：Claude Code 未登录[\s\S]*诊断输出（已脱敏）：\nstderr line/);

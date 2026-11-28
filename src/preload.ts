@@ -9,7 +9,7 @@ function listen<T>(channel: string, listener: (event: T) => void): () => void {
 
 const api: DesktopAPI = {
 	externalAgents: {
-		executors: () => ipcRenderer.invoke("pi:external:executors"),
+		executors: (options) => ipcRenderer.invoke("pi:external:executors", options),
 		configure: (input) => ipcRenderer.invoke("pi:external:configure", input),
 		start: (input) => ipcRenderer.invoke("pi:external:start", input),
 		list: (conversationId) => ipcRenderer.invoke("pi:external:list", conversationId),
@@ -19,6 +19,10 @@ const api: DesktopAPI = {
 		cancel: (id) => ipcRenderer.invoke("pi:external:cancel", id),
 		respond: (id, requestId, response) => ipcRenderer.invoke("pi:external:respond", id, requestId, response),
 		replay: (id, afterSequence) => ipcRenderer.invoke("pi:external:replay", id, afterSequence),
+		diff: (id, checkpointId, path, includeText) => ipcRenderer.invoke("pi:external:diff", id, checkpointId, path, includeText),
+		changeFiles: (input) => ipcRenderer.invoke("pi:external:change-files", input),
+		review: (input) => ipcRenderer.invoke("pi:external:review", input),
+		compare: (input) => ipcRenderer.invoke("pi:external:compare", input),
 		onEvent: (listener) => listen("pi:external:event", listener),
 	},
 	agents: {

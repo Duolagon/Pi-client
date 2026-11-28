@@ -4,8 +4,9 @@ import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { createBashToolDefinition, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition, ToolInfo } from "@earendil-works/pi-coding-agent";
+import { knownExternalProviders } from "./external-registry.ts";
 import {
-	agentIsolationValues, agentModelValues, asModelToolResult, batchedToolNames, deferredSpecialistTools, delegatingToolNames, desktopModelToolNames, validateControlRequest,
+	agentIsolationValues, asModelToolResult, batchedToolNames, deferredSpecialistTools, delegatingToolNames, desktopModelToolNames, validateControlRequest,
 	kaggleComputerUseActions, validateDesktopToolInput, validateToolOverrides,
 	type DesktopModelToolName, type DesktopToolInfo, type NotificationUsage, type ToolCallBatch, type ToolControlRequest,
 	type ToolControlResponse, type ToolOverrides,
@@ -52,9 +53,10 @@ const taskId = boundedText(200);
 export const toolSchemas: Record<DesktopModelToolName, JsonSchema> = {
 	Agent: schema({
 		description: { ...boundedText(160), description: "A short (3-5 word) description of the task" },
-		prompt: { ...boundedText(MAX_AGENT_PROMPT), description: "The complete, self-contained task for the agent to perform" },
+		prompt: { ...boundedText(MAX_AGENT_PROMPT), description: "The complete, self-contained task for a new agent. A review_of task uses the original task's prompt and diff." },
 		subagent_type: { ...boundedText(100), description: 'The type of specialized agent to use (default: general-purpose). Use "fork" to fork this conversation.' },
-		model: { type: "string", enum: [...agentModelValues], description: "Optional model alias for this agent; it takes precedence over the agent definition. Omit to inherit." },
+		model: { ...boundedText(200), description: "One of sonnet, opus, haiku, fable or inherit for a Pi agent, or a native model ID for an external executor." },
+		effort: { ...boundedText(32), description: "Optional native thinking effort for this external task." },
 		run_in_background: { type: "boolean", description: "Run the agent in the background (default true). Set false only when your next step depends on the result." },
 		name: { type: "string", pattern: "^[A-Za-z][A-Za-z0-9_-]{0,63}$", description: "Optional name to address this agent later" },
 		isolation: { type: "string", enum: [...agentIsolationValues], description: '"worktree" runs in an isolated Git worktree; "shared" uses this working directory. "remote" is not supported.' },
@@ -63,11 +65,18 @@ export const toolSchemas: Record<DesktopModelToolName, JsonSchema> = {
 			type: "array", minItems: 1, maxItems: MAX_AGENT_SCOPE_PATHS, items: boundedText(MAX_AGENT_SCOPE_PATH_LENGTH),
 			description: "Restrict a local read-only agent to these project-relative files or directories. Use distinct scopes for independent reviews. Absolute paths, globs, forks, and external executors are not supported.",
 		},
-		executor: { type: "string", enum: ["pi", "codex", "claude", "kimi", "antigravity"], description: "Engine that runs the agent (default pi)" },
+		executor: { type: "string", enum: ["pi", ...knownExternalProviders], description: "Engine that runs the agent (default pi). Use AgentExecutors to check local availability." },
 		fork: { type: "boolean", description: 'Deprecated alias of subagent_type "fork"' },
+		output_schema: { type: "object", description: "Optional inline JSON Schema for the final result of an external executor. Read the validated structured_output field from Agent or TaskOutput." },
+		review_of: { ...taskId, description: "An owned external task ID to review in a new read-only task using its original requirement and diff." },
+		candidates: {
+			type: "array", minItems: 1, maxItems: 3,
+			items: schema({ executor: { type: "string", enum: knownExternalProviders }, model: boundedText(200), effort: boundedText(32) }, ["executor"]),
+			description: "Candidate comparison requires the user to start it from the task interface.",
+		},
 		mode: { ...boundedText(100), description: "Accepted for compatibility and ignored" },
 		team_name: { ...boundedText(200), description: "Accepted for compatibility and ignored" },
-	}, ["description", "prompt"]),
+	}, ["description"]),
 	SendMessage: schema({
 		to: { ...boundedText(MAX_SEND_TARGET), description: 'The agentId, agent name, teammate name, "team-lead", or "*" for broadcast' },
 		message: { ...boundedText(MAX_SEND_MESSAGE), description: "The message for the agent or teammate; it keeps its whole previous conversation" },
@@ -234,7 +243,8 @@ const descriptions: Record<DesktopModelToolName, string> = {
 		"Agents run in the background by default: the call returns at once with an agentId, and the result is delivered to you automatically as a <task-notification> message (not user input) when the agent finishes. Do not poll TaskOutput or sleep while waiting. If your next step is a combined report, use run_in_background=false for all agents in that batch so you receive their results before synthesizing.",
 		"For parallel reviews of one codebase, give each agent distinct scope_paths so their work does not overlap.",
 		"Treat a report as evidence, not proof. Verify the consequential, uncertain or missing parts instead of re-reading every assigned file, then summarize for the user.",
-		"Read-only agents (Explore, Plan) share this directory. Writable agents run in an isolated Git worktree; in a folder without Git they run in the foreground and you wait for them. Nothing is merged automatically. Use executor=codex, claude, kimi or antigravity (see AgentExecutors) for an external engine.",
+		"Read-only agents (Explore, Plan) share this directory. Writable agents in Git use an isolated worktree. Local Pi agents may run in the foreground in projects without Git. Merge explicitly after review. Call AgentExecutors to discover installed external engines and their capabilities.",
+		"Use review_of to independently review an owned external task through its original requirement and diff. Let the host choose a different read-only executor where available. Candidate comparison starts from the user interface.",
 		"To continue an agent you launched (with its full previous context), use SendMessage with its agentId or name instead of launching a new one.",
 		"In the main conversation, for many agents in a fixed shape (fan out over a list, verify each finding, loop until nothing new turns up), a WorkflowRun script can replace issuing the calls by hand; subagents cannot run workflows.",
 	].join("\n"),

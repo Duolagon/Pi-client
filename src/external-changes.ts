@@ -1,7 +1,9 @@
 import type { GitCheckpointDiff } from "./git-types.ts";
-import type { ExternalChangeSummary } from "./external-types.ts";
+import type { ExternalChangeSummary, ExternalChangedFile } from "./external-types.ts";
+import { createHash } from "node:crypto";
 
 export const MAX_SUMMARY_FILES = 200;
+export const MAX_INLINE_PATCH_BYTES = 8 * 1024;
 
 /** Count added and removed lines of a unified diff, ignoring its headers. */
 export function diffLineCounts(diff: string): { additions: number; deletions: number } {
@@ -22,7 +24,7 @@ export function summarizeCheckpoint(diff: GitCheckpointDiff): ExternalChangeSumm
 	let additions = 0;
 	let deletions = 0;
 	let truncated = Boolean(diff.truncated || diff.excludedFiles || diff.files.length > MAX_SUMMARY_FILES);
-	const files = diff.files.slice(0, MAX_SUMMARY_FILES).map((file) => {
+	const files = diff.files.slice(0, MAX_SUMMARY_FILES).map<ExternalChangedFile>((file) => {
 		const summary = { path: file.path, status: file.status };
 		if (file.truncated) truncated = true;
 		if (file.binary) return { ...summary, binary: true };
@@ -32,27 +34,20 @@ export function summarizeCheckpoint(diff: GitCheckpointDiff): ExternalChangeSumm
 		deletions += counts.deletions;
 		return { ...summary, ...counts };
 	});
-	return { files, truncated, additions, deletions, checkpointId: diff.checkpointId };
-}
-
-/** File names are untrusted; keep every path on one line inside the notification markup. */
-function formatPath(path: string): string {
-	return path.replace(/[\x00-\x1f\x7f\u2028\u2029]/g, (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`)
-		.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
-
-/** Text block for a task notification or tool result: a diff stat the controller can act on. */
-export function formatChangeSummary(changes: ExternalChangeSummary | undefined, worktreePath?: string): string {
-	if (!changes) return "";
-	const lines = [`<changes files="${changes.files.length}${changes.truncated ? "+" : ""}" additions="${changes.additions}" deletions="${changes.deletions}">`];
-	if (worktreePath) lines.push(`worktree: ${formatPath(worktreePath)}`);
-	if (!changes.files.length && !changes.truncated) lines.push("(no files changed)");
-	for (const file of changes.files.slice(0, 60)) {
-		const counts = file.binary ? " (binary)" : file.additions === undefined || file.deletions === undefined
-			? " (line counts unavailable)" : ` +${file.additions} -${file.deletions}`;
-		lines.push(`${file.status.padEnd(8)} ${formatPath(file.path)}${counts}`);
+	const hash = createHash("sha256");
+	let patch = "";
+	let inline = !truncated;
+	for (const file of diff.files) {
+		if (file.binary || !file.diff.trim()) inline = false;
+		const segment = file.diff.endsWith("\n") ? file.diff : `${file.diff}\n`;
+		if (inline && Buffer.byteLength(patch) + Buffer.byteLength(segment) <= MAX_INLINE_PATCH_BYTES)
+			patch += segment;
+		else inline = false;
+		if (!truncated && !file.binary) hash.update(JSON.stringify([file.path, file.status, file.diff]));
 	}
-	if (changes.files.length > 60 || changes.truncated) lines.push("… summary is partial; inspect the worktree for the full changes");
-	lines.push("</changes>");
-	return lines.join("\n");
+	return { files, truncated, additions, deletions, checkpointId: diff.checkpointId,
+		...(inline && patch ? { patch } : {}),
+		...(!truncated && files.length && files.every((file) => !file.binary) ? { fingerprint: hash.digest("hex") } : {}) };
 }
+
+export { formatChangeSummary } from "./external-change-format.ts";

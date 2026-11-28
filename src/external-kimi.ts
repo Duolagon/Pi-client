@@ -2,9 +2,11 @@ import { isAbsolute } from "node:path";
 import { JsonLineProcess, type RpcId } from "./external-rpc.ts";
 import { validateRuntimePolicy } from "./permission-policy.ts";
 import { ExternalFailure, ExternalRpcError, withDiagnostics } from "./external-errors.ts";
+import { acpExecutorDefinition, acpRestoreMethod } from "./external-registry.ts";
+import { externalPlan } from "./external-plan.ts";
 import type {
 	ExternalAdapter, ExternalApprovalOption, ExternalApprovalResponse,
-	ExternalSession, ExternalSessionOptions, ExternalTurnResult,
+	ExternalProvider, ExternalSession, ExternalSessionOptions, ExternalTurnResult,
 } from "./external-types.ts";
 
 const desktopTools = new Set([
@@ -17,10 +19,10 @@ const outputLimit = 1024 * 1024;
 export interface AcpProfile {
 	/** Name used in errors, e.g. "Kimi". */
 	label: string;
-	args: string[];
-	env: Record<string, string>;
-	/** Kimi exposes session modes; the host must force its manual "default" mode. */
-	requireDefaultMode: boolean;
+	args: readonly string[];
+	env: Readonly<Record<string, string>>;
+	/** Explicitly known manual approval mode that the host must enforce before a prompt. */
+	manualMode?: string;
 	/** True when the CLI can run actions its own rules allow without asking the host (no forced manual mode). */
 	selfApproves?: boolean;
 	fallbackToolName: string;
@@ -28,10 +30,21 @@ export interface AcpProfile {
 	loginHint?: string;
 }
 
-export const kimiProfile: AcpProfile = {
-	label: "Kimi", args: ["acp"], env: { KIMI_CODE_NO_AUTO_UPDATE: "1", KIMI_CLI_NO_AUTO_UPDATE: "1" },
-	requireDefaultMode: true, fallbackToolName: "kimi_tool",
-};
+export function acpProfileFor(id: ExternalProvider): AcpProfile | undefined {
+	const definition = acpExecutorDefinition(id);
+	if (!definition) return undefined;
+	return {
+		label: definition.label,
+		args: definition.acp.args,
+		env: definition.acp.env ?? {},
+		manualMode: definition.manualMode,
+		selfApproves: definition.capabilities.approvalSemantics === "agent-rules",
+		fallbackToolName: `${id.replaceAll("-", "_")}_tool`,
+		loginHint: definition.loginHint,
+	};
+}
+
+export const kimiProfile = acpProfileFor("kimi")!;
 
 /** ACP can forward native approvals, but does not authorize every native read/tool. */
 export function assertAcpPolicy(options: ExternalSessionOptions, label: string, selfApproves = false): void {
@@ -71,7 +84,7 @@ class AcpSession implements ExternalSession {
 	private options: ExternalSessionOptions;
 	private profile: AcpProfile;
 	/** True once the host forced the CLI's manual mode; later switches to unattended modes are refused. */
-	private modeGuard = false;
+	private modeGuard?: string;
 	private rpc: JsonLineProcess;
 	private nativeId?: string;
 	private closed = false;
@@ -89,13 +102,14 @@ class AcpSession implements ExternalSession {
 		this.options = options;
 		this.profile = profile;
 		this.rpc = new JsonLineProcess({
-			executable: options.executable, args: profile.args, cwd: options.cwd,
+			executable: options.executable, args: [...profile.args], cwd: options.cwd,
 			env: { ...options.env, ...profile.env },
 			onNotification: (method, params) => this.notification(method, params),
 			onRequest: (method, params, id) => this.request(method, params, id),
 		});
 	}
 	get sessionId(): string | undefined { return this.nativeId; }
+	get supportsResume(): boolean { return Boolean(acpRestoreMethod(this.capabilities)); }
 	diagnostics(): string { return this.rpc.stderrTail; }
 
 	async initialize(): Promise<void> {
@@ -153,9 +167,7 @@ class AcpSession implements ExternalSession {
 		const resume = this.options.resumeSessionId;
 		let restored: Record<string, unknown>;
 		if (resume) {
-			const sessionCapabilities = optionalRecord(this.capabilities.sessionCapabilities);
-			const method = sessionCapabilities.resume !== undefined ? "session/resume"
-				: this.capabilities.loadSession === true ? "session/load" : undefined;
+			const method = acpRestoreMethod(this.capabilities);
 			if (!method) throw new Error(`Installed ${label} ACP does not support restoring the requested session`);
 			restored = this.record(await this.rpc.request(method, { sessionId: resume, cwd: this.options.cwd, mcpServers: [] }), "restored session");
 			this.nativeId = restored.sessionId === undefined ? resume : this.text_(restored.sessionId, "session ID", 300);
@@ -164,18 +176,35 @@ class AcpSession implements ExternalSession {
 			restored = this.record(await this.rpc.request("session/new", { cwd: this.options.cwd, mcpServers: [] }), "new session");
 			this.nativeId = this.text_(restored.sessionId, "session ID", 300);
 		}
+		await this.forceManualMode(restored);
 		await this.applyConfig(restored);
-		const modes = optionalRecord(restored.modes);
-		const advertised = Array.isArray(modes.availableModes) && modes.availableModes.length > 0;
-		const hasDefault = advertised && (modes.availableModes as unknown[]).some((mode) => optionalRecord(mode).id === "default");
-		if (!hasDefault && (this.profile.requireDefaultMode || advertised))
-			throw new Error(`Installed ${label} ACP does not expose its manual/default approval mode`);
-		// A resumed session may have saved unattended mode. Never inherit it implicitly.
-		if (hasDefault) {
-			await this.rpc.request("session/set_mode", { sessionId: this.nativeId, modeId: "default" });
-			this.modeGuard = true;
-		}
 		this.options.onEvent({ type: "session", sessionId: this.nativeId });
+	}
+
+	private async forceManualMode(restored: Record<string, unknown>): Promise<void> {
+		const modes = optionalRecord(restored.modes);
+		const advertised = Array.isArray(modes.availableModes) ? modes.availableModes : [];
+		const wanted = this.profile.manualMode ?? "default";
+		// A resumed session may have saved unattended mode. Never inherit it implicitly.
+		if (advertised.some((mode) => optionalRecord(mode).id === wanted)) {
+			await this.rpc.request("session/set_mode", { sessionId: this.nativeId, modeId: wanted });
+			this.modeGuard = wanted;
+			return;
+		}
+		if (this.profile.manualMode && Array.isArray(restored.configOptions)) {
+			const option = restored.configOptions.map(optionalRecord).find((item) => item.category === "mode");
+			if (option && typeof option.id === "string" && configValues(option.options).includes(wanted)) {
+				const response = optionalRecord(await this.rpc.request("session/set_config_option", { sessionId: this.nativeId, configId: option.id, value: wanted }));
+				if (!Array.isArray(response.configOptions) ||
+					!response.configOptions.map(optionalRecord).some((item) => item.id === option.id && item.currentValue === wanted))
+					throw new Error("Installed " + this.profile.label + " ACP did not confirm its manual/default approval mode");
+				restored.configOptions = response.configOptions;
+				this.modeGuard = wanted;
+				return;
+			}
+		}
+		if (this.profile.manualMode || advertised.length)
+			throw new Error("Installed " + this.profile.label + " ACP does not expose its manual/default approval mode");
 	}
 
 	run(prompt: string, signal?: AbortSignal): Promise<ExternalTurnResult> {
@@ -267,13 +296,20 @@ class AcpSession implements ExternalSession {
 			const ended = update.status === "completed" || update.status === "failed";
 			if (ended && !previous?.ended) this.options.onEvent({ type: "tool_end", id, isError: update.status === "failed", output });
 			this.toolCalls.set(id, { name, input, ended: ended || Boolean(previous?.ended) });
+		} else if (update.sessionUpdate === "plan") {
+			const plan = externalPlan(update.entries, "content");
+			if (plan) this.options.onEvent(plan);
 		} else if (update.sessionUpdate === "usage_update") {
 			// ACP cost is cumulative for the session; only USD is comparable with the host budget.
 			const cost = optionalRecord(update.cost);
 			if (cost.currency === "USD" && typeof cost.amount === "number" && Number.isFinite(cost.amount) && cost.amount >= 0)
 				this.options.onEvent({ type: "usage", sessionCostUsd: cost.amount });
 		} else if (update.sessionUpdate === "current_mode_update") {
-			if (this.modeGuard && update.currentModeId !== "default" && update.currentModeId !== "plan")
+			if (this.modeGuard && update.currentModeId !== this.modeGuard && update.currentModeId !== "plan")
+				throw new Error(`${this.profile.label} changed to an unattended mode outside the host approval flow`);
+		} else if (update.sessionUpdate === "config_option_update" && this.modeGuard && Array.isArray(update.configOptions)) {
+			const mode = update.configOptions.map(optionalRecord).find((option) => option.category === "mode")?.currentValue;
+			if (typeof mode === "string" && mode !== this.modeGuard && mode !== "plan")
 				throw new Error(`${this.profile.label} changed to an unattended mode outside the host approval flow`);
 		}
 	}

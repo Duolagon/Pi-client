@@ -182,6 +182,17 @@ test("Kimi confirms an existing legacy model without rewriting global CLI settin
 	} finally { await data.cleanup(); }
 });
 
+test("Kimi surfaces native plan updates, tool completion and USD telemetry", async () => {
+	const data = await fixture({ permission: async () => ({ decision: "allow", answers: { q0: "continue" } }) });
+	const session = await new KimiAdapter().open(data.options);
+	try {
+		assert.equal((await session.run("timeline")).text, "本地时间线演示完成");
+		assert.deepEqual(data.events.flatMap((event) => event.type === "plan" ? event.steps.map((step) => step.status) : []), ["in_progress", "completed"]);
+		assert.ok(data.events.some((event) => event.type === "tool_end" && event.output === "本地演示工具输出"));
+		assert.ok(data.events.some((event) => event.type === "usage" && event.sessionCostUsd === 0.012));
+	} finally { await session.close(); await data.cleanup(); }
+});
+
 test("Kimi maps ACP auth_required to a structured login failure", async () => {
 	const { ExternalFailure } = await import("../src/external-errors.ts");
 	const data = await fixture({ env: { ACP_TEST_AUTH: "1" } });

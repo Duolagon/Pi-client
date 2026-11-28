@@ -40,11 +40,14 @@ type Entry =
 	| { kind: "excluded" }
 	| { kind: "file" | "symlink"; mode: number; hash: string; size: number; binary: boolean };
 interface Manifest {
+	/** User-discarded paths in this sealed task result. The historical turn stays immutable. */
+	discardedTaskPaths?: string[];
 	version: 1;
 	checkpoint: GitCheckpoint;
 	before: Record<string, Entry>;
 	after?: Record<string, Entry>;
 }
+type SealedCheckpoint = Manifest & { after: NonNullable<Manifest["after"]> };
 interface ReviewDirectories {
 	selected: string;
 	objective?: string;
@@ -146,17 +149,9 @@ export class GitSnapshots {
 	async list(project: string, conversationId?: string): Promise<GitCheckpoint[]> {
 		const root = await this.queryRoot(project);
 		return this.serialize(root, async () => {
-			let names: string[];
-			try {
-				names = await readdir(this.directory(root));
-			} catch (error) {
-				if (code(error) === "ENOENT") return [];
-				throw error;
-			}
 			const checkpoints: GitCheckpoint[] = [];
-			for (const name of names) {
-				if (!/^[a-f0-9-]{36}\.json$/.test(name)) continue;
-				const { checkpoint } = await this.load(root, name.slice(0, -5));
+			for (const id of await this.checkpointIds(root)) {
+				const { checkpoint } = await this.load(root, id);
 				if (!conversationId || checkpoint.conversationId === conversationId) checkpoints.push(checkpoint);
 			}
 			return checkpoints.sort((a, b) => b.createdAt - a.createdAt);
@@ -169,28 +164,45 @@ export class GitSnapshots {
 		return this.serialize(root, async () => {
 			const manifest = await this.load(root, id, conversationId);
 			if (!manifest.after) throw new Error("任务尚未结束，请先完成快照。");
-			if (path !== undefined) checkPath(path);
-			const selected =
-				path === undefined
-					? manifest.checkpoint.changes
-					: manifest.checkpoint.changes.filter((item) => item.path === path);
-			if (path !== undefined && !selected.length) throw new Error("此路径不在该快照的修改列表中。");
-			const files: GitCheckpointDiff["files"] = [];
-			for (const change of selected.slice(0, maxFiles ?? selected.length)) {
-				const result = await this.fileDiff(
-					change.path,
-					manifest.before[change.path] ?? missing,
-					manifest.after[change.path] ?? missing,
-				);
-				files.push({ ...change, ...result });
-			}
-			return {
-				checkpointId: id,
-				files,
-				...(manifest.checkpoint.excludedFiles ? { excludedFiles: manifest.checkpoint.excludedFiles } : {}),
-				...(files.length < selected.length ? { truncated: true } : {}),
-			};
+			const sealed = { ...manifest, after: manifest.after };
+			return this.diffCheckpoint(sealed, path, maxFiles);
 		});
+	}
+
+	/** Return the net changes of an external task through a selected sealed turn. */
+	async diffTaskChanges(project: string, id: string, taskId: string, path?: string, maxFiles?: number, includeText = true): Promise<GitCheckpointDiff> {
+		const root = await this.queryRoot(project);
+		return this.serialize(root, async () => {
+			const manifest = await this.taskCheckpoint(root, id, taskId);
+			const diff = await this.diffCheckpoint(manifest, path, maxFiles, includeText);
+			if (path === undefined && !diff.excludedFiles && !diff.truncated && diff.files.length) {
+				const hash = createHash("sha256");
+				for (const file of diff.files) {
+					hash.update(JSON.stringify([file.path, manifest.before[file.path] ?? missing, manifest.after[file.path] ?? missing]) + "\n");
+				}
+				diff.fingerprint = hash.digest("hex");
+			}
+			return diff;
+		});
+	}
+
+	private async diffCheckpoint({ checkpoint, before, after }: SealedCheckpoint, path?: string, maxFiles?: number, includeText = true): Promise<GitCheckpointDiff> {
+		if (path !== undefined) checkPath(path);
+		const selected = path === undefined ? checkpoint.changes : checkpoint.changes.filter((item) => item.path === path);
+		if (path !== undefined && !selected.length) throw new Error("此路径不在该快照的修改列表中。");
+		const files: GitCheckpointDiff["files"] = [];
+		for (const change of selected.slice(0, maxFiles ?? selected.length)) {
+			const result = includeText
+				? await this.fileDiff(change.path, before[change.path] ?? missing, after[change.path] ?? missing)
+				: { diff: "", truncated: false };
+			files.push({ ...change, ...result });
+		}
+		return {
+			checkpointId: checkpoint.id,
+			files,
+			...(checkpoint.excludedFiles ? { excludedFiles: checkpoint.excludedFiles } : {}),
+			...(files.length < selected.length ? { truncated: true } : {}),
+		};
 	}
 
 	/** Check for an observable worktree change without saving blobs or computing a textual diff. */
@@ -337,98 +349,9 @@ export class GitSnapshots {
 		return this.serialize(root, async () => {
 			const manifest = await this.load(root, id, conversationId);
 			if (!manifest.after) throw new Error("任务尚未结束，不能撤销未完成的快照。");
-			const changed = new Set(manifest.checkpoint.changes.map((item) => item.path));
-			const selected = [...new Set(paths ?? changed)];
-			for (const path of selected) {
-				checkPath(path);
-				if (!changed.has(path)) throw new Error("只能恢复此快照中实际发生变化的路径。");
-			}
-			const conflicts: GitRestoreConflict[] = [];
-			const skipped: string[] = [];
-			const restored: string[] = [];
-			if ((await this.head(root)) !== manifest.checkpoint.afterHead)
-				conflicts.push({ path: "", reason: "Git HEAD 已在快照结束后改变，请先回到原分支／提交。" });
-			const states = new Map<string, Entry>();
-			for (const path of selected) {
-				try {
-					const current = await this.inspect(root, path);
-					states.set(path, current);
-					if (equal(current, manifest.before[path] ?? missing)) skipped.push(path);
-					else if (!equal(current, manifest.after[path] ?? missing))
-						conflicts.push({ path, reason: "文件在快照结束后又被修改，已保留当前内容。" });
-					const before = manifest.before[path] ?? missing;
-					if (before.kind === "file" || before.kind === "symlink") await this.bytes(before);
-				} catch (error) {
-					conflicts.push({ path, reason: error instanceof Error ? error.message : String(error) });
-				}
-			}
-			const selectedSet = new Set(selected);
-			for (const path of selected) {
-				if (skipped.includes(path)) continue;
-				const before = manifest.before[path] ?? missing;
-				const current = states.get(path);
-				if (current?.kind === "directory" && before.kind !== "directory") {
-					for (const child of await this.descendants(root, path)) {
-						if (!selectedSet.has(child) || (manifest.before[child] ?? missing).kind !== "missing") {
-							conflicts.push({ path, reason: `目录包含未选择恢复或快照之外的路径：${child}` });
-							break;
-						}
-					}
-				}
-				for (const parent of parents(path)) {
-					const actual = await this.inspect(root, parent);
-					if (
-						actual.kind !== "missing" &&
-						actual.kind !== "directory" &&
-						(!selectedSet.has(parent) || manifest.before[parent]?.kind !== "directory")
-					) {
-						conflicts.push({ path, reason: `父路径不是安全目录：${parent}` });
-						break;
-					}
-				}
-			}
-			if (conflicts.length)
-				return { status: "conflict", checkpoint: manifest.checkpoint, restored, skipped, conflicts };
-			const removed = new Set<string>();
-			const pending = selected.filter((path) => !skipped.includes(path));
-			try {
-				for (const path of [...pending].sort(deepestFirst)) {
-					const before = manifest.before[path] ?? missing;
-					const current = states.get(path)!;
-					if (current.kind !== "missing" && (before.kind === "missing" || current.kind !== before.kind)) {
-						await this.assertCurrent(root, path, manifest.after[path] ?? missing);
-						await this.safeParents(root, path);
-						if (current.kind === "directory") await rmdir(join(root, path));
-						else await unlink(join(root, path));
-						removed.add(path);
-					}
-				}
-				for (const path of [...pending].sort((a, b) => deepestFirst(b, a))) {
-					const before = manifest.before[path] ?? missing;
-					if (before.kind === "missing") {
-						restored.push(path);
-						continue;
-					}
-					await this.safeParents(root, path, manifest.before);
-					await this.assertCurrent(root, path, removed.has(path) ? missing : (manifest.after[path] ?? missing));
-					if (before.kind === "directory") {
-						await mkdir(join(root, path), { recursive: false, mode: before.mode }).catch(
-							(error: NodeJS.ErrnoException) => {
-								if (error.code !== "EEXIST") throw error;
-							},
-						);
-						await chmod(join(root, path), before.mode);
-					} else if (before.kind === "file" || before.kind === "symlink")
-						await this.replace(root, path, before, removed.has(path) ? missing : (manifest.after[path] ?? missing));
-					restored.push(path);
-				}
-			} catch (error) {
-				conflicts.push({
-					path: pending.find((path) => !restored.includes(path)) ?? "",
-					reason: error instanceof Error ? error.message : String(error),
-				});
-			}
-			manifest.checkpoint.restoredPaths = [...new Set([...manifest.checkpoint.restoredPaths, ...restored, ...skipped])];
+			const result = await this.transfer(root, manifest.checkpoint, manifest.after, manifest.before, paths);
+			if (result.status === "conflict") return result;
+			manifest.checkpoint.restoredPaths = [...new Set([...manifest.checkpoint.restoredPaths, ...result.restored, ...result.skipped])];
 			manifest.checkpoint.status = manifest.checkpoint.changes.every((change) =>
 				manifest.checkpoint.restoredPaths.includes(change.path),
 			)
@@ -437,14 +360,165 @@ export class GitSnapshots {
 					? "partially-restored"
 					: "ready";
 			await this.save(manifest);
-			return {
-				status: conflicts.length ? "partial" : restored.length ? "restored" : "unchanged",
-				checkpoint: manifest.checkpoint,
-				restored,
-				skipped,
-				conflicts,
-			};
+			return result;
 		});
+	}
+
+	/** Apply an external task's net changes to a separate checkout after checking every destination. */
+	async apply(source: string, target: string, id: string, conversationId: string, paths?: string[]): Promise<GitRestoreResult> {
+		const [from, root] = await Promise.all([this.queryRoot(source), this.projectRoot(target)]);
+		if (inside(from, root) || inside(root, from)) throw new Error("应用目标必须是独立的项目工作区。");
+		const [first, second] = [from, root].sort();
+		return this.serialize(first, () => this.serialize(second, async () => {
+			const manifest = await this.taskCheckpoint(from, id, conversationId);
+			const { checkpoint, before, after } = manifest;
+			if (!paths && checkpoint.excludedFiles) throw new Error("有文件未纳入检查点，请单独选择要应用的文件。");
+			const selected = paths ?? checkpoint.changes.map((change) => change.path);
+			const reverted: string[] = [];
+			// Older clients discarded files without recording the decision. Also covers interruption
+			// between restoring a file and saving its discard record. Archived worktrees have no live source.
+			const exists = await lstat(from).then(() => true, (error) => {
+				if (code(error) === "ENOENT") return false;
+				throw error;
+			});
+			const known = new Set(checkpoint.changes.map((change) => change.path));
+			for (const path of selected) {
+				if (!known.has(path)) throw new Error("请选择当前任务改动中的路径。");
+				if (exists && equal(await this.inspect(from, path), before[path] ?? missing)) reverted.push(path);
+			}
+			const ignored = new Set(reverted);
+			const result = await this.transfer(root, checkpoint, before, after, selected.filter(path => !ignored.has(path)), true);
+			result.skipped.push(...reverted);
+			return result;
+		}));
+	}
+
+	/** Discard an external task's selected net changes without rewriting its turn checkpoints. */
+	async discardTaskChanges(project: string, id: string, taskId: string, paths?: string[]): Promise<GitRestoreResult> {
+		const root = await this.projectRoot(project);
+		return this.serialize(root, async () => {
+			const manifest = await this.taskCheckpoint(root, id, taskId);
+			if (!paths && manifest.checkpoint.excludedFiles) throw new Error("有文件未纳入检查点，请单独选择要丢弃的文件。");
+			const result = await this.transfer(root, manifest.checkpoint, manifest.after, manifest.before, paths);
+			const discarded = [...result.restored, ...result.skipped];
+			if (result.status !== "conflict" && discarded.length) {
+				const sealed = await this.load(root, id, taskId);
+				sealed.discardedTaskPaths = [...new Set([...(sealed.discardedTaskPaths ?? []), ...discarded])];
+				await this.save(sealed);
+			}
+			return result;
+		});
+	}
+
+	private async transfer(
+		root: string, checkpoint: GitCheckpoint, expected: Record<string, Entry>,
+		desired: Record<string, Entry>, paths?: string[], applying = false,
+	): Promise<GitRestoreResult> {
+		const changed = new Set(checkpoint.changes.map((item) => item.path));
+		const selected = [...new Set(paths ?? changed)];
+		for (const path of selected) {
+			checkPath(path);
+			if (!changed.has(path)) throw new Error("只能恢复此快照中实际发生变化的路径。");
+		}
+		const conflicts: GitRestoreConflict[] = [];
+		const skipped: string[] = [];
+		const restored: string[] = [];
+		if (!applying && (await this.head(root)) !== checkpoint.afterHead)
+			conflicts.push({ path: "", reason: "Git HEAD 已在快照结束后改变，请先回到原分支／提交。" });
+		const states = new Map<string, Entry>();
+		for (const path of selected) {
+			try {
+				const current = await this.inspect(root, path);
+				states.set(path, current);
+				if (equal(current, desired[path] ?? missing)) skipped.push(path);
+				else if (!equal(current, expected[path] ?? missing))
+					conflicts.push({ path, reason: "文件在快照结束后又被修改，已保留当前内容。" });
+				const before = desired[path] ?? missing;
+				if (before.kind === "file" || before.kind === "symlink") {
+					const bytes = await this.bytes(before);
+					if (applying && before.kind === "symlink") {
+						const link = bytes.toString();
+						const destination = resolve(root, dirname(path), link);
+						const canonical = await this.queryRoot(destination);
+						if (isAbsolute(link) || [destination, canonical].some((target) =>
+							!inside(root, target) || relative(root, target).split(sep).some((part) => part.toLowerCase() === ".git")))
+							throw new Error("任务中的符号链接指向项目外或 Git 元数据。");
+					}
+				}
+			} catch (error) {
+				conflicts.push({ path, reason: error instanceof Error ? error.message : String(error) });
+			}
+		}
+		const selectedSet = new Set(selected);
+		for (const path of selected) {
+			if (skipped.includes(path)) continue;
+			const before = desired[path] ?? missing;
+			const current = states.get(path);
+			if (current?.kind === "directory" && before.kind !== "directory") {
+				for (const child of await this.descendants(root, path)) {
+					if (!selectedSet.has(child) || (desired[child] ?? missing).kind !== "missing") {
+						conflicts.push({ path, reason: `目录包含未选择恢复或快照之外的路径：${child}` });
+						break;
+					}
+				}
+			}
+			for (const parent of parents(path)) {
+				const actual = await this.inspect(root, parent);
+				if (
+					actual.kind !== "missing" &&
+					actual.kind !== "directory" &&
+					(!selectedSet.has(parent) || desired[parent]?.kind !== "directory")
+				) {
+					conflicts.push({ path, reason: `父路径不是安全目录：${parent}` });
+					break;
+				}
+			}
+		}
+		if (conflicts.length)
+			return { status: "conflict", checkpoint: checkpoint, restored, skipped, conflicts };
+		const removed = new Set<string>();
+		const pending = selected.filter((path) => !skipped.includes(path));
+		try {
+			for (const path of [...pending].sort(deepestFirst)) {
+				const before = desired[path] ?? missing;
+				const current = states.get(path)!;
+				if (current.kind !== "missing" && (before.kind === "missing" || current.kind !== before.kind)) {
+					await this.assertCurrent(root, path, expected[path] ?? missing);
+					await this.safeParents(root, path);
+					if (current.kind === "directory") await rmdir(join(root, path));
+					else await unlink(join(root, path));
+					removed.add(path);
+				}
+			}
+			for (const path of [...pending].sort((a, b) => deepestFirst(b, a))) {
+				const before = desired[path] ?? missing;
+				if (before.kind === "missing") {
+					restored.push(path);
+					continue;
+				}
+				await this.safeParents(root, path, desired);
+				await this.assertCurrent(root, path, removed.has(path) ? missing : (expected[path] ?? missing));
+				if (before.kind === "directory") {
+					await mkdir(join(root, path), { recursive: false, mode: before.mode }).catch(
+						(error: NodeJS.ErrnoException) => {
+							if (error.code !== "EEXIST") throw error;
+						},
+					);
+					await chmod(join(root, path), before.mode);
+				} else if (before.kind === "file" || before.kind === "symlink")
+					await this.replace(root, path, before, removed.has(path) ? missing : (expected[path] ?? missing));
+				restored.push(path);
+			}
+		} catch (error) {
+			conflicts.push({
+				path: pending.find((path) => !restored.includes(path)) ?? "",
+				reason: error instanceof Error ? error.message : String(error),
+			});
+		}
+		return {
+			status: conflicts.length ? "partial" : restored.length ? "restored" : "unchanged",
+			checkpoint, restored, skipped, conflicts,
+		};
 	}
 
 	private async projectRoot(project: string, signal?: AbortSignal): Promise<string> {
@@ -668,6 +742,51 @@ export class GitSnapshots {
 		}
 	}
 
+	private async checkpointIds(root: string): Promise<string[]> {
+		const names = await readdir(this.directory(root)).catch((error: unknown) => {
+			if (code(error) === "ENOENT") return [];
+			throw error;
+		});
+		return names.filter((name) => /^[a-f0-9-]{36}\.json$/.test(name)).map((name) => name.slice(0, -5));
+	}
+
+	private async taskCheckpoint(root: string, id: string, taskId: string): Promise<SealedCheckpoint> {
+		const selected = await this.load(root, id, taskId);
+		if (!selected.after) throw new Error("任务检查点尚未封存。");
+		if (selected.checkpoint.kind) throw new Error("请选择外部任务的轮次检查点。");
+		let baseline = selected;
+		for (const candidateId of await this.checkpointIds(root)) {
+			if (candidateId === id) continue;
+			const candidate = await this.load(root, candidateId);
+			if (candidate.checkpoint.conversationId === taskId && !candidate.checkpoint.kind &&
+				candidate.checkpoint.createdAt < baseline.checkpoint.createdAt)
+				baseline = candidate;
+		}
+		const sealed = { ...selected, after: selected.after };
+		if (!selected.discardedTaskPaths?.length)
+			return baseline === selected ? sealed : this.withBaseline(sealed, baseline);
+		// Project the user's decisions onto the cumulative result only.
+		const after = Object.assign(Object.create(null), sealed.after) as Record<string, Entry>;
+		for (const path of selected.discardedTaskPaths) after[path] = baseline.before[path] ?? missing;
+		return this.withBaseline({ ...sealed, after }, baseline);
+	}
+
+	private withBaseline(manifest: SealedCheckpoint, baseline: Manifest): SealedCheckpoint {
+		const before = baseline.before;
+		const excluded = excludedPaths(before, manifest.after);
+		return {
+			...manifest,
+			before,
+			checkpoint: {
+				...manifest.checkpoint,
+				beforeHead: baseline.checkpoint.beforeHead,
+				changes: changes(before, manifest.after, excluded),
+				excludedFiles: excluded.size || undefined,
+				restoredPaths: [],
+			},
+		};
+	}
+
 	private async load(project: string, id: string, conversationId?: string): Promise<Manifest> {
 		if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error("快照 ID 无效。");
 		const input: unknown = JSON.parse(await readFile(join(this.directory(project), `${id}.json`), "utf8"));
@@ -851,6 +970,11 @@ function validateManifest(input: unknown, project: string, id: string): Manifest
 			entries[path] = entry;
 		}
 		value[key] = entries;
+	}
+	if (value.discardedTaskPaths !== undefined) {
+		if (!Array.isArray(value.discardedTaskPaths) || value.discardedTaskPaths.length > maxEntries)
+			throw new Error("无效的任务丢弃记录。");
+		for (const path of value.discardedTaskPaths) checkPath(path);
 	}
 	for (const path of value.checkpoint.restoredPaths) checkPath(path);
 	const excluded = excludedPaths(value.before, value.after ?? {});

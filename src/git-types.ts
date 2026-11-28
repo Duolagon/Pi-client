@@ -32,6 +32,8 @@ export interface GitCheckpoint {
 }
 
 export interface GitCheckpointDiff {
+	/** Fingerprint of the complete task delta, including file contents and modes. */
+	fingerprint?: string;
 	checkpointId: string;
 	excludedFiles?: number;
 	truncated?: boolean;

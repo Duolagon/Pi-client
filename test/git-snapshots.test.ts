@@ -87,6 +87,96 @@ test("restore preflights every selected file before writing and reports external
 	}
 });
 
+test("applying a sealed task checkpoint checks all destination paths before writing and can retry safely", async () => {
+	const { project, service, cleanup } = await fixture();
+	try {
+		const target = join(project, "..", "destination");
+		await exec("git", ["init", target]);
+		await writeFile(join(target, "tracked.txt"), "newer destination edit\n");
+		const start = await service.begin(project, "external-owner");
+		await writeFile(join(project, "tracked.txt"), "task edits the tracked file\n");
+		await writeFile(join(project, "new.txt"), "new file from task\n");
+		await service.finish(project, start.id);
+
+		await assert.rejects(service.apply(project, target, start.id, "other-owner"), /不属于当前会话/);
+		const conflict = await service.apply(project, target, start.id, "external-owner");
+		assert.equal(conflict.status, "conflict");
+		assert.deepEqual(conflict.conflicts.map(({ path }) => path), ["tracked.txt"]);
+		assert.equal(await readFile(join(target, "tracked.txt"), "utf8"), "newer destination edit\n");
+		await assert.rejects(lstat(join(target, "new.txt")), { code: "ENOENT" });
+
+		await writeFile(join(target, "tracked.txt"), "user's unstaged work\n");
+		const result = await service.apply(project, target, start.id, "external-owner");
+		assert.equal(result.status, "restored", JSON.stringify(result));
+		assert.deepEqual(result.restored.sort(), ["new.txt", "tracked.txt"]);
+		assert.equal(await readFile(join(target, "new.txt"), "utf8"), "new file from task\n");
+		assert.equal(await readFile(join(target, "tracked.txt"), "utf8"), "task edits the tracked file\n");
+		assert.equal((await service.apply(project, target, start.id, "external-owner")).status, "unchanged");
+		assert.equal((await service.list(project, "external-owner"))[0].status, "ready");
+		// A discard performed by an older client left no manifest record.
+		await rm(join(project, "new.txt"));
+		await rm(join(target, "new.txt"));
+		const retry = await service.apply(project, target, start.id, "external-owner");
+		assert.ok(retry.skipped.includes("new.txt"));
+		await assert.rejects(lstat(join(target, "new.txt")), { code: "ENOENT" });
+	} finally {
+		await cleanup();
+	}
+});
+
+test("external task diffs, application, and discard use the original baseline through a selected turn", async () => {
+	const { project, service, cleanup } = await fixture();
+	try {
+		const taskId = "external-task";
+		const target = join(project, "..", "destination");
+		await exec("git", ["init", target]);
+		await writeFile(join(target, "tracked.txt"), "user's unstaged work\n");
+		const first = await service.begin(project, taskId, "First turn");
+		await writeFile(join(project, "tracked.txt"), "first revision\n");
+		await writeFile(join(project, "first-only.txt"), "first turn adds this file\n");
+		await service.finish(project, first.id, { conversationId: taskId });
+		const second = await service.begin(project, taskId, "Reply to review");
+		await writeFile(join(project, "tracked.txt"), "revised after feedback\n");
+		await writeFile(join(project, "second-only.txt"), "second turn adds this file\n");
+		await service.finish(project, second.id, { conversationId: taskId });
+
+		const firstList = await service.diffTaskChanges(project, first.id, taskId, undefined, 200, false);
+		assert.deepEqual(firstList.files.map(({ path }) => path), ["first-only.txt", "tracked.txt"]);
+		const secondList = await service.diffTaskChanges(project, second.id, taskId, undefined, 200, false);
+		assert.deepEqual(secondList.files.map(({ path }) => path), ["first-only.txt", "second-only.txt", "tracked.txt"]);
+		assert.ok(secondList.files.every(({ diff }) => diff === ""), "listing cumulative paths avoids patch generation");
+		const net = await service.diffTaskChanges(project, second.id, taskId, "tracked.txt");
+		assert.match(net.files[0].diff, /-user's unstaged work\n\+revised after feedback/);
+		const turnDiff = await service.diff(project, second.id, undefined, taskId);
+		assert.deepEqual(turnDiff.files.map(({ path }) => path), ["second-only.txt", "tracked.txt"]);
+		assert.match(turnDiff.files[1].diff, /-first revision\n\+revised after feedback/);
+
+		const fingerprint = secondList.fingerprint;
+		assert.ok(fingerprint);
+		const drop = await service.discardTaskChanges(project, second.id, taskId, ["first-only.txt"]);
+		assert.deepEqual(drop.restored, ["first-only.txt"]);
+		const remaining = await service.diffTaskChanges(project, second.id, taskId, undefined, 200, false);
+		assert.deepEqual(remaining.files.map(({ path }) => path), ["second-only.txt", "tracked.txt"]);
+		assert.notEqual(remaining.fingerprint, fingerprint);
+		await assert.rejects(service.apply(project, target, second.id, taskId, ["first-only.txt"]));
+		const applied = await service.apply(project, target, second.id, taskId);
+		assert.equal(applied.status, "restored", JSON.stringify(applied));
+		assert.deepEqual(applied.restored.sort(), ["second-only.txt", "tracked.txt"]);
+		await assert.rejects(lstat(join(target, "first-only.txt")), { code: "ENOENT" });
+		assert.equal(await readFile(join(target, "tracked.txt"), "utf8"), "revised after feedback\n");
+
+		const discarded = await service.discardTaskChanges(project, second.id, taskId);
+		assert.equal(discarded.status, "restored", JSON.stringify(discarded));
+		assert.equal(await readFile(join(project, "tracked.txt"), "utf8"), "user's unstaged work\n");
+		await assert.rejects(lstat(join(project, "first-only.txt")), { code: "ENOENT" });
+		await assert.rejects(lstat(join(project, "second-only.txt")), { code: "ENOENT" });
+		assert.equal((await service.discardTaskChanges(project, second.id, taskId)).status, "unchanged");
+		assert.deepEqual((await service.list(project, taskId)).map(({ status }) => status), ["ready", "ready"]);
+	} finally {
+		await cleanup();
+	}
+});
+
 test("binary bytes, executable permissions, deletion, and symlinks survive a durable checkpoint", async () => {
 	const { project, data, service, cleanup } = await fixture();
 	try {

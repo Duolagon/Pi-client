@@ -4009,6 +4009,8 @@ function Desktop({ api }: { api: DesktopAPI }) {
 				<TasksDrawer
 					project={snapshot.active?.project}
 					conversationId={snapshot.active?.id}
+					readOnly={activePermMode === "read" || activePermMode === "plan"}
+					delegated={snapshot.active?.kind === "subagent"}
 					agentTeams={snapshot.settings.agentTeams === true}
 					initialTaskId={taskInitialId}
 					tabRequest={tasksTab}

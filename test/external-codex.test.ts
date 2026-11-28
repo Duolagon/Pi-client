@@ -34,6 +34,42 @@ test("Codex adapter streams Unicode exactly once, reports usage and reuses the n
 	} finally { await session.close(); await data.cleanup(); }
 });
 
+test("Codex sends a turn outputSchema and returns only the final structured answer", async () => {
+	const data = await fixture();
+	const log = join(data.root, "wire.jsonl");
+	data.options.env.CODEX_FIXTURE_LOG = log;
+	const outputSchema = { type: "object", properties: { count: { type: "integer" } }, required: ["count"], additionalProperties: false };
+	const session = await new CodexAdapter().open({ ...data.options, outputSchema });
+	try {
+		assert.equal((await session.run("structured output")).text, '{"count":3}');
+		const packets = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+		assert.deepEqual(packets.find((packet) => packet.method === "turn/start").params.outputSchema, outputSchema);
+		assert.ok(data.events.some((event) => event.type === "text_delta" && event.text === "Working on the report"));
+	} finally { await session.close(); await data.cleanup(); }
+});
+
+test("Codex steers the exact active turn or declines cleanly for an older CLI", async () => {
+	for (const supported of [true, false]) {
+		let ready!: () => void;
+		const observed = new Promise<void>((resolve) => { ready = resolve; });
+		const data = await fixture(supported ? {} : { CODEX_FIXTURE_NO_STEER: "1" }, async () => {
+			ready();
+			return new Promise(() => {});
+		});
+		const session = await new CodexAdapter().open(data.options);
+		try {
+			const turn = session.run("wait");
+			await observed;
+			assert.equal(await session.steer?.("additional requirement"), supported);
+			if (supported) assert.equal((await turn).text, "added: additional requirement");
+			else {
+				await session.interrupt();
+				assert.equal((await turn).status, "cancelled");
+			}
+		} finally { await session.close(); await data.cleanup(); }
+	}
+});
+
 test("Codex routes command/file approvals with original ids and denies all files if one is rejected", async () => {
 	const data = await fixture({}, async (request) => ({ decision: typeof request.input.path === "string" && request.input.path.endsWith("two.txt") ? "deny" : "allow" }));
 	const session = await new CodexAdapter().open(data.options);

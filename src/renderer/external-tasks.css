@@ -1,0 +1,90 @@
+.cc-external-launch-options {
+	display: flex;
+	flex-basis: 100%;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+
+.cc-external-task-output {
+	max-height: 25vh;
+	overflow: auto;
+}
+.cc-external-task-content > * + * { margin-top: 8px; }
+.cc-external-task-error { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.cc-external-timeline {
+	display: grid;
+	gap: 12px;
+	padding: 10px;
+	font-size: var(--fs-sm);
+}
+
+.cc-external-timeline h3,
+.cc-external-turn h4,
+.cc-external-timeline p {
+	margin: 0;
+}
+
+.cc-external-timeline h3 { font-size: var(--fs-md); }
+
+.cc-external-turn-head,
+.cc-external-timeline-notice {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 6px 12px;
+}
+
+.cc-external-timeline-items,
+.cc-external-plan-steps {
+	list-style: none;
+	margin: 6px 0 0;
+	padding: 0;
+}
+
+.cc-external-timeline-items > li {
+	display: grid;
+	grid-template-columns: max-content minmax(0, 1fr);
+	gap: 10px;
+	padding: 6px 0;
+	border-top: 1px solid var(--cl-line-soft);
+}
+
+.cc-external-timeline time { color: var(--cl-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.cc-external-timeline-item { overflow-wrap: anywhere; }
+.cc-external-timeline-item > .cc-source-tag { margin-inline-start: 6px; }
+.cc-external-timeline-item details { margin-top: 4px; }
+.cc-external-timeline-item summary { cursor: pointer; color: var(--cl-3); }
+.cc-external-timeline-item .cc-bash-out { max-height: 16vh; overflow: auto; }
+.cc-external-plan-steps > li { display: flex; gap: 6px; align-items: baseline; padding: 2px 0; }
+.cc-external-plan-steps .cc-source-tag { flex: none; }
+
+.cc-external-comparisons { padding: 8px 10px 10px; }
+.cc-external-comparisons h3 { margin: 8px 0; font-size: var(--fs-md); }
+.cc-external-comparison-actions { flex-wrap: wrap; justify-content: flex-start; }
+.cc-external-comparison-form {
+	display: grid;
+	gap: 8px;
+	min-width: 0;
+	margin: 8px 0 0;
+	padding: 10px;
+	border: 1px solid var(--cl-line);
+	border-radius: var(--r-md);
+}
+.cc-external-comparison-form p { margin: 0; }
+.cc-external-candidate-config { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.cc-external-candidate-config input { min-width: 110px; flex: 1; }
+.cc-external-candidate-config select {
+	height: 32px;
+	padding: 0 8px;
+	border: 1px solid var(--cl-line);
+	border-radius: var(--r-sm);
+	background: var(--cl-surface);
+	color: var(--cl-text);
+	font-size: var(--fs-sm);
+}
+.cc-external-candidate-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); }
+.cc-external-candidate { border: 1px solid var(--cl-line); border-radius: var(--r-md); padding: 10px; }
+.cc-external-candidate h4 { margin: 0 0 4px; overflow-wrap: anywhere; }
+.cc-external-candidate p { margin: 4px 0; }
+.cc-external-candidate .cc-bash-out { max-height: 20vh; overflow: auto; }

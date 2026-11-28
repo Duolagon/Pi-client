@@ -1,24 +1,30 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile, rename, realpath, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { discoverExecutors, executablePath, validateExecutorInput } from "./external-executors.ts";
+import { checkExecutorCompatibility, discoverExecutors, executablePath, validateExecutorInput } from "./external-executors.ts";
 import type { ExternalExecutorSettings } from "./external-executors.ts";
 import { MAX_AGENT_OUTPUT, exceedsLength } from "./delegation-limits.ts";
 import { evaluatePermission, validateRuntimePolicy } from "./permission-policy.ts";
 import type { PermissionRule, RuntimePermissionPolicy } from "./permission-types.ts";
 import type { WorktreeCreateInput, WorktreeInfo } from "./worktree-types.ts";
 import { localDay, type UsageRecord } from "./usage-stats.ts";
-import { MAX_SUMMARY_FILES } from "./external-changes.ts";
+import { MAX_INLINE_PATCH_BYTES, MAX_SUMMARY_FILES } from "./external-changes.ts";
+import { externalModelOptions } from "./external-model-options.ts";
+import { externalExecutorDefinition, isExternalProvider } from "./external-registry.ts";
+import { createRegistryExternalAdapter } from "./external-registry-adapter.ts";
 import { describeExternalFailure, diagnosticsOf, redactDiagnostic } from "./external-errors.ts";
+import { acpOutputInstruction, parseAgentOutputSchema, parseAgentOutputText, validateAgentOutput, type AgentOutputSchema } from "./agent-output-schema.ts";
 import type {
 	ExternalAdapter, ExternalAdapterEvent, ExternalApprovalRequest, ExternalApprovalResponse, ExternalEvent,
 	ExternalExecutor, ExternalExecutorInput, ExternalProvider, ExternalReplay, ExternalSession,
-	ExternalTask, ExternalTaskResult, ExternalTaskSendInput, ExternalTaskStartInput, ExternalChangeSummary,
+	ExternalTask, ExternalTaskResult, ExternalTaskSendInput, ExternalTaskStartInput, ExternalChangeSummary, ExternalUsage,
 } from "./external-types.ts";
 
 const active = new Set(["queued", "running", "waiting_for_input"]);
 const outputLimit = MAX_AGENT_OUTPUT;
+const maxPendingMessages = 8;
+const maxUndeliveredResults = 8;
 const policyModesByRestriction: RuntimePermissionPolicy["mode"][] = ["read", "plan", "ask", "acceptEdits", "auto"];
 /**
  * Why an external task stopped. A background parent is told about every stop except its own
@@ -30,11 +36,19 @@ export type ExternalStopReason = "user_stop" | "model_stop" | "parent_abort" | "
 const stopReasons: readonly ExternalStopReason[] = ["user_stop", "model_stop", "parent_abort", "policy_change", "restart", "executor_stop"];
 const silentStops: ReadonlySet<ExternalStopReason> = new Set(["model_stop", "parent_abort"]);
 /** `notify` marks a background task whose result is delivered through the host's outbox. */
+interface VerifiedExecutor {
+	executable: string;
+	version?: string;
+	compatibility: "compatible" | "incompatible";
+	continuation: boolean;
+	error?: string;
+}
 interface StoredNativeUsage {
 	/** Latest cumulative native session cost, kept separate from cost observed by this app. */
 	observedCostUsd?: number;
+	observedTokens?: Omit<ExternalUsage, "costUsd">;
 	costUsd: number;
-	days: Record<string, { input: number; output: number; cost: number; turns: number }>;
+	days: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number; cost: number; turns: number }>;
 }
 interface StoredTask {
 	task: ExternalTask;
@@ -45,6 +59,10 @@ interface StoredTask {
 	stopReason?: ExternalStopReason;
 	usage?: StoredNativeUsage;
 	usesMultiSettings?: true;
+	outputSchema?: AgentOutputSchema;
+	originalPrompt?: string;
+	followUps?: string[];
+	undelivered?: ExternalNotification[];
 }
 /** A finished background turn whose result the parent has not received yet. */
 export interface ExternalNotification { task: ExternalTask; stopReason?: ExternalStopReason }
@@ -57,9 +75,11 @@ interface Runtime {
 	logBytes: number;
 	logWrites: Promise<void>;
 	approvals: Map<string, { request: ExternalApprovalRequest; resolve(response: ExternalApprovalResponse): void }>;
+	sessionGrants?: Set<string>;
 	/** The run has not recorded its final output yet; a stopped task is delivered after it has. */
 	executing?: boolean;
 	usage?: Extract<ExternalAdapterEvent, { type: "usage" }>;
+	usageAttempts?: Array<NonNullable<Runtime["usage"]>>;
 }
 export interface ExternalAgentOptions {
 	dataDir: string;
@@ -67,7 +87,7 @@ export interface ExternalAgentOptions {
 	networkEnv?(): NodeJS.ProcessEnv;
 	nodeExecutable: string;
 	claudeHelperPath: string;
-	adapters: Record<ExternalProvider, ExternalAdapter>;
+	adapters: Partial<Record<ExternalProvider, ExternalAdapter>>;
 	maxConcurrent?: number;
 	project(conversationId: string): string;
 	isProjectTrusted(project: string): boolean;
@@ -101,6 +121,7 @@ export class ExternalAgents {
 	private pumping = false;
 	private initialized = false;
 	private closed = false;
+	private verified = new Map<ExternalProvider, VerifiedExecutor>();
 	private executorsCache?: { at: number; values: ExternalExecutor[] };
 	constructor(options: ExternalAgentOptions) { this.options = options; }
 
@@ -113,9 +134,18 @@ export class ExternalAgents {
 				const input = validateExecutorInput({ ...(entry as object), id });
 				this.settings[input.id] = { enabled: input.enabled ?? true, executable: input.executable ?? undefined };
 			}
+			for (const [id, value] of Object.entries(raw.verified ?? {})) {
+				const check = value as Partial<VerifiedExecutor> | null;
+				if (!isExternalProvider(id) || !check || typeof check.executable !== "string" || !isAbsolute(check.executable) ||
+					(check.compatibility !== "compatible" && check.compatibility !== "incompatible") ||
+					typeof check.continuation !== "boolean" || (check.version !== undefined && typeof check.version !== "string") ||
+					(check.error !== undefined && typeof check.error !== "string")) continue;
+				this.verified.set(id, { executable: check.executable, version: check.version, compatibility: check.compatibility,
+					continuation: check.continuation, error: check.error });
+			}
 			for (const record of raw.tasks) {
 				const task = record?.task;
-				if (!task || typeof task.id !== "string" || !/^external-[a-f0-9-]{36}$/.test(task.id) || !["codex", "claude", "kimi", "antigravity"].includes(task.executor) ||
+				if (!task || typeof task.id !== "string" || !/^external-[a-f0-9-]{36}$/.test(task.id) || !isExternalProvider(task.executor) ||
 					typeof task.parentConversationId !== "string" || !/^[a-zA-Z0-9._-]{1,200}$/.test(task.parentConversationId) ||
 					!["queued", "running", "waiting_for_input", "completed", "failed", "cancelled", "interrupted"].includes(task.status) ||
 					typeof task.workingDirectory !== "string" || !isAbsolute(task.workingDirectory) || typeof task.project !== "string" || !isAbsolute(task.project) ||
@@ -124,15 +154,25 @@ export class ExternalAgents {
 					throw new Error("外部任务存档无效。");
 				if (task.nativeSessionId !== undefined && (typeof task.nativeSessionId !== "string" || task.nativeSessionId.length > 500 || task.nativeSessionId.includes("\0"))) throw new Error("外部会话标识无效。");
 				task.pendingApprovals = [];
+				Object.assign(task, externalModelOptions(task.model, task.effort));
 				task.runInBackground = Boolean(record.notify);
 				task.changes = validatedChanges(task.changes);
+				task.usage = validatedTurnUsage(task.usage);
+				const followUps = storedFollowUps(record.followUps);
+				task.pendingMessages = followUps?.length;
+				delete task.sendDisposition;
+				const outputSchema = record.outputSchema === undefined ? undefined : parseAgentOutputSchema(record.outputSchema);
+				task.structuredOutput = task.status === "completed" && outputSchema && task.structuredOutput !== undefined
+					? validateAgentOutput(outputSchema, task.structuredOutput) : undefined;
 				if (record.notifiedTurn !== undefined && (!Number.isSafeInteger(record.notifiedTurn) || record.notifiedTurn < 1 || record.notifiedTurn > task.turn)) throw new Error("外部任务通知状态无效。");
 				if (record.stopReason !== undefined && !stopReasons.includes(record.stopReason)) throw new Error("外部任务停止原因无效。");
 				// A turn the app lost while it ran is reported to a background parent as stopped.
 				// Records interrupted before stop reasons existed carry none and are never replayed.
 				if (active.has(task.status)) { task.status = "interrupted"; task.error = "应用已重启；未重放任务，可显式发送新指令恢复原生会话。"; record.stopReason = "restart"; }
 				this.tasks.set(task.id, { task, policy: validateRuntimePolicy(record.policy), prompt: record.prompt, notify: Boolean(record.notify), notifiedTurn: record.notifiedTurn, stopReason: record.stopReason,
-					usage: validatedUsage(record.usage), ...(record.usesMultiSettings === true ? { usesMultiSettings: true } : {}) });
+					usage: validatedUsage(record.usage), outputSchema,
+					originalPrompt: typeof record.originalPrompt === "string" ? record.originalPrompt.slice(0, 2 * 1024 * 1024) : undefined,
+					followUps, undelivered: storedNotifications(record.undelivered, task, outputSchema), ...(record.usesMultiSettings === true ? { usesMultiSettings: true } : {}) });
 				// The event log can be newer than the last atomic task snapshot after a crash.
 				const recovered = await this.replay(task.id);
 				task.eventSequence = Math.max(task.eventSequence, recovered.latestSequence);
@@ -164,7 +204,7 @@ export class ExternalAgents {
 		for (const { task, usage } of this.tasks.values()) {
 			for (const [day, entry] of Object.entries(usage?.days ?? {})) {
 				entries.push({ key: `${task.id}:${day}`, day, model: `external/${task.executor}`, input: entry.input, output: entry.output,
-					cacheRead: 0, cacheWrite: 0, cost: entry.cost, samples: entry.turns });
+					cacheRead: entry.cacheRead ?? 0, cacheWrite: entry.cacheWrite ?? 0, cost: entry.cost, samples: entry.turns });
 			}
 		}
 		return entries;
@@ -189,16 +229,37 @@ export class ExternalAgents {
 			(active.has(task.status) || this.runtimes.get(task.id)?.executing === true));
 	}
 	snapshot(id: string): ExternalTask { return structuredClone(this.record(id).task); }
-	async executors(): Promise<ExternalExecutor[]> {
-		if (!this.executorsCache || Date.now() - this.executorsCache.at > 10000) this.executorsCache = { at: Date.now(), values: await discoverExecutors(this.settings, this.options.env) };
-		return structuredClone(this.executorsCache.values);
+	notifyChangesUpdated(id: string): void {
+		const task = this.record(id).task;
+		this.update(task, task.status, task.error);
+	}
+	async executors(options?: { verifyCompatibility?: boolean }): Promise<ExternalExecutor[]> {
+		if (options?.verifyCompatibility || !this.executorsCache || Date.now() - this.executorsCache.at > 10000) this.executorsCache = { at: Date.now(), values: await discoverExecutors(this.settings, this.options.env) };
+		const discovered = this.executorsCache.values;
+		if (options?.verifyCompatibility) {
+			const checked = await Promise.all(discovered.map((item) => checkExecutorCompatibility(item, this.options.env)));
+			for (const item of checked) {
+				if (item.executable && item.compatibility && item.compatibility !== "unverified")
+					this.verified.set(item.id, { executable: item.executable, version: item.version, compatibility: item.compatibility,
+						continuation: item.capabilities.continuation, error: item.error });
+				else this.verified.delete(item.id);
+			}
+			await this.persist();
+			return checked;
+		}
+		return structuredClone(discovered.map((item) => {
+			const check = this.verified.get(item.id);
+			return item.available && check && check.executable === item.executable && check.version === item.version
+				? { ...item, compatibility: check.compatibility, available: check.compatibility === "compatible",
+					error: check.error, capabilities: { ...item.capabilities, continuation: check.continuation } } : item;
+		}));
 	}
 	configure(value: ExternalExecutorInput): Promise<ExternalExecutor[]> {
 		return this.serialize(async () => {
 			const input = validateExecutorInput(value);
 			if ([...this.tasks.values()].some(({ task }) => task.executor === input.id && active.has(task.status))) throw new Error("请先停止该执行器的活动任务。");
 			const executable = input.executable === undefined ? this.settings[input.id]?.executable : input.executable === null ? undefined : await executablePath(input.executable);
-			this.settings[input.id] = { enabled: input.enabled ?? this.settings[input.id]?.enabled ?? true, executable };
+			this.settings[input.id] = { enabled: input.enabled ?? this.settings[input.id]?.enabled ?? externalExecutorDefinition(input.id)!.enabledByDefault, executable };
 			for (const [id, runtime] of this.runtimes) if (this.record(id).task.executor === input.id) { await runtime.session?.close(); runtime.session = undefined; }
 			this.executorsCache = undefined;
 			await this.persist();
@@ -206,12 +267,21 @@ export class ExternalAgents {
 		});
 	}
 
-	start(input: ExternalTaskStartInput, owner: string, toolCallId?: string): Promise<ExternalTask> {
+	originalRequest(id: string, owner?: string): string {
+		const record = this.record(id, owner);
+		if (record.originalPrompt) return record.originalPrompt;
+		if (record.task.turn === 1) return record.prompt;
+		throw new Error("此历史任务未保存初始需求。");
+	}
+
+	start(input: ExternalTaskStartInput, owner: string, toolCallId?: string, provenance?: { reviewOf?: string; comparisonId?: string }): Promise<ExternalTask> {
 		const usesMultiSettings = this.options.usesMultiSettings?.(owner) === true;
 		return this.serialize(async () => {
 			if (this.options.delegated(owner)) throw new Error("子任务不能再委派外部 Agent。");
 			validatePrompt(input.prompt); validateDescription(input.description);
-			if (!["codex", "claude", "kimi", "antigravity"].includes(input.executor)) throw new Error("未知外部执行器。");
+			const model = externalModelOptions(input.model, input.effort);
+			const outputSchema = input.output_schema === undefined ? undefined : parseAgentOutputSchema(input.output_schema);
+			if (!isExternalProvider(input.executor)) throw new Error("未知外部执行器。");
 			const previous = toolCallId && [...this.tasks.values()].find(({ task }) => task.parentConversationId === owner && task.parentToolCallId === toolCallId);
 			if (previous) return structuredClone(previous.task);
 			this.options.checkBudget?.(input.executor);
@@ -234,9 +304,12 @@ export class ExternalAgents {
 			const workingDirectory = tree ? await realpath(join(tree.path, relative(tree.repository, project))) : project;
 			const now = Date.now();
 			const task: ExternalTask = { id: `external-${randomUUID()}`, executor: input.executor, parentConversationId: owner, parentToolCallId: toolCallId,
-				title: input.description, project, workingDirectory, worktreeId: tree?.id, subagentType, readOnly, status: "queued", createdAt: now, updatedAt: now,
+				title: input.description, project, workingDirectory, worktreeId: tree?.id, subagentType, readOnly, ...model, status: "queued", createdAt: now, updatedAt: now,
 				revision: 0, turn: 1, eventSequence: 0, output: "", truncated: false, pendingApprovals: [], runInBackground: input.run_in_background ?? false };
-			this.tasks.set(task.id, { task, policy, prompt: input.prompt, notify: input.run_in_background ?? false,
+			if (provenance?.reviewOf) task.reviewOf = provenance.reviewOf;
+			if (provenance?.comparisonId) task.comparisonId = provenance.comparisonId;
+			this.tasks.set(task.id, { task, policy, prompt: input.prompt, originalPrompt: input.prompt, notify: input.run_in_background ?? false,
+				outputSchema,
 				...(usesMultiSettings ? { usesMultiSettings: true } : {}) });
 			this.update(task, "queued"); await this.persist(); this.pump(); return structuredClone(task);
 		});
@@ -245,16 +318,57 @@ export class ExternalAgents {
 	send(input: ExternalTaskSendInput, owner?: string): Promise<ExternalTask> {
 		return this.serialize(async () => {
 			validatePrompt(input.message);
-			const record = this.record(input.taskId, owner); const task = record.task;
-			if (active.has(task.status)) throw new Error("子任务仍在运行；请先等待完成或取消，再发送下一轮指令。");
+			const record = this.record(input.taskId, owner);
+			const task = record.task;
 			this.options.checkBudget?.(task.executor);
-			await this.runtimes.get(task.id)?.running;
+			const runtime = this.runtimes.get(task.id);
+			if (task.supportsResume === false && task.nativeSessionId && !runtime?.session)
+				throw new Error("此 ACP 执行器无法恢复已关闭的会话，请新建任务。");
+			if (active.has(task.status) && !record.followUps?.length && runtime?.session?.steer &&
+				!runtime.abort?.signal.aborted && await runtime.session.steer(input.message)) {
+				return { ...structuredClone(task), sendDisposition: "steered" };
+			}
+			const messages = [...(record.followUps ?? []), input.message];
+			const prompt = messages.join("\n\n");
+			validatePrompt(prompt);
+			if (active.has(task.status)) {
+				if (messages.length > maxPendingMessages) throw new Error("排队的追加消息已达上限。");
+				record.followUps = messages;
+				task.pendingMessages = messages.length;
+				this.update(task, task.status, task.error);
+				await this.persist();
+				return { ...structuredClone(task), sendDisposition: "queued" };
+			}
+			await runtime?.running;
 			await realpath(task.workingDirectory);
-			record.prompt = input.message; record.notify = input.runInBackground ?? false; record.stopReason = undefined;
-			task.runInBackground = record.notify;
-			task.turn++; task.output = ""; task.error = undefined; task.truncated = false; task.changes = undefined;
-			this.update(task, "queued"); await this.persist(); this.pump(); return structuredClone(task);
+			await this.queueTurn(record, prompt, input.runInBackground ?? false);
+			return structuredClone(task);
 		});
+	}
+
+	private async queueTurn(record: StoredTask, prompt: string, background: boolean): Promise<void> {
+		const { task } = record;
+		if (shouldNotify(record)) {
+			const pending = record.undelivered ??= [];
+			if (pending.length >= maxUndeliveredResults) throw new Error("请先交付此前的后台结果，再运行下一轮。");
+			pending.push({ task: structuredClone(task), stopReason: record.stopReason });
+		}
+		record.prompt = prompt;
+		record.notify = background;
+		record.stopReason = undefined;
+		record.followUps = undefined;
+		task.pendingMessages = undefined;
+		task.runInBackground = background;
+		task.turn++;
+		task.output = "";
+		task.error = undefined;
+		task.truncated = false;
+		task.changes = undefined;
+		task.structuredOutput = undefined;
+		task.usage = undefined;
+		this.update(task, "queued");
+		await this.persist();
+		this.pump();
 	}
 
 	async result(id: string, options: { block?: boolean; timeout?: number } = {}, owner?: string, signal?: AbortSignal): Promise<ExternalTaskResult> {
@@ -269,7 +383,10 @@ export class ExternalAgents {
 		return { task_id: task.id, executor: task.executor, parent_conversation_id: task.parentConversationId, parent_tool_call_id: task.parentToolCallId,
 			status: task.status, turn: task.turn, native_session_id: task.nativeSessionId, worktree_id: task.worktreeId, working_directory: task.workingDirectory,
 			output: task.output, truncated: task.truncated, error: task.error, pending_approvals: task.pendingApprovals.length,
-			...(task.changes && !active.has(task.status) ? { changes: structuredClone(task.changes) } : {}) };
+			...(task.pendingMessages ? { pending_messages: task.pendingMessages } : {}),
+			...(task.usage ? { usage: { ...task.usage } } : {}),
+			...(task.changes && !active.has(task.status) ? { changes: structuredClone(task.changes) } : {}),
+			...(task.status === "completed" && task.structuredOutput !== undefined ? { structured_output: structuredClone(task.structuredOutput) } : {}) };
 	}
 	async awaitModelResult(id: string, owner: string, background: boolean, signal?: AbortSignal): Promise<ExternalTaskResult> {
 		if (background) return this.result(id, {}, owner, signal);
@@ -295,11 +412,19 @@ export class ExternalAgents {
 		const task = record.task;
 		if (!active.has(task.status)) return structuredClone(task);
 		record.stopReason = reason;
+		if (reason === "user_stop" || reason === "model_stop" || reason === "parent_abort") {
+			record.followUps = undefined;
+			task.pendingMessages = undefined;
+		}
 		this.update(task, "cancelled", error);
 		const runtime = this.runtimes.get(id);
 		this.clearApprovals(task, runtime);
 		runtime?.abort?.abort(new Error("用户取消了外部任务。"));
 		await runtime?.session?.interrupt().catch(() => {});
+		if (runtime?.session && !runtime.executing) {
+			await runtime.session.close().catch(() => {});
+			runtime.session = undefined;
+		}
 		await this.persist(); this.pump();
 		// A running turn is delivered once it has recorded its output (see run()).
 		if (record.notify && !silentStops.has(reason)) this.options.flushNotifications(task.parentConversationId);
@@ -323,25 +448,36 @@ export class ExternalAgents {
 	/** Finished background turns of `owner` that have not been delivered yet. */
 	pendingNotifications(owner: string): ExternalNotification[] {
 		return [...this.tasks.values()]
-			.filter(({ task, notify, notifiedTurn, stopReason }) => notify && task.parentConversationId === owner && notifiedTurn !== task.turn &&
-				!this.runtimes.get(task.id)?.executing &&
-				(["completed", "failed"].includes(task.status) ||
-					(["cancelled", "interrupted"].includes(task.status) && stopReason !== undefined && !silentStops.has(stopReason))))
-			.map(({ task, stopReason }) => ({ task: structuredClone(task), ...(stopReason ? { stopReason } : {}) }));
+			.filter(({ task }) => task.parentConversationId === owner)
+			.flatMap((record) => [
+				...(record.undelivered ?? []),
+				...(shouldNotify(record) && !this.runtimes.get(record.task.id)?.executing ? [{ task: record.task, stopReason: record.stopReason }] : []),
+			]).map((notice) => structuredClone(notice));
 	}
-	/** Record a delivered turn; a later turn of the same task notifies again. */
+	/** Record a delivered turn, including one archived while a follow-up runs. */
 	async markNotified(id: string, turn: number): Promise<void> {
 		const record = this.tasks.get(id);
-		if (!record || record.task.turn !== turn) return;
-		record.notifiedTurn = turn;
+		if (!record) return;
+		if (record.task.turn === turn) record.notifiedTurn = turn;
+		else record.undelivered = record.undelivered?.filter((notice) => notice.task.turn !== turn);
 		await this.persist();
 	}
+
 	/** Protocols without a per-tool authorization hook cannot safely keep running after revocation. */
 	async invalidatePolicies(): Promise<void> {
+		for (const runtime of this.runtimes.values()) runtime.sessionGrants?.clear();
 		for (const { task } of this.tasks.values()) {
 			if (task.executor === "claude") continue;
 			if (active.has(task.status))
 				await this.cancel(task.id, undefined, "policy_change", "宿主权限已更改，外部任务已停止；请在新权限下显式继续。");
+			else {
+				const runtime = this.runtimes.get(task.id);
+				if (runtime?.session?.supportsResume === false) {
+					const session = runtime.session;
+					runtime.session = undefined;
+					await session.close();
+				}
+			}
 		}
 		await this.persist();
 	}
@@ -350,12 +486,26 @@ export class ExternalAgents {
 		const runtime = this.runtimes.get(id); const pending = runtime?.approvals.get(requestId);
 		if (!pending || !active.has(task.status)) throw new Error("此外部审批已失效。");
 		if (!["allow", "deny", "cancel"].includes(response.decision)) throw new Error("审批决定无效。");
-		if (response.optionId && !pending.request.options?.some((option) => option.id === response.optionId)) throw new Error("审批选项无效。");
+		if (response.optionId) {
+			const option = pending.request.options?.find((item) => item.id === response.optionId);
+			if (!option || (pending.request.kind !== "question" && ["allow_always", "reject_always"].includes(option.kind ?? "")))
+				throw new Error("审批选项无效，外部执行器仅接收单次决定。");
+		}
+		const { rememberForSession, ...nativeResponse } = response;
+		if (rememberForSession && (response.decision !== "allow" || !canRemember(pending.request)))
+			throw new Error("此请求仅支持单次授权。");
 		if (response.decision === "allow" && pending.request.kind !== "question") {
 			const decision = await evaluatePermission(this.policyFor(this.record(id)), normalizeCall(pending.request));
 			if (decision.action === "deny") { this.resolveApproval(task, runtime!, requestId, { decision: "deny" }); throw new Error(decision.reason); }
 		}
-		this.resolveApproval(task, runtime!, requestId, response);
+		if (!runtime!.approvals.has(requestId) || !active.has(task.status)) throw new Error("此外部审批已失效。");
+		if (rememberForSession) {
+			const grants = runtime!.sessionGrants ??= new Set();
+			if (grants.size >= 100) grants.delete(grants.values().next().value!);
+			grants.add(permissionFingerprint(pending.request));
+			nativeResponse.optionId = pending.request.options?.find((option) => option.kind === "allow_once")?.id;
+		}
+		this.resolveApproval(task, runtime!, requestId, nativeResponse);
 		await this.persist();
 	}
 
@@ -391,7 +541,18 @@ export class ExternalAgents {
 				this.update(record.task, "running");
 				runtime.executing = true;
 				runtime.abort = new AbortController();
-				runtime.running = this.run(record, runtime).finally(() => { runtime.running = undefined; this.options.onActivityChange(); this.pump(); });
+				runtime.running = this.run(record, runtime).finally(() => {
+					runtime.running = undefined;
+					this.options.onActivityChange();
+					this.pump();
+					if (!this.closed && record.task.status === "completed" && record.followUps?.length) {
+						const turn = record.task.turn;
+						void this.serialize(async () => {
+							if (record.task.turn === turn && record.task.status === "completed" && record.followUps?.length)
+								await this.queueTurn(record, record.followUps.join("\n\n"), true);
+						}).catch(() => {});
+					}
+				});
 			}
 		}).finally(() => { this.pumping = false; }).catch(() => {});
 	}
@@ -418,9 +579,11 @@ export class ExternalAgents {
 		let budget: Awaited<ReturnType<NonNullable<ExternalAgentOptions["reserveBudget"]>>>;
 		let status: ExternalTask["status"] = "completed";
 		let failure: string | undefined;
+		let structuredOutput: unknown;
 		let env = this.options.env;
 		const resumed = task.nativeSessionId !== undefined;
 		runtime.usage = undefined;
+		runtime.usageAttempts = undefined;
 		try {
 			await realpath(task.workingDirectory);
 			const executor = (await this.executors()).find((item) => item.id === task.executor)!;
@@ -435,30 +598,37 @@ export class ExternalAgents {
 			env = { ...this.options.env, ...this.options.networkEnv?.() };
 			for (const key of Object.keys(env)) if (key.startsWith("PI_DESKTOP_") || key.startsWith("PI_CODING_")) delete env[key];
 			const pinned = record.usesMultiSettings ? this.options.executorModel?.(task.executor) : undefined;
-			if (!runtime.session) runtime.session = await this.options.adapters[task.executor].open({
-				...(pinned?.model ? { model: pinned.model } : {}), ...(pinned?.effort ? { effort: pinned.effort } : {}),
+			const model = task.model ?? pinned?.model;
+			const effort = task.effort ?? pinned?.effort;
+			const adapter = this.options.adapters[task.executor] ?? createRegistryExternalAdapter(task.executor);
+			if (!adapter) throw new Error("执行器协议不可用。");
+			if (!runtime.session) runtime.session = await adapter.open({
+				model, effort,
 				executable: executor.executable, cwd: task.workingDirectory, env, resumeSessionId: task.nativeSessionId,
 				policy: this.policyFor(record), helperPath: this.options.claudeHelperPath, nodeExecutable: this.options.nodeExecutable,
 				projectTrusted: this.options.isProjectTrusted(task.project),
 				maxBudgetUsd: budget?.maxBudgetUsd,
+				...(record.outputSchema && executor.capabilities.transport !== "acp" ? { outputSchema: record.outputSchema } : {}),
 				onEvent: (event) => {
 					if (event.type === "diagnostic") event = { ...event, message: redactDiagnostic(event.message, env).slice(0, 4000) };
 					this.adapterEvent(task, event);
 				},
 				onPermission: (request, signal) => this.permission(record, runtime, request, signal),
 			});
+			if (runtime.session.supportsResume !== undefined) task.supportsResume = runtime.session.supportsResume;
 			if (runtime.session.sessionId) task.nativeSessionId = runtime.session.sessionId;
 			await this.persist(); // Save the native ID before submitting a prompt whenever the protocol provides it.
 			runtime.abort!.signal.throwIfAborted();
-			const result = await runtime.session.run(record.prompt, runtime.abort!.signal);
-			if (result.sessionId) task.nativeSessionId = result.sessionId;
-			if (result.text) { task.output = result.text.slice(0, outputLimit); task.truncated = result.text.length > outputLimit; }
-			await runtime.session.close();
-			runtime.session = undefined;
+			const result = await this.runOutputTurn(record, runtime, executor.capabilities.transport);
+			if (runtime.session.supportsResume !== false) {
+				await runtime.session.close();
+				runtime.session = undefined;
+			}
 			const changes = await finishCheckpoint?.();
 			finishCheckpoint = undefined;
 			if (changes) task.changes = changes;
 			status = result.status;
+			structuredOutput = result.structuredOutput;
 		} catch (error) {
 			status = runtime.abort?.signal.aborted ? "cancelled" : "failed";
 			if (status === "cancelled") failure = redactDiagnostic(error instanceof Error ? error.message : String(error), env).slice(0, 4000);
@@ -469,15 +639,27 @@ export class ExternalAgents {
 			}
 		} finally {
 			this.clearApprovals(task, runtime);
-			await runtime.session?.close().catch(() => {}); runtime.session = undefined;
 			const changes = await finishCheckpoint?.().catch((error: unknown) => {
 				this.event(task, { type: "diagnostic", message: `无法完成恢复点：${error instanceof Error ? error.message : String(error)}` });
 			});
 			if (changes) task.changes = changes;
-			if (runtime.usage) this.recordUsage(record, runtime.usage, resumed);
+			const reported = [...(runtime.usageAttempts ?? []), ...(runtime.usage ? [runtime.usage] : [])];
+			if (reported.length) this.recordUsage(record, reported, resumed, status === "failed");
 			await budget?.release().catch(() => {});
+			// An ACP without load/resume can still accept queued input in its open session.
+			const keepForQueue = !this.closed && !runtime.abort?.signal.aborted && status === "completed" &&
+				runtime.session?.supportsResume === false && Boolean(record.followUps?.length);
+			if (!keepForQueue) {
+				const session = runtime.session;
+				runtime.session = undefined;
+				await session?.close().catch(() => {});
+			}
 			if (active.has(task.status)) {
 				if (status === "cancelled") record.stopReason = "executor_stop";
+				if (status === "completed" && record.outputSchema && structuredOutput !== undefined) {
+					task.structuredOutput = structuredOutput;
+					if (!task.output) task.output = JSON.stringify(structuredOutput);
+				}
 				this.update(task, status, failure);
 			}
 			runtime.executing = false;
@@ -486,23 +668,73 @@ export class ExternalAgents {
 		}
 	}
 
-	private recordUsage(record: StoredTask, reported: Extract<ExternalAdapterEvent, { type: "usage" }>, resumed: boolean): void {
-		const input = usageNumber(reported.inputTokens) ?? 0;
-		const output = usageNumber(reported.outputTokens) ?? 0;
-		const cost = usageNumber(reported.sessionCostUsd);
+	private async runOutputTurn(record: StoredTask, runtime: Runtime, transport: ExternalExecutor["capabilities"]["transport"]) {
+		const { task, outputSchema } = record;
+		const session = runtime.session!;
+		const signal = runtime.abort!.signal;
+		const instruction = outputSchema && transport === "acp" ? acpOutputInstruction(outputSchema) : undefined;
+		const run = async (prompt: string) => {
+			const result = await session.run(prompt, signal);
+			if (result.sessionId) task.nativeSessionId = result.sessionId;
+			if (result.text || outputSchema) {
+				task.output = result.text.slice(0, outputLimit);
+				task.truncated = result.text.length > outputLimit;
+			}
+			return result;
+		};
+		const first = await run(instruction ? `${record.prompt}\n\n${instruction}` : record.prompt);
+		if (!outputSchema || first.status !== "completed") return first;
+		try {
+			return { ...first, structuredOutput: validateAgentOutput(outputSchema,
+				transport === "sdk" ? first.structuredOutput : parseAgentOutputText(first.text)) };
+		} catch {
+			if (!instruction) throw new Error("The external executor did not return a valid result for output_schema.");
+		}
+		signal.throwIfAborted();
+		this.event(task, { type: "diagnostic", message: "结构化结果未通过校验，执行器将重新整理一次输出。" });
+		task.output = "";
+		task.truncated = false;
+		if (runtime.usage) (runtime.usageAttempts ??= []).push(runtime.usage);
+		runtime.usage = undefined;
+		const retry = await run(`The previous result was not valid for the requested JSON Schema. Reformat your existing answer only. Do not repeat tools or edits.\n\n${instruction}`);
+		if (retry.status !== "completed") return retry;
+		try { return { ...retry, structuredOutput: validateAgentOutput(outputSchema, parseAgentOutputText(retry.text)) }; }
+		catch { throw new Error("The external executor returned invalid structured output after one retry."); }
+	}
+
+	private recordUsage(record: StoredTask, reports: NonNullable<Runtime["usage"]>[], resumed: boolean, failed: boolean): void {
 		const totals = record.usage ??= { costUsd: 0, days: {} };
-		const previous = totals.observedCostUsd;
-		// Old native sessions have no local baseline. Their first cumulative observation
-		// establishes one, instead of charging historical usage to this app's current turn.
-		const delta = cost === undefined || (previous === undefined && resumed) ? 0 : cost - (previous !== undefined && cost >= previous ? previous : 0);
-		if (cost !== undefined) totals.observedCostUsd = cost;
-		if (!input && !output && !delta) return;
-		totals.costUsd += delta;
+		const usage: ExternalUsage = {};
+		for (const report of reports) {
+			for (const key of tokenFields) {
+				const total = usageNumber(report.sessionTokens?.[key]);
+				const previous = totals.observedTokens?.[key];
+				if (failed && total === 0 && !report[key]) continue;
+				const count = total === undefined || (previous === undefined && resumed)
+					? usageNumber(report[key]) : total - (previous !== undefined && total >= previous ? previous : 0);
+				if (total !== undefined) (totals.observedTokens ??= {})[key] = total;
+				if (count !== undefined) usage[key] = (usage[key] ?? 0) + count;
+			}
+			const cost = usageNumber(report.sessionCostUsd);
+			const previous = totals.observedCostUsd;
+			if (failed && cost === 0 && report.costUsd === undefined) continue;
+			// For a resumed session whose baseline predates the app, do not charge historical usage.
+			const delta = usageNumber(report.costUsd) ?? (cost === undefined || (previous === undefined && resumed)
+				? undefined : cost - (previous !== undefined && cost >= previous ? previous : 0));
+			if (cost !== undefined) totals.observedCostUsd = cost;
+			if (delta !== undefined) usage.costUsd = (usage.costUsd ?? 0) + delta;
+		}
+		if (!Object.keys(usage).length) return;
+		record.task.usage = usage;
+		this.event(record.task, { type: "usage", ...usage });
+		totals.costUsd += usage.costUsd ?? 0;
 		const day = localDay(Date.now());
 		const entry = totals.days[day] ??= { input: 0, output: 0, cost: 0, turns: 0 };
-		entry.input += input;
-		entry.output += output;
-		entry.cost += delta;
+		entry.input += usage.inputTokens ?? 0;
+		entry.output += usage.outputTokens ?? 0;
+		entry.cacheRead = (entry.cacheRead ?? 0) + (usage.cachedInputTokens ?? 0);
+		entry.cacheWrite = (entry.cacheWrite ?? 0) + (usage.cacheWriteTokens ?? 0);
+		entry.cost += usage.costUsd ?? 0;
 		entry.turns++;
 		for (const key of Object.keys(totals.days).sort().slice(0, -365)) delete totals.days[key];
 	}
@@ -517,6 +749,8 @@ export class ExternalAgents {
 			// dontAsk never surfaces an approval prompt; anything not pre-approved is denied.
 			if (decision.action === "deny" || (decision.action === "ask" && policy.dontAsk)) return { decision: "deny" };
 			if (decision.action === "allow") return { decision: "allow" };
+			if (runtime.sessionGrants?.size && canRemember(request) && runtime.sessionGrants.has(permissionFingerprint(request)))
+				return { decision: "allow", optionId: request.options?.find((option) => option.kind === "allow_once")?.id };
 		}
 		const id = randomUUID();
 		const pending = { ...structuredClone(request), id };
@@ -605,7 +839,7 @@ export class ExternalAgents {
 		this.operation = promise.then(() => {}, () => {}); return promise;
 	}
 	private persist(): Promise<void> {
-		const body = JSON.stringify({ version: 1, settings: this.settings, tasks: [...this.tasks.values()] });
+		const body = JSON.stringify({ version: 1, settings: this.settings, verified: Object.fromEntries(this.verified), tasks: [...this.tasks.values()] });
 		this.persistence = this.persistence.catch(() => {}).then(async () => {
 			const target = join(this.options.dataDir, "external-agents.json");
 			await writeFile(`${target}.tmp`, body, { mode: 0o600 }); await rename(`${target}.tmp`, target);
@@ -615,6 +849,19 @@ export class ExternalAgents {
 
 function usageNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+const tokenFields = ["inputTokens", "outputTokens", "cachedInputTokens", "cacheWriteTokens"] as const;
+
+function validatedTurnUsage(value: unknown): ExternalUsage | undefined {
+	if (!value || typeof value !== "object") return;
+	const input = value as ExternalUsage;
+	const usage: ExternalUsage = {};
+	for (const key of [...tokenFields, "costUsd"] as const) {
+		const count = usageNumber(input[key]);
+		if (count !== undefined) usage[key] = count;
+	}
+	if (Object.keys(usage).length) return usage;
 }
 
 function validatedUsage(value: unknown): StoredNativeUsage | undefined {
@@ -627,15 +874,58 @@ function validatedUsage(value: unknown): StoredNativeUsage | undefined {
 		if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !entry || typeof entry !== "object") continue;
 		const input = usageNumber(entry.input), output = usageNumber(entry.output), cost = usageNumber(entry.cost), turns = usageNumber(entry.turns);
 		if (input !== undefined && output !== undefined && cost !== undefined && turns)
-			days[day] = { input, output, cost, turns };
+			days[day] = { input, output, cost, turns, cacheRead: usageNumber(entry.cacheRead), cacheWrite: usageNumber(entry.cacheWrite) };
 	}
-	return { costUsd, observedCostUsd: usageNumber(candidate.observedCostUsd), days };
+	return { costUsd, observedCostUsd: usageNumber(candidate.observedCostUsd), observedTokens: validatedTurnUsage(candidate.observedTokens), days };
 }
 
-function validatePrompt(value: string): void { if (typeof value !== "string" || !value.trim() || exceedsLength(value, 2 * 1024 * 1024) || value.includes("\0")) throw new Error("外部任务指令无效。"); }
+function validatePrompt(value: string): void { if (typeof value !== "string" || !value.trim() || Buffer.byteLength(value) > 2 * 1024 * 1024 || value.includes("\0")) throw new Error("外部任务指令无效。"); }
 function validateDescription(value: string): void { if (typeof value !== "string" || !value.trim() || exceedsLength(value, 160) || value.includes("\0")) throw new Error("外部任务名称无效。"); }
 function contains(root: string, path: string): boolean { const part = relative(root, path); return !isAbsolute(part) && part !== ".." && !part.startsWith(`..${sep}`); }
 function overlaps(left: string, right: string): boolean { return contains(left, right) || contains(right, left); }
+function shouldNotify({ task, notify, notifiedTurn, stopReason }: StoredTask): boolean {
+	return notify && notifiedTurn !== task.turn && (["completed", "failed"].includes(task.status) ||
+		(["cancelled", "interrupted"].includes(task.status) && stopReason !== undefined && !silentStops.has(stopReason)));
+}
+
+function storedFollowUps(value: unknown): string[] | undefined {
+	if (!Array.isArray(value) || !value.length || value.length > maxPendingMessages || value.some((item) => typeof item !== "string")) return;
+	try { validatePrompt(value.join("\n\n")); return value as string[]; }
+	catch { return undefined; }
+}
+
+function storedNotifications(value: unknown, task: ExternalTask, schema?: AgentOutputSchema): ExternalNotification[] | undefined {
+	if (!Array.isArray(value) || value.length > maxUndeliveredResults) return;
+	return value.flatMap((entry: ExternalNotification) => {
+		const old = entry?.task;
+		if (!old || old.id !== task.id || !Number.isSafeInteger(old.turn) || old.turn < 1 || old.turn >= task.turn ||
+			!["completed", "failed", "cancelled", "interrupted"].includes(old.status) ||
+			typeof old.output !== "string" || old.output.length > outputLimit || !Number.isFinite(old.updatedAt)) return [];
+		let structuredOutput: ExternalTask["structuredOutput"];
+		if (schema && old.structuredOutput !== undefined) {
+			try { structuredOutput = validateAgentOutput(schema, old.structuredOutput); } catch { structuredOutput = undefined; }
+		}
+		return [{
+			task: {
+				...task, turn: old.turn, status: old.status, updatedAt: old.updatedAt, output: old.output,
+				truncated: old.truncated === true, error: typeof old.error === "string" ? old.error.slice(0, 8000) : undefined,
+				pendingApprovals: [], pendingMessages: undefined, changes: validatedChanges(old.changes), usage: validatedTurnUsage(old.usage), structuredOutput,
+			},
+			stopReason: entry.stopReason && stopReasons.includes(entry.stopReason) ? entry.stopReason : undefined,
+		}];
+	});
+}
+
+function canRemember(request: ExternalApprovalRequest): boolean {
+	return request.kind !== "question" && request.kind !== "permissions" &&
+		Object.keys(request.input).length > 0 &&
+		(!request.options?.length || request.options.some((option) => option.kind === "allow_once"));
+}
+
+function permissionFingerprint(request: ExternalApprovalRequest): string {
+	return createHash("sha256").update(JSON.stringify([request.kind, request.toolName, request.input])).digest("hex");
+}
+
 function normalizeCall(request: ExternalApprovalRequest) {
 	const names: Record<string, string> = { Read: "read", Write: "write", Edit: "edit", MultiEdit: "edit", Bash: "bash", Shell: "bash", Grep: "grep", Glob: "find", List: "ls", LS: "ls" };
 	return { toolName: names[request.toolName] ?? request.toolName, input: { ...request.input, ...(typeof request.input.file_path === "string" ? { path: request.input.file_path } : {}) } };
@@ -656,5 +946,7 @@ function validatedChanges(value: unknown): ExternalChangeSummary | undefined {
 	return {
 		files: files.map(({ path, status, binary, additions, deletions }) => ({ path, status, binary, additions, deletions })),
 		truncated: input.truncated, additions: input.additions as number, deletions: input.deletions as number,
+		...(typeof input.patch === "string" && Buffer.byteLength(input.patch) <= MAX_INLINE_PATCH_BYTES ? { patch: input.patch } : {}),
+		...(typeof input.fingerprint === "string" && /^[a-f0-9]{64}$/.test(input.fingerprint) ? { fingerprint: input.fingerprint } : {}),
 		...(typeof input.checkpointId === "string" && input.checkpointId.length <= 200 ? { checkpointId: input.checkpointId } : {}) };
 }

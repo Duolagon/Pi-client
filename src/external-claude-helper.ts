@@ -6,7 +6,9 @@ import { query, type Options, type Query, type SDKMessage, type SDKUserMessage }
 import { evaluatePermission, validateRuntimePolicy } from "./permission-policy.ts";
 import type { RuntimePermissionPolicy } from "./permission-types.ts";
 import type { ExternalAdapterEvent, ExternalApprovalRequest, ExternalApprovalResponse, ExternalTurnResult } from "./external-types.ts";
-import { redactDiagnostic } from "./external-errors.ts";
+import { redactDiagnostic, type ExternalFailureKind } from "./external-errors.ts";
+import { parseAgentOutputSchema, type AgentOutputSchema } from "./agent-output-schema.ts";
+import { externalPlan } from "./external-plan.ts";
 
 export interface ClaudeHelperConfig {
 	executable: string;
@@ -18,15 +20,17 @@ export interface ClaudeHelperConfig {
 	/** Native model id or alias (e.g. `opus`, `claude-sonnet-5-5`); absent keeps the CLI default. */
 	model?: string;
 	effort?: "low" | "medium" | "high" | "xhigh" | "max";
+	outputSchema?: AgentOutputSchema;
 }
 export type ClaudeHelperRequest =
 	| { type: "init"; id: string; config: ClaudeHelperConfig }
 	| { type: "run"; id: string; prompt: string }
+	| { type: "steer"; id: string; prompt: string }
 	| { type: "interrupt" | "close"; id: string }
 	| { type: "permission_response"; id: string; response: ExternalApprovalResponse };
 export type ClaudeHelperPacket =
 	| { type: "response"; id: string; ok: true; value?: unknown }
-	| { type: "response"; id: string; ok: false; error: string }
+	| { type: "response"; id: string; ok: false; error: string; kind?: ExternalFailureKind }
 	| { type: "event"; event: ExternalAdapterEvent }
 	| { type: "permission_cancelled"; id: string; reason: string }
 	| { type: "permission"; request: ExternalApprovalRequest };
@@ -107,6 +111,7 @@ export class ClaudeSdkHelper {
 				if (config.effort !== undefined && !["low", "medium", "high", "xhigh", "max"].includes(config.effort as string)) throw new Error("Invalid Claude effort");
 				this.config = { executable: config.executable, cwd: config.cwd, policy: validateRuntimePolicy(config.policy),
 					model: config.model as string | undefined, effort: config.effort as ClaudeHelperConfig["effort"],
+					outputSchema: config.outputSchema === undefined ? undefined : parseAgentOutputSchema(config.outputSchema),
 					resumeSessionId: config.resumeSessionId as string | undefined, projectTrusted: config.projectTrusted === true,
 					maxBudgetUsd: config.maxBudgetUsd as number | undefined };
 				this.sessionId = this.config.resumeSessionId;
@@ -116,6 +121,18 @@ export class ClaudeSdkHelper {
 				return;
 			}
 			if (!this.config || this.closed) throw new Error("Claude helper is unavailable");
+			if (request.type === "steer") {
+				if (typeof request.prompt !== "string" || !request.prompt.trim() || Buffer.byteLength(request.prompt) > 2 * 1024 * 1024) throw new Error("Invalid Claude prompt");
+				if (!this.current || this.current.cancelled || !this.native) {
+					this.respond(request.id, false);
+					return;
+				}
+				// query() feeds this long-lived iterable to Query.streamInput.
+				// A new finite stream would close the CLI stdin when it ended.
+				this.queue.push({ type: "user", message: { role: "user", content: request.prompt }, parent_tool_use_id: null, client_composed: true });
+				this.respond(request.id, true);
+				return;
+			}
 			if (request.type === "run") {
 				if (typeof request.prompt !== "string" || !request.prompt.trim() || Buffer.byteLength(request.prompt) > 2 * 1024 * 1024) throw new Error("Invalid Claude prompt");
 				if (this.current) throw new Error("Claude already has a running turn");
@@ -173,6 +190,7 @@ export class ClaudeSdkHelper {
 			maxBudgetUsd: config.maxBudgetUsd,
 			...(config.model ? { model: config.model } : {}),
 			...(config.effort ? { effort: config.effort } : {}),
+			...(config.outputSchema ? { outputFormat: { type: "json_schema", schema: config.outputSchema } } : {}),
 			...(readonly ? { tools: ["Read", "Grep", "Glob", "LS"] } : {}),
 			// SDK hooks remain in force even when native permission settings would auto-allow.
 			hooks: {
@@ -280,21 +298,47 @@ export class ClaudeSdkHelper {
 		if (item.type === "tool_progress" && typeof item.tool_use_id === "string") this.event({ type: "tool_update", id: item.tool_use_id, text: typeof item.elapsed_time_seconds === "number" ? `${item.elapsed_time_seconds}s` : "Running" });
 		if (item.type === "result" && this.current) {
 			const usage = item.usage && typeof item.usage === "object" ? record(item.usage) : {};
+			const sessionTokens = claudeSessionTokens(item.modelUsage);
 			this.event({ type: "usage", inputTokens: numeric(usage.input_tokens), outputTokens: numeric(usage.output_tokens),
-				sessionCostUsd: numeric(item.total_cost_usd) });
-			if (item.is_error && !this.current.cancelled) {
+				cachedInputTokens: numeric(usage.cache_read_input_tokens), cacheWriteTokens: numeric(usage.cache_creation_input_tokens),
+				sessionCostUsd: numeric(item.total_cost_usd), ...(sessionTokens ? { sessionTokens } : {}) });
+			const refusal = item.stop_reason === "refusal";
+			if ((item.is_error || refusal || item.stop_reason === "model_context_window_exceeded" || String(item.subtype).startsWith("error_")) && !this.current.cancelled) {
 				const id = this.current.id;
 				this.current = undefined;
-				const failure = [`Claude returned ${String(item.subtype)}`, ...(Array.isArray(item.errors) ? item.errors.map(String) : [])].join("\n");
-				this.send({ type: "response", id, ok: false, error: message(failure) });
+				const failure = [
+					refusal ? "Claude refusal" : "Claude Code request failed",
+					typeof item.api_error_status === "number" ? `HTTP ${item.api_error_status}` : undefined,
+					item.subtype !== "success" ? item.subtype : undefined,
+					typeof item.result === "string" ? item.result : undefined,
+					...(Array.isArray(item.errors) ? item.errors.map(String) : []),
+				].filter(Boolean).join("\n");
+				const kind = claudeResultFailure(refusal, item);
+				this.cancelPermissions();
+				this.send({ type: "response", id, ok: false, error: message(failure), kind });
 				return;
 			}
 			const text = typeof item.result === "string" ? item.result : this.current.text;
 			if (!this.current.streamed && text) this.event({ type: "text_delta", text });
-			this.finish({ status: this.current.cancelled ? "cancelled" : "completed", text, sessionId: this.sessionId });
+			if (!this.current.cancelled && typeof item.queued_turn_count === "number" && item.queued_turn_count > 0) {
+				this.current.text = "";
+				this.current.streamed = false;
+				return;
+			}
+			this.finish({ status: this.current.cancelled ? "cancelled" : "completed", text, sessionId: this.sessionId,
+				...(!this.current.cancelled && this.config?.outputSchema && item.structured_output !== undefined
+					? { structuredOutput: item.structured_output } : {}) });
 		}
 	}
-	private toolStart(id: string, name: string, input: unknown): void { if (!this.started.has(id)) { this.started.add(id); this.event({ type: "tool_start", id, name, input }); } }
+	private toolStart(id: string, name: string, input: unknown): void {
+		if (this.started.has(id)) return;
+		this.started.add(id);
+		this.event({ type: "tool_start", id, name, input });
+		if (name === "TodoWrite" && input && typeof input === "object") {
+			const plan = externalPlan((input as Record<string, unknown>).todos, "content");
+			if (plan) this.event(plan);
+		}
+	}
 	private toolEnd(id: string, isError: boolean, output?: string): void { if (!this.finished.has(id)) { this.finished.add(id); this.event({ type: "tool_end", id, isError, output: output?.slice(0, 128 * 1024) }); } }
 	private event(event: ExternalAdapterEvent): void { this.send({ type: "event", event }); }
 	private respond(id: string, value: unknown): void { this.send({ type: "response", id, ok: true, value }); }
@@ -305,6 +349,29 @@ export class ClaudeSdkHelper {
 function record(value: unknown): Record<string, unknown> { if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid Claude protocol object"); return value as Record<string, unknown>; }
 function message(error: unknown): string { return redact(error instanceof Error ? error.message : String(error)).slice(0, 8000); }
 function numeric(value: unknown): number | undefined { return typeof value === "number" && Number.isFinite(value) ? value : undefined; }
+function claudeResultFailure(refusal: boolean, item: Record<string, unknown>): ExternalFailureKind | undefined {
+	if (refusal) return "refusal";
+	if (item.subtype === "error_max_budget_usd" || item.api_error_status === 402) return "quota";
+	if (item.api_error_status === 401) return "auth";
+	if (item.api_error_status === 429 || item.api_error_status === 529) return "rate_limit";
+	if (item.stop_reason === "model_context_window_exceeded") return "context";
+}
+
+function claudeSessionTokens(value: unknown) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return;
+	const usage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0 };
+	let count = 0;
+	for (const entry of Object.values(value)) {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+		const model = entry as Record<string, unknown>;
+		usage.inputTokens += numeric(model.inputTokens) ?? 0;
+		usage.outputTokens += numeric(model.outputTokens) ?? 0;
+		usage.cachedInputTokens += numeric(model.cacheReadInputTokens) ?? 0;
+		usage.cacheWriteTokens += numeric(model.cacheCreationInputTokens) ?? 0;
+		count++;
+	}
+	if (count) return usage;
+}
 function printable(value: unknown): string { return typeof value === "string" ? value : JSON.stringify(value) ?? ""; }
 function answerStrings(answers: ExternalApprovalResponse["answers"]): Record<string, string> { return Object.fromEntries(Object.entries(answers ?? {}).map(([key, value]) => [key, Array.isArray(value) ? value.join(", ") : value])); }
 function permissionResponse(value: unknown): ExternalApprovalResponse {
